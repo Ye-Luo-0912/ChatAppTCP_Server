@@ -1,0 +1,79 @@
+{
+  "schemaVersion": 1,
+  "generatedAtUtc": "2026-07-20T16:30:45.4377457+00:00",
+  "environment": {
+    "os": "Windows",
+    "sdk": "11.0.100-preview.6",
+    "gatewayTargetFramework": "net11.0",
+    "realtimeTargetFramework": "net10.0",
+    "topology": "local single node; fresh dependency containers per scenario"
+  },
+  "configuration": {
+    "targetPipelineOperationsPerSecond": 80,
+    "pipelineConcurrency": 32,
+    "pipelinePayloadBytes": 512,
+    "tcpConnections": 1000,
+    "faultAfterSeconds": 20,
+    "faultDurationSeconds": 10,
+    "recoveryWindowSeconds": 60,
+    "natsFaultAction": "pause/unpause",
+    "postgresFaultAction": "stop/start",
+    "garnetFaultAction": "stop/start"
+  },
+  "acceptance": {
+    "explicitFailures": 0,
+    "jetStreamPendingFinal": 0,
+    "outboxPendingFinalMaximum": 16,
+    "serviceMustRecover": true,
+    "backlogMustConverge": true
+  },
+  "results": [
+    {
+      "target": "Nats",
+      "passed": true,
+      "readyRecoverySeconds": 0.095,
+      "convergenceSeconds": 0.121,
+      "succeeded": 6336,
+      "failed": 0,
+      "throughputPerSecond": 70.16,
+      "p95Milliseconds": 162.5,
+      "p99Milliseconds": 200.5,
+      "jetStreamPendingFinal": 0,
+      "outboxPendingFinal": 0,
+      "artifact": ".artifacts/performance/fault-injection-20260720-162138Z/"
+    },
+    {
+      "target": "Postgres",
+      "passed": true,
+      "readyRecoverySeconds": 3.586,
+      "convergenceSeconds": 6.682,
+      "succeeded": 6080,
+      "failed": 0,
+      "throughputPerSecond": 67.36,
+      "p95Milliseconds": 149.5,
+      "p99Milliseconds": 190.5,
+      "jetStreamPendingFinal": 0,
+      "outboxPendingFinal": 4,
+      "artifact": ".artifacts/performance/fault-injection-20260720-162520Z/"
+    },
+    {
+      "target": "Garnet",
+      "passed": true,
+      "readyRecoverySeconds": 3.321,
+      "convergenceSeconds": 3.341,
+      "succeeded": 7173,
+      "failed": 0,
+      "throughputPerSecond": 79.35,
+      "p95Milliseconds": 118.5,
+      "p99Milliseconds": 136.0,
+      "jetStreamPendingFinal": 0,
+      "outboxPendingFinal": 6,
+      "artifact": ".artifacts/performance/fault-injection-20260720-162719Z/"
+    }
+  ],
+  "caveats": [
+    "NATS transient disconnection uses pause/unpause. Single-replica crash durability is not covered.",
+    "Hard restart must be validated separately with a three-replica JetStream topology.",
+    "This is a fault-recovery baseline, not a maximum-throughput benchmark."
+  ]
+}

@@ -1,0 +1,30 @@
+namespace ChatApp.TcpGateway.Core.Protocol;
+
+public enum PacketCommand : ushort
+{
+    Heartbeat = 0,
+    AuthenticationRequest = 1,
+    AuthenticationResponse = 2,
+    ChatMessage = 101,
+    MessageAcknowledgement = 102,
+    MessageReceipt = 103,
+    MessageReceiptAcknowledgement = 104,
+    MessageReceiptUpdated = 105,
+    MessageHistoryRequest = 106,
+    MessageHistoryPage = 107,
+    ConversationListRequest = 108,
+    ConversationListPage = 109,
+    ConversationMarkReadRequest = 110,
+    ConversationMarkReadResponse = 111,
+    ConversationChanged = 112,
+    UnreadCountChanged = 113,
+    SyncBootstrapRequest = 114,
+    SyncBootstrapResponse = 115,
+    ConversationSetPrefsRequest = 116,
+    ConversationSetPrefsResponse = 117,
+    MessageRecallRequest = 118,
+    MessageRecallAck = 119,
+    MessageRecalled = 120,
+    HeartbeatAcknowledgement = 1000,
+    Error = 500
+}

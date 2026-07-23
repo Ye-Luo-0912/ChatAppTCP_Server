@@ -1,0 +1,58 @@
+groups:
+  - name: chatapp-realtime
+    rules:
+      - alert: ChatAppNatsDisconnected
+        expr: max_over_time(chatapp_nats_connection_connected[30s]) == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: ChatApp Realtime is disconnected from NATS
+
+      - alert: ChatAppJetStreamBacklogGrowing
+        expr: max_over_time(chatapp_jetstream_pending[10m]) > 1000 and deriv(chatapp_jetstream_pending[10m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: JetStream consumer backlog is growing
+
+      - alert: ChatAppOutboxAgeWarning
+        expr: realtime_outbox_oldest_age_seconds > 30
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Realtime Outbox oldest record exceeds 30 seconds
+
+      - alert: ChatAppOutboxAgeCritical
+        expr: realtime_outbox_oldest_age_seconds > 120
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: Realtime Outbox oldest record exceeds 120 seconds
+
+      - alert: ChatAppOutboxBacklogGrowing
+        expr: max_over_time(realtime_outbox_pending[10m]) > 1000 and deriv(realtime_outbox_pending[10m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Realtime Outbox backlog is growing
+
+      - alert: ChatAppNpgsqlPoolNearCapacity
+        expr: sum(db_client_connection_count{db_client_connection_state="used"}) / clamp_min(max(db_client_connection_max), 1) > 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Npgsql used connection count exceeds 80 percent of pool capacity
+
+      - alert: ChatAppGen2GcPressure
+        expr: increase(dotnet_gc_collections_total{gc_heap_generation="gen2"}[10m]) > 15
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Realtime process has sustained Gen2 GC pressure

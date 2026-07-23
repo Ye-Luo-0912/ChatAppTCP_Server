@@ -1,0 +1,268 @@
+{
+  "schemaVersion": 1,
+  "id": "2026-07-20-local-single-node-30m",
+  "classification": "local-development-baseline",
+  "sourceArtifact": ".artifacts/performance/benchmark-20260720-102632Z/benchmark-report.json",
+  "window": {
+    "startedAtUtc": "2026-07-20T18:26:32.9736311+08:00",
+    "completedAtUtc": "2026-07-20T18:57:07.6329318+08:00",
+    "warmupSeconds": 30.0,
+    "durationSeconds": 1800.0,
+    "sampleIntervalMilliseconds": 5000.0
+  },
+  "environment": {
+    "machine": "MECHREVO WUJIE15XA",
+    "processor": "AMD Ryzen 7 8845HS w/ Radeon 780M Graphics",
+    "physicalCores": 8,
+    "logicalProcessors": 16,
+    "physicalMemoryGiB": 31.29,
+    "operatingSystem": "Microsoft Windows 10.0.26300",
+    "architecture": "X64",
+    "dotnetRuntime": ".NET 11.0.0-preview.6.26359.118",
+    "dotnetSdk": "11.0.100-preview.6.26359.118",
+    "dependencyTopology": "isolated single-node NATS JetStream + PostgreSQL + Garnet on Docker Desktop"
+  },
+  "configuration": {
+    "buildConfiguration": "Release",
+    "gatewayCount": 2,
+    "tcpMode": "connection",
+    "tcpConnections": 1000,
+    "pipelineConcurrency": 8,
+    "pipelineTargetOperationsPerSecond": 0,
+    "pipelinePayloadBytes": 512,
+    "serialization": "json"
+  },
+  "result": {
+    "passed": true,
+    "errors": [],
+    "pipeline": {
+      "succeeded": 94715,
+      "failed": 0,
+      "errorRatePercent": 0.0,
+      "completedPipelinesPerSecond": 52.60800648474121,
+      "generatorAllocatedBytes": 6425278352,
+      "latencies": {
+        "message_publish_ack": {
+          "count": 94715,
+          "averageMs": 1.0,
+          "p50Ms": 1.0,
+          "p95Ms": 1.5,
+          "p99Ms": 2.5,
+          "maximumMs": 22.388
+        },
+        "message_persisted_outbox": {
+          "count": 94715,
+          "averageMs": 67.397,
+          "p50Ms": 19.5,
+          "p95Ms": 207.5,
+          "p99Ms": 214.0,
+          "maximumMs": 244.186
+        },
+        "receipt_publish_ack": {
+          "count": 94715,
+          "averageMs": 1.081,
+          "p50Ms": 1.5,
+          "p95Ms": 2.0,
+          "p99Ms": 2.5,
+          "maximumMs": 16.14
+        },
+        "receipt_persisted_outbox": {
+          "count": 94715,
+          "averageMs": 71.768,
+          "p50Ms": 20.5,
+          "p95Ms": 219.5,
+          "p99Ms": 221.0,
+          "maximumMs": 334.261
+        },
+        "history_query": {
+          "count": 94715,
+          "averageMs": 12.867,
+          "p50Ms": 13.0,
+          "p95Ms": 21.0,
+          "p99Ms": 25.5,
+          "maximumMs": 114.569
+        },
+        "complete_pipeline": {
+          "count": 94715,
+          "averageMs": 152.063,
+          "p50Ms": 50.5,
+          "p95Ms": 437.5,
+          "p99Ms": 441.5,
+          "maximumMs": 625.979
+        }
+      }
+    },
+    "tcp": {
+      "requestedConnections": 1000,
+      "successfulConnections": 1000,
+      "failedConnections": 0,
+      "perGateway": [
+        {
+          "endpoint": "127.0.0.1:18888",
+          "succeeded": 500,
+          "failed": 0
+        },
+        {
+          "endpoint": "127.0.0.1:18889",
+          "succeeded": 500,
+          "failed": 0
+        }
+      ]
+    },
+    "messageHealth": {
+      "natsConnected": 1.0,
+      "messageConsumerPending": 0.0,
+      "receiptConsumerPending": 0.0,
+      "outboxPending": 8.0,
+      "outboxOldestAgeSeconds": 3.605,
+      "messagesPersisted": 94715.0,
+      "receiptsApplied": 94715.0,
+      "historyQueries": 94715.0,
+      "outboxPublished": 189430.0,
+      "failureRedeliveryDropCounterIncrease": 0
+    },
+    "processResources": [
+      {
+        "role": "gateway-1",
+        "samples": 366,
+        "averageCpuPercentOfHost": 0.05286897510440424,
+        "maximumCpuPercentOfHost": 0.7673975068990028,
+        "firstWorkingSetMiB": 53.48,
+        "lastWorkingSetMiB": 70.88,
+        "maximumWorkingSetMiB": 97.88,
+        "workingSetChangeMiB": 17.4,
+        "firstPrivateMemoryMiB": 20.25,
+        "lastPrivateMemoryMiB": 32.35,
+        "maximumPrivateMemoryMiB": 59.66,
+        "privateMemoryChangeMiB": 12.1
+      },
+      {
+        "role": "gateway-2",
+        "samples": 366,
+        "averageCpuPercentOfHost": 0.05228132463327142,
+        "maximumCpuPercentOfHost": 0.7862498571918659,
+        "firstWorkingSetMiB": 53.88,
+        "lastWorkingSetMiB": 70.5,
+        "maximumWorkingSetMiB": 96.86,
+        "workingSetChangeMiB": 16.62,
+        "firstPrivateMemoryMiB": 20.88,
+        "lastPrivateMemoryMiB": 31.02,
+        "maximumPrivateMemoryMiB": 58.45,
+        "privateMemoryChangeMiB": 10.15
+      },
+      {
+        "role": "pipeline-load",
+        "samples": 360,
+        "averageCpuPercentOfHost": 0.24147772718275018,
+        "maximumCpuPercentOfHost": 1.8474762826183495,
+        "firstWorkingSetMiB": 50.13,
+        "lastWorkingSetMiB": 74.18,
+        "maximumWorkingSetMiB": 80.36,
+        "workingSetChangeMiB": 24.04,
+        "firstPrivateMemoryMiB": 20.22,
+        "lastPrivateMemoryMiB": 40.14,
+        "maximumPrivateMemoryMiB": 46.84,
+        "privateMemoryChangeMiB": 19.91
+      },
+      {
+        "role": "realtime-1",
+        "samples": 366,
+        "averageCpuPercentOfHost": 0.9694538755725389,
+        "maximumCpuPercentOfHost": 5.446875939720807,
+        "firstWorkingSetMiB": 95.53,
+        "lastWorkingSetMiB": 136.84,
+        "maximumWorkingSetMiB": 147.69,
+        "workingSetChangeMiB": 41.31,
+        "firstPrivateMemoryMiB": 45.8,
+        "lastPrivateMemoryMiB": 75.16,
+        "maximumPrivateMemoryMiB": 86.51,
+        "privateMemoryChangeMiB": 29.37
+      },
+      {
+        "role": "tcp-load-1",
+        "samples": 360,
+        "averageCpuPercentOfHost": 5.436395904089549E-05,
+        "maximumCpuPercentOfHost": 0.01951666129568148,
+        "firstWorkingSetMiB": 25.19,
+        "lastWorkingSetMiB": 25.09,
+        "maximumWorkingSetMiB": 25.21,
+        "workingSetChangeMiB": -0.1,
+        "firstPrivateMemoryMiB": 8.06,
+        "lastPrivateMemoryMiB": 7.76,
+        "maximumPrivateMemoryMiB": 8.06,
+        "privateMemoryChangeMiB": -0.3
+      },
+      {
+        "role": "tcp-load-2",
+        "samples": 360,
+        "averageCpuPercentOfHost": 0.0,
+        "maximumCpuPercentOfHost": 0.0,
+        "firstWorkingSetMiB": 24.97,
+        "lastWorkingSetMiB": 24.94,
+        "maximumWorkingSetMiB": 25.06,
+        "workingSetChangeMiB": -0.03,
+        "firstPrivateMemoryMiB": 7.75,
+        "lastPrivateMemoryMiB": 7.53,
+        "maximumPrivateMemoryMiB": 7.75,
+        "privateMemoryChangeMiB": -0.22
+      }
+    ],
+    "dockerResources": [
+      {
+        "role": "garnet",
+        "samples": 367,
+        "averageCpuPercentOneCoreEquals100": 0.027929155313351474,
+        "maximumCpuPercentOneCoreEquals100": 3.07,
+        "firstMemoryMiB": 26.41,
+        "lastMemoryMiB": 41.34,
+        "averageMemoryMiB": 37.64,
+        "maximumMemoryMiB": 44.54,
+        "memoryChangeMiB": 14.93,
+        "lastNetworkIo": "54.6kB / 82.3kB",
+        "lastBlockIo": "1.95MB / 0B"
+      },
+      {
+        "role": "nats",
+        "samples": 367,
+        "averageCpuPercentOneCoreEquals100": 9.096757493188003,
+        "maximumCpuPercentOneCoreEquals100": 38.91,
+        "firstMemoryMiB": 5.05,
+        "lastMemoryMiB": 94.83,
+        "averageMemoryMiB": 115.9,
+        "maximumMemoryMiB": 180.2,
+        "memoryChangeMiB": 89.78,
+        "lastNetworkIo": "1.29GB / 1.5GB",
+        "lastBlockIo": "13.4MB / 606MB"
+      },
+      {
+        "role": "postgres",
+        "samples": 367,
+        "averageCpuPercentOneCoreEquals100": 62.3160217983651,
+        "maximumCpuPercentOneCoreEquals100": 324.4,
+        "firstMemoryMiB": 42.76,
+        "lastMemoryMiB": 486.8,
+        "averageMemoryMiB": 326.11,
+        "maximumMemoryMiB": 486.8,
+        "memoryChangeMiB": 444.04,
+        "lastNetworkIo": "528MB / 1.15GB",
+        "lastBlockIo": "19.7MB / 5.08GB"
+      }
+    ]
+  },
+  "comparisonPolicy": {
+    "scope": "advisory; compare only on the same machine, topology, duration, payload and concurrency",
+    "manualReviewRegressionPercent": 10,
+    "gates": {
+      "requiredPassed": true,
+      "maximumFailedOperations": 0,
+      "minimumSuccessfulTcpConnections": 1000,
+      "minimumCompletedPipelinesPerSecond": 47.35,
+      "maximumCompletePipelineP95Ms": 481.25,
+      "maximumCompletePipelineP99Ms": 485.65,
+      "maximumFinalJetStreamPendingPerConsumer": 0,
+      "maximumFinalOutboxPending": 16,
+      "maximumFinalOutboxOldestAgeSeconds": 15,
+      "maximumFailureRedeliveryDropCounterIncrease": 0
+    }
+  }
+}

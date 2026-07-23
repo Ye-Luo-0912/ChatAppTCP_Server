@@ -1,0 +1,74 @@
+{
+  "uid": "chatapp-realtime",
+  "title": "ChatApp Realtime",
+  "tags": ["chatapp", "realtime"],
+  "timezone": "browser",
+  "schemaVersion": 41,
+  "version": 1,
+  "refresh": "15s",
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "NATS connection",
+      "datasource": {"type": "prometheus", "uid": "chatapp-prometheus"},
+      "targets": [{"expr": "max(chatapp_nats_connection_connected)", "refId": "A"}],
+      "fieldConfig": {"defaults": {"thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 1}]}, "mappings": [{"type": "value", "options": {"0": {"text": "Disconnected", "color": "red"}, "1": {"text": "Connected", "color": "green"}}}]}, "overrides": []},
+      "gridPos": {"h": 5, "w": 6, "x": 0, "y": 0}
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "JetStream pending",
+      "datasource": {"type": "prometheus", "uid": "chatapp-prometheus"},
+      "targets": [{"expr": "sum(chatapp_jetstream_pending)", "refId": "A"}],
+      "fieldConfig": {"defaults": {"unit": "none", "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "orange", "value": 1000}]}}, "overrides": []},
+      "gridPos": {"h": 5, "w": 6, "x": 6, "y": 0}
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Outbox pending",
+      "datasource": {"type": "prometheus", "uid": "chatapp-prometheus"},
+      "targets": [{"expr": "sum(realtime_outbox_pending)", "refId": "A"}],
+      "fieldConfig": {"defaults": {"unit": "none", "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "orange", "value": 1000}]}}, "overrides": []},
+      "gridPos": {"h": 5, "w": 6, "x": 12, "y": 0}
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Outbox oldest age",
+      "datasource": {"type": "prometheus", "uid": "chatapp-prometheus"},
+      "targets": [{"expr": "max(realtime_outbox_oldest_age_seconds)", "refId": "A"}],
+      "fieldConfig": {"defaults": {"unit": "s", "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "orange", "value": 30}, {"color": "red", "value": 120}]}}, "overrides": []},
+      "gridPos": {"h": 5, "w": 6, "x": 18, "y": 0}
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "JetStream pending by consumer",
+      "datasource": {"type": "prometheus", "uid": "chatapp-prometheus"},
+      "targets": [{"expr": "sum by (consumer) (chatapp_jetstream_pending)", "legendFormat": "{{consumer}}", "refId": "A"}],
+      "fieldConfig": {"defaults": {"unit": "none"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 5}
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Npgsql connections",
+      "datasource": {"type": "prometheus", "uid": "chatapp-prometheus"},
+      "targets": [{"expr": "sum by (db_client_connection_state) (db_client_connection_count)", "legendFormat": "{{db_client_connection_state}}", "refId": "A"}, {"expr": "max(db_client_connection_max)", "legendFormat": "pool max", "refId": "B"}],
+      "fieldConfig": {"defaults": {"unit": "none"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 5}
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "GC allocation and Gen2 collections",
+      "datasource": {"type": "prometheus", "uid": "chatapp-prometheus"},
+      "targets": [{"expr": "rate(dotnet_gc_heap_total_allocated_bytes_total[5m])", "legendFormat": "allocated bytes/s", "refId": "A"}, {"expr": "rate(dotnet_gc_collections_total{gc_heap_generation=\"gen2\"}[5m])", "legendFormat": "Gen2/s", "refId": "B"}],
+      "fieldConfig": {"defaults": {}, "overrides": []},
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 13}
+    }
+  ]
+}

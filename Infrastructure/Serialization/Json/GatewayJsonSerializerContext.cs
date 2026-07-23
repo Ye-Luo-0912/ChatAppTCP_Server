@@ -1,0 +1,51 @@
+using System.Text.Json.Serialization;
+using ChatApp.TcpGateway.Core.Messaging;
+using ChatApp.TcpGateway.Core.Messaging.Conversations;
+using ChatApp.TcpGateway.Core.Messaging.History;
+using ChatApp.TcpGateway.Core.Messaging.Sync;
+using ChatApp.TcpGateway.Infrastructure.Authentication.Models;
+
+namespace ChatApp.TcpGateway.Infrastructure.Serialization.Json;
+
+[JsonSourceGenerationOptions(
+    PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase,
+    PropertyNameCaseInsensitive = true,
+    WriteIndented = false,
+    DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull)]
+[JsonSerializable(typeof(AuthenticationRequest))]
+[JsonSerializable(typeof(AuthenticationResponse))]
+[JsonSerializable(typeof(ChatMessage))]
+[JsonSerializable(typeof(AttachmentRef))]
+[JsonSerializable(typeof(List<AttachmentRef>))]
+[JsonSerializable(typeof(AttachmentWireStatus))]
+[JsonSerializable(typeof(MessageAcknowledgement))]
+[JsonSerializable(typeof(MessageReceiptRequest))]
+[JsonSerializable(typeof(MessageReceiptAcknowledgement))]
+[JsonSerializable(typeof(MessageReceiptUpdate))]
+[JsonSerializable(typeof(MessageHistoryRequest))]
+[JsonSerializable(typeof(MessageHistoryResponse))]
+[JsonSerializable(typeof(MessageHistoryCursor))]
+[JsonSerializable(typeof(MessageHistoryItem))]
+[JsonSerializable(typeof(List<MessageHistoryItem>))]
+[JsonSerializable(typeof(ConversationListRequest))]
+[JsonSerializable(typeof(ConversationListResponse))]
+[JsonSerializable(typeof(ConversationListCursor))]
+[JsonSerializable(typeof(ConversationListItem))]
+[JsonSerializable(typeof(List<ConversationListItem>))]
+[JsonSerializable(typeof(ConversationMarkReadRequest))]
+[JsonSerializable(typeof(ConversationMarkReadResponse))]
+[JsonSerializable(typeof(ConversationSetPrefsRequest))]
+[JsonSerializable(typeof(ConversationSetPrefsResponse))]
+[JsonSerializable(typeof(MessageRecallRequest))]
+[JsonSerializable(typeof(MessageRecallAcknowledgement))]
+[JsonSerializable(typeof(MessageRecalledUpdate))]
+[JsonSerializable(typeof(ConversationChanged))]
+[JsonSerializable(typeof(UnreadCountChanged))]
+[JsonSerializable(typeof(SyncBootstrapRequest))]
+[JsonSerializable(typeof(SyncBootstrapResponse))]
+[JsonSerializable(typeof(ConversationSyncWatermark))]
+[JsonSerializable(typeof(List<ConversationSyncWatermark>))]
+[JsonSerializable(typeof(ConversationHistoryCatchUp))]
+[JsonSerializable(typeof(List<ConversationHistoryCatchUp>))]
+[JsonSerializable(typeof(AccessTokenRecord))]
+public partial class GatewayJsonSerializerContext : JsonSerializerContext;

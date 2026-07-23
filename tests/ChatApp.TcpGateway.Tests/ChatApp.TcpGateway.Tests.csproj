@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+    <TestingPlatformDotnetTestSupport>true</TestingPlatformDotnetTestSupport>
+    <AssemblyName>ChatApp.TcpGateway.Tests</AssemblyName>
+    <RootNamespace>ChatApp.TcpGateway.Tests</RootNamespace>
+    <!-- xUnit 惯用下划线命名；分析器 CA1707 与之冲突 -->
+    <NoWarn>$(NoWarn);CA1707</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="xunit.v3" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\ChatApp.TcpGateway.csproj" />
+    <ProjectReference Include="..\..\Core\Core.csproj" />
+    <ProjectReference Include="..\..\Infrastructure\Infrastructure.csproj" />
+    <ProjectReference Include="..\..\tools\ChatApp.Realtime.PipelineLoadGenerator\ChatApp.Realtime.PipelineLoadGenerator.csproj" />
+  </ItemGroup>
+</Project>

@@ -1,0 +1,40 @@
+{
+  "completedAtUtc": "2026-07-22T10:40:00Z",
+  "host": "Linux CachyOS x86_64 via ssh chatapp-linux",
+  "runtime": ".NET 11.0.100-preview.6.26359.118",
+  "soak": {
+    "durationSeconds": 28800,
+    "warmupSeconds": 300,
+    "pipelineTargetPerSecond": 80,
+    "pipelineSucceeded": 2303575,
+    "pipelineFailed": 0,
+    "pipelineThroughputPerSecond": 79.9836,
+    "pipelineP50Milliseconds": 68.5,
+    "pipelineP95Milliseconds": 200.5,
+    "pipelineP99Milliseconds": 270.0,
+    "jetStreamPendingFinal": 0,
+    "outboxPendingFinal": 0,
+    "outboxOldestAgeSecondsMaximum": 4.605,
+    "postgresMaximumMemoryBytes": 279969792,
+    "natsMaximumMemoryBytes": 317299097,
+    "realtimeLastWorkingSetBytes": 213291008,
+    "realtimeMaximumPrivateMemoryBytes": 430530560,
+    "gen2CollectionsDelta": 59,
+    "lohHeapBytesFinal": 11457304,
+    "connectionPoolMaximumUsed": 14,
+    "connectionPoolMaximumIdle": 18
+  },
+  "jetStreamThreeReplicaHardRestart": {
+    "replicas": 3,
+    "faultAction": "stop-start nats-1",
+    "pipelineSucceeded": 4816,
+    "pipelineFailed": 0,
+    "pipelineThroughputPerSecond": 40.0808,
+    "pipelineP95Milliseconds": 111.0,
+    "natsDisconnectedDelta": 1,
+    "natsReconnectionsDelta": 1,
+    "jetStreamPendingFinal": 0,
+    "outboxPendingFinal": 6,
+    "natsConnectedFinal": 1
+  }
+}

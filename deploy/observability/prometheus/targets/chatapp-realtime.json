@@ -1,0 +1,9 @@
+[
+  {
+    "targets": ["127.0.0.1:18080"],
+    "labels": {
+      "service": "chatapp-realtime",
+      "environment": "linux-test"
+    }
+  }
+]

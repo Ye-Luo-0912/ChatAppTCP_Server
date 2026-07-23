@@ -1,0 +1,63 @@
+{
+  "id": "2026-07-20-local-single-node-capacity-curve",
+  "kind": "bounded-closed-loop-capacity-curve",
+  "environment": {
+    "gatewayCount": 2,
+    "tcpConnections": 1000,
+    "pipelineConcurrency": 32,
+    "payloadBytes": 512,
+    "warmupSeconds": 10,
+    "measurementSecondsPerRate": 60,
+    "natsImage": "nats:2.10.26-alpine",
+    "postgresImage": "postgres:16.8",
+    "garnetImage": "ghcr.io/microsoft/garnet:1.0.84"
+  },
+  "curve": [
+    { "targetPerSecond": 40, "achievedPerSecond": 40.16, "attainmentPercent": 100.4, "failed": 0, "p95Ms": 151.5, "p99Ms": 199.5 },
+    { "targetPerSecond": 80, "achievedPerSecond": 79.05, "attainmentPercent": 98.8, "failed": 0, "p95Ms": 144.0, "p99Ms": 255.5 },
+    { "targetPerSecond": 120, "achievedPerSecond": 115.79, "attainmentPercent": 96.5, "failed": 0, "p95Ms": 190.5, "p99Ms": 214.5 },
+    { "targetPerSecond": 160, "achievedPerSecond": 126.63, "attainmentPercent": 79.1, "failed": 0, "p95Ms": 402.5, "p99Ms": 1245.5 },
+    { "targetPerSecond": 200, "achievedPerSecond": 186.61, "attainmentPercent": 93.3, "failed": 0, "p95Ms": 159.5, "p99Ms": 211.0 },
+    { "targetPerSecond": 240, "achievedPerSecond": 213.67, "attainmentPercent": 89.0, "failed": 0, "p95Ms": 185.5, "p99Ms": 205.0 },
+    { "targetPerSecond": 280, "achievedPerSecond": 190.50, "attainmentPercent": 68.0, "failed": 0, "p95Ms": 208.0, "p99Ms": 317.0 },
+    { "targetPerSecond": 320, "achievedPerSecond": 252.08, "attainmentPercent": 78.8, "failed": 0, "p95Ms": 142.0, "p99Ms": 167.0 },
+    { "targetPerSecond": 400, "achievedPerSecond": 204.70, "attainmentPercent": 51.2, "failed": 0, "p95Ms": 205.5, "p99Ms": 392.0 }
+  ],
+  "sustainedConfirmation": {
+    "targetPerSecond": 120,
+    "warmupSeconds": 30,
+    "measurementSeconds": 300,
+    "succeeded": 34626,
+    "failed": 0,
+    "achievedPerSecond": 115.35,
+    "attainmentPercent": 96.1,
+    "p50Ms": 91.5,
+    "p95Ms": 174.0,
+    "p99Ms": 214.0,
+    "historyP95Ms": 4.0,
+    "messageOutboxP95Ms": 150.5,
+    "receiptOutboxP95Ms": 22.0,
+    "jetStreamPendingFinal": 0,
+    "outboxPendingFinal": 7,
+    "outboxOldestAgeSecondsFinal": 2.957,
+    "postgresAverageCpuPercent": 27.2,
+    "postgresMaximumCpuPercent": 61.43
+  },
+  "recommendedInitialOperatingBudgetPerNode": 80,
+  "shortTermGate": {
+    "targetPerSecond": 120,
+    "minimumAchievedPerSecond": 110,
+    "maximumErrorRatePercent": 0,
+    "maximumP95Ms": 200,
+    "maximumP99Ms": 250,
+    "maximumJetStreamPendingFinal": 0,
+    "maximumOutboxPendingFinal": 16,
+    "maximumOutboxOldestAgeSecondsFinal": 15
+  },
+  "notes": [
+    "Each rate used fresh NATS, PostgreSQL, and Garnet containers.",
+    "The generator uses bounded closed-loop pacing; high-rate target misses are not equivalent to an open-loop server queue.",
+    "The 252.08 pipeline/s observation is a short peak, not a sustained operating limit.",
+    "Use 80 pipeline/s as the initial per-node operating budget until soak and failure-injection tests pass."
+  ]
+}
