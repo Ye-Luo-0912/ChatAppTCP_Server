@@ -132,11 +132,17 @@ file sealed class ScriptedEphemeralBus(EphemeralTypingEvent? typing = null) : IR
     public Task<ConversationSetPrefsResult> SetConversationPrefsAsync(ConversationSetPrefsCommand command, CancellationToken ct = default) =>
         Task.FromResult(ConversationSetPrefsResult.Failed(command.RequestId, "x", "x"));
 
+    public Task<GroupConversationResult> MutateGroupConversationAsync(GroupConversationCommand command, CancellationToken ct = default) =>
+        Task.FromResult(GroupConversationResult.Failed(command.RequestId, "x", "x"));
+
     public Task<MessageRecallResult> RecallMessageAsync(MessageRecallCommand command, CancellationToken ct = default) =>
         Task.FromResult(MessageRecallResult.Failed(command.RequestId, "x", "x"));
 
     public Task<MessageEditResult> EditMessageAsync(MessageEditCommand command, CancellationToken ct = default) =>
         Task.FromResult(MessageEditResult.Failed(command.RequestId, "x", "x"));
+
+    public Task<MessageReactionResult> ReactToMessageAsync(MessageReactionCommand command, CancellationToken ct = default) =>
+        Task.FromResult(MessageReactionResult.Failed(command.RequestId, "x", "x"));
 
     public Task<SyncBootstrapPage> QuerySyncBootstrapAsync(SyncBootstrapQuery query, CancellationToken ct = default) =>
         Task.FromResult(SyncBootstrapPage.Failed(query.RequestId, "x", "x"));

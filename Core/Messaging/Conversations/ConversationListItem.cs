@@ -5,6 +5,7 @@ public sealed class ConversationListItem
     public required string ConversationId { get; init; }
     public ConversationType Type { get; init; } = ConversationType.Direct;
     public long? PeerUserId { get; init; }
+    public string? Title { get; init; }
     public string? LastMessageId { get; init; }
     public string? LastMessagePreview { get; init; }
     public long? LastMessageAtMs { get; init; }

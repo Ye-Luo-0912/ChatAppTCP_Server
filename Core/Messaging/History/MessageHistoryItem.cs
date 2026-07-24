@@ -18,6 +18,7 @@ public sealed class MessageHistoryItem
     public bool IsEdited => EditVersion > 1 || EditedAtMs is > 0;
 
     public IReadOnlyList<AttachmentRef>? Attachments { get; init; }
+    public IReadOnlyList<MessageReactionSummary>? Reactions { get; init; }
 
     public string? ReplyToMessageId { get; init; }
     public long? ReplyToSenderUserId { get; init; }

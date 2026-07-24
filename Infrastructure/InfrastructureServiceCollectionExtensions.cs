@@ -71,6 +71,18 @@ public static class InfrastructureServiceCollectionExtensions
         services.AddSingleton<IPayloadCodec<ConversationSetPrefsResponse>>(
             static _ => new JsonPayloadCodec<ConversationSetPrefsResponse>(
                 GatewayJsonSerializerContext.Default.ConversationSetPrefsResponse));
+        services.AddSingleton<IPayloadCodec<MemberJoinedUpdate>>(
+            static _ => new JsonPayloadCodec<MemberJoinedUpdate>(
+                GatewayJsonSerializerContext.Default.MemberJoinedUpdate));
+        services.AddSingleton<IPayloadCodec<MemberLeftUpdate>>(
+            static _ => new JsonPayloadCodec<MemberLeftUpdate>(
+                GatewayJsonSerializerContext.Default.MemberLeftUpdate));
+        services.AddSingleton<IPayloadCodec<MemberRemovedUpdate>>(
+            static _ => new JsonPayloadCodec<MemberRemovedUpdate>(
+                GatewayJsonSerializerContext.Default.MemberRemovedUpdate));
+        services.AddSingleton<IPayloadCodec<RoleChangedUpdate>>(
+            static _ => new JsonPayloadCodec<RoleChangedUpdate>(
+                GatewayJsonSerializerContext.Default.RoleChangedUpdate));
         services.AddSingleton<IPayloadCodec<MessageRecallRequest>>(
             static _ => new JsonPayloadCodec<MessageRecallRequest>(
                 GatewayJsonSerializerContext.Default.MessageRecallRequest));
@@ -89,6 +101,24 @@ public static class InfrastructureServiceCollectionExtensions
         services.AddSingleton<IPayloadCodec<MessageEditedUpdate>>(
             static _ => new JsonPayloadCodec<MessageEditedUpdate>(
                 GatewayJsonSerializerContext.Default.MessageEditedUpdate));
+        services.AddSingleton<IPayloadCodec<AddReactionRequest>>(
+            static _ => new JsonPayloadCodec<AddReactionRequest>(
+                GatewayJsonSerializerContext.Default.AddReactionRequest));
+        services.AddSingleton<IPayloadCodec<AddReactionAcknowledgement>>(
+            static _ => new JsonPayloadCodec<AddReactionAcknowledgement>(
+                GatewayJsonSerializerContext.Default.AddReactionAcknowledgement));
+        services.AddSingleton<IPayloadCodec<ReactionAddedUpdate>>(
+            static _ => new JsonPayloadCodec<ReactionAddedUpdate>(
+                GatewayJsonSerializerContext.Default.ReactionAddedUpdate));
+        services.AddSingleton<IPayloadCodec<RemoveReactionRequest>>(
+            static _ => new JsonPayloadCodec<RemoveReactionRequest>(
+                GatewayJsonSerializerContext.Default.RemoveReactionRequest));
+        services.AddSingleton<IPayloadCodec<RemoveReactionAcknowledgement>>(
+            static _ => new JsonPayloadCodec<RemoveReactionAcknowledgement>(
+                GatewayJsonSerializerContext.Default.RemoveReactionAcknowledgement));
+        services.AddSingleton<IPayloadCodec<ReactionRemovedUpdate>>(
+            static _ => new JsonPayloadCodec<ReactionRemovedUpdate>(
+                GatewayJsonSerializerContext.Default.ReactionRemovedUpdate));
         services.AddSingleton<IPayloadCodec<ConversationChanged>>(
             static _ => new JsonPayloadCodec<ConversationChanged>(
                 GatewayJsonSerializerContext.Default.ConversationChanged));

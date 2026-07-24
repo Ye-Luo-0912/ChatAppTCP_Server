@@ -93,6 +93,18 @@ public sealed class RealtimeMessagingTests
                 GatewayJsonSerializerContext.Default.MessageRecalledUpdate),
             new JsonPayloadCodec<MessageEditedUpdate>(
                 GatewayJsonSerializerContext.Default.MessageEditedUpdate),
+            new JsonPayloadCodec<ReactionAddedUpdate>(
+                GatewayJsonSerializerContext.Default.ReactionAddedUpdate),
+            new JsonPayloadCodec<ReactionRemovedUpdate>(
+                GatewayJsonSerializerContext.Default.ReactionRemovedUpdate),
+            new JsonPayloadCodec<MemberJoinedUpdate>(
+                GatewayJsonSerializerContext.Default.MemberJoinedUpdate),
+            new JsonPayloadCodec<MemberLeftUpdate>(
+                GatewayJsonSerializerContext.Default.MemberLeftUpdate),
+            new JsonPayloadCodec<MemberRemovedUpdate>(
+                GatewayJsonSerializerContext.Default.MemberRemovedUpdate),
+            new JsonPayloadCodec<RoleChangedUpdate>(
+                GatewayJsonSerializerContext.Default.RoleChangedUpdate),
             metrics,
             TimeProvider.System,
             NullLogger<RealtimeEventDispatcher>.Instance);
@@ -191,6 +203,15 @@ public sealed class RealtimeMessagingTests
                     "not_used",
                     "not used"));
 
+        public Task<GroupConversationResult> MutateGroupConversationAsync(
+            GroupConversationCommand command,
+            CancellationToken ct = default) =>
+            Task.FromResult(
+                GroupConversationResult.Failed(
+                    command.RequestId,
+                    "not_used",
+                    "not used"));
+
         public Task<MessageRecallResult> RecallMessageAsync(
             MessageRecallCommand command,
             CancellationToken ct = default) =>
@@ -205,6 +226,15 @@ public sealed class RealtimeMessagingTests
             CancellationToken ct = default) =>
             Task.FromResult(
                 MessageEditResult.Failed(
+                    command.RequestId,
+                    "not_used",
+                    "not used"));
+
+        public Task<MessageReactionResult> ReactToMessageAsync(
+            MessageReactionCommand command,
+            CancellationToken ct = default) =>
+            Task.FromResult(
+                MessageReactionResult.Failed(
                     command.RequestId,
                     "not_used",
                     "not used"));

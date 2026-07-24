@@ -327,6 +327,14 @@ public sealed class TcpGatewayAttachmentValidationTests
                 GatewayJsonSerializerContext.Default.MessageEditRequest);
             var messageEditAcknowledgementCodec = new JsonPayloadCodec<MessageEditAcknowledgement>(
                 GatewayJsonSerializerContext.Default.MessageEditAcknowledgement);
+            var addReactionRequestCodec = new JsonPayloadCodec<AddReactionRequest>(
+                GatewayJsonSerializerContext.Default.AddReactionRequest);
+            var addReactionAcknowledgementCodec = new JsonPayloadCodec<AddReactionAcknowledgement>(
+                GatewayJsonSerializerContext.Default.AddReactionAcknowledgement);
+            var removeReactionRequestCodec = new JsonPayloadCodec<RemoveReactionRequest>(
+                GatewayJsonSerializerContext.Default.RemoveReactionRequest);
+            var removeReactionAcknowledgementCodec = new JsonPayloadCodec<RemoveReactionAcknowledgement>(
+                GatewayJsonSerializerContext.Default.RemoveReactionAcknowledgement);
             var syncBootstrapRequestCodec = new JsonPayloadCodec<SyncBootstrapRequest>(
                 GatewayJsonSerializerContext.Default.SyncBootstrapRequest);
             var syncBootstrapResponseCodec = new JsonPayloadCodec<SyncBootstrapResponse>(
@@ -354,6 +362,10 @@ public sealed class TcpGatewayAttachmentValidationTests
                 messageRecallAcknowledgementCodec,
                 messageEditRequestCodec,
                 messageEditAcknowledgementCodec,
+                addReactionRequestCodec,
+                addReactionAcknowledgementCodec,
+                removeReactionRequestCodec,
+                removeReactionAcknowledgementCodec,
                 syncBootstrapRequestCodec,
                 syncBootstrapResponseCodec,
                 messageBus,
@@ -364,6 +376,8 @@ public sealed class TcpGatewayAttachmentValidationTests
                 new NoopLeaseStore(),
                 new NoopGlobalPresenceStore(),
                 new UserSessionRegistry(),
+                new PresenceWatcherRegistry(),
+                new TypingFanoutCoordinator(TimeProvider.System),
                 metrics,
                 TimeProvider.System,
                 NullLogger<TcpGatewayService>.Instance,
@@ -509,6 +523,15 @@ public sealed class TcpGatewayAttachmentValidationTests
                     mutedUntilMs: null,
                     changed: false));
 
+        public Task<GroupConversationResult> MutateGroupConversationAsync(
+            GroupConversationCommand command,
+            CancellationToken ct = default) =>
+            Task.FromResult(
+                GroupConversationResult.Failed(
+                    command.RequestId,
+                    "not_used",
+                    "not used"));
+
         public Task<MessageRecallResult> RecallMessageAsync(
             MessageRecallCommand command,
             CancellationToken ct = default) =>
@@ -530,6 +553,15 @@ public sealed class TcpGatewayAttachmentValidationTests
                     content: command.Content,
                     editVersion: 2,
                     editedAtMs: command.OccurredAtMs));
+
+        public Task<MessageReactionResult> ReactToMessageAsync(
+            MessageReactionCommand command,
+            CancellationToken ct = default) =>
+            Task.FromResult(
+                MessageReactionResult.Failed(
+                    command.RequestId,
+                    "not_used",
+                    "not used"));
 
         public Task<SyncBootstrapPage> QuerySyncBootstrapAsync(
             SyncBootstrapQuery query,

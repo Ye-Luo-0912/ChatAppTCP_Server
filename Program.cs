@@ -70,6 +70,8 @@ builder.Services.AddGatewayObservability(
 builder.Services.AddSingleton(TimeProvider.System);
 builder.Services.AddSingleton<GatewayMetrics>();
 builder.Services.AddSingleton<UserSessionRegistry>();
+builder.Services.AddSingleton<PresenceWatcherRegistry>();
+builder.Services.AddSingleton<TypingFanoutCoordinator>();
 builder.Services.AddSingleton<IGlobalPresenceStore, RedisGlobalPresenceStore>();
 builder.Services.AddSingleton<RealtimeEventDispatcher>();
 builder.Services.AddGatewayInfrastructure();

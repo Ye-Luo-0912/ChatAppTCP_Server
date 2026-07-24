@@ -40,6 +40,10 @@ using RealtimeMessageRecallCommand =
     ChatApp.Realtime.Abstractions.Messaging.MessageRecallCommand;
 using RealtimeMessageEditCommand =
     ChatApp.Realtime.Abstractions.Messaging.MessageEditCommand;
+using RealtimeMessageReactionCommand =
+    ChatApp.Realtime.Abstractions.Messaging.MessageReactionCommand;
+using RealtimeMessageReactionAction =
+    ChatApp.Realtime.Abstractions.Messaging.MessageReactionAction;
 using RealtimeSyncBootstrapQuery =
     ChatApp.Realtime.Abstractions.Sync.SyncBootstrapQuery;
 using RealtimeConversationSyncWatermark =
@@ -69,6 +73,10 @@ internal sealed partial class TcpGatewayService : BackgroundService
     private readonly IPayloadCodec<MessageRecallAcknowledgement> _messageRecallAcknowledgementCodec;
     private readonly IPayloadCodec<MessageEditRequest> _messageEditRequestCodec;
     private readonly IPayloadCodec<MessageEditAcknowledgement> _messageEditAcknowledgementCodec;
+    private readonly IPayloadCodec<AddReactionRequest> _addReactionRequestCodec;
+    private readonly IPayloadCodec<AddReactionAcknowledgement> _addReactionAcknowledgementCodec;
+    private readonly IPayloadCodec<RemoveReactionRequest> _removeReactionRequestCodec;
+    private readonly IPayloadCodec<RemoveReactionAcknowledgement> _removeReactionAcknowledgementCodec;
     private readonly IPayloadCodec<SyncBootstrapRequest> _syncBootstrapRequestCodec;
     private readonly IPayloadCodec<SyncBootstrapResponse> _syncBootstrapResponseCodec;
     private readonly JsonPayloadCodec<TypingNotify> _typingNotifyCodec;
@@ -77,6 +85,18 @@ internal sealed partial class TcpGatewayService : BackgroundService
     private readonly JsonPayloadCodec<PresenceUnwatchRequest> _presenceUnwatchRequestCodec;
     private readonly JsonPayloadCodec<PresenceSnapshotResponse> _presenceSnapshotResponseCodec;
     private readonly JsonPayloadCodec<PresenceChanged> _presenceChangedCodec;
+    private readonly JsonPayloadCodec<CreateGroupRequest> _createGroupRequestCodec;
+    private readonly JsonPayloadCodec<CreateGroupResponse> _createGroupResponseCodec;
+    private readonly JsonPayloadCodec<AddGroupMembersRequest> _addGroupMembersRequestCodec;
+    private readonly JsonPayloadCodec<AddGroupMembersResponse> _addGroupMembersResponseCodec;
+    private readonly JsonPayloadCodec<RemoveGroupMemberRequest> _removeGroupMemberRequestCodec;
+    private readonly JsonPayloadCodec<RemoveGroupMemberResponse> _removeGroupMemberResponseCodec;
+    private readonly JsonPayloadCodec<LeaveGroupRequest> _leaveGroupRequestCodec;
+    private readonly JsonPayloadCodec<LeaveGroupResponse> _leaveGroupResponseCodec;
+    private readonly JsonPayloadCodec<ChangeMemberRoleRequest> _changeMemberRoleRequestCodec;
+    private readonly JsonPayloadCodec<ChangeMemberRoleResponse> _changeMemberRoleResponseCodec;
+    private readonly JsonPayloadCodec<ListGroupMembersRequest> _listGroupMembersRequestCodec;
+    private readonly JsonPayloadCodec<ListGroupMembersResponse> _listGroupMembersResponseCodec;
     private readonly IRealtimeMessageBus _messageBus;
     private readonly RealtimeIntegrationOptions _integrationOptions;
     private readonly IDeviceSessionLeaseStore _deviceSessionLeaseStore;
@@ -119,6 +139,10 @@ internal sealed partial class TcpGatewayService : BackgroundService
         IPayloadCodec<MessageRecallAcknowledgement> messageRecallAcknowledgementCodec,
         IPayloadCodec<MessageEditRequest> messageEditRequestCodec,
         IPayloadCodec<MessageEditAcknowledgement> messageEditAcknowledgementCodec,
+        IPayloadCodec<AddReactionRequest> addReactionRequestCodec,
+        IPayloadCodec<AddReactionAcknowledgement> addReactionAcknowledgementCodec,
+        IPayloadCodec<RemoveReactionRequest> removeReactionRequestCodec,
+        IPayloadCodec<RemoveReactionAcknowledgement> removeReactionAcknowledgementCodec,
         IPayloadCodec<SyncBootstrapRequest> syncBootstrapRequestCodec,
         IPayloadCodec<SyncBootstrapResponse> syncBootstrapResponseCodec,
         IRealtimeMessageBus messageBus,
@@ -126,6 +150,8 @@ internal sealed partial class TcpGatewayService : BackgroundService
         IDeviceSessionLeaseStore deviceSessionLeaseStore,
         IGlobalPresenceStore globalPresence,
         UserSessionRegistry userSessions,
+        PresenceWatcherRegistry presenceWatchers,
+        TypingFanoutCoordinator typingFanout,
         GatewayMetrics metrics,
         TimeProvider timeProvider,
         ILogger<TcpGatewayService> logger,
@@ -151,6 +177,10 @@ internal sealed partial class TcpGatewayService : BackgroundService
         _messageRecallAcknowledgementCodec = messageRecallAcknowledgementCodec;
         _messageEditRequestCodec = messageEditRequestCodec;
         _messageEditAcknowledgementCodec = messageEditAcknowledgementCodec;
+        _addReactionRequestCodec = addReactionRequestCodec;
+        _addReactionAcknowledgementCodec = addReactionAcknowledgementCodec;
+        _removeReactionRequestCodec = removeReactionRequestCodec;
+        _removeReactionAcknowledgementCodec = removeReactionAcknowledgementCodec;
         _syncBootstrapRequestCodec = syncBootstrapRequestCodec;
         _syncBootstrapResponseCodec = syncBootstrapResponseCodec;
         _typingNotifyCodec = new JsonPayloadCodec<TypingNotify>(
@@ -165,13 +195,37 @@ internal sealed partial class TcpGatewayService : BackgroundService
             GatewayJsonSerializerContext.Default.PresenceSnapshotResponse);
         _presenceChangedCodec = new JsonPayloadCodec<PresenceChanged>(
             GatewayJsonSerializerContext.Default.PresenceChanged);
+        _createGroupRequestCodec = new JsonPayloadCodec<CreateGroupRequest>(
+            GatewayJsonSerializerContext.Default.CreateGroupRequest);
+        _createGroupResponseCodec = new JsonPayloadCodec<CreateGroupResponse>(
+            GatewayJsonSerializerContext.Default.CreateGroupResponse);
+        _addGroupMembersRequestCodec = new JsonPayloadCodec<AddGroupMembersRequest>(
+            GatewayJsonSerializerContext.Default.AddGroupMembersRequest);
+        _addGroupMembersResponseCodec = new JsonPayloadCodec<AddGroupMembersResponse>(
+            GatewayJsonSerializerContext.Default.AddGroupMembersResponse);
+        _removeGroupMemberRequestCodec = new JsonPayloadCodec<RemoveGroupMemberRequest>(
+            GatewayJsonSerializerContext.Default.RemoveGroupMemberRequest);
+        _removeGroupMemberResponseCodec = new JsonPayloadCodec<RemoveGroupMemberResponse>(
+            GatewayJsonSerializerContext.Default.RemoveGroupMemberResponse);
+        _leaveGroupRequestCodec = new JsonPayloadCodec<LeaveGroupRequest>(
+            GatewayJsonSerializerContext.Default.LeaveGroupRequest);
+        _leaveGroupResponseCodec = new JsonPayloadCodec<LeaveGroupResponse>(
+            GatewayJsonSerializerContext.Default.LeaveGroupResponse);
+        _changeMemberRoleRequestCodec = new JsonPayloadCodec<ChangeMemberRoleRequest>(
+            GatewayJsonSerializerContext.Default.ChangeMemberRoleRequest);
+        _changeMemberRoleResponseCodec = new JsonPayloadCodec<ChangeMemberRoleResponse>(
+            GatewayJsonSerializerContext.Default.ChangeMemberRoleResponse);
+        _listGroupMembersRequestCodec = new JsonPayloadCodec<ListGroupMembersRequest>(
+            GatewayJsonSerializerContext.Default.ListGroupMembersRequest);
+        _listGroupMembersResponseCodec = new JsonPayloadCodec<ListGroupMembersResponse>(
+            GatewayJsonSerializerContext.Default.ListGroupMembersResponse);
         _messageBus = messageBus;
         _integrationOptions = integrationOptions;
         _deviceSessionLeaseStore = deviceSessionLeaseStore;
         _globalPresence = globalPresence;
         _userSessions = userSessions;
-        _presenceWatchers = new PresenceWatcherRegistry(timeProvider);
-        _typingFanout = new TypingFanoutCoordinator(timeProvider);
+        _presenceWatchers = presenceWatchers;
+        _typingFanout = typingFanout;
         _metrics = metrics;
         _timeProvider = timeProvider;
         _logger = logger;
@@ -682,11 +736,52 @@ internal sealed partial class TcpGatewayService : BackgroundService
                     .ConfigureAwait(false);
                 break;
 
+            case PacketCommand.AddReactionRequest:
+                await HandleAddReactionRequestAsync(
+                        frame.Payload,
+                        session,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+                break;
+
+            case PacketCommand.RemoveReactionRequest:
+                await HandleRemoveReactionRequestAsync(
+                        frame.Payload,
+                        session,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+                break;
+
             case PacketCommand.SyncBootstrapRequest:
                 await HandleSyncBootstrapRequestAsync(
                         frame.Payload,
                         session,
                         cancellationToken)
+                    .ConfigureAwait(false);
+                break;
+
+            case PacketCommand.CreateGroupRequest:
+                await HandleCreateGroupRequestAsync(frame.Payload, session, cancellationToken)
+                    .ConfigureAwait(false);
+                break;
+            case PacketCommand.AddGroupMembersRequest:
+                await HandleAddGroupMembersRequestAsync(frame.Payload, session, cancellationToken)
+                    .ConfigureAwait(false);
+                break;
+            case PacketCommand.RemoveGroupMemberRequest:
+                await HandleRemoveGroupMemberRequestAsync(frame.Payload, session, cancellationToken)
+                    .ConfigureAwait(false);
+                break;
+            case PacketCommand.LeaveGroupRequest:
+                await HandleLeaveGroupRequestAsync(frame.Payload, session, cancellationToken)
+                    .ConfigureAwait(false);
+                break;
+            case PacketCommand.ChangeMemberRoleRequest:
+                await HandleChangeMemberRoleRequestAsync(frame.Payload, session, cancellationToken)
+                    .ConfigureAwait(false);
+                break;
+            case PacketCommand.ListGroupMembersRequest:
+                await HandleListGroupMembersRequestAsync(frame.Payload, session, cancellationToken)
                     .ConfigureAwait(false);
                 break;
 
@@ -982,8 +1077,12 @@ internal sealed partial class TcpGatewayService : BackgroundService
         var hasAttachments = message?.AttachmentIds is { Count: > 0 };
         var hasReply = !string.IsNullOrWhiteSpace(message?.ReplyToMessageId);
         var hasForward = !string.IsNullOrWhiteSpace(message?.ForwardedFromMessageId);
+        var isGroup = !string.IsNullOrWhiteSpace(message?.ConversationId)
+                      && Realtime.Abstractions.Conversations.ConversationId.IsGroup(
+                          message!.ConversationId);
         if (message is null ||
-            message.TargetUserId <= 0 ||
+            (!isGroup && message.TargetUserId <= 0) ||
+            (isGroup && message.ConversationId!.Length > 64) ||
             (string.IsNullOrWhiteSpace(message.Content) && !hasAttachments) ||
             message.MessageId?.Length > ChatMessageLimits.MaxClientMessageIdLength ||
             (message.AttachmentIds is { Count: > 0 } &&
@@ -1031,7 +1130,8 @@ internal sealed partial class TcpGatewayService : BackgroundService
             SenderUserId = sender.UserId,
             SenderSessionId = sender.SessionId
                 ?? $"tcp-{sender.ConnectionId}",
-            ReceiverUserId = message.TargetUserId,
+            ReceiverUserId = isGroup ? 0 : message.TargetUserId,
+            ConversationId = isGroup ? message.ConversationId!.Trim() : null,
             Content = message.Content ?? string.Empty,
             AttachmentIds = message.AttachmentIds,
             ReplyToMessageId = string.IsNullOrWhiteSpace(message.ReplyToMessageId)
@@ -1252,6 +1352,14 @@ internal sealed partial class TcpGatewayService : BackgroundService
                             EditedAtMs = item.EditedAtMs,
                             ChangedAtMs = item.ChangedAtMs,
                             Attachments = AttachmentWireMapper.Map(item.Attachments),
+                            Reactions = item.Reactions?
+                                .Select(static reaction => new MessageReactionSummary
+                                {
+                                    Emoji = reaction.Emoji,
+                                    Count = reaction.Count,
+                                    ReactedByMe = reaction.ReactedByMe
+                                })
+                                .ToArray(),
                             ReplyToMessageId = item.ReplyToMessageId,
                             ReplyToSenderUserId = item.ReplyToSenderUserId,
                             ReplyToPreview = item.ReplyToPreview,
@@ -1380,6 +1488,7 @@ internal sealed partial class TcpGatewayService : BackgroundService
                                 ConversationId = item.ConversationId,
                                 Type = (ConversationType)(byte)item.Type,
                                 PeerUserId = item.PeerUserId,
+                                Title = item.Title,
                                 LastMessageId = item.LastMessageId,
                                 LastMessagePreview = item.LastMessagePreview,
                                 LastMessageAtMs = item.LastMessageAtMs,
@@ -1710,6 +1819,7 @@ internal sealed partial class TcpGatewayService : BackgroundService
                                 ConversationId = item.ConversationId,
                                 Type = (ConversationType)(byte)item.Type,
                                 PeerUserId = item.PeerUserId,
+                                Title = item.Title,
                                 LastMessageId = item.LastMessageId,
                                 LastMessagePreview = item.LastMessagePreview,
                                 LastMessageAtMs = item.LastMessageAtMs,
@@ -1754,6 +1864,14 @@ internal sealed partial class TcpGatewayService : BackgroundService
                                     EditedAtMs = item.EditedAtMs,
                                     ChangedAtMs = item.ChangedAtMs,
                                     Attachments = AttachmentWireMapper.Map(item.Attachments),
+                                    Reactions = item.Reactions?
+                                        .Select(static reaction => new MessageReactionSummary
+                                        {
+                                            Emoji = reaction.Emoji,
+                                            Count = reaction.Count,
+                                            ReactedByMe = reaction.ReactedByMe
+                                        })
+                                        .ToArray(),
                                     ReplyToMessageId = item.ReplyToMessageId,
                                     ReplyToSenderUserId = item.ReplyToSenderUserId,
                                     ReplyToPreview = item.ReplyToPreview,
@@ -1830,6 +1948,376 @@ internal sealed partial class TcpGatewayService : BackgroundService
             _conversationMarkReadResponseCodec,
             response);
         session.TryQueue(outboundFrame);
+    }
+
+    private async ValueTask HandleCreateGroupRequestAsync(
+        ReadOnlySequence<byte> payload,
+        TcpClientSession session,
+        CancellationToken cancellationToken)
+    {
+        var request = _createGroupRequestCodec.Deserialize(payload);
+        if (request is null
+            || string.IsNullOrWhiteSpace(request.RequestId)
+            || request.RequestId.Length > 64
+            || string.IsNullOrWhiteSpace(request.Title)
+            || request.Title.Trim().Length > 128)
+        {
+            _metrics.ProtocolError();
+            SendCreateGroupResponse(session, new CreateGroupResponse
+            {
+                RequestId = request?.RequestId ?? string.Empty,
+                Succeeded = false,
+                ErrorCode = "invalid_request",
+                ErrorMessage = "创建群请求参数无效。"
+            });
+            return;
+        }
+
+        try
+        {
+            var result = await _messageBus.MutateGroupConversationAsync(
+                    new Realtime.Abstractions.Conversations.GroupConversationCommand
+                    {
+                        RequestId = request.RequestId,
+                        ActorUserId = session.UserId,
+                        Operation = Realtime.Abstractions.Conversations.GroupConversationOperation.Create,
+                        Title = request.Title.Trim(),
+                        MemberUserIds = request.MemberUserIds,
+                        ActorSessionId = session.SessionId
+                    },
+                    cancellationToken)
+                .ConfigureAwait(false);
+            SendCreateGroupResponse(session, new CreateGroupResponse
+            {
+                RequestId = result.RequestId,
+                Succeeded = result.Succeeded,
+                ErrorCode = result.ErrorCode,
+                ErrorMessage = result.ErrorMessage,
+                ConversationId = result.ConversationId,
+                Title = result.Title,
+                Members = MapMembers(result.Members)
+            });
+        }
+        catch (Exception ex)
+        {
+            LogCreateGroupFailed(_logger, request.RequestId, ex);
+            SendCreateGroupResponse(session, new CreateGroupResponse
+            {
+                RequestId = request.RequestId,
+                Succeeded = false,
+                ErrorCode = "group_unavailable",
+                ErrorMessage = "群服务暂时不可用。"
+            });
+        }
+    }
+
+    private async ValueTask HandleAddGroupMembersRequestAsync(
+        ReadOnlySequence<byte> payload,
+        TcpClientSession session,
+        CancellationToken cancellationToken)
+    {
+        var request = _addGroupMembersRequestCodec.Deserialize(payload);
+        if (request is null
+            || string.IsNullOrWhiteSpace(request.RequestId)
+            || string.IsNullOrWhiteSpace(request.ConversationId)
+            || request.MemberUserIds is not { Count: > 0 })
+        {
+            SendGroupMutateResponse(
+                session,
+                PacketCommand.AddGroupMembersResponse,
+                _addGroupMembersResponseCodec,
+                new AddGroupMembersResponse
+                {
+                    RequestId = request?.RequestId ?? string.Empty,
+                    Succeeded = false,
+                    ErrorCode = "invalid_request",
+                    ErrorMessage = "添加成员请求参数无效。"
+                });
+            return;
+        }
+
+        await SendGroupCommandAsync(
+                session,
+                new Realtime.Abstractions.Conversations.GroupConversationCommand
+                {
+                    RequestId = request.RequestId,
+                    ActorUserId = session.UserId,
+                    Operation = Realtime.Abstractions.Conversations.GroupConversationOperation.AddMembers,
+                    ConversationId = request.ConversationId.Trim(),
+                    MemberUserIds = request.MemberUserIds,
+                    ActorSessionId = session.SessionId
+                },
+                result => new AddGroupMembersResponse
+                {
+                    RequestId = result.RequestId,
+                    Succeeded = result.Succeeded,
+                    ErrorCode = result.ErrorCode,
+                    ErrorMessage = result.ErrorMessage,
+                    ConversationId = result.ConversationId,
+                    Members = MapMembers(result.Members)
+                },
+                PacketCommand.AddGroupMembersResponse,
+                _addGroupMembersResponseCodec,
+                cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    private async ValueTask HandleRemoveGroupMemberRequestAsync(
+        ReadOnlySequence<byte> payload,
+        TcpClientSession session,
+        CancellationToken cancellationToken)
+    {
+        var request = _removeGroupMemberRequestCodec.Deserialize(payload);
+        if (request is null
+            || string.IsNullOrWhiteSpace(request.RequestId)
+            || string.IsNullOrWhiteSpace(request.ConversationId)
+            || request.TargetUserId <= 0)
+        {
+            SendGroupMutateResponse(
+                session,
+                PacketCommand.RemoveGroupMemberResponse,
+                _removeGroupMemberResponseCodec,
+                new RemoveGroupMemberResponse
+                {
+                    RequestId = request?.RequestId ?? string.Empty,
+                    Succeeded = false,
+                    ErrorCode = "invalid_request",
+                    ErrorMessage = "移除成员请求参数无效。"
+                });
+            return;
+        }
+
+        await SendGroupCommandAsync(
+                session,
+                new Realtime.Abstractions.Conversations.GroupConversationCommand
+                {
+                    RequestId = request.RequestId,
+                    ActorUserId = session.UserId,
+                    Operation = Realtime.Abstractions.Conversations.GroupConversationOperation.RemoveMember,
+                    ConversationId = request.ConversationId.Trim(),
+                    TargetUserId = request.TargetUserId,
+                    ActorSessionId = session.SessionId
+                },
+                result => new RemoveGroupMemberResponse
+                {
+                    RequestId = result.RequestId,
+                    Succeeded = result.Succeeded,
+                    ErrorCode = result.ErrorCode,
+                    ErrorMessage = result.ErrorMessage,
+                    ConversationId = result.ConversationId
+                },
+                PacketCommand.RemoveGroupMemberResponse,
+                _removeGroupMemberResponseCodec,
+                cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    private async ValueTask HandleLeaveGroupRequestAsync(
+        ReadOnlySequence<byte> payload,
+        TcpClientSession session,
+        CancellationToken cancellationToken)
+    {
+        var request = _leaveGroupRequestCodec.Deserialize(payload);
+        if (request is null
+            || string.IsNullOrWhiteSpace(request.RequestId)
+            || string.IsNullOrWhiteSpace(request.ConversationId))
+        {
+            SendGroupMutateResponse(
+                session,
+                PacketCommand.LeaveGroupResponse,
+                _leaveGroupResponseCodec,
+                new LeaveGroupResponse
+                {
+                    RequestId = request?.RequestId ?? string.Empty,
+                    Succeeded = false,
+                    ErrorCode = "invalid_request",
+                    ErrorMessage = "退群请求参数无效。"
+                });
+            return;
+        }
+
+        await SendGroupCommandAsync(
+                session,
+                new Realtime.Abstractions.Conversations.GroupConversationCommand
+                {
+                    RequestId = request.RequestId,
+                    ActorUserId = session.UserId,
+                    Operation = Realtime.Abstractions.Conversations.GroupConversationOperation.Leave,
+                    ConversationId = request.ConversationId.Trim(),
+                    ActorSessionId = session.SessionId
+                },
+                result => new LeaveGroupResponse
+                {
+                    RequestId = result.RequestId,
+                    Succeeded = result.Succeeded,
+                    ErrorCode = result.ErrorCode,
+                    ErrorMessage = result.ErrorMessage,
+                    ConversationId = result.ConversationId
+                },
+                PacketCommand.LeaveGroupResponse,
+                _leaveGroupResponseCodec,
+                cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    private async ValueTask HandleChangeMemberRoleRequestAsync(
+        ReadOnlySequence<byte> payload,
+        TcpClientSession session,
+        CancellationToken cancellationToken)
+    {
+        var request = _changeMemberRoleRequestCodec.Deserialize(payload);
+        if (request is null
+            || string.IsNullOrWhiteSpace(request.RequestId)
+            || string.IsNullOrWhiteSpace(request.ConversationId)
+            || request.TargetUserId <= 0)
+        {
+            SendGroupMutateResponse(
+                session,
+                PacketCommand.ChangeMemberRoleResponse,
+                _changeMemberRoleResponseCodec,
+                new ChangeMemberRoleResponse
+                {
+                    RequestId = request?.RequestId ?? string.Empty,
+                    Succeeded = false,
+                    ErrorCode = "invalid_request",
+                    ErrorMessage = "角色变更请求参数无效。"
+                });
+            return;
+        }
+
+        await SendGroupCommandAsync(
+                session,
+                new Realtime.Abstractions.Conversations.GroupConversationCommand
+                {
+                    RequestId = request.RequestId,
+                    ActorUserId = session.UserId,
+                    Operation = Realtime.Abstractions.Conversations.GroupConversationOperation.ChangeRole,
+                    ConversationId = request.ConversationId.Trim(),
+                    TargetUserId = request.TargetUserId,
+                    NewRole = (Realtime.Abstractions.Conversations.ConversationMemberRole)(byte)request.NewRole,
+                    ActorSessionId = session.SessionId
+                },
+                result => new ChangeMemberRoleResponse
+                {
+                    RequestId = result.RequestId,
+                    Succeeded = result.Succeeded,
+                    ErrorCode = result.ErrorCode,
+                    ErrorMessage = result.ErrorMessage,
+                    ConversationId = result.ConversationId
+                },
+                PacketCommand.ChangeMemberRoleResponse,
+                _changeMemberRoleResponseCodec,
+                cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    private async ValueTask HandleListGroupMembersRequestAsync(
+        ReadOnlySequence<byte> payload,
+        TcpClientSession session,
+        CancellationToken cancellationToken)
+    {
+        var request = _listGroupMembersRequestCodec.Deserialize(payload);
+        if (request is null
+            || string.IsNullOrWhiteSpace(request.RequestId)
+            || string.IsNullOrWhiteSpace(request.ConversationId))
+        {
+            SendGroupMutateResponse(
+                session,
+                PacketCommand.ListGroupMembersResponse,
+                _listGroupMembersResponseCodec,
+                new ListGroupMembersResponse
+                {
+                    RequestId = request?.RequestId ?? string.Empty,
+                    Succeeded = false,
+                    ErrorCode = "invalid_request",
+                    ErrorMessage = "成员列表请求参数无效。"
+                });
+            return;
+        }
+
+        await SendGroupCommandAsync(
+                session,
+                new Realtime.Abstractions.Conversations.GroupConversationCommand
+                {
+                    RequestId = request.RequestId,
+                    ActorUserId = session.UserId,
+                    Operation = Realtime.Abstractions.Conversations.GroupConversationOperation.ListMembers,
+                    ConversationId = request.ConversationId.Trim(),
+                    ActorSessionId = session.SessionId
+                },
+                result => new ListGroupMembersResponse
+                {
+                    RequestId = result.RequestId,
+                    Succeeded = result.Succeeded,
+                    ErrorCode = result.ErrorCode,
+                    ErrorMessage = result.ErrorMessage,
+                    ConversationId = result.ConversationId,
+                    Members = MapMembers(result.Members)
+                },
+                PacketCommand.ListGroupMembersResponse,
+                _listGroupMembersResponseCodec,
+                cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    private async ValueTask SendGroupCommandAsync<TResponse>(
+        TcpClientSession session,
+        Realtime.Abstractions.Conversations.GroupConversationCommand command,
+        Func<Realtime.Abstractions.Conversations.GroupConversationResult, TResponse> map,
+        PacketCommand responseCommand,
+        IPayloadCodec<TResponse> responseCodec,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            var result = await _messageBus.MutateGroupConversationAsync(command, cancellationToken)
+                .ConfigureAwait(false);
+            SendGroupMutateResponse(session, responseCommand, responseCodec, map(result));
+        }
+        catch (Exception ex)
+        {
+            LogGroupCommandFailed(_logger, command.RequestId, ex);
+            SendGroupMutateResponse(
+                session,
+                responseCommand,
+                responseCodec,
+                map(Realtime.Abstractions.Conversations.GroupConversationResult.Failed(
+                    command.RequestId,
+                    "group_unavailable",
+                    "群服务暂时不可用。")));
+        }
+    }
+
+    private void SendCreateGroupResponse(TcpClientSession session, CreateGroupResponse response) =>
+        SendGroupMutateResponse(
+            session,
+            PacketCommand.CreateGroupResponse,
+            _createGroupResponseCodec,
+            response);
+
+    private static void SendGroupMutateResponse<TResponse>(
+        TcpClientSession session,
+        PacketCommand command,
+        IPayloadCodec<TResponse> codec,
+        TResponse response)
+    {
+        using var frame = OutboundFrameFactory.Create(command, codec, response);
+        session.TryQueue(frame);
+    }
+
+    private static ConversationMemberItem[]? MapMembers(
+        IReadOnlyList<Realtime.Abstractions.Conversations.ConversationMemberItem>? members)
+    {
+        if (members is null)
+            return null;
+        return members
+            .Select(static m => new ConversationMemberItem
+            {
+                UserId = m.UserId,
+                Role = (ConversationMemberRole)(byte)m.Role,
+                JoinedAtMs = m.JoinedAtMs
+            })
+            .ToArray();
     }
 
     private void SendConversationSetPrefsResponse(
@@ -2043,6 +2531,212 @@ internal sealed partial class TcpGatewayService : BackgroundService
         using var outboundFrame = OutboundFrameFactory.Create(
             PacketCommand.MessageEditAck,
             _messageEditAcknowledgementCodec,
+            response);
+        session.TryQueue(outboundFrame);
+    }
+
+    private async ValueTask HandleAddReactionRequestAsync(
+        ReadOnlySequence<byte> payload,
+        TcpClientSession session,
+        CancellationToken cancellationToken)
+    {
+        var request = _addReactionRequestCodec.Deserialize(payload);
+        if (request is null)
+        {
+            _metrics.ProtocolError();
+            session.Close(SessionCloseReason.ProtocolViolation);
+            return;
+        }
+
+        var requestId = string.IsNullOrWhiteSpace(request.RequestId)
+            ? Guid.CreateVersion7().ToString("N")
+            : request.RequestId;
+        if (requestId.Length > 64
+            || string.IsNullOrWhiteSpace(request.MessageId)
+            || request.MessageId.Length > 64
+            || string.IsNullOrWhiteSpace(request.Emoji)
+            || request.Emoji.Trim().Length > 32)
+        {
+            SendAddReactionAcknowledgement(
+                session,
+                new AddReactionAcknowledgement
+                {
+                    RequestId = requestId.Length <= 64 ? requestId : string.Empty,
+                    MessageId = request.MessageId,
+                    Succeeded = false,
+                    ErrorCode = "invalid_add_reaction_request",
+                    ErrorMessage = "添加反应请求参数无效。"
+                });
+            return;
+        }
+
+        var command = new RealtimeMessageReactionCommand
+        {
+            RequestId = requestId,
+            MessageId = request.MessageId,
+            Emoji = request.Emoji.Trim(),
+            Action = RealtimeMessageReactionAction.Add,
+            ActorUserId = session.UserId,
+            ActorSessionId = session.SessionId ?? $"tcp-{session.ConnectionId}",
+            OccurredAtMs = _timeProvider.GetUtcNow().ToUnixTimeMilliseconds()
+        };
+
+        try
+        {
+            var result = await _messageBus
+                .ReactToMessageAsync(command, cancellationToken)
+                .ConfigureAwait(false);
+
+            SendAddReactionAcknowledgement(
+                session,
+                new AddReactionAcknowledgement
+                {
+                    RequestId = result.RequestId,
+                    MessageId = result.MessageId,
+                    Succeeded = result.Succeeded,
+                    ErrorCode = result.ErrorCode,
+                    ErrorMessage = result.ErrorMessage,
+                    ConversationId = result.ConversationId,
+                    Emoji = result.Emoji,
+                    OccurredAtMs = result.OccurredAtMs,
+                    EmojiCount = result.EmojiCount
+                });
+        }
+        catch (OperationCanceledException)
+            when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception exception)
+        {
+            LogAddReactionFailed(
+                _logger,
+                session.ConnectionId,
+                requestId,
+                exception);
+            SendAddReactionAcknowledgement(
+                session,
+                new AddReactionAcknowledgement
+                {
+                    RequestId = requestId,
+                    MessageId = request.MessageId,
+                    Succeeded = false,
+                    ErrorCode = "message_reaction_unavailable",
+                    ErrorMessage = "消息反应服务暂时不可用，请稍后重试。"
+                });
+        }
+    }
+
+    private async ValueTask HandleRemoveReactionRequestAsync(
+        ReadOnlySequence<byte> payload,
+        TcpClientSession session,
+        CancellationToken cancellationToken)
+    {
+        var request = _removeReactionRequestCodec.Deserialize(payload);
+        if (request is null)
+        {
+            _metrics.ProtocolError();
+            session.Close(SessionCloseReason.ProtocolViolation);
+            return;
+        }
+
+        var requestId = string.IsNullOrWhiteSpace(request.RequestId)
+            ? Guid.CreateVersion7().ToString("N")
+            : request.RequestId;
+        if (requestId.Length > 64
+            || string.IsNullOrWhiteSpace(request.MessageId)
+            || request.MessageId.Length > 64
+            || string.IsNullOrWhiteSpace(request.Emoji)
+            || request.Emoji.Trim().Length > 32)
+        {
+            SendRemoveReactionAcknowledgement(
+                session,
+                new RemoveReactionAcknowledgement
+                {
+                    RequestId = requestId.Length <= 64 ? requestId : string.Empty,
+                    MessageId = request.MessageId,
+                    Succeeded = false,
+                    ErrorCode = "invalid_remove_reaction_request",
+                    ErrorMessage = "移除反应请求参数无效。"
+                });
+            return;
+        }
+
+        var command = new RealtimeMessageReactionCommand
+        {
+            RequestId = requestId,
+            MessageId = request.MessageId,
+            Emoji = request.Emoji.Trim(),
+            Action = RealtimeMessageReactionAction.Remove,
+            ActorUserId = session.UserId,
+            ActorSessionId = session.SessionId ?? $"tcp-{session.ConnectionId}",
+            OccurredAtMs = _timeProvider.GetUtcNow().ToUnixTimeMilliseconds()
+        };
+
+        try
+        {
+            var result = await _messageBus
+                .ReactToMessageAsync(command, cancellationToken)
+                .ConfigureAwait(false);
+
+            SendRemoveReactionAcknowledgement(
+                session,
+                new RemoveReactionAcknowledgement
+                {
+                    RequestId = result.RequestId,
+                    MessageId = result.MessageId,
+                    Succeeded = result.Succeeded,
+                    ErrorCode = result.ErrorCode,
+                    ErrorMessage = result.ErrorMessage,
+                    ConversationId = result.ConversationId,
+                    Emoji = result.Emoji,
+                    OccurredAtMs = result.OccurredAtMs,
+                    EmojiCount = result.EmojiCount
+                });
+        }
+        catch (OperationCanceledException)
+            when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception exception)
+        {
+            LogRemoveReactionFailed(
+                _logger,
+                session.ConnectionId,
+                requestId,
+                exception);
+            SendRemoveReactionAcknowledgement(
+                session,
+                new RemoveReactionAcknowledgement
+                {
+                    RequestId = requestId,
+                    MessageId = request.MessageId,
+                    Succeeded = false,
+                    ErrorCode = "message_reaction_unavailable",
+                    ErrorMessage = "消息反应服务暂时不可用，请稍后重试。"
+                });
+        }
+    }
+
+    private void SendAddReactionAcknowledgement(
+        TcpClientSession session,
+        AddReactionAcknowledgement response)
+    {
+        using var outboundFrame = OutboundFrameFactory.Create(
+            PacketCommand.AddReactionAck,
+            _addReactionAcknowledgementCodec,
+            response);
+        session.TryQueue(outboundFrame);
+    }
+
+    private void SendRemoveReactionAcknowledgement(
+        TcpClientSession session,
+        RemoveReactionAcknowledgement response)
+    {
+        using var outboundFrame = OutboundFrameFactory.Create(
+            PacketCommand.RemoveReactionAck,
+            _removeReactionAcknowledgementCodec,
             response);
         session.TryQueue(outboundFrame);
     }
@@ -2597,6 +3291,24 @@ internal sealed partial class TcpGatewayService : BackgroundService
     }
 
     [LoggerMessage(
+        EventId = 40,
+        Level = LogLevel.Warning,
+        Message = "创建群失败 RequestId={RequestId}")]
+    private static partial void LogCreateGroupFailed(
+        ILogger logger,
+        string requestId,
+        Exception exception);
+
+    [LoggerMessage(
+        EventId = 41,
+        Level = LogLevel.Warning,
+        Message = "群操作失败 RequestId={RequestId}")]
+    private static partial void LogGroupCommandFailed(
+        ILogger logger,
+        string requestId,
+        Exception exception);
+
+    [LoggerMessage(
         EventId = 1,
         Level = LogLevel.Information,
         Message = "TCP gateway listening on {Endpoint}; maximum connections: {MaxConnections}.")]
@@ -2711,6 +3423,26 @@ internal sealed partial class TcpGatewayService : BackgroundService
         Level = LogLevel.Warning,
         Message = "Connection {ConnectionId} could not edit message for request {RequestId}.")]
     private static partial void LogMessageEditFailed(
+        ILogger logger,
+        uint connectionId,
+        string requestId,
+        Exception exception);
+
+    [LoggerMessage(
+        EventId = 63,
+        Level = LogLevel.Warning,
+        Message = "Connection {ConnectionId} could not add reaction for request {RequestId}.")]
+    private static partial void LogAddReactionFailed(
+        ILogger logger,
+        uint connectionId,
+        string requestId,
+        Exception exception);
+
+    [LoggerMessage(
+        EventId = 64,
+        Level = LogLevel.Warning,
+        Message = "Connection {ConnectionId} could not remove reaction for request {RequestId}.")]
+    private static partial void LogRemoveReactionFailed(
         ILogger logger,
         uint connectionId,
         string requestId,

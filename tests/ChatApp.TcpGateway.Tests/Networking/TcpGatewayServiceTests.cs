@@ -115,6 +115,18 @@ public sealed class TcpGatewayServiceTests
         var messageEditAcknowledgementCodec =
             new JsonPayloadCodec<MessageEditAcknowledgement>(
                 GatewayJsonSerializerContext.Default.MessageEditAcknowledgement);
+        var addReactionRequestCodec =
+            new JsonPayloadCodec<AddReactionRequest>(
+                GatewayJsonSerializerContext.Default.AddReactionRequest);
+        var addReactionAcknowledgementCodec =
+            new JsonPayloadCodec<AddReactionAcknowledgement>(
+                GatewayJsonSerializerContext.Default.AddReactionAcknowledgement);
+        var removeReactionRequestCodec =
+            new JsonPayloadCodec<RemoveReactionRequest>(
+                GatewayJsonSerializerContext.Default.RemoveReactionRequest);
+        var removeReactionAcknowledgementCodec =
+            new JsonPayloadCodec<RemoveReactionAcknowledgement>(
+                GatewayJsonSerializerContext.Default.RemoveReactionAcknowledgement);
         var syncBootstrapRequestCodec =
             new JsonPayloadCodec<SyncBootstrapRequest>(
                 GatewayJsonSerializerContext.Default.SyncBootstrapRequest);
@@ -142,6 +154,10 @@ public sealed class TcpGatewayServiceTests
             messageRecallAcknowledgementCodec,
             messageEditRequestCodec,
             messageEditAcknowledgementCodec,
+            addReactionRequestCodec,
+            addReactionAcknowledgementCodec,
+            removeReactionRequestCodec,
+            removeReactionAcknowledgementCodec,
             syncBootstrapRequestCodec,
             syncBootstrapResponseCodec,
             messageBus,
@@ -152,6 +168,8 @@ public sealed class TcpGatewayServiceTests
             new NoopDeviceSessionLeaseStore(),
             new NoopGlobalPresenceStore(),
             userSessions,
+            new PresenceWatcherRegistry(),
+            new TypingFanoutCoordinator(TimeProvider.System),
             metrics,
             TimeProvider.System,
             NullLogger<TcpGatewayService>.Instance,
@@ -242,6 +260,18 @@ public sealed class TcpGatewayServiceTests
                     GatewayJsonSerializerContext.Default.MessageRecalledUpdate),
                 new JsonPayloadCodec<MessageEditedUpdate>(
                     GatewayJsonSerializerContext.Default.MessageEditedUpdate),
+                new JsonPayloadCodec<ReactionAddedUpdate>(
+                    GatewayJsonSerializerContext.Default.ReactionAddedUpdate),
+                new JsonPayloadCodec<ReactionRemovedUpdate>(
+                    GatewayJsonSerializerContext.Default.ReactionRemovedUpdate),
+                new JsonPayloadCodec<MemberJoinedUpdate>(
+                    GatewayJsonSerializerContext.Default.MemberJoinedUpdate),
+                new JsonPayloadCodec<MemberLeftUpdate>(
+                    GatewayJsonSerializerContext.Default.MemberLeftUpdate),
+                new JsonPayloadCodec<MemberRemovedUpdate>(
+                    GatewayJsonSerializerContext.Default.MemberRemovedUpdate),
+                new JsonPayloadCodec<RoleChangedUpdate>(
+                    GatewayJsonSerializerContext.Default.RoleChangedUpdate),
                 metrics,
                 TimeProvider.System,
                 NullLogger<RealtimeEventDispatcher>.Instance);
@@ -621,6 +651,15 @@ public sealed class TcpGatewayServiceTests
                     mutedUntilMs: null,
                     changed: false));
 
+        public Task<GroupConversationResult> MutateGroupConversationAsync(
+            GroupConversationCommand command,
+            CancellationToken ct = default) =>
+            Task.FromResult(
+                GroupConversationResult.Failed(
+                    command.RequestId,
+                    "not_used",
+                    "not used"));
+
         public Task<MessageRecallResult> RecallMessageAsync(
             MessageRecallCommand command,
             CancellationToken ct = default) =>
@@ -642,6 +681,15 @@ public sealed class TcpGatewayServiceTests
                     content: command.Content,
                     editVersion: 2,
                     editedAtMs: command.OccurredAtMs));
+
+        public Task<MessageReactionResult> ReactToMessageAsync(
+            MessageReactionCommand command,
+            CancellationToken ct = default) =>
+            Task.FromResult(
+                MessageReactionResult.Failed(
+                    command.RequestId,
+                    "not_used",
+                    "not used"));
 
         public Task<SyncBootstrapPage> QuerySyncBootstrapAsync(
             SyncBootstrapQuery query,
