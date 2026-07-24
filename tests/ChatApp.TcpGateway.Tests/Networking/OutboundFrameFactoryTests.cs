@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Buffers.Binary;
 using ChatApp.TcpGateway.Core.Messaging;
 using ChatApp.TcpGateway.Core.Protocol;
 using ChatApp.TcpGateway.Gateway.Networking.Buffers;
@@ -25,20 +26,28 @@ public sealed class OutboundFrameFactoryTests
             codec,
             response);
 
-        var sequence = new ReadOnlySequence<byte>(outbound.Memory);
-        var status = PacketParser.TryParse(
-            ref sequence,
-            out var frame);
-        var decoded = codec.Deserialize(frame.Payload);
-
-        Assert.Equal(PacketParseStatus.Success, status);
+        // P0-5 后 PacketParser.TryParse 拒绝服务端→客户端命令（GetMaxPayloadSize 返回 -1），
+        // 因此这里直接读取包头验证，不走解析器。
+        var span = outbound.Memory.Span;
         Assert.Equal(
-            PacketCommand.AuthenticationResponse,
-            frame.Command);
+            PacketProtocol.MagicNumber,
+            BinaryPrimitives.ReadUInt32LittleEndian(span));
+        Assert.Equal(
+            (ushort)PacketCommand.AuthenticationResponse,
+            BinaryPrimitives.ReadUInt16LittleEndian(
+                span[PacketProtocol.CommandOffset..]));
+        var payloadLength = BinaryPrimitives.ReadInt32LittleEndian(
+            span[PacketProtocol.LengthOffset..]);
+
+        var payload = outbound.Memory.Slice(
+            PacketProtocol.HeaderSize,
+            payloadLength);
+        var decoded = codec.Deserialize(
+            new ReadOnlySequence<byte>(payload));
+
         Assert.NotNull(decoded);
         Assert.True(decoded.Success);
         Assert.Equal(42, decoded.UserId);
-        Assert.True(sequence.IsEmpty);
     }
 
     [Fact]
