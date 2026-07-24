@@ -13,7 +13,7 @@ internal static class AccessTokenCacheKey
 
         var byteCount = Encoding.UTF8.GetByteCount(token);
         byte[]? rented = null;
-        Span<byte> tokenBytes = byteCount <= 256
+        var tokenBytes = byteCount <= 256
             ? stackalloc byte[byteCount]
             : (rented = System.Buffers.ArrayPool<byte>.Shared.Rent(byteCount));
 

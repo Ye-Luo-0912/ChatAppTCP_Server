@@ -5,10 +5,12 @@ using System.Net;
 using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
 using ChatApp.Realtime.Abstractions.Events;
 using ChatApp.Realtime.Abstractions.Messaging;
 using ChatApp.Realtime.Integration;
-using System.Text.Json;
+using ChatApp.Realtime.Integration.Configuration;
+using ChatApp.Realtime.Integration.Ephemeral;
 using ChatApp.TcpGateway.Configuration;
 using ChatApp.TcpGateway.Core.Authentication;
 using ChatApp.TcpGateway.Core.Messaging;
@@ -17,10 +19,12 @@ using ChatApp.TcpGateway.Core.Messaging.History;
 using ChatApp.TcpGateway.Core.Messaging.Sync;
 using ChatApp.TcpGateway.Core.Protocol;
 using ChatApp.TcpGateway.Core.Serialization;
-using ChatApp.TcpGateway.Diagnostics;
-using ChatApp.TcpGateway.Networking.Buffers;
+using ChatApp.TcpGateway.Gateway.Diagnostics;
+using ChatApp.TcpGateway.Gateway.Messaging;
+using ChatApp.TcpGateway.Gateway.Networking.Buffers;
+using ChatApp.TcpGateway.Gateway.Networking.Sessions;
+using ChatApp.TcpGateway.Infrastructure.Serialization.Json;
 using ChatApp.TcpGateway.Networking.Sessions;
-using ChatApp.TcpGateway.Messaging;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -34,12 +38,14 @@ using RealtimeConversationSetPrefsCommand =
     ChatApp.Realtime.Abstractions.Conversations.ConversationSetPrefsCommand;
 using RealtimeMessageRecallCommand =
     ChatApp.Realtime.Abstractions.Messaging.MessageRecallCommand;
+using RealtimeMessageEditCommand =
+    ChatApp.Realtime.Abstractions.Messaging.MessageEditCommand;
 using RealtimeSyncBootstrapQuery =
     ChatApp.Realtime.Abstractions.Sync.SyncBootstrapQuery;
 using RealtimeConversationSyncWatermark =
     ChatApp.Realtime.Abstractions.Sync.ConversationSyncWatermark;
 
-namespace ChatApp.TcpGateway.Networking;
+namespace ChatApp.TcpGateway.Gateway.Networking;
 
 internal sealed partial class TcpGatewayService : BackgroundService
 {
@@ -61,10 +67,20 @@ internal sealed partial class TcpGatewayService : BackgroundService
     private readonly IPayloadCodec<ConversationSetPrefsResponse> _conversationSetPrefsResponseCodec;
     private readonly IPayloadCodec<MessageRecallRequest> _messageRecallRequestCodec;
     private readonly IPayloadCodec<MessageRecallAcknowledgement> _messageRecallAcknowledgementCodec;
+    private readonly IPayloadCodec<MessageEditRequest> _messageEditRequestCodec;
+    private readonly IPayloadCodec<MessageEditAcknowledgement> _messageEditAcknowledgementCodec;
     private readonly IPayloadCodec<SyncBootstrapRequest> _syncBootstrapRequestCodec;
     private readonly IPayloadCodec<SyncBootstrapResponse> _syncBootstrapResponseCodec;
+    private readonly JsonPayloadCodec<TypingNotify> _typingNotifyCodec;
+    private readonly JsonPayloadCodec<TypingUpdate> _typingUpdateCodec;
+    private readonly JsonPayloadCodec<PresenceQueryRequest> _presenceQueryRequestCodec;
+    private readonly JsonPayloadCodec<PresenceUnwatchRequest> _presenceUnwatchRequestCodec;
+    private readonly JsonPayloadCodec<PresenceSnapshotResponse> _presenceSnapshotResponseCodec;
+    private readonly JsonPayloadCodec<PresenceChanged> _presenceChangedCodec;
     private readonly IRealtimeMessageBus _messageBus;
+    private readonly RealtimeIntegrationOptions _integrationOptions;
     private readonly IDeviceSessionLeaseStore _deviceSessionLeaseStore;
+    private readonly IGlobalPresenceStore _globalPresence;
     private readonly GatewayMetrics _metrics;
     private readonly TimeProvider _timeProvider;
     private readonly ILogger<TcpGatewayService> _logger;
@@ -74,6 +90,8 @@ internal sealed partial class TcpGatewayService : BackgroundService
     private readonly ConcurrentDictionary<uint, TcpClientSession> _sessions = new();
     private readonly ConcurrentDictionary<uint, Task> _clientTasks = new();
     private readonly UserSessionRegistry _userSessions;
+    private readonly PresenceWatcherRegistry _presenceWatchers;
+    private readonly TypingFanoutCoordinator _typingFanout;
 
     private readonly TaskCompletionSource _listenerReady = new(
         TaskCreationOptions.RunContinuationsAsynchronously);
@@ -99,10 +117,14 @@ internal sealed partial class TcpGatewayService : BackgroundService
         IPayloadCodec<ConversationSetPrefsResponse> conversationSetPrefsResponseCodec,
         IPayloadCodec<MessageRecallRequest> messageRecallRequestCodec,
         IPayloadCodec<MessageRecallAcknowledgement> messageRecallAcknowledgementCodec,
+        IPayloadCodec<MessageEditRequest> messageEditRequestCodec,
+        IPayloadCodec<MessageEditAcknowledgement> messageEditAcknowledgementCodec,
         IPayloadCodec<SyncBootstrapRequest> syncBootstrapRequestCodec,
         IPayloadCodec<SyncBootstrapResponse> syncBootstrapResponseCodec,
         IRealtimeMessageBus messageBus,
+        RealtimeIntegrationOptions integrationOptions,
         IDeviceSessionLeaseStore deviceSessionLeaseStore,
+        IGlobalPresenceStore globalPresence,
         UserSessionRegistry userSessions,
         GatewayMetrics metrics,
         TimeProvider timeProvider,
@@ -127,11 +149,29 @@ internal sealed partial class TcpGatewayService : BackgroundService
         _conversationSetPrefsResponseCodec = conversationSetPrefsResponseCodec;
         _messageRecallRequestCodec = messageRecallRequestCodec;
         _messageRecallAcknowledgementCodec = messageRecallAcknowledgementCodec;
+        _messageEditRequestCodec = messageEditRequestCodec;
+        _messageEditAcknowledgementCodec = messageEditAcknowledgementCodec;
         _syncBootstrapRequestCodec = syncBootstrapRequestCodec;
         _syncBootstrapResponseCodec = syncBootstrapResponseCodec;
+        _typingNotifyCodec = new JsonPayloadCodec<TypingNotify>(
+            GatewayJsonSerializerContext.Default.TypingNotify);
+        _typingUpdateCodec = new JsonPayloadCodec<TypingUpdate>(
+            GatewayJsonSerializerContext.Default.TypingUpdate);
+        _presenceQueryRequestCodec = new JsonPayloadCodec<PresenceQueryRequest>(
+            GatewayJsonSerializerContext.Default.PresenceQueryRequest);
+        _presenceUnwatchRequestCodec = new JsonPayloadCodec<PresenceUnwatchRequest>(
+            GatewayJsonSerializerContext.Default.PresenceUnwatchRequest);
+        _presenceSnapshotResponseCodec = new JsonPayloadCodec<PresenceSnapshotResponse>(
+            GatewayJsonSerializerContext.Default.PresenceSnapshotResponse);
+        _presenceChangedCodec = new JsonPayloadCodec<PresenceChanged>(
+            GatewayJsonSerializerContext.Default.PresenceChanged);
         _messageBus = messageBus;
+        _integrationOptions = integrationOptions;
         _deviceSessionLeaseStore = deviceSessionLeaseStore;
+        _globalPresence = globalPresence;
         _userSessions = userSessions;
+        _presenceWatchers = new PresenceWatcherRegistry(timeProvider);
+        _typingFanout = new TypingFanoutCoordinator(timeProvider);
         _metrics = metrics;
         _timeProvider = timeProvider;
         _logger = logger;
@@ -204,7 +244,7 @@ internal sealed partial class TcpGatewayService : BackgroundService
                     .AcceptAsync(executionToken)
                     .ConfigureAwait(false);
 
-                if (!_connectionSlots.Wait(0, CancellationToken.None))
+                if (!await _connectionSlots.WaitAsync(0, CancellationToken.None))
                 {
                     _metrics.ConnectionRejected();
                     socket.Dispose();
@@ -228,7 +268,7 @@ internal sealed partial class TcpGatewayService : BackgroundService
         }
         finally
         {
-            execution.Cancel();
+            await execution.CancelAsync();
             Volatile.Write(ref _listener, null);
             listener.Dispose();
 
@@ -359,10 +399,16 @@ internal sealed partial class TcpGatewayService : BackgroundService
                     ? SessionCloseReason.ApplicationStopping
                     : SessionCloseReason.RemoteClosed);
 
-            _userSessions.Remove(session);
+            var wentOffline = _userSessions.Remove(session);
+            if (wentOffline)
+            {
+                if (_options.EnableEphemeralPresenceAndTyping)
+                    await PublishPresenceChangedAsync(session.UserId, isOnline: false, CancellationToken.None)
+                        .ConfigureAwait(false);
+                _presenceWatchers.RemoveWatcher(session.UserId);
+            }
 
-            if (session.UserId > 0
-                && session.DeviceIdHash is ulong deviceHash
+            if (session is { UserId: > 0, DeviceIdHash: { } deviceHash }
                 && !string.IsNullOrWhiteSpace(session.SessionId))
             {
                 try
@@ -628,12 +674,33 @@ internal sealed partial class TcpGatewayService : BackgroundService
                     .ConfigureAwait(false);
                 break;
 
+            case PacketCommand.MessageEditRequest:
+                await HandleMessageEditRequestAsync(
+                    frame.Payload,
+                    session,
+                    cancellationToken)
+                    .ConfigureAwait(false);
+                break;
+
             case PacketCommand.SyncBootstrapRequest:
                 await HandleSyncBootstrapRequestAsync(
                         frame.Payload,
                         session,
                         cancellationToken)
                     .ConfigureAwait(false);
+                break;
+
+            case PacketCommand.TypingNotify:
+                HandleTypingNotify(frame.Payload, session);
+                break;
+
+            case PacketCommand.PresenceQuery:
+                await HandlePresenceQueryAsync(frame.Payload, session, cancellationToken)
+                    .ConfigureAwait(false);
+                break;
+
+            case PacketCommand.PresenceUnwatch:
+                HandlePresenceUnwatch(frame.Payload, session);
                 break;
 
             case PacketCommand.Heartbeat:
@@ -710,7 +777,10 @@ internal sealed partial class TcpGatewayService : BackgroundService
             result.UserId,
             result.SessionId,
             result.DeviceIdHash);
-        _userSessions.Add(session);
+        var becameOnline = _userSessions.Add(session);
+        if (becameOnline && _options.EnableEphemeralPresenceAndTyping)
+            await PublishPresenceChangedAsync(result.UserId, isOnline: true, cancellationToken)
+                .ConfigureAwait(false);
 
         if (_options.ReplaceSameDeviceSession)
         {
@@ -744,7 +814,7 @@ internal sealed partial class TcpGatewayService : BackgroundService
             await RevokeSessionAsync(victim, occurredAtMs, cancellationToken).ConfigureAwait(false);
 
         // 2) Redis/Garnet 设备租约：发现跨 Gateway 的旧 SessionId 并广播 SessionRevoked。
-        if (incoming.DeviceIdHash is not ulong deviceHash
+        if (incoming.DeviceIdHash is not { } deviceHash
             || string.IsNullOrWhiteSpace(incoming.SessionId)
             || incoming.UserId <= 0)
         {
@@ -1178,6 +1248,9 @@ internal sealed partial class TcpGatewayService : BackgroundService
                             DeliveredAtMs = item.DeliveredAtMs,
                             ReadAtMs = item.ReadAtMs,
                             RecalledAtMs = item.RecalledAtMs,
+                            EditVersion = item.EditVersion,
+                            EditedAtMs = item.EditedAtMs,
+                            ChangedAtMs = item.ChangedAtMs,
                             Attachments = AttachmentWireMapper.Map(item.Attachments),
                             ReplyToMessageId = item.ReplyToMessageId,
                             ReplyToSenderUserId = item.ReplyToSenderUserId,
@@ -1299,28 +1372,30 @@ internal sealed partial class TcpGatewayService : BackgroundService
                     Succeeded = page.Succeeded,
                     ErrorCode = page.ErrorCode,
                     ErrorMessage = page.ErrorMessage,
-                    Items = page.Items
-                        .Select(static item => new Core.Messaging.Conversations.ConversationListItem
-                        {
-                            ConversationId = item.ConversationId,
-                            Type = (Core.Messaging.Conversations.ConversationType)(byte)item.Type,
-                            PeerUserId = item.PeerUserId,
-                            LastMessageId = item.LastMessageId,
-                            LastMessagePreview = item.LastMessagePreview,
-                            LastMessageAtMs = item.LastMessageAtMs,
-                            LastSenderUserId = item.LastSenderUserId,
-                            UnreadCount = item.UnreadCount,
-                            LastReadMessageId = item.LastReadMessageId,
-                            LastReadAtMs = item.LastReadAtMs,
-                            IsPinned = item.IsPinned,
-                            PinnedAtMs = item.PinnedAtMs,
-                            IsMuted = item.IsMuted,
-                            MutedUntilMs = item.MutedUntilMs
-                        })
-                        .ToArray(),
+                    Items =
+                    [
+                        .. page.Items
+                            .Select(static item => new ConversationListItem
+                            {
+                                ConversationId = item.ConversationId,
+                                Type = (ConversationType)(byte)item.Type,
+                                PeerUserId = item.PeerUserId,
+                                LastMessageId = item.LastMessageId,
+                                LastMessagePreview = item.LastMessagePreview,
+                                LastMessageAtMs = item.LastMessageAtMs,
+                                LastSenderUserId = item.LastSenderUserId,
+                                UnreadCount = item.UnreadCount,
+                                LastReadMessageId = item.LastReadMessageId,
+                                LastReadAtMs = item.LastReadAtMs,
+                                IsPinned = item.IsPinned,
+                                PinnedAtMs = item.PinnedAtMs,
+                                IsMuted = item.IsMuted,
+                                MutedUntilMs = item.MutedUntilMs
+                            })
+                    ],
                     NextCursor = page.NextCursor is null
                         ? null
-                        : new Core.Messaging.Conversations.ConversationListCursor
+                        : new ConversationListCursor
                         {
                             IsPinned = page.NextCursor.IsPinned,
                             PinnedAtMs = page.NextCursor.PinnedAtMs,
@@ -1627,28 +1702,30 @@ internal sealed partial class TcpGatewayService : BackgroundService
                     ErrorCode = page.ErrorCode,
                     ErrorMessage = page.ErrorMessage,
                     ServerTimeMs = page.ServerTimeMs,
-                    Conversations = page.Conversations
-                        .Select(static item => new Core.Messaging.Conversations.ConversationListItem
-                        {
-                            ConversationId = item.ConversationId,
-                            Type = (Core.Messaging.Conversations.ConversationType)(byte)item.Type,
-                            PeerUserId = item.PeerUserId,
-                            LastMessageId = item.LastMessageId,
-                            LastMessagePreview = item.LastMessagePreview,
-                            LastMessageAtMs = item.LastMessageAtMs,
-                            LastSenderUserId = item.LastSenderUserId,
-                            UnreadCount = item.UnreadCount,
-                            LastReadMessageId = item.LastReadMessageId,
-                            LastReadAtMs = item.LastReadAtMs,
-                            IsPinned = item.IsPinned,
-                            PinnedAtMs = item.PinnedAtMs,
-                            IsMuted = item.IsMuted,
-                            MutedUntilMs = item.MutedUntilMs
-                        })
-                        .ToArray(),
+                    Conversations =
+                    [
+                        .. page.Conversations
+                            .Select(static item => new ConversationListItem
+                            {
+                                ConversationId = item.ConversationId,
+                                Type = (ConversationType)(byte)item.Type,
+                                PeerUserId = item.PeerUserId,
+                                LastMessageId = item.LastMessageId,
+                                LastMessagePreview = item.LastMessagePreview,
+                                LastMessageAtMs = item.LastMessageAtMs,
+                                LastSenderUserId = item.LastSenderUserId,
+                                UnreadCount = item.UnreadCount,
+                                LastReadMessageId = item.LastReadMessageId,
+                                LastReadAtMs = item.LastReadAtMs,
+                                IsPinned = item.IsPinned,
+                                PinnedAtMs = item.PinnedAtMs,
+                                IsMuted = item.IsMuted,
+                                MutedUntilMs = item.MutedUntilMs
+                            })
+                    ],
                     ConversationsNextCursor = page.ConversationsNextCursor is null
                         ? null
-                        : new Core.Messaging.Conversations.ConversationListCursor
+                        : new ConversationListCursor
                         {
                             IsPinned = page.ConversationsNextCursor.IsPinned,
                             PinnedAtMs = page.ConversationsNextCursor.PinnedAtMs,
@@ -1673,6 +1750,9 @@ internal sealed partial class TcpGatewayService : BackgroundService
                                     DeliveredAtMs = item.DeliveredAtMs,
                                     ReadAtMs = item.ReadAtMs,
                                     RecalledAtMs = item.RecalledAtMs,
+                                    EditVersion = item.EditVersion,
+                                    EditedAtMs = item.EditedAtMs,
+                                    ChangedAtMs = item.ChangedAtMs,
                                     Attachments = AttachmentWireMapper.Map(item.Attachments),
                                     ReplyToMessageId = item.ReplyToMessageId,
                                     ReplyToSenderUserId = item.ReplyToSenderUserId,
@@ -1690,6 +1770,17 @@ internal sealed partial class TcpGatewayService : BackgroundService
                                     ReceivedAtMs = catchUp.NextCursor.ReceivedAtMs,
                                     MessageId = catchUp.NextCursor.MessageId
                                 }
+                        })
+                        .ToArray(),
+                    ResetsRequired = page.ResetsRequired
+                        .Select(static reset => new SyncCursorResetRequired
+                        {
+                            ConversationId = reset.ConversationId,
+                            Reason = (SyncCursorResetReason)(byte)reset.Reason,
+                            TipMessageId = reset.TipMessageId,
+                            TipReceivedAtMs = reset.TipReceivedAtMs,
+                            ClientAfterReceivedAtMs = reset.ClientAfterReceivedAtMs,
+                            ClientAfterMessageId = reset.ClientAfterMessageId
                         })
                         .ToArray()
                 });
@@ -1852,6 +1943,110 @@ internal sealed partial class TcpGatewayService : BackgroundService
         session.TryQueue(outboundFrame);
     }
 
+    private async ValueTask HandleMessageEditRequestAsync(
+        ReadOnlySequence<byte> payload,
+        TcpClientSession session,
+        CancellationToken cancellationToken)
+    {
+        var request = _messageEditRequestCodec.Deserialize(payload);
+        if (request is null)
+        {
+            _metrics.ProtocolError();
+            session.Close(SessionCloseReason.ProtocolViolation);
+            return;
+        }
+
+        var requestId = string.IsNullOrWhiteSpace(request.RequestId)
+            ? Guid.CreateVersion7().ToString("N")
+            : request.RequestId;
+        if (requestId.Length > 64
+            || string.IsNullOrWhiteSpace(request.MessageId)
+            || request.MessageId.Length > 64
+            || request.Content.Length > 65_536)
+        {
+            SendMessageEditAcknowledgement(
+                session,
+                new MessageEditAcknowledgement
+                {
+                    RequestId = requestId.Length <= 64
+                        ? requestId
+                        : string.Empty,
+                    MessageId = request.MessageId,
+                    Succeeded = false,
+                    ErrorCode = "invalid_message_edit_request",
+                    ErrorMessage = "消息编辑请求参数无效。"
+                });
+            return;
+        }
+
+        var command = new RealtimeMessageEditCommand
+        {
+            RequestId = requestId,
+            MessageId = request.MessageId,
+            Content = request.Content,
+            SenderUserId = session.UserId,
+            SenderSessionId = session.SessionId
+                ?? $"tcp-{session.ConnectionId}",
+            OccurredAtMs = _timeProvider.GetUtcNow().ToUnixTimeMilliseconds()
+        };
+
+        try
+        {
+            var result = await _messageBus
+                .EditMessageAsync(command, cancellationToken)
+                .ConfigureAwait(false);
+
+            SendMessageEditAcknowledgement(
+                session,
+                new MessageEditAcknowledgement
+                {
+                    RequestId = result.RequestId,
+                    MessageId = result.MessageId,
+                    Succeeded = result.Succeeded,
+                    ErrorCode = result.ErrorCode,
+                    ErrorMessage = result.ErrorMessage,
+                    ConversationId = result.ConversationId,
+                    Content = result.Content,
+                    EditVersion = result.EditVersion,
+                    EditedAtMs = result.EditedAtMs
+                });
+        }
+        catch (OperationCanceledException)
+            when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception exception)
+        {
+            LogMessageEditFailed(
+                _logger,
+                session.ConnectionId,
+                requestId,
+                exception);
+            SendMessageEditAcknowledgement(
+                session,
+                new MessageEditAcknowledgement
+                {
+                    RequestId = requestId,
+                    MessageId = request.MessageId,
+                    Succeeded = false,
+                    ErrorCode = "message_edit_unavailable",
+                    ErrorMessage = "消息编辑服务暂时不可用，请稍后重试。"
+                });
+        }
+    }
+
+    private void SendMessageEditAcknowledgement(
+        TcpClientSession session,
+        MessageEditAcknowledgement response)
+    {
+        using var outboundFrame = OutboundFrameFactory.Create(
+            PacketCommand.MessageEditAck,
+            _messageEditAcknowledgementCodec,
+            response);
+        session.TryQueue(outboundFrame);
+    }
+
     private void SendMessageReceiptAcknowledgement(
         TcpClientSession session,
         MessageReceiptCommand command,
@@ -1876,6 +2071,334 @@ internal sealed partial class TcpGatewayService : BackgroundService
             acknowledgement);
         session.TryQueue(outboundFrame);
     }
+
+    /// <summary>
+    /// 输入状态：本机 UserSessionRegistry 扇出。多网关需后续 ephemeral NATS。
+    /// 默认关闭（<see cref="TcpGatewayOptions.EnableEphemeralPresenceAndTyping"/>）。
+    /// 要求 ConversationId 与双方用户匹配（私聊成员校验）。
+    /// </summary>
+    private void HandleTypingNotify(
+        ReadOnlySequence<byte> payload,
+        TcpClientSession session)
+    {
+        if (!_options.EnableEphemeralPresenceAndTyping)
+            return;
+
+        var notify = _typingNotifyCodec.Deserialize(payload);
+        if (notify is null
+            || notify.TargetUserId <= 0
+            || notify.TargetUserId == session.UserId)
+        {
+            return;
+        }
+
+        if (!TryAuthorizeDirectConversation(
+                notify.ConversationId,
+                session.UserId,
+                notify.TargetUserId,
+                out var conversationId))
+        {
+            return;
+        }
+
+        if (!_typingFanout.TryAccept(
+                session.UserId,
+                conversationId,
+                notify.IsTyping,
+                out var expireAt))
+        {
+            return;
+        }
+
+        FanoutTypingUpdate(session.UserId, notify.TargetUserId, conversationId, notify.IsTyping);
+        PublishEphemeralTypingFireAndForget(
+            session.UserId,
+            notify.TargetUserId,
+            conversationId,
+            notify.IsTyping);
+
+        if (notify.IsTyping && expireAt is { } exp)
+        {
+            _ = ExpireTypingAfterAsync(
+                session.UserId,
+                notify.TargetUserId,
+                conversationId,
+                exp);
+        }
+    }
+
+    private void PublishEphemeralTypingFireAndForget(
+        long senderUserId,
+        long targetUserId,
+        string conversationId,
+        bool isTyping)
+    {
+        var evt = new EphemeralTypingEvent
+        {
+            OriginInstanceId = _integrationOptions.InstanceId,
+            SenderUserId = senderUserId,
+            TargetUserId = targetUserId,
+            ConversationId = conversationId,
+            IsTyping = isTyping
+        };
+        _ = PublishEphemeralTypingSafeAsync(evt);
+    }
+
+    private async Task PublishEphemeralTypingSafeAsync(EphemeralTypingEvent evt)
+    {
+        try
+        {
+            await _messageBus.PublishEphemeralTypingAsync(evt).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            LogEphemeralTypingPublishFailed(_logger, evt.TargetUserId, ex);
+        }
+    }
+
+    private void FanoutTypingUpdate(
+        long senderUserId,
+        long targetUserId,
+        string conversationId,
+        bool isTyping)
+    {
+        var targets = _userSessions.GetSnapshot(targetUserId);
+        if (targets.Length == 0)
+            return;
+
+        var update = new TypingUpdate
+        {
+            SenderUserId = senderUserId,
+            ConversationId = conversationId,
+            IsTyping = isTyping
+        };
+
+        using var frame = OutboundFrameFactory.Create(
+            PacketCommand.TypingUpdate,
+            _typingUpdateCodec,
+            update);
+        foreach (var target in targets)
+            target.TryQueue(frame);
+    }
+
+    private async Task ExpireTypingAfterAsync(
+        long senderUserId,
+        long targetUserId,
+        string conversationId,
+        DateTimeOffset expireAt)
+    {
+        try
+        {
+            var delay = expireAt - _timeProvider.GetUtcNow();
+            if (delay > TimeSpan.Zero)
+                await Task.Delay(delay, CancellationToken.None).ConfigureAwait(false);
+
+            if (!_typingFanout.TryTakeExpired(senderUserId, conversationId, expireAt))
+                return;
+
+            FanoutTypingUpdate(senderUserId, targetUserId, conversationId, isTyping: false);
+            PublishEphemeralTypingFireAndForget(
+                senderUserId,
+                targetUserId,
+                conversationId,
+                isTyping: false);
+        }
+        catch (Exception ex)
+        {
+            LogTypingExpireFailed(_logger, senderUserId, conversationId, ex);
+        }
+    }
+
+    private static bool TryAuthorizeDirectConversation(
+        string? conversationId,
+        long userA,
+        long userB,
+        out string normalizedId)
+    {
+        normalizedId = string.Empty;
+        if (string.IsNullOrWhiteSpace(conversationId))
+            return false;
+
+        var expected = Realtime.Abstractions.Conversations.ConversationId.CreateDirect(userA, userB);
+        if (!string.Equals(conversationId.Trim(), expected, StringComparison.Ordinal))
+            return false;
+
+        normalizedId = expected;
+        return true;
+    }
+
+    private async ValueTask HandlePresenceQueryAsync(
+        ReadOnlySequence<byte> payload,
+        TcpClientSession session,
+        CancellationToken cancellationToken)
+    {
+        var request = _presenceQueryRequestCodec.Deserialize(payload);
+        if (request is null || string.IsNullOrWhiteSpace(request.RequestId))
+            return;
+
+        if (!_options.EnableEphemeralPresenceAndTyping)
+        {
+            using var disabled = OutboundFrameFactory.Create(
+                PacketCommand.PresenceSnapshot,
+                _presenceSnapshotResponseCodec,
+                new PresenceSnapshotResponse
+                {
+                    RequestId = request.RequestId.Trim(),
+                    Items = []
+                });
+            session.TryQueue(disabled);
+            return;
+        }
+
+        var requested = (request.UserIds ?? Array.Empty<long>())
+            .Where(id => id > 0 && id != session.UserId)
+            .Distinct()
+            .Take(100)
+            .ToArray();
+
+        long[] allowedIds;
+        try
+        {
+            var auth = await _messageBus
+                .AuthorizePresenceAsync(
+                    new PresenceAuthorizeQuery
+                    {
+                        WatcherUserId = session.UserId,
+                        TargetUserIds = requested
+                    },
+                    cancellationToken)
+                .ConfigureAwait(false);
+            allowedIds =
+            [
+                .. auth.AllowedUserIds
+                    .Where(static id => id > 0)
+                    .Distinct()
+            ];
+        }
+        catch (Exception ex)
+        {
+            LogPresenceAuthorizeFailed(_logger, session.UserId, ex);
+            allowedIds = [];
+        }
+
+        _presenceWatchers.WatchMany(allowedIds, session.UserId);
+
+        IReadOnlyDictionary<long, bool> onlineMap;
+        try
+        {
+            onlineMap = await _globalPresence
+                .GetOnlineManyAsync(allowedIds, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch
+        {
+            onlineMap = new Dictionary<long, bool>();
+        }
+
+        var items = new PresenceSnapshotItem[allowedIds.Length];
+        for (var i = 0; i < allowedIds.Length; i++)
+        {
+            var userId = allowedIds[i];
+            var localOnline = _userSessions.GetSnapshot(userId).Length > 0;
+            var globalOnline = onlineMap.TryGetValue(userId, out var on) && on;
+            items[i] = new PresenceSnapshotItem
+            {
+                UserId = userId,
+                IsOnline = localOnline || globalOnline
+            };
+        }
+
+        var response = new PresenceSnapshotResponse
+        {
+            RequestId = request.RequestId.Trim(),
+            Items = items
+        };
+
+        using var outbound = OutboundFrameFactory.Create(
+            PacketCommand.PresenceSnapshot,
+            _presenceSnapshotResponseCodec,
+            response);
+        session.TryQueue(outbound);
+    }
+
+    private void HandlePresenceUnwatch(
+        ReadOnlySequence<byte> payload,
+        TcpClientSession session)
+    {
+        if (!_options.EnableEphemeralPresenceAndTyping)
+            return;
+
+        var request = _presenceUnwatchRequestCodec.Deserialize(payload);
+        if (request?.UserIds is null || request.UserIds.Count == 0)
+            return;
+
+        var selfUserId = session.UserId;
+        var userIds = request.UserIds
+            .Where(id => id > 0 && id != selfUserId)
+            .Distinct()
+            .Take(100)
+            .ToArray();
+        _presenceWatchers.UnwatchMany(userIds, selfUserId);
+    }
+
+    private async Task PublishPresenceChangedAsync(
+        long userId,
+        bool isOnline,
+        CancellationToken cancellationToken)
+    {
+        if (isOnline)
+            await _globalPresence
+                .SetOnlineAsync(userId, _integrationOptions.InstanceId, cancellationToken)
+                .ConfigureAwait(false);
+        else
+            await _globalPresence
+                .SetOfflineAsync(userId, _integrationOptions.InstanceId, cancellationToken)
+                .ConfigureAwait(false);
+
+        BroadcastPresenceChangedLocal(userId, isOnline);
+
+        try
+        {
+            await _messageBus
+                .PublishEphemeralPresenceAsync(
+                    new EphemeralPresenceEvent
+                    {
+                        OriginInstanceId = _integrationOptions.InstanceId,
+                        UserId = userId,
+                        IsOnline = isOnline
+                    },
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            LogEphemeralPresencePublishFailed(_logger, userId, ex);
+        }
+    }
+
+    private void BroadcastPresenceChangedLocal(long userId, bool isOnline)
+    {
+        var watchers = _presenceWatchers.GetWatchers(userId);
+        if (watchers.Length == 0)
+            return;
+
+        var update = new PresenceChanged
+        {
+            UserId = userId,
+            IsOnline = isOnline
+        };
+
+        using var frame = OutboundFrameFactory.Create(
+            PacketCommand.PresenceChanged,
+            _presenceChangedCodec,
+            update);
+        foreach (var watcherId in watchers)
+        {
+            foreach (var watcherSession in _userSessions.GetSnapshot(watcherId))
+                watcherSession.TryQueue(frame);
+        }
+    }
+
     private void SendMessageAcknowledgement(
         TcpClientSession session,
         string clientMessageId,
@@ -1942,7 +2465,31 @@ internal sealed partial class TcpGatewayService : BackgroundService
             : trimmed[..ChatMessageLimits.MaxForwardedFromPreviewLength];
     }
 
+    // 20（long 含符号最大位数）+ 1（':'）+ clientMessageId 最大 UTF8 字节数 + 余量。
+    private const int CommandIdScratchBytes =
+        20 + 1 + (ChatMessageLimits.MaxClientMessageIdLength * 3) + 16;
+
     private static string CreateCommandId(
+        long senderUserId,
+        string clientMessageId)
+    {
+        var maxIdBytes = Encoding.UTF8.GetMaxByteCount(clientMessageId.Length);
+        if (20 + 1 + maxIdBytes > CommandIdScratchBytes)
+            return CreateCommandIdSlow(senderUserId, clientMessageId);
+
+        Span<byte> scratch = stackalloc byte[CommandIdScratchBytes];
+        var written = 0;
+        senderUserId.TryFormat(scratch, out var idLen);
+        written += idLen;
+        scratch[written++] = (byte)':';
+        written += Encoding.UTF8.GetBytes(clientMessageId, scratch[written..]);
+
+        Span<byte> hash = stackalloc byte[32];
+        SHA256.HashData(scratch[..written], hash);
+        return Convert.ToHexStringLower(hash);
+    }
+
+    private static string CreateCommandIdSlow(
         long senderUserId,
         string clientMessageId)
     {
@@ -1952,7 +2499,35 @@ internal sealed partial class TcpGatewayService : BackgroundService
             SHA256.HashData(source));
     }
 
+    // 20（long）+ 1（':'）+ messageId 最大 UTF8 字节数 + 1（':'）+ 3（byte）+ 余量。
+    private const int ReceiptCommandIdScratchBytes =
+        20 + 1 + (64 * 3) + 1 + 3 + 16;
+
     private static string CreateReceiptCommandId(
+        long receiverUserId,
+        string messageId,
+        MessageReceiptType receiptType)
+    {
+        var maxIdBytes = Encoding.UTF8.GetMaxByteCount(messageId.Length);
+        if (20 + 1 + maxIdBytes + 1 + 3 > ReceiptCommandIdScratchBytes)
+            return CreateReceiptCommandIdSlow(receiverUserId, messageId, receiptType);
+
+        Span<byte> scratch = stackalloc byte[ReceiptCommandIdScratchBytes];
+        var written = 0;
+        receiverUserId.TryFormat(scratch, out var idLen);
+        written += idLen;
+        scratch[written++] = (byte)':';
+        written += Encoding.UTF8.GetBytes(messageId, scratch[written..]);
+        scratch[written++] = (byte)':';
+        ((byte)receiptType).TryFormat(scratch[written..], out var typeLen);
+        written += typeLen;
+
+        Span<byte> hash = stackalloc byte[32];
+        SHA256.HashData(scratch[..written], hash);
+        return Convert.ToHexStringLower(hash);
+    }
+
+    private static string CreateReceiptCommandIdSlow(
         long receiverUserId,
         string messageId,
         MessageReceiptType receiptType)
@@ -1989,6 +2564,15 @@ internal sealed partial class TcpGatewayService : BackgroundService
                     {
                         session.Close(
                             SessionCloseReason.IdleTimedOut);
+                    }
+                    else if (_options.EnableEphemeralPresenceAndTyping
+                             && session is { IsAuthenticated: true, UserId: > 0 }
+                             && _userSessions.GetSnapshot(session.UserId).Length > 0)
+                    {
+                        _ = _globalPresence.RefreshOnlineAsync(
+                            session.UserId,
+                            _integrationOptions.InstanceId,
+                            CancellationToken.None);
                     }
                 }
             }
@@ -2123,6 +2707,16 @@ internal sealed partial class TcpGatewayService : BackgroundService
         Exception exception);
 
     [LoggerMessage(
+        EventId = 62,
+        Level = LogLevel.Warning,
+        Message = "Connection {ConnectionId} could not edit message for request {RequestId}.")]
+    private static partial void LogMessageEditFailed(
+        ILogger logger,
+        uint connectionId,
+        string requestId,
+        Exception exception);
+
+    [LoggerMessage(
         EventId = 10,
         Level = LogLevel.Warning,
         Message = "Connection {ConnectionId} could not query sync bootstrap for request {RequestId}.")]
@@ -2130,6 +2724,43 @@ internal sealed partial class TcpGatewayService : BackgroundService
         ILogger logger,
         uint connectionId,
         string requestId,
+        Exception exception);
+
+    [LoggerMessage(
+        EventId = 13,
+        Level = LogLevel.Debug,
+        Message = "Typing 自动过期失败 Sender={SenderUserId} Conversation={ConversationId}")]
+    private static partial void LogTypingExpireFailed(
+        ILogger logger,
+        long senderUserId,
+        string conversationId,
+        Exception exception);
+
+    [LoggerMessage(
+        EventId = 14,
+        Level = LogLevel.Debug,
+        Message = "Ephemeral Typing 发布失败 Target={TargetUserId}")]
+    private static partial void LogEphemeralTypingPublishFailed(
+        ILogger logger,
+        long targetUserId,
+        Exception exception);
+
+    [LoggerMessage(
+        EventId = 15,
+        Level = LogLevel.Warning,
+        Message = "Presence 好友鉴权失败，返回空快照 UserId={UserId}")]
+    private static partial void LogPresenceAuthorizeFailed(
+        ILogger logger,
+        long userId,
+        Exception exception);
+
+    [LoggerMessage(
+        EventId = 16,
+        Level = LogLevel.Debug,
+        Message = "Ephemeral Presence 发布失败 UserId={UserId}")]
+    private static partial void LogEphemeralPresencePublishFailed(
+        ILogger logger,
+        long userId,
         Exception exception);
 
     private sealed record ClientTaskContext(

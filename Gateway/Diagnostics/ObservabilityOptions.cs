@@ -1,4 +1,4 @@
-namespace ChatApp.TcpGateway.Diagnostics;
+namespace ChatApp.TcpGateway.Gateway.Diagnostics;
 
 public sealed class ObservabilityOptions
 {

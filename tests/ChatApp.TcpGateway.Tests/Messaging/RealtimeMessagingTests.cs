@@ -7,11 +7,13 @@ using ChatApp.Realtime.Abstractions.Sync;
 using ChatApp.Realtime.Integration;
 using ChatApp.TcpGateway.Core.Messaging;
 using ChatApp.TcpGateway.Core.Messaging.Conversations;
-using ChatApp.TcpGateway.Diagnostics;
+using ChatApp.TcpGateway.Gateway.Diagnostics;
+using ChatApp.TcpGateway.Gateway.Networking.Sessions;
 using ChatApp.TcpGateway.Infrastructure.Serialization.Json;
-using ChatApp.TcpGateway.Messaging;
 using ChatApp.TcpGateway.Networking.Sessions;
 using Microsoft.Extensions.Logging.Abstractions;
+using RealtimeEventConsumerService = ChatApp.TcpGateway.Gateway.Messaging.RealtimeEventConsumerService;
+using RealtimeEventDispatcher = ChatApp.TcpGateway.Gateway.Messaging.RealtimeEventDispatcher;
 
 namespace ChatApp.TcpGateway.Tests.Messaging;
 
@@ -89,6 +91,8 @@ public sealed class RealtimeMessagingTests
                 GatewayJsonSerializerContext.Default.UnreadCountChanged),
             new JsonPayloadCodec<MessageRecalledUpdate>(
                 GatewayJsonSerializerContext.Default.MessageRecalledUpdate),
+            new JsonPayloadCodec<MessageEditedUpdate>(
+                GatewayJsonSerializerContext.Default.MessageEditedUpdate),
             metrics,
             TimeProvider.System,
             NullLogger<RealtimeEventDispatcher>.Instance);
@@ -196,6 +200,15 @@ public sealed class RealtimeMessagingTests
                     "not_used",
                     "not used"));
 
+        public Task<MessageEditResult> EditMessageAsync(
+            MessageEditCommand command,
+            CancellationToken ct = default) =>
+            Task.FromResult(
+                MessageEditResult.Failed(
+                    command.RequestId,
+                    "not_used",
+                    "not used"));
+
         public Task<SyncBootstrapPage> QuerySyncBootstrapAsync(
             SyncBootstrapQuery query,
             CancellationToken ct = default) =>
@@ -244,6 +257,47 @@ public sealed class RealtimeMessagingTests
             await Task.CompletedTask;
             yield break;
         }
+
+        public Task PublishEphemeralTypingAsync(
+            ChatApp.Realtime.Integration.Ephemeral.EphemeralTypingEvent evt,
+            CancellationToken ct = default) =>
+            Task.CompletedTask;
+
+        public Task PublishEphemeralPresenceAsync(
+            ChatApp.Realtime.Integration.Ephemeral.EphemeralPresenceEvent evt,
+            CancellationToken ct = default) =>
+            Task.CompletedTask;
+
+        public async IAsyncEnumerable<ChatApp.Realtime.Integration.Ephemeral.EphemeralTypingEvent>
+            ConsumeEphemeralTypingAsync([EnumeratorCancellation] CancellationToken ct = default)
+        {
+            ct.ThrowIfCancellationRequested();
+            await Task.CompletedTask;
+            yield break;
+        }
+
+        public async IAsyncEnumerable<ChatApp.Realtime.Integration.Ephemeral.EphemeralPresenceEvent>
+            ConsumeEphemeralPresenceAsync([EnumeratorCancellation] CancellationToken ct = default)
+        {
+            ct.ThrowIfCancellationRequested();
+            await Task.CompletedTask;
+            yield break;
+        }
+
+        public Task<ChatApp.Realtime.Integration.Ephemeral.PresenceAuthorizeResponse> AuthorizePresenceAsync(
+            ChatApp.Realtime.Integration.Ephemeral.PresenceAuthorizeQuery query,
+            CancellationToken ct = default) =>
+            Task.FromResult(new ChatApp.Realtime.Integration.Ephemeral.PresenceAuthorizeResponse
+            {
+                AllowedUserIds = query.TargetUserIds
+            });
+
+        public Task ServePresenceAuthorizeAsync(
+            Func<ChatApp.Realtime.Integration.Ephemeral.PresenceAuthorizeQuery, CancellationToken,
+                ValueTask<ChatApp.Realtime.Integration.Ephemeral.PresenceAuthorizeResponse>> handler,
+            CancellationToken ct = default) =>
+            Task.CompletedTask;
+
         public Task<TimeSpan> PingAsync(
             CancellationToken ct = default) =>
             Task.FromResult(TimeSpan.FromMilliseconds(1));

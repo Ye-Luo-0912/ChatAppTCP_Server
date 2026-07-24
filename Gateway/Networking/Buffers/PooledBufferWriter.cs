@@ -1,6 +1,6 @@
 using System.Buffers;
 
-namespace ChatApp.TcpGateway.Networking.Buffers;
+namespace ChatApp.TcpGateway.Gateway.Networking.Buffers;
 
 internal sealed class PooledBufferWriter : IBufferWriter<byte>, IDisposable
 {

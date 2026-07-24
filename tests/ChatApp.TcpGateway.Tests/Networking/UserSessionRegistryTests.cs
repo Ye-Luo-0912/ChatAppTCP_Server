@@ -1,5 +1,6 @@
 using System.Net.Sockets;
-using ChatApp.TcpGateway.Diagnostics;
+using ChatApp.TcpGateway.Gateway.Diagnostics;
+using ChatApp.TcpGateway.Gateway.Networking.Sessions;
 using ChatApp.TcpGateway.Networking.Sessions;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -55,6 +56,24 @@ public sealed class UserSessionRegistryTests
         Assert.Single(registry.GetSnapshot(42));
 
         registry.Remove(second);
+        Assert.Empty(registry.GetSnapshot(42));
+    }
+
+    [Fact]
+    public async Task Add_ReturnsTrueOnlyForFirstOnline_RemoveReturnsTrueOnlyForLastOffline()
+    {
+        using var metrics = new GatewayMetrics();
+        await using var first = CreateSession(1, metrics);
+        await using var second = CreateSession(2, metrics);
+        var registry = new UserSessionRegistry();
+
+        first.Authenticate(42, "first", deviceIdHash: 1);
+        second.Authenticate(42, "second", deviceIdHash: 2);
+
+        Assert.True(registry.Add(first));
+        Assert.False(registry.Add(second));
+        Assert.False(registry.Remove(first));
+        Assert.True(registry.Remove(second));
         Assert.Empty(registry.GetSnapshot(42));
     }
 

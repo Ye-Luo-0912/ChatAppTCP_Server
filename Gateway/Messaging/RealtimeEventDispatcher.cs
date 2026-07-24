@@ -5,12 +5,13 @@ using ChatApp.TcpGateway.Core.Messaging;
 using ChatApp.TcpGateway.Core.Messaging.Conversations;
 using ChatApp.TcpGateway.Core.Protocol;
 using ChatApp.TcpGateway.Core.Serialization;
-using ChatApp.TcpGateway.Diagnostics;
-using ChatApp.TcpGateway.Networking.Buffers;
+using ChatApp.TcpGateway.Gateway.Diagnostics;
+using ChatApp.TcpGateway.Gateway.Networking.Buffers;
+using ChatApp.TcpGateway.Gateway.Networking.Sessions;
 using ChatApp.TcpGateway.Networking.Sessions;
 using Microsoft.Extensions.Logging;
 
-namespace ChatApp.TcpGateway.Messaging;
+namespace ChatApp.TcpGateway.Gateway.Messaging;
 
 internal sealed partial class RealtimeEventDispatcher
 {
@@ -20,6 +21,7 @@ internal sealed partial class RealtimeEventDispatcher
     private readonly IPayloadCodec<ConversationChanged> _conversationChangedCodec;
     private readonly IPayloadCodec<UnreadCountChanged> _unreadCountChangedCodec;
     private readonly IPayloadCodec<MessageRecalledUpdate> _messageRecalledUpdateCodec;
+    private readonly IPayloadCodec<MessageEditedUpdate> _messageEditedUpdateCodec;
     private readonly GatewayMetrics _metrics;
     private readonly TimeProvider _timeProvider;
     private readonly ILogger<RealtimeEventDispatcher> _logger;
@@ -31,6 +33,7 @@ internal sealed partial class RealtimeEventDispatcher
         IPayloadCodec<ConversationChanged> conversationChangedCodec,
         IPayloadCodec<UnreadCountChanged> unreadCountChangedCodec,
         IPayloadCodec<MessageRecalledUpdate> messageRecalledUpdateCodec,
+        IPayloadCodec<MessageEditedUpdate> messageEditedUpdateCodec,
         GatewayMetrics metrics,
         TimeProvider timeProvider,
         ILogger<RealtimeEventDispatcher> logger)
@@ -41,6 +44,7 @@ internal sealed partial class RealtimeEventDispatcher
         _conversationChangedCodec = conversationChangedCodec;
         _unreadCountChangedCodec = unreadCountChangedCodec;
         _messageRecalledUpdateCodec = messageRecalledUpdateCodec;
+        _messageEditedUpdateCodec = messageEditedUpdateCodec;
         _metrics = metrics;
         _timeProvider = timeProvider;
         _logger = logger;
@@ -74,6 +78,10 @@ internal sealed partial class RealtimeEventDispatcher
 
             case RealtimeEventType.MessageRecalled:
                 DispatchMessageRecalled(realtimeEvent);
+                break;
+
+            case RealtimeEventType.MessageEdited:
+                DispatchMessageEdited(realtimeEvent);
                 break;
 
             default:
@@ -156,25 +164,7 @@ internal sealed partial class RealtimeEventDispatcher
             _chatMessageCodec,
             message);
 
-        var queuedDeliveries = 0;
-        foreach (var target in targets)
-        {
-            // 发送方回声：跳过产生该消息的来源会话，避免本机重复。
-            if (isSenderEcho
-                && !string.IsNullOrWhiteSpace(realtimeEvent.SessionId)
-                && string.Equals(
-                    target.SessionId,
-                    realtimeEvent.SessionId,
-                    StringComparison.Ordinal))
-            {
-                continue;
-            }
-
-            if (target.TryQueue(outboundFrame))
-            {
-                queuedDeliveries++;
-            }
-        }
+        var queuedDeliveries = targets.Where(target => !isSenderEcho || string.IsNullOrWhiteSpace(realtimeEvent.SessionId) || !string.Equals(target.SessionId, realtimeEvent.SessionId, StringComparison.Ordinal)).Count(target => target.TryQueue(outboundFrame));
 
         _metrics.RealtimeEventHandled(queuedDeliveries);
     }
@@ -240,10 +230,78 @@ internal sealed partial class RealtimeEventDispatcher
             _messageRecalledUpdateCodec,
             update);
 
+        var queuedDeliveries = targets.Where(target => !isSenderEcho || string.IsNullOrWhiteSpace(realtimeEvent.SessionId) || !string.Equals(target.SessionId, realtimeEvent.SessionId, StringComparison.Ordinal)).Count(target => target.TryQueue(outboundFrame));
+
+        _metrics.RealtimeEventHandled(queuedDeliveries);
+    }
+
+    private void DispatchMessageEdited(RealtimeEvent realtimeEvent)
+    {
+        if (string.IsNullOrWhiteSpace(realtimeEvent.PayloadJson))
+        {
+            RejectEvent(realtimeEvent, "missing-payload");
+            return;
+        }
+
+        ChatApp.Realtime.Abstractions.Messaging.RealtimeMessageEditedPayload?
+            payload;
+        try
+        {
+            payload = RealtimeWireSerializer.DeserializeMessageEdited(
+                realtimeEvent.PayloadJson);
+        }
+        catch (JsonException)
+        {
+            RejectEvent(realtimeEvent, "invalid-payload-json");
+            return;
+        }
+
+        if (payload is null ||
+            string.IsNullOrWhiteSpace(payload.MessageId) ||
+            payload.SenderUserId <= 0 ||
+            payload.ReceiverUserId <= 0 ||
+            payload.EditVersion < 1 ||
+            payload.EditedAtMs <= 0)
+        {
+            RejectEvent(realtimeEvent, "invalid-message-edited-payload");
+            return;
+        }
+
+        var isReceiverTarget = payload.ReceiverUserId == realtimeEvent.TargetUserId;
+        var isSenderEcho = payload.SenderUserId == realtimeEvent.TargetUserId;
+        if (!isReceiverTarget && !isSenderEcho)
+        {
+            RejectEvent(realtimeEvent, "invalid-message-edited-payload");
+            return;
+        }
+
+        var targets = _userSessions.GetSnapshot(
+            realtimeEvent.TargetUserId);
+        if (targets.Length == 0)
+        {
+            _metrics.RealtimeEventHandled(queuedDeliveries: 0);
+            return;
+        }
+
+        var update = new MessageEditedUpdate
+        {
+            MessageId = payload.MessageId,
+            ConversationId = payload.ConversationId,
+            SenderUserId = payload.SenderUserId,
+            ReceiverUserId = payload.ReceiverUserId,
+            Content = payload.Content,
+            EditVersion = payload.EditVersion,
+            EditedAtMs = payload.EditedAtMs
+        };
+
+        using var outboundFrame = OutboundFrameFactory.Create(
+            PacketCommand.MessageEdited,
+            _messageEditedUpdateCodec,
+            update);
+
         var queuedDeliveries = 0;
         foreach (var target in targets)
         {
-            // 发送方回声：跳过产生该撤回的来源会话，避免本机重复。
             if (isSenderEcho
                 && !string.IsNullOrWhiteSpace(realtimeEvent.SessionId)
                 && string.Equals(
@@ -255,9 +313,7 @@ internal sealed partial class RealtimeEventDispatcher
             }
 
             if (target.TryQueue(outboundFrame))
-            {
                 queuedDeliveries++;
-            }
         }
 
         _metrics.RealtimeEventHandled(queuedDeliveries);
@@ -319,12 +375,7 @@ internal sealed partial class RealtimeEventDispatcher
             _messageReceiptUpdateCodec,
             update);
 
-        var queuedDeliveries = 0;
-        foreach (var target in targets)
-        {
-            if (target.TryQueue(outboundFrame))
-                queuedDeliveries++;
-        }
+        var queuedDeliveries = targets.Count(target => target.TryQueue(outboundFrame));
 
         _metrics.RealtimeEventHandled(queuedDeliveries);
     }
@@ -337,7 +388,7 @@ internal sealed partial class RealtimeEventDispatcher
             return;
         }
 
-        ChatApp.Realtime.Abstractions.Conversations.RealtimeConversationChangedPayload?
+        Realtime.Abstractions.Conversations.RealtimeConversationChangedPayload?
             payload;
         try
         {
@@ -401,7 +452,7 @@ internal sealed partial class RealtimeEventDispatcher
             return;
         }
 
-        ChatApp.Realtime.Abstractions.Conversations.RealtimeUnreadCountChangedPayload?
+        Realtime.Abstractions.Conversations.RealtimeUnreadCountChangedPayload?
             payload;
         try
         {

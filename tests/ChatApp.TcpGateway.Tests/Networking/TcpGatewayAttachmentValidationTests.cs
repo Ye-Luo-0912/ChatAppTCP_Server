@@ -14,13 +14,15 @@ using ChatApp.TcpGateway.Core.Messaging.Conversations;
 using ChatApp.TcpGateway.Core.Messaging.History;
 using ChatApp.TcpGateway.Core.Messaging.Sync;
 using ChatApp.TcpGateway.Core.Protocol;
-using ChatApp.TcpGateway.Diagnostics;
+using ChatApp.TcpGateway.Gateway.Diagnostics;
+using ChatApp.TcpGateway.Gateway.Networking.Sessions;
 using ChatApp.TcpGateway.Infrastructure.Serialization.Json;
 using ChatApp.TcpGateway.Networking;
 using ChatApp.TcpGateway.Networking.Sessions;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using RealtimeHistory = ChatApp.Realtime.Abstractions.Messaging.History;
+using TcpGatewayService = ChatApp.TcpGateway.Gateway.Networking.TcpGatewayService;
 
 namespace ChatApp.TcpGateway.Tests.Networking;
 
@@ -321,6 +323,10 @@ public sealed class TcpGatewayAttachmentValidationTests
                 GatewayJsonSerializerContext.Default.MessageRecallRequest);
             var messageRecallAcknowledgementCodec = new JsonPayloadCodec<MessageRecallAcknowledgement>(
                 GatewayJsonSerializerContext.Default.MessageRecallAcknowledgement);
+            var messageEditRequestCodec = new JsonPayloadCodec<MessageEditRequest>(
+                GatewayJsonSerializerContext.Default.MessageEditRequest);
+            var messageEditAcknowledgementCodec = new JsonPayloadCodec<MessageEditAcknowledgement>(
+                GatewayJsonSerializerContext.Default.MessageEditAcknowledgement);
             var syncBootstrapRequestCodec = new JsonPayloadCodec<SyncBootstrapRequest>(
                 GatewayJsonSerializerContext.Default.SyncBootstrapRequest);
             var syncBootstrapResponseCodec = new JsonPayloadCodec<SyncBootstrapResponse>(
@@ -346,10 +352,17 @@ public sealed class TcpGatewayAttachmentValidationTests
                 conversationSetPrefsResponseCodec,
                 messageRecallRequestCodec,
                 messageRecallAcknowledgementCodec,
+                messageEditRequestCodec,
+                messageEditAcknowledgementCodec,
                 syncBootstrapRequestCodec,
                 syncBootstrapResponseCodec,
                 messageBus,
+                new ChatApp.Realtime.Integration.Configuration.RealtimeIntegrationOptions
+                {
+                    InstanceId = "test-gateway-attach"
+                },
                 new NoopLeaseStore(),
+                new NoopGlobalPresenceStore(),
                 new UserSessionRegistry(),
                 metrics,
                 TimeProvider.System,
@@ -506,6 +519,18 @@ public sealed class TcpGatewayAttachmentValidationTests
                     conversationId: null,
                     recalledAtMs: command.OccurredAtMs));
 
+        public Task<MessageEditResult> EditMessageAsync(
+            MessageEditCommand command,
+            CancellationToken ct = default) =>
+            Task.FromResult(
+                MessageEditResult.Success(
+                    command.RequestId,
+                    command.MessageId,
+                    conversationId: null,
+                    content: command.Content,
+                    editVersion: 2,
+                    editedAtMs: command.OccurredAtMs));
+
         public Task<SyncBootstrapPage> QuerySyncBootstrapAsync(
             SyncBootstrapQuery query,
             CancellationToken ct = default) =>
@@ -544,6 +569,48 @@ public sealed class TcpGatewayAttachmentValidationTests
             await Task.CompletedTask;
             yield break;
         }
+
+        public Task PublishEphemeralTypingAsync(
+            ChatApp.Realtime.Integration.Ephemeral.EphemeralTypingEvent evt,
+            CancellationToken ct = default) =>
+            Task.CompletedTask;
+
+        public Task PublishEphemeralPresenceAsync(
+            ChatApp.Realtime.Integration.Ephemeral.EphemeralPresenceEvent evt,
+            CancellationToken ct = default) =>
+            Task.CompletedTask;
+
+        public async IAsyncEnumerable<ChatApp.Realtime.Integration.Ephemeral.EphemeralTypingEvent>
+            ConsumeEphemeralTypingAsync(
+                [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+        {
+            ct.ThrowIfCancellationRequested();
+            await Task.CompletedTask;
+            yield break;
+        }
+
+        public async IAsyncEnumerable<ChatApp.Realtime.Integration.Ephemeral.EphemeralPresenceEvent>
+            ConsumeEphemeralPresenceAsync(
+                [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+        {
+            ct.ThrowIfCancellationRequested();
+            await Task.CompletedTask;
+            yield break;
+        }
+
+        public Task<ChatApp.Realtime.Integration.Ephemeral.PresenceAuthorizeResponse> AuthorizePresenceAsync(
+            ChatApp.Realtime.Integration.Ephemeral.PresenceAuthorizeQuery query,
+            CancellationToken ct = default) =>
+            Task.FromResult(new ChatApp.Realtime.Integration.Ephemeral.PresenceAuthorizeResponse
+            {
+                AllowedUserIds = query.TargetUserIds
+            });
+
+        public Task ServePresenceAuthorizeAsync(
+            Func<ChatApp.Realtime.Integration.Ephemeral.PresenceAuthorizeQuery, CancellationToken,
+                ValueTask<ChatApp.Realtime.Integration.Ephemeral.PresenceAuthorizeResponse>> handler,
+            CancellationToken ct = default) =>
+            Task.CompletedTask;
 
         public Task<TimeSpan> PingAsync(CancellationToken ct = default) =>
             Task.FromResult(TimeSpan.Zero);

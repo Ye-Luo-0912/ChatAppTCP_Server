@@ -80,6 +80,15 @@ public static class InfrastructureServiceCollectionExtensions
         services.AddSingleton<IPayloadCodec<MessageRecalledUpdate>>(
             static _ => new JsonPayloadCodec<MessageRecalledUpdate>(
                 GatewayJsonSerializerContext.Default.MessageRecalledUpdate));
+        services.AddSingleton<IPayloadCodec<MessageEditRequest>>(
+            static _ => new JsonPayloadCodec<MessageEditRequest>(
+                GatewayJsonSerializerContext.Default.MessageEditRequest));
+        services.AddSingleton<IPayloadCodec<MessageEditAcknowledgement>>(
+            static _ => new JsonPayloadCodec<MessageEditAcknowledgement>(
+                GatewayJsonSerializerContext.Default.MessageEditAcknowledgement));
+        services.AddSingleton<IPayloadCodec<MessageEditedUpdate>>(
+            static _ => new JsonPayloadCodec<MessageEditedUpdate>(
+                GatewayJsonSerializerContext.Default.MessageEditedUpdate));
         services.AddSingleton<IPayloadCodec<ConversationChanged>>(
             static _ => new JsonPayloadCodec<ConversationChanged>(
                 GatewayJsonSerializerContext.Default.ConversationChanged));

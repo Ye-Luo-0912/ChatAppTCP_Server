@@ -1,7 +1,7 @@
 using System.Diagnostics.Metrics;
 using ChatApp.TcpGateway.Core.Authentication;
 
-namespace ChatApp.TcpGateway.Diagnostics;
+namespace ChatApp.TcpGateway.Gateway.Diagnostics;
 
 public sealed class GatewayMetrics : IDisposable
 {

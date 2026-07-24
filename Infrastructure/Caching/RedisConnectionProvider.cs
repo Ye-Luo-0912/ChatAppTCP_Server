@@ -33,7 +33,7 @@ public sealed partial class RedisConnectionProvider(
 
     public async Task StopAsync(CancellationToken cancellationToken)
     {
-        var connection = Interlocked.Exchange(ref _connection, null);
+        await using var connection = Interlocked.Exchange(ref _connection, null);
         if (connection is null)
         {
             return;
@@ -42,21 +42,14 @@ public sealed partial class RedisConnectionProvider(
         connection.ConnectionFailed -= OnConnectionFailed;
         connection.ConnectionRestored -= OnConnectionRestored;
 
-        try
-        {
-            await connection.CloseAsync(allowCommandsToComplete: true)
-                .WaitAsync(cancellationToken)
-                .ConfigureAwait(false);
-        }
-        finally
-        {
-            connection.Dispose();
-        }
+        await connection.CloseAsync(allowCommandsToComplete: true)
+            .WaitAsync(cancellationToken)
+            .ConfigureAwait(false);
     }
 
     public async ValueTask DisposeAsync()
     {
-        var connection = Interlocked.Exchange(ref _connection, null);
+        await using var connection = Interlocked.Exchange(ref _connection, null);
         if (connection is null)
         {
             return;
@@ -65,7 +58,6 @@ public sealed partial class RedisConnectionProvider(
         connection.ConnectionFailed -= OnConnectionFailed;
         connection.ConnectionRestored -= OnConnectionRestored;
         await connection.CloseAsync(allowCommandsToComplete: false).ConfigureAwait(false);
-        connection.Dispose();
     }
 
     private void OnConnectionFailed(object? sender, ConnectionFailedEventArgs args) =>

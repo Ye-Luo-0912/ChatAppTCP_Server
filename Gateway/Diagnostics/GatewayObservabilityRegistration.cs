@@ -6,7 +6,7 @@ using OpenTelemetry.Metrics;
 using OpenTelemetry.Resources;
 using OpenTelemetry.Trace;
 
-namespace ChatApp.TcpGateway.Diagnostics;
+namespace ChatApp.TcpGateway.Gateway.Diagnostics;
 
 public static class GatewayObservabilityRegistration
 {

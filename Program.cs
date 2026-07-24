@@ -1,16 +1,19 @@
 using ChatApp.Realtime.Integration.Configuration;
 using ChatApp.Realtime.Integration.DependencyInjection;
 using ChatApp.TcpGateway.Configuration;
-using ChatApp.TcpGateway.Diagnostics;
+using ChatApp.TcpGateway.Gateway.Diagnostics;
+using ChatApp.TcpGateway.Gateway.Networking.Sessions;
 using ChatApp.TcpGateway.Infrastructure;
 using ChatApp.TcpGateway.Infrastructure.Caching;
-using ChatApp.TcpGateway.Messaging;
-using ChatApp.TcpGateway.Networking;
-using ChatApp.TcpGateway.Networking.Sessions;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using EphemeralPresenceTypingConsumerService = ChatApp.TcpGateway.Gateway.Messaging.EphemeralPresenceTypingConsumerService;
+using RealtimeEventConsumerService = ChatApp.TcpGateway.Gateway.Messaging.RealtimeEventConsumerService;
+using RealtimeEventDispatcher = ChatApp.TcpGateway.Gateway.Messaging.RealtimeEventDispatcher;
+using RedisGlobalPresenceStore = ChatApp.TcpGateway.Gateway.Networking.Sessions.RedisGlobalPresenceStore;
+using TcpGatewayService = ChatApp.TcpGateway.Gateway.Networking.TcpGatewayService;
 
 var builder = Host.CreateApplicationBuilder(args);
 builder.Configuration
@@ -67,11 +70,13 @@ builder.Services.AddGatewayObservability(
 builder.Services.AddSingleton(TimeProvider.System);
 builder.Services.AddSingleton<GatewayMetrics>();
 builder.Services.AddSingleton<UserSessionRegistry>();
+builder.Services.AddSingleton<IGlobalPresenceStore, RedisGlobalPresenceStore>();
 builder.Services.AddSingleton<RealtimeEventDispatcher>();
 builder.Services.AddGatewayInfrastructure();
 builder.Services.AddChatAppRealtimeIntegration(
     realtimeIntegrationOptions);
 builder.Services.AddHostedService<RealtimeEventConsumerService>();
+builder.Services.AddHostedService<EphemeralPresenceTypingConsumerService>();
 builder.Services.AddHostedService<TcpGatewayService>();
 
 await builder.Build().RunAsync();

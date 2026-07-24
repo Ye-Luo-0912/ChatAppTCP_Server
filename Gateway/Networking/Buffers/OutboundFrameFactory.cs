@@ -1,7 +1,7 @@
 using ChatApp.TcpGateway.Core.Protocol;
 using ChatApp.TcpGateway.Core.Serialization;
 
-namespace ChatApp.TcpGateway.Networking.Buffers;
+namespace ChatApp.TcpGateway.Gateway.Networking.Buffers;
 
 internal static class OutboundFrameFactory
 {

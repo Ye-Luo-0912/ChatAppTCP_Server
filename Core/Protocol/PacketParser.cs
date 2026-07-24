@@ -16,18 +16,32 @@ public static class PacketParser
             return PacketParseStatus.NeedMoreData;
         }
 
-        Span<byte> header = stackalloc byte[PacketProtocol.HeaderSize];
-        buffer.Slice(0, PacketProtocol.HeaderSize).CopyTo(header);
-
-        if (BinaryPrimitives.ReadUInt32LittleEndian(header) != PacketProtocol.MagicNumber)
+        // 连续 FirstSpan 快路径：绝大多数完整 TCP 段无需复制 10 字节头。
+        // stackalloc 不得赋给跨分支存活的 Span（CS8352），因此在分支内直接读字段。
+        uint magic;
+        ushort commandRaw;
+        int payloadLength;
+        if (buffer.FirstSpan.Length >= PacketProtocol.HeaderSize)
         {
-            return PacketParseStatus.InvalidPacket;
+            var header = buffer.FirstSpan[..PacketProtocol.HeaderSize];
+            magic = BinaryPrimitives.ReadUInt32LittleEndian(header);
+            commandRaw = BinaryPrimitives.ReadUInt16LittleEndian(
+                header[PacketProtocol.CommandOffset..]);
+            payloadLength = BinaryPrimitives.ReadInt32LittleEndian(
+                header[PacketProtocol.LengthOffset..]);
+        }
+        else
+        {
+            Span<byte> headerCopy = stackalloc byte[PacketProtocol.HeaderSize];
+            buffer.Slice(0, PacketProtocol.HeaderSize).CopyTo(headerCopy);
+            magic = BinaryPrimitives.ReadUInt32LittleEndian(headerCopy);
+            commandRaw = BinaryPrimitives.ReadUInt16LittleEndian(
+                headerCopy[PacketProtocol.CommandOffset..]);
+            payloadLength = BinaryPrimitives.ReadInt32LittleEndian(
+                headerCopy[PacketProtocol.LengthOffset..]);
         }
 
-        var payloadLength = BinaryPrimitives.ReadInt32LittleEndian(
-            header[PacketProtocol.LengthOffset..]);
-
-        if (payloadLength is < 0 or > PacketProtocol.MaxPayloadSize)
+        if (magic != PacketProtocol.MagicNumber || payloadLength is < 0 or > PacketProtocol.MaxPayloadSize)
         {
             return PacketParseStatus.InvalidPacket;
         }
@@ -38,8 +52,7 @@ public static class PacketParser
             return PacketParseStatus.NeedMoreData;
         }
 
-        var command = (PacketCommand)BinaryPrimitives.ReadUInt16LittleEndian(
-            header[PacketProtocol.CommandOffset..]);
+        var command = (PacketCommand)commandRaw;
 
         frame = new PacketFrame(
             command,

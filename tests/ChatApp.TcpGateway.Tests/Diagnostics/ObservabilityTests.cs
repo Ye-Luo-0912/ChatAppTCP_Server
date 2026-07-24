@@ -1,6 +1,6 @@
 using System.Diagnostics;
 using ChatApp.Realtime.Integration;
-using ChatApp.TcpGateway.Diagnostics;
+using ChatApp.TcpGateway.Gateway.Diagnostics;
 
 namespace ChatApp.TcpGateway.Tests.Diagnostics;
 

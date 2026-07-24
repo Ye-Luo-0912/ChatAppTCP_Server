@@ -40,6 +40,12 @@ public sealed class TcpGatewayOptions
     /// </summary>
     public bool ReplaceSameDeviceSession { get; set; } = true;
 
+    /// <summary>
+    /// Presence/Typing：本机扇出 + NATS Core ephemeral 跨网关（不进 Outbox）。
+    /// 默认关闭；开启前需 Server 侧 PresenceAuthorizeWorker（好友鉴权）与 Redis 全局在线键。
+    /// </summary>
+    public bool EnableEphemeralPresenceAndTyping { get; set; }
+
     public bool IsValid() =>
         System.Net.IPAddress.TryParse(ListenAddress, out _) &&
         Port is > 0 and <= ushort.MaxValue &&

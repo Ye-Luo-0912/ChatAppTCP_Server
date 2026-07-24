@@ -25,6 +25,15 @@ public enum PacketCommand : ushort
     MessageRecallRequest = 118,
     MessageRecallAck = 119,
     MessageRecalled = 120,
+    TypingNotify = 121,
+    TypingUpdate = 122,
+    PresenceQuery = 123,
+    PresenceSnapshot = 124,
+    PresenceChanged = 125,
+    PresenceUnwatch = 126,
+    MessageEditRequest = 127,
+    MessageEditAck = 128,
+    MessageEdited = 129,
     HeartbeatAcknowledgement = 1000,
     Error = 500
 }

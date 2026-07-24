@@ -1,7 +1,8 @@
 using System.Net.Sockets;
 using System.Threading.Channels;
-using ChatApp.TcpGateway.Diagnostics;
-using ChatApp.TcpGateway.Networking.Buffers;
+using ChatApp.TcpGateway.Gateway.Diagnostics;
+using ChatApp.TcpGateway.Gateway.Networking.Buffers;
+using ChatApp.TcpGateway.Gateway.Networking.Sessions;
 using Microsoft.Extensions.Logging;
 
 namespace ChatApp.TcpGateway.Networking.Sessions;
@@ -110,7 +111,9 @@ internal sealed partial class TcpClientSession : IAsyncDisposable
     /// <summary>
     /// 记录入站帧并按 1 秒窗口同时限制包数与字节数。
     /// </summary>
+    /// <param name="maximumBytesPerSecond"></param>
     /// <param name="frameByteCount">整帧字节数（包头 + payload）。</param>
+    /// <param name="maximumPacketsPerSecond"></param>
     public bool RecordInboundTraffic(
         int maximumPacketsPerSecond,
         long maximumBytesPerSecond,

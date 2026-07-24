@@ -1,9 +1,9 @@
 using ChatApp.Realtime.Integration;
-using ChatApp.TcpGateway.Diagnostics;
+using ChatApp.TcpGateway.Gateway.Diagnostics;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
-namespace ChatApp.TcpGateway.Messaging;
+namespace ChatApp.TcpGateway.Gateway.Messaging;
 
 internal sealed partial class RealtimeEventConsumerService : BackgroundService
 {

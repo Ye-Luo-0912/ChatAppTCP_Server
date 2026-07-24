@@ -1,16 +1,20 @@
 using System.Collections.Concurrent;
+using ChatApp.TcpGateway.Networking.Sessions;
 
-namespace ChatApp.TcpGateway.Networking.Sessions;
+namespace ChatApp.TcpGateway.Gateway.Networking.Sessions;
 
 internal sealed class UserSessionRegistry
 {
     private readonly ConcurrentDictionary<long, SessionBucket> _users = new();
 
-    public void Add(TcpClientSession session)
+    /// <summary>
+    /// 加入会话。返回 true 表示该用户从离线变为首次在线（本机视角）。
+    /// </summary>
+    public bool Add(TcpClientSession session)
     {
         if (!session.IsAuthenticated || session.UserId == 0)
         {
-            return;
+            return false;
         }
 
         while (true)
@@ -26,32 +30,38 @@ internal sealed class UserSessionRegistry
                     continue;
                 }
 
+                var becameOnline = bucket.Sessions.Count == 0;
                 bucket.Sessions[session.ConnectionId] = session;
                 Volatile.Write(
                     ref bucket.Snapshot,
                     [.. bucket.Sessions.Values]);
-                return;
+                return becameOnline;
             }
         }
     }
 
-    public void Remove(TcpClientSession session)
+    /// <summary>
+    /// 移除会话。返回 true 表示该用户已无剩余会话（本机视角最后下线）。
+    /// </summary>
+    public bool Remove(TcpClientSession session)
     {
         if (session.UserId == 0 ||
             !_users.TryGetValue(session.UserId, out var bucket))
         {
-            return;
+            return false;
         }
 
         lock (bucket.SyncRoot)
         {
-            bucket.Sessions.Remove(session.ConnectionId);
+            if (!bucket.Sessions.Remove(session.ConnectionId))
+                return false;
+
             if (bucket.Sessions.Count != 0)
             {
                 Volatile.Write(
                     ref bucket.Snapshot,
                     [.. bucket.Sessions.Values]);
-                return;
+                return false;
             }
 
             bucket.Retired = true;
@@ -62,17 +72,14 @@ internal sealed class UserSessionRegistry
             {
                 _users.TryRemove(session.UserId, out _);
             }
+
+            return true;
         }
     }
 
     public TcpClientSession[] GetSnapshot(long userId)
     {
-        if (!_users.TryGetValue(userId, out var bucket))
-        {
-            return [];
-        }
-
-        return Volatile.Read(ref bucket.Snapshot);
+        return !_users.TryGetValue(userId, out var bucket) ? [] : Volatile.Read(ref bucket.Snapshot);
     }
 
     /// <summary>
@@ -96,25 +103,12 @@ internal sealed class UserSessionRegistry
                 return [];
 
             List<TcpClientSession>? victims = null;
-            foreach (var existing in bucket.Sessions.Values)
+            foreach (var existing in from existing in bucket.Sessions.Values where !ReferenceEquals(existing, incoming)
+                         && existing.ConnectionId != incoming.ConnectionId where existing.DeviceIdHash == incoming.DeviceIdHash where !string.Equals(
+                         existing.SessionId,
+                         incoming.SessionId,
+                         StringComparison.Ordinal) select existing)
             {
-                if (ReferenceEquals(existing, incoming)
-                    || existing.ConnectionId == incoming.ConnectionId)
-                {
-                    continue;
-                }
-
-                if (existing.DeviceIdHash != incoming.DeviceIdHash)
-                    continue;
-
-                if (string.Equals(
-                        existing.SessionId,
-                        incoming.SessionId,
-                        StringComparison.Ordinal))
-                {
-                    continue;
-                }
-
                 victims ??= [];
                 victims.Add(existing);
             }

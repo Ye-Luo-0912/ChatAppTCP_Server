@@ -1,8 +1,8 @@
 using System.Buffers;
 using ChatApp.TcpGateway.Core.Messaging;
 using ChatApp.TcpGateway.Core.Protocol;
+using ChatApp.TcpGateway.Gateway.Networking.Buffers;
 using ChatApp.TcpGateway.Infrastructure.Serialization.Json;
-using ChatApp.TcpGateway.Networking.Buffers;
 
 namespace ChatApp.TcpGateway.Tests.Networking;
 

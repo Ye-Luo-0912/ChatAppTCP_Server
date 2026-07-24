@@ -1,6 +1,6 @@
 using System.Buffers;
 
-namespace ChatApp.TcpGateway.Networking.Buffers;
+namespace ChatApp.TcpGateway.Gateway.Networking.Buffers;
 
 internal sealed class SharedOutboundFrame : IDisposable
 {
@@ -48,14 +48,13 @@ internal sealed class SharedOutboundFrame : IDisposable
     public void Dispose()
     {
         var remaining = Interlocked.Decrement(ref _referenceCount);
-        if (remaining > 0)
+        
+        switch (remaining)
         {
-            return;
-        }
-
-        if (remaining < 0)
-        {
-            throw new InvalidOperationException("Outbound frame released too many times.");
+            case > 0:
+                return;
+            case < 0:
+                throw new InvalidOperationException("Outbound frame released too many times.");
         }
 
         var buffer = Interlocked.Exchange(ref _buffer, null);

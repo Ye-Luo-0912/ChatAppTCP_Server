@@ -12,6 +12,10 @@ public sealed class MessageHistoryItem
     public long? DeliveredAtMs { get; init; }
     public long? ReadAtMs { get; init; }
     public long? RecalledAtMs { get; init; }
+    public int EditVersion { get; init; } = 1;
+    public long? EditedAtMs { get; init; }
+    public long ChangedAtMs { get; init; }
+    public bool IsEdited => EditVersion > 1 || EditedAtMs is > 0;
 
     public IReadOnlyList<AttachmentRef>? Attachments { get; init; }
 

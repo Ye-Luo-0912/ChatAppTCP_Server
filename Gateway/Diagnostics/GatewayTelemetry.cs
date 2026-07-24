@@ -1,7 +1,7 @@
 using System.Diagnostics;
 using ChatApp.TcpGateway.Core.Protocol;
 
-namespace ChatApp.TcpGateway.Diagnostics;
+namespace ChatApp.TcpGateway.Gateway.Diagnostics;
 
 public static class GatewayTelemetry
 {

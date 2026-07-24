@@ -102,9 +102,12 @@ ConversationListRequest(108) + MessageHistoryRequest(106) 组合。
 - SyncBootstrapRequest(114) 携带各会话本地水位
   `(ConversationId, AfterReceivedAtMs, AfterMessageId)`；网关注入 UserId，
   不接收客户端 UserId。
-- SyncBootstrapResponse(115) 返回 `ServerTimeMs`、会话列表（含未读）、以及按
-  未读/水位优先选取的 `CatchUps`（每会话一页历史，可带 `HasMore` / `NextCursor`）。
+- SyncBootstrapResponse(115) 返回 `ServerTimeMs`、会话列表（含未读）、按
+  未读/水位优先选取的 `CatchUps`，以及可选的 `ResetsRequired`（无效水位需全量恢复：
+  `MessageNotFound` / `AheadOfTip` / `MembershipLost` / `GapTooLarge`，附 tip 提示）。
+  消息保留 / tombstone horizon 驱动的失效尚未实现。
 - 客户端合并下行实时 `ChatMessage` 与补偿历史时，**必须按 MessageId 去重**。
+  收到 `ResetsRequired` 时应清除本地该会话游标并全量拉历史，不要当作增量成功。
 - 发送方多设备：RealtimeServices 在持久化后向发送者其他在线设备推送
   `MessageReceived` 回声；网关 `RealtimeEventDispatcher` 会跳过与事件
   `SessionId` 相同的发起会话，避免本机重复收到自己刚发的消息。
