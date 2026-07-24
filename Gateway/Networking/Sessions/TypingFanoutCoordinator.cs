@@ -1,6 +1,7 @@
 using System.Runtime.CompilerServices;
 using System.Threading.Channels;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace ChatApp.TcpGateway.Gateway.Networking.Sessions;
 
@@ -17,7 +18,7 @@ namespace ChatApp.TcpGateway.Gateway.Networking.Sessions;
 /// Typing 属于“最新状态有效”的易失数据，不应使用无界 fire-and-forget Task。
 /// </para>
 /// </summary>
-internal sealed class TypingFanoutCoordinator
+internal sealed partial class TypingFanoutCoordinator
 {
     public static readonly TimeSpan DefaultMinInterval = TimeSpan.FromMilliseconds(500);
     public static readonly TimeSpan DefaultTtl = TimeSpan.FromSeconds(4);
@@ -289,7 +290,7 @@ internal sealed class TypingFanoutCoordinator
                 entry.Key.SenderUserId,
                 entry.TargetUserId,
                 entry.Key.ConversationId,
-                isTyping: false));
+                IsTyping: false));
         }
 
         bucket.Clear();

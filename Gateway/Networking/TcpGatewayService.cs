@@ -289,6 +289,8 @@ internal sealed partial class TcpGatewayService : BackgroundService
 
         LogGatewayStarted(_logger, endpoint, _options.MaxConnections);
         var heartbeatTask = RunHeartbeatLoopAsync(executionToken);
+        // P0-2: Typing 时间轮 pump 与发射消费由本机宿主驱动，替代旧的每状态 Task.Delay 过期。
+        var typingFanoutTask = RunTypingFanoutLoopAsync(executionToken);
 
         try
         {
@@ -338,6 +340,7 @@ internal sealed partial class TcpGatewayService : BackgroundService
             }
 
             await heartbeatTask.ConfigureAwait(false);
+            await typingFanoutTask.ConfigureAwait(false);
             LogGatewayStopped(_logger);
         }
     }
@@ -2795,30 +2798,15 @@ internal sealed partial class TcpGatewayService : BackgroundService
             return;
         }
 
-        if (!_typingFanout.TryAccept(
-                session.UserId,
-                conversationId,
-                notify.IsTyping,
-                out var expireAt))
-        {
-            return;
-        }
-
-        FanoutTypingUpdate(session.UserId, notify.TargetUserId, conversationId, notify.IsTyping);
-        PublishEphemeralTypingFireAndForget(
+        // P0-2: 发射路径由协调器统一管理。TryAccept 内部决定是否发射：
+        // 限频命中、全局/单用户槽位超限、无活跃 typing 的 isTyping=false 均不发射。
+        // 本机扇出与 ephemeral 发布由 RunTypingEmissionConsumerAsync 消费 ReadEmissionsAsync 完成，
+        // 过期由时间轮 pump 负责，不再为此处创建独立 Task.Delay。
+        _typingFanout.TryAccept(
             session.UserId,
             notify.TargetUserId,
             conversationId,
             notify.IsTyping);
-
-        if (notify.IsTyping && expireAt is { } exp)
-        {
-            _ = ExpireTypingAfterAsync(
-                session.UserId,
-                notify.TargetUserId,
-                conversationId,
-                exp);
-        }
     }
 
     private void PublishEphemeralTypingFireAndForget(
@@ -2875,31 +2863,78 @@ internal sealed partial class TcpGatewayService : BackgroundService
             target.TryQueue(frame);
     }
 
-    private async Task ExpireTypingAfterAsync(
-        long senderUserId,
-        long targetUserId,
-        string conversationId,
-        DateTimeOffset expireAt)
+    /// <summary>
+    /// P0-2: Typing 时间轮 pump 与发射消费统一由本任务驱动。
+    /// pump 按 tick 推进过期扫描；消费方从 <see cref="TypingFanoutCoordinator.ReadEmissionsAsync"/>
+    /// 拉取合并后的最新状态执行本机扇出与 ephemeral 发布。
+    /// </summary>
+    private async Task RunTypingFanoutLoopAsync(CancellationToken cancellationToken)
+    {
+        if (!_options.EnableEphemeralPresenceAndTyping)
+            return;
+
+        var pumpTask = RunTypingPumpAsync(cancellationToken);
+        var consumeTask = RunTypingEmissionConsumerAsync(cancellationToken);
+        await Task.WhenAll(pumpTask, consumeTask).ConfigureAwait(false);
+    }
+
+    private async Task RunTypingPumpAsync(CancellationToken cancellationToken)
+    {
+        using var timer = new PeriodicTimer(
+            TypingFanoutCoordinator.DefaultTickInterval,
+            _timeProvider);
+
+        try
+        {
+            while (await timer
+                       .WaitForNextTickAsync(cancellationToken)
+                       .ConfigureAwait(false))
+            {
+                _typingFanout.PumpExpired();
+            }
+        }
+        catch (OperationCanceledException)
+            when (cancellationToken.IsCancellationRequested)
+        {
+            // Normal host shutdown.
+        }
+    }
+
+    private async Task RunTypingEmissionConsumerAsync(CancellationToken cancellationToken)
     {
         try
         {
-            var delay = expireAt - _timeProvider.GetUtcNow();
-            if (delay > TimeSpan.Zero)
-                await Task.Delay(delay, CancellationToken.None).ConfigureAwait(false);
-
-            if (!_typingFanout.TryTakeExpired(senderUserId, conversationId, expireAt))
-                return;
-
-            FanoutTypingUpdate(senderUserId, targetUserId, conversationId, isTyping: false);
-            PublishEphemeralTypingFireAndForget(
-                senderUserId,
-                targetUserId,
-                conversationId,
-                isTyping: false);
+            await foreach (var emission in _typingFanout
+                               .ReadEmissionsAsync(cancellationToken)
+                               .ConfigureAwait(false))
+            {
+                try
+                {
+                    FanoutTypingUpdate(
+                        emission.SenderUserId,
+                        emission.TargetUserId,
+                        emission.ConversationId,
+                        emission.IsTyping);
+                    PublishEphemeralTypingFireAndForget(
+                        emission.SenderUserId,
+                        emission.TargetUserId,
+                        emission.ConversationId,
+                        emission.IsTyping);
+                }
+                catch (Exception ex)
+                {
+                    LogTypingFanoutFailed(
+                        _logger,
+                        emission.SenderUserId,
+                        emission.ConversationId,
+                        ex);
+                }
+            }
         }
-        catch (Exception ex)
+        catch (OperationCanceledException)
+            when (cancellationToken.IsCancellationRequested)
         {
-            LogTypingExpireFailed(_logger, senderUserId, conversationId, ex);
+            // Normal host shutdown.
         }
     }
 
@@ -3461,8 +3496,8 @@ internal sealed partial class TcpGatewayService : BackgroundService
     [LoggerMessage(
         EventId = 13,
         Level = LogLevel.Debug,
-        Message = "Typing 自动过期失败 Sender={SenderUserId} Conversation={ConversationId}")]
-    private static partial void LogTypingExpireFailed(
+        Message = "Typing 发射扇出失败 Sender={SenderUserId} Conversation={ConversationId}")]
+    private static partial void LogTypingFanoutFailed(
         ILogger logger,
         long senderUserId,
         string conversationId,
