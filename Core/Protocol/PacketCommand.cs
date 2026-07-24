@@ -56,6 +56,7 @@ public enum PacketCommand : ushort
     MemberLeft = 149,
     MemberRemoved = 150,
     RoleChanged = 151,
+    ConversationRead = 152,
     HeartbeatAcknowledgement = 1000,
     Error = 500
 }

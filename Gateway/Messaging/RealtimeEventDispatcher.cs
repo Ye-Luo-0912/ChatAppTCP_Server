@@ -20,6 +20,7 @@ internal sealed partial class RealtimeEventDispatcher
     private readonly IPayloadCodec<MessageReceiptUpdate> _messageReceiptUpdateCodec;
     private readonly IPayloadCodec<ConversationChanged> _conversationChangedCodec;
     private readonly IPayloadCodec<UnreadCountChanged> _unreadCountChangedCodec;
+    private readonly IPayloadCodec<ConversationReadUpdate> _conversationReadUpdateCodec;
     private readonly IPayloadCodec<MessageRecalledUpdate> _messageRecalledUpdateCodec;
     private readonly IPayloadCodec<MessageEditedUpdate> _messageEditedUpdateCodec;
     private readonly IPayloadCodec<ReactionAddedUpdate> _reactionAddedUpdateCodec;
@@ -38,6 +39,7 @@ internal sealed partial class RealtimeEventDispatcher
         IPayloadCodec<MessageReceiptUpdate> messageReceiptUpdateCodec,
         IPayloadCodec<ConversationChanged> conversationChangedCodec,
         IPayloadCodec<UnreadCountChanged> unreadCountChangedCodec,
+        IPayloadCodec<ConversationReadUpdate> conversationReadUpdateCodec,
         IPayloadCodec<MessageRecalledUpdate> messageRecalledUpdateCodec,
         IPayloadCodec<MessageEditedUpdate> messageEditedUpdateCodec,
         IPayloadCodec<ReactionAddedUpdate> reactionAddedUpdateCodec,
@@ -55,6 +57,7 @@ internal sealed partial class RealtimeEventDispatcher
         _messageReceiptUpdateCodec = messageReceiptUpdateCodec;
         _conversationChangedCodec = conversationChangedCodec;
         _unreadCountChangedCodec = unreadCountChangedCodec;
+        _conversationReadUpdateCodec = conversationReadUpdateCodec;
         _messageRecalledUpdateCodec = messageRecalledUpdateCodec;
         _messageEditedUpdateCodec = messageEditedUpdateCodec;
         _reactionAddedUpdateCodec = reactionAddedUpdateCodec;
@@ -92,6 +95,10 @@ internal sealed partial class RealtimeEventDispatcher
 
             case RealtimeEventType.UnreadCountChanged:
                 DispatchUnreadCountChanged(realtimeEvent);
+                break;
+
+            case RealtimeEventType.ConversationRead:
+                DispatchConversationRead(realtimeEvent);
                 break;
 
             case RealtimeEventType.MessageRecalled:
@@ -745,6 +752,66 @@ internal sealed partial class RealtimeEventDispatcher
         using var outboundFrame = OutboundFrameFactory.Create(
             PacketCommand.UnreadCountChanged,
             _unreadCountChangedCodec,
+            update);
+
+        var queuedDeliveries = 0;
+        foreach (var target in targets)
+        {
+            if (target.TryQueue(outboundFrame))
+                queuedDeliveries++;
+        }
+
+        _metrics.RealtimeEventHandled(queuedDeliveries);
+    }
+
+    private void DispatchConversationRead(RealtimeEvent realtimeEvent)
+    {
+        if (string.IsNullOrWhiteSpace(realtimeEvent.PayloadJson))
+        {
+            RejectEvent(realtimeEvent, "missing-conversation-read-payload");
+            return;
+        }
+
+        Realtime.Abstractions.Conversations.RealtimeConversationReadPayload? payload;
+        try
+        {
+            payload = RealtimeWireSerializer.DeserializeConversationRead(
+                realtimeEvent.PayloadJson);
+        }
+        catch (JsonException)
+        {
+            RejectEvent(realtimeEvent, "invalid-conversation-read-json");
+            return;
+        }
+
+        if (payload is null
+            || string.IsNullOrWhiteSpace(payload.ConversationId)
+            || string.IsNullOrWhiteSpace(payload.LastReadMessageId)
+            || payload.ReaderUserId <= 0
+            || payload.LastReadAtMs <= 0
+            || realtimeEvent.TargetUserId <= 0)
+        {
+            RejectEvent(realtimeEvent, "invalid-conversation-read-payload");
+            return;
+        }
+
+        var targets = _userSessions.GetSnapshot(realtimeEvent.TargetUserId);
+        if (targets.Length == 0)
+        {
+            _metrics.RealtimeEventHandled(queuedDeliveries: 0);
+            return;
+        }
+
+        var update = new ConversationReadUpdate
+        {
+            ConversationId = payload.ConversationId,
+            ReaderUserId = payload.ReaderUserId,
+            LastReadMessageId = payload.LastReadMessageId,
+            LastReadAtMs = payload.LastReadAtMs
+        };
+        using var outboundFrame = OutboundFrameFactory.Create(
+            PacketCommand.ConversationRead,
+            _conversationReadUpdateCodec,
             update);
 
         var queuedDeliveries = 0;

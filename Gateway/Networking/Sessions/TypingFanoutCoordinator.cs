@@ -183,7 +183,11 @@ internal sealed partial class TypingFanoutCoordinator
             }
             else
             {
-                for (var tick = _lastPumpedTick + 1; tick <= currentTick; tick++)
+                // 仅扫描已完成的 tick（tick < currentTick）。
+                // 若扫描当前 tick，桶内尚未到期的条目（如限频刷新后 ExpireAt 落在本 tick 窗口后半段）
+                // 会被 leftover 重新挂回同一个已扫描桶，导致该桶在本圈内不再被访问、过期被搁置一圈。
+                // 代价是过期最多延迟一个 tick（TTL=4s、tick=500ms 时 ≤0.5s），对 Typing 易失状态可接受。
+                for (var tick = _lastPumpedTick + 1; tick < currentTick; tick++)
                     SweepBucketLocked(tick, now, emissions);
             }
 

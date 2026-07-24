@@ -125,6 +125,9 @@ public static class InfrastructureServiceCollectionExtensions
         services.AddSingleton<IPayloadCodec<UnreadCountChanged>>(
             static _ => new JsonPayloadCodec<UnreadCountChanged>(
                 GatewayJsonSerializerContext.Default.UnreadCountChanged));
+        services.AddSingleton<IPayloadCodec<ConversationReadUpdate>>(
+            static _ => new JsonPayloadCodec<ConversationReadUpdate>(
+                GatewayJsonSerializerContext.Default.ConversationReadUpdate));
         services.AddSingleton<IPayloadCodec<SyncBootstrapRequest>>(
             static _ => new JsonPayloadCodec<SyncBootstrapRequest>(
                 GatewayJsonSerializerContext.Default.SyncBootstrapRequest));

@@ -256,6 +256,8 @@ public sealed class TcpGatewayServiceTests
                     GatewayJsonSerializerContext.Default.ConversationChanged),
                 new JsonPayloadCodec<UnreadCountChanged>(
                     GatewayJsonSerializerContext.Default.UnreadCountChanged),
+                new JsonPayloadCodec<ConversationReadUpdate>(
+                    GatewayJsonSerializerContext.Default.ConversationReadUpdate),
                 new JsonPayloadCodec<MessageRecalledUpdate>(
                     GatewayJsonSerializerContext.Default.MessageRecalledUpdate),
                 new JsonPayloadCodec<MessageEditedUpdate>(

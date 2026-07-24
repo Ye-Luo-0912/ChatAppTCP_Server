@@ -78,6 +78,7 @@ namespace ChatApp.TcpGateway.Infrastructure.Serialization.Json;
 [JsonSerializable(typeof(PresenceChanged))]
 [JsonSerializable(typeof(ConversationChanged))]
 [JsonSerializable(typeof(UnreadCountChanged))]
+[JsonSerializable(typeof(ConversationReadUpdate))]
 [JsonSerializable(typeof(SyncBootstrapRequest))]
 [JsonSerializable(typeof(SyncBootstrapResponse))]
 [JsonSerializable(typeof(ConversationSyncWatermark))]
