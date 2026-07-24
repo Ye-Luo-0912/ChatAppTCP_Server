@@ -8,13 +8,13 @@ using ChatApp.Realtime.Abstractions.Events;
 using ChatApp.Realtime.Abstractions.Messaging;
 using ChatApp.Realtime.Abstractions.Sync;
 using ChatApp.Realtime.Integration;
-using ChatApp.TcpGateway.Configuration;
 using ChatApp.TcpGateway.Core.Authentication;
 using ChatApp.TcpGateway.Core.Messaging;
 using ChatApp.TcpGateway.Core.Messaging.Conversations;
 using ChatApp.TcpGateway.Core.Messaging.History;
 using ChatApp.TcpGateway.Core.Messaging.Sync;
 using ChatApp.TcpGateway.Core.Protocol;
+using ChatApp.TcpGateway.Gateway.Configuration;
 using ChatApp.TcpGateway.Gateway.Diagnostics;
 using ChatApp.TcpGateway.Gateway.Networking.Sessions;
 using ChatApp.TcpGateway.Infrastructure.Serialization.Json;
@@ -85,12 +85,18 @@ public sealed class TcpGatewayServiceTests
         var historyResponseCodec =
             new JsonPayloadCodec<MessageHistoryResponse>(
                 GatewayJsonSerializerContext.Default.MessageHistoryResponse);
+        var historyItemCodec =
+            new JsonPayloadCodec<MessageHistoryItem[]>(
+                GatewayJsonSerializerContext.Default.MessageHistoryItemArray);
         var conversationListRequestCodec =
             new JsonPayloadCodec<ConversationListRequest>(
                 GatewayJsonSerializerContext.Default.ConversationListRequest);
         var conversationListResponseCodec =
             new JsonPayloadCodec<ConversationListResponse>(
                 GatewayJsonSerializerContext.Default.ConversationListResponse);
+        var conversationListItemCodec =
+            new JsonPayloadCodec<ChatApp.TcpGateway.Core.Messaging.Conversations.ConversationListItem[]>(
+                GatewayJsonSerializerContext.Default.ConversationListItemArray);
         var conversationMarkReadRequestCodec =
             new JsonPayloadCodec<ConversationMarkReadRequest>(
                 GatewayJsonSerializerContext.Default.ConversationMarkReadRequest);
@@ -144,8 +150,10 @@ public sealed class TcpGatewayServiceTests
             receiptAcknowledgementCodec,
             historyRequestCodec,
             historyResponseCodec,
+            historyItemCodec,
             conversationListRequestCodec,
             conversationListResponseCodec,
+            conversationListItemCodec,
             conversationMarkReadRequestCodec,
             conversationMarkReadResponseCodec,
             conversationSetPrefsRequestCodec,

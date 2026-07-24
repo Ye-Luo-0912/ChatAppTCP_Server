@@ -1,6 +1,6 @@
 namespace ChatApp.TcpGateway.Core.Messaging.Conversations;
 
-public sealed class ConversationListResponse
+public sealed record ConversationListResponse
 {
     public required string RequestId { get; init; }
     public bool Succeeded { get; init; }

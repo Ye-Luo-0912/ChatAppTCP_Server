@@ -1,6 +1,6 @@
 using ChatApp.TcpGateway.Core.Protocol;
 
-namespace ChatApp.TcpGateway.Configuration;
+namespace ChatApp.TcpGateway.Gateway.Configuration;
 
 public sealed class TcpGatewayOptions
 {

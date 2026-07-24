@@ -1,6 +1,6 @@
 namespace ChatApp.TcpGateway.Core.Messaging.History;
 
-public sealed class MessageHistoryResponse
+public sealed record MessageHistoryResponse
 {
     public required string RequestId { get; init; }
     public bool Succeeded { get; init; }

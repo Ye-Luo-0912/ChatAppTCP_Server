@@ -8,7 +8,7 @@ using ChatApp.Realtime.Abstractions.Sync;
 using ChatApp.Realtime.Integration;
 using ChatApp.Realtime.Integration.Configuration;
 using ChatApp.Realtime.Integration.Ephemeral;
-using ChatApp.TcpGateway.Configuration;
+using ChatApp.TcpGateway.Gateway.Configuration;
 using ChatApp.TcpGateway.Gateway.Diagnostics;
 using ChatApp.TcpGateway.Gateway.Networking.Sessions;
 using ChatApp.TcpGateway.Infrastructure;

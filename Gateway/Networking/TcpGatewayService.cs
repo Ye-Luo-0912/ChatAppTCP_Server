@@ -11,7 +11,6 @@ using ChatApp.Realtime.Abstractions.Messaging;
 using ChatApp.Realtime.Integration;
 using ChatApp.Realtime.Integration.Configuration;
 using ChatApp.Realtime.Integration.Ephemeral;
-using ChatApp.TcpGateway.Configuration;
 using ChatApp.TcpGateway.Core.Authentication;
 using ChatApp.TcpGateway.Core.Messaging;
 using ChatApp.TcpGateway.Core.Messaging.Conversations;
@@ -19,6 +18,7 @@ using ChatApp.TcpGateway.Core.Messaging.History;
 using ChatApp.TcpGateway.Core.Messaging.Sync;
 using ChatApp.TcpGateway.Core.Protocol;
 using ChatApp.TcpGateway.Core.Serialization;
+using ChatApp.TcpGateway.Gateway.Configuration;
 using ChatApp.TcpGateway.Gateway.Diagnostics;
 using ChatApp.TcpGateway.Gateway.Messaging;
 using ChatApp.TcpGateway.Gateway.Networking.Buffers;
@@ -63,8 +63,10 @@ internal sealed partial class TcpGatewayService : BackgroundService
     private readonly IPayloadCodec<MessageReceiptAcknowledgement> _messageReceiptAcknowledgementCodec;
     private readonly IPayloadCodec<MessageHistoryRequest> _messageHistoryRequestCodec;
     private readonly IPayloadCodec<MessageHistoryResponse> _messageHistoryResponseCodec;
+    private readonly IPayloadCodec<MessageHistoryItem[]> _messageHistoryItemCodec;
     private readonly IPayloadCodec<ConversationListRequest> _conversationListRequestCodec;
     private readonly IPayloadCodec<ConversationListResponse> _conversationListResponseCodec;
+    private readonly IPayloadCodec<ConversationListItem[]> _conversationListItemCodec;
     private readonly IPayloadCodec<ConversationMarkReadRequest> _conversationMarkReadRequestCodec;
     private readonly IPayloadCodec<ConversationMarkReadResponse> _conversationMarkReadResponseCodec;
     private readonly IPayloadCodec<ConversationSetPrefsRequest> _conversationSetPrefsRequestCodec;
@@ -129,8 +131,10 @@ internal sealed partial class TcpGatewayService : BackgroundService
         IPayloadCodec<MessageReceiptAcknowledgement> messageReceiptAcknowledgementCodec,
         IPayloadCodec<MessageHistoryRequest> messageHistoryRequestCodec,
         IPayloadCodec<MessageHistoryResponse> messageHistoryResponseCodec,
+        IPayloadCodec<MessageHistoryItem[]> messageHistoryItemCodec,
         IPayloadCodec<ConversationListRequest> conversationListRequestCodec,
         IPayloadCodec<ConversationListResponse> conversationListResponseCodec,
+        IPayloadCodec<ConversationListItem[]> conversationListItemCodec,
         IPayloadCodec<ConversationMarkReadRequest> conversationMarkReadRequestCodec,
         IPayloadCodec<ConversationMarkReadResponse> conversationMarkReadResponseCodec,
         IPayloadCodec<ConversationSetPrefsRequest> conversationSetPrefsRequestCodec,
@@ -167,8 +171,10 @@ internal sealed partial class TcpGatewayService : BackgroundService
         _messageReceiptAcknowledgementCodec = messageReceiptAcknowledgementCodec;
         _messageHistoryRequestCodec = messageHistoryRequestCodec;
         _messageHistoryResponseCodec = messageHistoryResponseCodec;
+        _messageHistoryItemCodec = messageHistoryItemCodec;
         _conversationListRequestCodec = conversationListRequestCodec;
         _conversationListResponseCodec = conversationListResponseCodec;
+        _conversationListItemCodec = conversationListItemCodec;
         _conversationMarkReadRequestCodec = conversationMarkReadRequestCodec;
         _conversationMarkReadResponseCodec = conversationMarkReadResponseCodec;
         _conversationSetPrefsRequestCodec = conversationSetPrefsRequestCodec;
@@ -562,6 +568,18 @@ internal sealed partial class TcpGatewayService : BackgroundService
 
                 while (session.IsConnected)
                 {
+                    // P0-5：未认证状态下，在等待完整 Payload 前立即拒绝非认证命令。
+                    // 攻击者可能声明 ChatMessage（上限 64 KiB）等命令并慢速发送，
+                    // 旧实现在完整 Payload 到达后才由 ProcessPacketAsync 拒绝，浪费缓冲与连接。
+                    if (!session.IsAuthenticated &&
+                        PacketParser.TryPeekCommand(buffer, out var peekedCommand) &&
+                        !PacketProtocol.IsAuthenticationCommand(peekedCommand))
+                    {
+                        _metrics.ProtocolError();
+                        session.Close(SessionCloseReason.ProtocolViolation);
+                        return;
+                    }
+
                     var parseStatus = PacketParser.TryParse(
                         ref buffer,
                         out var frame);
@@ -1286,6 +1304,7 @@ internal sealed partial class TcpGatewayService : BackgroundService
             request.AfterMessageId);
         if (requestId.Length > 64
             || request.Limit < 0
+            || request.Limit > PacketProtocol.HistoryPageMaxItems
             || hasBeforeTime != hasBeforeMessage
             || hasAfterTime != hasAfterMessage
             || (hasBeforeTime && hasAfterTime)
@@ -1330,56 +1349,91 @@ internal sealed partial class TcpGatewayService : BackgroundService
                 .ConfigureAwait(false);
             _metrics.HistoryQueryCompleted();
 
-            SendMessageHistoryResponse(
-                session,
+            var mappedItems = page.Items
+                .Select(static item => new MessageHistoryItem
+                {
+                    MessageId = item.MessageId,
+                    ClientMessageId = item.ClientMessageId,
+                    SenderUserId = item.SenderUserId,
+                    ReceiverUserId = item.ReceiverUserId,
+                    ConversationId = item.ConversationId,
+                    Content = item.Content,
+                    ReceivedAtMs = item.ReceivedAtMs,
+                    DeliveredAtMs = item.DeliveredAtMs,
+                    ReadAtMs = item.ReadAtMs,
+                    RecalledAtMs = item.RecalledAtMs,
+                    EditVersion = item.EditVersion,
+                    EditedAtMs = item.EditedAtMs,
+                    ChangedAtMs = item.ChangedAtMs,
+                    Attachments = AttachmentWireMapper.Map(item.Attachments),
+                    Reactions = item.Reactions?
+                        .Select(static reaction => new MessageReactionSummary
+                        {
+                            Emoji = reaction.Emoji,
+                            Count = reaction.Count,
+                            ReactedByMe = reaction.ReactedByMe
+                        })
+                        .ToArray(),
+                    ReplyToMessageId = item.ReplyToMessageId,
+                    ReplyToSenderUserId = item.ReplyToSenderUserId,
+                    ReplyToPreview = item.ReplyToPreview,
+                    ForwardedFromMessageId = item.ForwardedFromMessageId,
+                    ForwardedFromSenderUserId = item.ForwardedFromSenderUserId,
+                    ForwardedFromPreview = item.ForwardedFromPreview
+                })
+                .ToArray();
+
+            var originalNextCursor = page.NextCursor is null
+                ? null
+                : new MessageHistoryCursor
+                {
+                    ReceivedAtMs = page.NextCursor.ReceivedAtMs,
+                    MessageId = page.NextCursor.MessageId
+                };
+
+            // P0-6：按字节预算截断，确保响应可装入单帧 TCP Payload。
+            // 截断时以第 k 条（最后保留条目）派生新 NextCursor，HasMore=true。
+            var response = ResponseByteBudget.Truncate(
                 new MessageHistoryResponse
                 {
                     RequestId = page.RequestId,
                     Succeeded = page.Succeeded,
                     ErrorCode = page.ErrorCode,
                     ErrorMessage = page.ErrorMessage,
-                    Items = page.Items
-                        .Select(static item => new MessageHistoryItem
-                        {
-                            MessageId = item.MessageId,
-                            ClientMessageId = item.ClientMessageId,
-                            SenderUserId = item.SenderUserId,
-                            ReceiverUserId = item.ReceiverUserId,
-                            ConversationId = item.ConversationId,
-                            Content = item.Content,
-                            ReceivedAtMs = item.ReceivedAtMs,
-                            DeliveredAtMs = item.DeliveredAtMs,
-                            ReadAtMs = item.ReadAtMs,
-                            RecalledAtMs = item.RecalledAtMs,
-                            EditVersion = item.EditVersion,
-                            EditedAtMs = item.EditedAtMs,
-                            ChangedAtMs = item.ChangedAtMs,
-                            Attachments = AttachmentWireMapper.Map(item.Attachments),
-                            Reactions = item.Reactions?
-                                .Select(static reaction => new MessageReactionSummary
-                                {
-                                    Emoji = reaction.Emoji,
-                                    Count = reaction.Count,
-                                    ReactedByMe = reaction.ReactedByMe
-                                })
-                                .ToArray(),
-                            ReplyToMessageId = item.ReplyToMessageId,
-                            ReplyToSenderUserId = item.ReplyToSenderUserId,
-                            ReplyToPreview = item.ReplyToPreview,
-                            ForwardedFromMessageId = item.ForwardedFromMessageId,
-                            ForwardedFromSenderUserId = item.ForwardedFromSenderUserId,
-                            ForwardedFromPreview = item.ForwardedFromPreview
-                        })
-                        .ToArray(),
-                    NextCursor = page.NextCursor is null
-                        ? null
-                        : new MessageHistoryCursor
-                        {
-                            ReceivedAtMs = page.NextCursor.ReceivedAtMs,
-                            MessageId = page.NextCursor.MessageId
-                        },
+                    Items = mappedItems,
+                    NextCursor = originalNextCursor,
                     HasMore = page.HasMore
+                },
+                mappedItems.Length,
+                _messageHistoryResponseCodec,
+                PacketProtocol.WireResponseSoftLimit,
+                PacketProtocol.WireResponseHardLimit,
+                static (original, k) =>
+                {
+                    if (k >= original.Items.Count)
+                    {
+                        return original;
+                    }
+
+                    var prefix = k <= 0
+                        ? Array.Empty<MessageHistoryItem>()
+                        : original.Items.Take(k).ToArray();
+                    var cursor = k > 0
+                        ? new MessageHistoryCursor
+                        {
+                            ReceivedAtMs = prefix[k - 1].ReceivedAtMs,
+                            MessageId = prefix[k - 1].MessageId
+                        }
+                        : null;
+                    return original with
+                    {
+                        Items = prefix,
+                        NextCursor = cursor,
+                        HasMore = true
+                    };
                 });
+
+            SendMessageHistoryResponse(session, response);
         }
         catch (OperationCanceledException)
             when (cancellationToken.IsCancellationRequested)
@@ -1437,6 +1491,7 @@ internal sealed partial class TcpGatewayService : BackgroundService
         var hasCursorPinned = request.BeforeIsPinned.HasValue;
         if (requestId.Length > 64
             || request.Limit < 0
+            || request.Limit > PacketProtocol.ConversationListMaxItems
             || hasCursorId != hasCursorPinned
             || request.BeforeLastMessageAtMs is <= 0
             || request.BeforePinnedAtMs is <= 0
@@ -1475,47 +1530,82 @@ internal sealed partial class TcpGatewayService : BackgroundService
                 .ConfigureAwait(false);
             _metrics.HistoryQueryCompleted();
 
-            SendConversationListResponse(
-                session,
+            var mappedItems = page.Items
+                .Select(static item => new ConversationListItem
+                {
+                    ConversationId = item.ConversationId,
+                    Type = (ConversationType)(byte)item.Type,
+                    PeerUserId = item.PeerUserId,
+                    Title = item.Title,
+                    LastMessageId = item.LastMessageId,
+                    LastMessagePreview = item.LastMessagePreview,
+                    LastMessageAtMs = item.LastMessageAtMs,
+                    LastSenderUserId = item.LastSenderUserId,
+                    UnreadCount = item.UnreadCount,
+                    LastReadMessageId = item.LastReadMessageId,
+                    LastReadAtMs = item.LastReadAtMs,
+                    IsPinned = item.IsPinned,
+                    PinnedAtMs = item.PinnedAtMs,
+                    IsMuted = item.IsMuted,
+                    MutedUntilMs = item.MutedUntilMs
+                })
+                .ToArray();
+
+            var originalNextCursor = page.NextCursor is null
+                ? null
+                : new ConversationListCursor
+                {
+                    IsPinned = page.NextCursor.IsPinned,
+                    PinnedAtMs = page.NextCursor.PinnedAtMs,
+                    LastMessageAtMs = page.NextCursor.LastMessageAtMs,
+                    ConversationId = page.NextCursor.ConversationId
+                };
+
+            // P0-6：按字节预算截断，确保响应可装入单帧 TCP Payload。
+            // 截断时以第 k 条（最后保留条目）派生新 NextCursor，HasMore=true。
+            var response = ResponseByteBudget.Truncate(
                 new ConversationListResponse
                 {
                     RequestId = page.RequestId,
                     Succeeded = page.Succeeded,
                     ErrorCode = page.ErrorCode,
                     ErrorMessage = page.ErrorMessage,
-                    Items =
-                    [
-                        .. page.Items
-                            .Select(static item => new ConversationListItem
-                            {
-                                ConversationId = item.ConversationId,
-                                Type = (ConversationType)(byte)item.Type,
-                                PeerUserId = item.PeerUserId,
-                                Title = item.Title,
-                                LastMessageId = item.LastMessageId,
-                                LastMessagePreview = item.LastMessagePreview,
-                                LastMessageAtMs = item.LastMessageAtMs,
-                                LastSenderUserId = item.LastSenderUserId,
-                                UnreadCount = item.UnreadCount,
-                                LastReadMessageId = item.LastReadMessageId,
-                                LastReadAtMs = item.LastReadAtMs,
-                                IsPinned = item.IsPinned,
-                                PinnedAtMs = item.PinnedAtMs,
-                                IsMuted = item.IsMuted,
-                                MutedUntilMs = item.MutedUntilMs
-                            })
-                    ],
-                    NextCursor = page.NextCursor is null
-                        ? null
-                        : new ConversationListCursor
-                        {
-                            IsPinned = page.NextCursor.IsPinned,
-                            PinnedAtMs = page.NextCursor.PinnedAtMs,
-                            LastMessageAtMs = page.NextCursor.LastMessageAtMs,
-                            ConversationId = page.NextCursor.ConversationId
-                        },
+                    Items = mappedItems,
+                    NextCursor = originalNextCursor,
                     HasMore = page.HasMore
+                },
+                mappedItems.Length,
+                _conversationListResponseCodec,
+                PacketProtocol.WireResponseSoftLimit,
+                PacketProtocol.WireResponseHardLimit,
+                static (original, k) =>
+                {
+                    if (k >= original.Items.Count)
+                    {
+                        return original;
+                    }
+
+                    var prefix = k <= 0
+                        ? Array.Empty<ConversationListItem>()
+                        : original.Items.Take(k).ToArray();
+                    var cursor = k > 0
+                        ? new ConversationListCursor
+                        {
+                            IsPinned = prefix[k - 1].IsPinned,
+                            PinnedAtMs = prefix[k - 1].PinnedAtMs,
+                            LastMessageAtMs = prefix[k - 1].LastMessageAtMs,
+                            ConversationId = prefix[k - 1].ConversationId
+                        }
+                        : null;
+                    return original with
+                    {
+                        Items = prefix,
+                        NextCursor = cursor,
+                        HasMore = true
+                    };
                 });
+
+            SendConversationListResponse(session, response);
         }
         catch (OperationCanceledException)
             when (cancellationToken.IsCancellationRequested)
@@ -1755,9 +1845,12 @@ internal sealed partial class TcpGatewayService : BackgroundService
             : request.RequestId;
         if (requestId.Length > 64
             || request.ListLimit < 0
+            || request.ListLimit > PacketProtocol.ConversationListMaxItems
             || request.HistoryLimitPerConversation < 0
+            || request.HistoryLimitPerConversation > PacketProtocol.SyncMaxHistoryPerConversation
             || request.MaxConversationsWithHistory < 0
-            || request.Watermarks?.Count > 50
+            || request.MaxConversationsWithHistory > PacketProtocol.SyncMaxConversationsWithHistory
+            || request.Watermarks?.Count > PacketProtocol.SyncMaxWatermarks
             || request.Watermarks?.Any(static watermark =>
                 string.IsNullOrWhiteSpace(watermark.ConversationId)
                 || watermark.ConversationId.Length > 64
@@ -1805,106 +1898,187 @@ internal sealed partial class TcpGatewayService : BackgroundService
                 .ConfigureAwait(false);
             _metrics.HistoryQueryCompleted();
 
-            SendSyncBootstrapResponse(
-                session,
-                new SyncBootstrapResponse
+            var mappedConversations = page.Conversations
+                .Select(static item => new ConversationListItem
                 {
-                    RequestId = page.RequestId,
-                    Succeeded = page.Succeeded,
-                    ErrorCode = page.ErrorCode,
-                    ErrorMessage = page.ErrorMessage,
-                    ServerTimeMs = page.ServerTimeMs,
-                    Conversations =
-                    [
-                        .. page.Conversations
-                            .Select(static item => new ConversationListItem
-                            {
-                                ConversationId = item.ConversationId,
-                                Type = (ConversationType)(byte)item.Type,
-                                PeerUserId = item.PeerUserId,
-                                Title = item.Title,
-                                LastMessageId = item.LastMessageId,
-                                LastMessagePreview = item.LastMessagePreview,
-                                LastMessageAtMs = item.LastMessageAtMs,
-                                LastSenderUserId = item.LastSenderUserId,
-                                UnreadCount = item.UnreadCount,
-                                LastReadMessageId = item.LastReadMessageId,
-                                LastReadAtMs = item.LastReadAtMs,
-                                IsPinned = item.IsPinned,
-                                PinnedAtMs = item.PinnedAtMs,
-                                IsMuted = item.IsMuted,
-                                MutedUntilMs = item.MutedUntilMs
-                            })
-                    ],
-                    ConversationsNextCursor = page.ConversationsNextCursor is null
-                        ? null
-                        : new ConversationListCursor
+                    ConversationId = item.ConversationId,
+                    Type = (ConversationType)(byte)item.Type,
+                    PeerUserId = item.PeerUserId,
+                    Title = item.Title,
+                    LastMessageId = item.LastMessageId,
+                    LastMessagePreview = item.LastMessagePreview,
+                    LastMessageAtMs = item.LastMessageAtMs,
+                    LastSenderUserId = item.LastSenderUserId,
+                    UnreadCount = item.UnreadCount,
+                    LastReadMessageId = item.LastReadMessageId,
+                    LastReadAtMs = item.LastReadAtMs,
+                    IsPinned = item.IsPinned,
+                    PinnedAtMs = item.PinnedAtMs,
+                    IsMuted = item.IsMuted,
+                    MutedUntilMs = item.MutedUntilMs
+                })
+                .ToArray();
+
+            var originalConversationsCursor = page.ConversationsNextCursor is null
+                ? null
+                : new ConversationListCursor
+                {
+                    IsPinned = page.ConversationsNextCursor.IsPinned,
+                    PinnedAtMs = page.ConversationsNextCursor.PinnedAtMs,
+                    LastMessageAtMs = page.ConversationsNextCursor.LastMessageAtMs,
+                    ConversationId = page.ConversationsNextCursor.ConversationId
+                };
+
+            var mappedCatchUps = page.CatchUps
+                .Select(static catchUp => new ConversationHistoryCatchUp
+                {
+                    ConversationId = catchUp.ConversationId,
+                    Items = catchUp.Items
+                        .Select(static item => new MessageHistoryItem
                         {
-                            IsPinned = page.ConversationsNextCursor.IsPinned,
-                            PinnedAtMs = page.ConversationsNextCursor.PinnedAtMs,
-                            LastMessageAtMs = page.ConversationsNextCursor.LastMessageAtMs,
-                            ConversationId = page.ConversationsNextCursor.ConversationId
-                        },
-                    ConversationsHasMore = page.ConversationsHasMore,
-                    CatchUps = page.CatchUps
-                        .Select(static catchUp => new ConversationHistoryCatchUp
-                        {
-                            ConversationId = catchUp.ConversationId,
-                            Items = catchUp.Items
-                                .Select(static item => new MessageHistoryItem
+                            MessageId = item.MessageId,
+                            ClientMessageId = item.ClientMessageId,
+                            SenderUserId = item.SenderUserId,
+                            ReceiverUserId = item.ReceiverUserId,
+                            ConversationId = item.ConversationId,
+                            Content = item.Content,
+                            ReceivedAtMs = item.ReceivedAtMs,
+                            DeliveredAtMs = item.DeliveredAtMs,
+                            ReadAtMs = item.ReadAtMs,
+                            RecalledAtMs = item.RecalledAtMs,
+                            EditVersion = item.EditVersion,
+                            EditedAtMs = item.EditedAtMs,
+                            ChangedAtMs = item.ChangedAtMs,
+                            Attachments = AttachmentWireMapper.Map(item.Attachments),
+                            Reactions = item.Reactions?
+                                .Select(static reaction => new MessageReactionSummary
                                 {
-                                    MessageId = item.MessageId,
-                                    ClientMessageId = item.ClientMessageId,
-                                    SenderUserId = item.SenderUserId,
-                                    ReceiverUserId = item.ReceiverUserId,
-                                    ConversationId = item.ConversationId,
-                                    Content = item.Content,
-                                    ReceivedAtMs = item.ReceivedAtMs,
-                                    DeliveredAtMs = item.DeliveredAtMs,
-                                    ReadAtMs = item.ReadAtMs,
-                                    RecalledAtMs = item.RecalledAtMs,
-                                    EditVersion = item.EditVersion,
-                                    EditedAtMs = item.EditedAtMs,
-                                    ChangedAtMs = item.ChangedAtMs,
-                                    Attachments = AttachmentWireMapper.Map(item.Attachments),
-                                    Reactions = item.Reactions?
-                                        .Select(static reaction => new MessageReactionSummary
-                                        {
-                                            Emoji = reaction.Emoji,
-                                            Count = reaction.Count,
-                                            ReactedByMe = reaction.ReactedByMe
-                                        })
-                                        .ToArray(),
-                                    ReplyToMessageId = item.ReplyToMessageId,
-                                    ReplyToSenderUserId = item.ReplyToSenderUserId,
-                                    ReplyToPreview = item.ReplyToPreview,
-                                    ForwardedFromMessageId = item.ForwardedFromMessageId,
-                                    ForwardedFromSenderUserId = item.ForwardedFromSenderUserId,
-                                    ForwardedFromPreview = item.ForwardedFromPreview
+                                    Emoji = reaction.Emoji,
+                                    Count = reaction.Count,
+                                    ReactedByMe = reaction.ReactedByMe
                                 })
                                 .ToArray(),
-                            HasMore = catchUp.HasMore,
-                            NextCursor = catchUp.NextCursor is null
-                                ? null
-                                : new MessageHistoryCursor
-                                {
-                                    ReceivedAtMs = catchUp.NextCursor.ReceivedAtMs,
-                                    MessageId = catchUp.NextCursor.MessageId
-                                }
+                            ReplyToMessageId = item.ReplyToMessageId,
+                            ReplyToSenderUserId = item.ReplyToSenderUserId,
+                            ReplyToPreview = item.ReplyToPreview,
+                            ForwardedFromMessageId = item.ForwardedFromMessageId,
+                            ForwardedFromSenderUserId = item.ForwardedFromSenderUserId,
+                            ForwardedFromPreview = item.ForwardedFromPreview
                         })
                         .ToArray(),
-                    ResetsRequired = page.ResetsRequired
-                        .Select(static reset => new SyncCursorResetRequired
+                    HasMore = catchUp.HasMore,
+                    NextCursor = catchUp.NextCursor is null
+                        ? null
+                        : new MessageHistoryCursor
                         {
-                            ConversationId = reset.ConversationId,
-                            Reason = (SyncCursorResetReason)(byte)reset.Reason,
-                            TipMessageId = reset.TipMessageId,
-                            TipReceivedAtMs = reset.TipReceivedAtMs,
-                            ClientAfterReceivedAtMs = reset.ClientAfterReceivedAtMs,
-                            ClientAfterMessageId = reset.ClientAfterMessageId
-                        })
-                        .ToArray()
-                });
+                            ReceivedAtMs = catchUp.NextCursor.ReceivedAtMs,
+                            MessageId = catchUp.NextCursor.MessageId
+                        }
+                })
+                .ToArray();
+
+            var mappedResets = page.ResetsRequired
+                .Select(static reset => new SyncCursorResetRequired
+                {
+                    ConversationId = reset.ConversationId,
+                    Reason = (SyncCursorResetReason)(byte)reset.Reason,
+                    TipMessageId = reset.TipMessageId,
+                    TipReceivedAtMs = reset.TipReceivedAtMs,
+                    ClientAfterReceivedAtMs = reset.ClientAfterReceivedAtMs,
+                    ClientAfterMessageId = reset.ClientAfterMessageId
+                })
+                .ToArray();
+
+            // P0-6：按字节预算截断 SyncBootstrap 响应。
+            var conversationsBudget = PacketProtocol.WireResponseSoftLimit / 2;
+            var perCatchUpBudget = mappedCatchUps.Length > 0
+                ? (PacketProtocol.WireResponseSoftLimit - conversationsBudget) / mappedCatchUps.Length
+                : 0;
+
+            var truncatedConversations = ResponseByteBudget.TruncateArray(
+                mappedConversations,
+                _conversationListItemCodec,
+                conversationsBudget,
+                PacketProtocol.WireResponseHardLimit,
+                static (items, k) => k <= 0
+                    ? Array.Empty<ConversationListItem>()
+                    : items.Take(k).ToArray());
+
+            var conversationsWasTruncated = truncatedConversations.Length < mappedConversations.Length;
+            var conversationsCursor = conversationsWasTruncated
+                ? (truncatedConversations.Length > 0
+                    ? new ConversationListCursor
+                    {
+                        IsPinned = truncatedConversations[^1].IsPinned,
+                        PinnedAtMs = truncatedConversations[^1].PinnedAtMs,
+                        LastMessageAtMs = truncatedConversations[^1].LastMessageAtMs,
+                        ConversationId = truncatedConversations[^1].ConversationId
+                    }
+                    : null)
+                : originalConversationsCursor;
+            var conversationsHasMore = conversationsWasTruncated || page.ConversationsHasMore;
+
+            var truncatedCatchUps = new ConversationHistoryCatchUp[mappedCatchUps.Length];
+            for (var i = 0; i < mappedCatchUps.Length; i++)
+            {
+                var catchUp = mappedCatchUps[i];
+                var truncatedItems = ResponseByteBudget.TruncateArray(
+                    catchUp.Items,
+                    _messageHistoryItemCodec,
+                    perCatchUpBudget,
+                    PacketProtocol.WireResponseHardLimit,
+                    static (items, k) => k <= 0
+                        ? Array.Empty<MessageHistoryItem>()
+                        : items.Take(k).ToArray());
+
+                var itemsWereTruncated = truncatedItems.Length < catchUp.Items.Count;
+                var catchUpCursor = itemsWereTruncated
+                    ? (truncatedItems.Length > 0
+                        ? new MessageHistoryCursor
+                        {
+                            ReceivedAtMs = truncatedItems[^1].ReceivedAtMs,
+                            MessageId = truncatedItems[^1].MessageId
+                        }
+                        : null)
+                    : catchUp.NextCursor;
+
+                truncatedCatchUps[i] = catchUp with
+                {
+                    Items = truncatedItems,
+                    NextCursor = catchUpCursor,
+                    HasMore = itemsWereTruncated || catchUp.HasMore
+                };
+            }
+
+            var response = new SyncBootstrapResponse
+            {
+                RequestId = page.RequestId,
+                Succeeded = page.Succeeded,
+                ErrorCode = page.ErrorCode,
+                ErrorMessage = page.ErrorMessage,
+                ServerTimeMs = page.ServerTimeMs,
+                Conversations = truncatedConversations,
+                ConversationsNextCursor = conversationsCursor,
+                ConversationsHasMore = conversationsHasMore,
+                CatchUps = truncatedCatchUps,
+                ResetsRequired = mappedResets
+            };
+
+            var totalSize = ResponseByteBudget.MeasurePayload(
+                _syncBootstrapResponseCodec,
+                response,
+                PacketProtocol.WireResponseHardLimit);
+            while (totalSize < 0 && truncatedCatchUps.Length > 0)
+            {
+                truncatedCatchUps = truncatedCatchUps[..^1];
+                response = response with { CatchUps = truncatedCatchUps };
+                totalSize = ResponseByteBudget.MeasurePayload(
+                    _syncBootstrapResponseCodec,
+                    response,
+                    PacketProtocol.WireResponseHardLimit);
+            }
+
+            SendSyncBootstrapResponse(session, response);
         }
         catch (OperationCanceledException)
             when (cancellationToken.IsCancellationRequested)

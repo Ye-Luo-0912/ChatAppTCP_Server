@@ -74,7 +74,10 @@ internal sealed partial class TypingFanoutCoordinator
         for (var i = 0; i < _bucketCount; i++)
             _buckets[i] = new List<BucketEntry>();
 
-        _lastPumpedTick = CurrentTick;
+        // _lastPumpedTick 语义：已扫描到的最后一个 tick（含）。
+        // 初始化为 CurrentTick - 1，使得首个完成的 tick（CurrentTick）能在下一次 PumpExpired 时被扫描。
+        // 若初始化为 CurrentTick，则 currentTick - 1 这一已完成 tick 会被永久跳过（搁置 bug）。
+        _lastPumpedTick = CurrentTick - 1;
     }
 
     private long CurrentTick => _timeProvider.GetUtcNow().UtcTicks / _tickInterval.Ticks;
@@ -168,7 +171,11 @@ internal sealed partial class TypingFanoutCoordinator
     {
         var now = _timeProvider.GetUtcNow();
         var currentTick = now.UtcTicks / _tickInterval.Ticks;
-        if (currentTick <= _lastPumpedTick)
+
+        // _lastPumpedTick 指向已扫描的最后一个 tick（含）。下一个待扫 tick = _lastPumpedTick + 1。
+        // 仅扫描已完成 tick（tick < currentTick），保证 now 已超过桶内所有条目的 ExpireAt，无 leftover。
+        // 若 currentTick <= _lastPumpedTick + 1，则没有新的已完成 tick 可扫，直接返回。
+        if (currentTick <= _lastPumpedTick + 1)
             return;
 
         List<TypingEmission> emissions = new();
@@ -183,15 +190,17 @@ internal sealed partial class TypingFanoutCoordinator
             }
             else
             {
-                // 仅扫描已完成的 tick（tick < currentTick）。
-                // 若扫描当前 tick，桶内尚未到期的条目（如限频刷新后 ExpireAt 落在本 tick 窗口后半段）
-                // 会被 leftover 重新挂回同一个已扫描桶，导致该桶在本圈内不再被访问、过期被搁置一圈。
+                // 扫描 (_lastPumpedTick, currentTick) 区间内所有已完成 tick。
+                // 不扫描 currentTick 本身：当前 tick 窗口内可能有 ExpireAt 尚未到达的条目，
+                // 扫描它们会触发 leftover 路径并挂回同一桶，导致该桶在本圈内不再被访问（搁置一圈）。
                 // 代价是过期最多延迟一个 tick（TTL=4s、tick=500ms 时 ≤0.5s），对 Typing 易失状态可接受。
                 for (var tick = _lastPumpedTick + 1; tick < currentTick; tick++)
                     SweepBucketLocked(tick, now, emissions);
             }
 
-            _lastPumpedTick = currentTick;
+            // 更新为 currentTick - 1（最后一个已扫描的 tick）。
+            // 若设为 currentTick，下次 PumpExpired 的循环从 currentTick+1 开始，会永久跳过 currentTick tick。
+            _lastPumpedTick = currentTick - 1;
 
             if (emissions.Count > 0)
                 SignalEmissionsLocked(emissions);

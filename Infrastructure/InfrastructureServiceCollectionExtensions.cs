@@ -53,12 +53,18 @@ public static class InfrastructureServiceCollectionExtensions
         services.AddSingleton<IPayloadCodec<MessageHistoryResponse>>(
             static _ => new JsonPayloadCodec<MessageHistoryResponse>(
                 GatewayJsonSerializerContext.Default.MessageHistoryResponse));
+        services.AddSingleton<IPayloadCodec<MessageHistoryItem[]>>(
+            static _ => new JsonPayloadCodec<MessageHistoryItem[]>(
+                GatewayJsonSerializerContext.Default.MessageHistoryItemArray));
         services.AddSingleton<IPayloadCodec<ConversationListRequest>>(
             static _ => new JsonPayloadCodec<ConversationListRequest>(
                 GatewayJsonSerializerContext.Default.ConversationListRequest));
         services.AddSingleton<IPayloadCodec<ConversationListResponse>>(
             static _ => new JsonPayloadCodec<ConversationListResponse>(
                 GatewayJsonSerializerContext.Default.ConversationListResponse));
+        services.AddSingleton<IPayloadCodec<ConversationListItem[]>>(
+            static _ => new JsonPayloadCodec<ConversationListItem[]>(
+                GatewayJsonSerializerContext.Default.ConversationListItemArray));
         services.AddSingleton<IPayloadCodec<ConversationMarkReadRequest>>(
             static _ => new JsonPayloadCodec<ConversationMarkReadRequest>(
                 GatewayJsonSerializerContext.Default.ConversationMarkReadRequest));

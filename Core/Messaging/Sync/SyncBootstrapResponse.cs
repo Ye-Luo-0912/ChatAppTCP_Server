@@ -2,7 +2,7 @@ using ChatApp.TcpGateway.Core.Messaging.Conversations;
 
 namespace ChatApp.TcpGateway.Core.Messaging.Sync;
 
-public sealed class SyncBootstrapResponse
+public sealed record SyncBootstrapResponse
 {
     public required string RequestId { get; init; }
     public bool Succeeded { get; init; }

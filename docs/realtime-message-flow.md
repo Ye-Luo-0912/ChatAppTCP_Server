@@ -104,8 +104,10 @@ ConversationListRequest(108) + MessageHistoryRequest(106) 组合。
   不接收客户端 UserId。
 - SyncBootstrapResponse(115) 返回 `ServerTimeMs`、会话列表（含未读）、按
   未读/水位优先选取的 `CatchUps`，以及可选的 `ResetsRequired`（无效水位需全量恢复：
-  `MessageNotFound` / `AheadOfTip` / `MembershipLost` / `GapTooLarge`，附 tip 提示）。
-  消息保留 / tombstone horizon 驱动的失效尚未实现。
+  `MessageNotFound` / `AheadOfTip` / `MembershipLost` / `GapTooLarge` /
+  `BeyondRetention`，附 tip 提示）。`BeyondRetention` 由 Realtime
+  `SyncBootstrap:RetentionHorizonMs`（相对 tip）触发；在尚无消息年龄 GC 时作为
+  保留窗口替身，GC 落地后对已 purge 的旧水位也会重分类为此原因。
 - 客户端合并下行实时 `ChatMessage` 与补偿历史时，**必须按 MessageId 去重**。
   收到 `ResetsRequired` 时应清除本地该会话游标并全量拉历史，不要当作增量成功。
 - 发送方多设备：RealtimeServices 在持久化后向发送者其他在线设备推送

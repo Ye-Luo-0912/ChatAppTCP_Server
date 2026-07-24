@@ -1,6 +1,6 @@
 using ChatApp.Realtime.Integration.Configuration;
 using ChatApp.Realtime.Integration.DependencyInjection;
-using ChatApp.TcpGateway.Configuration;
+using ChatApp.TcpGateway.Gateway.Configuration;
 using ChatApp.TcpGateway.Gateway.Diagnostics;
 using ChatApp.TcpGateway.Gateway.Networking.Sessions;
 using ChatApp.TcpGateway.Infrastructure;
