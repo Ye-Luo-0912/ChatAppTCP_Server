@@ -2,6 +2,9 @@ using System.Buffers;
 using System.Threading.Channels;
 using ChatApp.TcpGateway.Core.Protocol;
 
+// CommandLane enum 已迁移至 Core/Protocol/CommandCatalog.cs，
+// 本命名空间通过 using 引用，保持现有代码引用 CommandLane 时不需改动命名空间。
+
 namespace ChatApp.TcpGateway.Gateway.Networking.Sessions;
 
 /// <summary>
@@ -270,20 +273,4 @@ internal readonly struct SessionCommand
             : new ReadOnlySequence<byte>(RentedBuffer, 0, PayloadLength);
 }
 
-/// <summary>
-/// 命令调度 lane 分类。
-/// </summary>
-internal enum CommandLane : byte
-{
-    /// <summary>Auth/Heartbeat/PresenceUnwatch：读循环内联处理。</summary>
-    Inline,
 
-    /// <summary>Chat/Receipt/Edit/Recall 等写操作：保持顺序。</summary>
-    OrderedWrite,
-
-    /// <summary>History/List/Sync 等查询：与 OrderedWrite 并行。</summary>
-    Query,
-
-    /// <summary>Typing 等瞬态命令：DropOldest，允许丢弃旧帧。</summary>
-    Ephemeral
-}
