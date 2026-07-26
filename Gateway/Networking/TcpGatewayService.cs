@@ -1584,22 +1584,27 @@ internal sealed class TcpGatewayService : BackgroundService
         }
 
         // 设备租约接管：原 ConnectionLeaseId 已随旧连接释放，这里用新 Session 的 ConnectionLeaseId 重新获取。
-        try
+        // 仅当原会话携带 DeviceIdHash 时才接管。缺少 DeviceIdHash 的会话不持有设备租约，
+        // 不应使用伪设备 0 接管——否则所有无 DeviceIdHash 的会话会落入同一零值设备键，相互覆盖租约。
+        if (context.DeviceIdHash is { } deviceHash)
         {
-            await _deviceSessionLeaseStore.TakeOverAsync(
-                context.UserId,
-                context.DeviceIdHash ?? 0,
-                context.SessionId,
-                session.ConnectionLeaseId,
-                _options.IdleTimeout + TimeSpan.FromMinutes(5),
-                cancellationToken).ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            _logger.TransportFailed(
-                GatewayTransportOperation.ClientProcessing,
-                session.ConnectionId,
-                ex);
+            try
+            {
+                await _deviceSessionLeaseStore.TakeOverAsync(
+                    context.UserId,
+                    deviceHash,
+                    context.SessionId,
+                    session.ConnectionLeaseId,
+                    _options.IdleTimeout + TimeSpan.FromMinutes(5),
+                    cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.TransportFailed(
+                    GatewayTransportOperation.ClientProcessing,
+                    session.ConnectionId,
+                    ex);
+            }
         }
 
         // 颁发新的 ResumeToken（旧 Token 已被消费）。
