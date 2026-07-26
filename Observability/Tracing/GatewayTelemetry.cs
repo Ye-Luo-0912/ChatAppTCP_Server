@@ -1,7 +1,7 @@
 using System.Diagnostics;
 using ChatApp.TcpGateway.Core.Protocol;
 
-namespace ChatApp.TcpGateway.Gateway.Diagnostics;
+namespace ChatApp.TcpGateway.Observability.Tracing;
 
 public static class GatewayTelemetry
 {
@@ -18,7 +18,7 @@ public static class GatewayTelemetry
             "tcp.command",
             ActivityKind.Server);
         activity?.SetTag("network.protocol.name", "tcp");
-        activity?.SetTag("chat.command", command.ToString());
+        activity?.SetTag("chat.command", PacketCommandNames.Get(command));
         return activity;
     }
 

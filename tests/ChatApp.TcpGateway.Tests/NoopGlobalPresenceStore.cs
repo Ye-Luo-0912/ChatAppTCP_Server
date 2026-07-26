@@ -6,11 +6,11 @@ namespace ChatApp.TcpGateway.Tests;
 
 internal sealed class NoopGlobalPresenceStore : IGlobalPresenceStore
 {
-    public Task SetOnlineAsync(long userId, string instanceId, CancellationToken ct = default) =>
-        Task.CompletedTask;
+    public Task<PresenceTransition> SetOnlineAsync(long userId, string instanceId, CancellationToken ct = default) =>
+        Task.FromResult(PresenceTransition.None);
 
-    public Task SetOfflineAsync(long userId, string instanceId, CancellationToken ct = default) =>
-        Task.CompletedTask;
+    public Task<PresenceTransition> SetOfflineAsync(long userId, string instanceId, CancellationToken ct = default) =>
+        Task.FromResult(PresenceTransition.None);
 
     public Task RefreshOnlineAsync(long userId, string instanceId, CancellationToken ct = default) =>
         Task.CompletedTask;

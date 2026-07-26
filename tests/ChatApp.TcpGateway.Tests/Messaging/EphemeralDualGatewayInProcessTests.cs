@@ -16,13 +16,21 @@ using ChatApp.TcpGateway.Gateway.Networking.Sessions;
 using ChatApp.TcpGateway.Networking.Sessions;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
+using Xunit;
 using EphemeralPresenceTypingConsumerService = ChatApp.TcpGateway.Gateway.Messaging.EphemeralPresenceTypingConsumerService;
 
 namespace ChatApp.TcpGateway.Tests.Messaging;
 
 /// <summary>
+/// MeterListener 全局监听器会捕获并行测试的测量，需串行化使用 OutboundEnqueueCounter 的测试。
+/// </summary>
+[CollectionDefinition("MeterListenerSerial", DisableParallelization = true)]
+public sealed class MeterListenerSerialDefinition { }
+
+/// <summary>
 /// 双 Gateway 进程内联调：共享内存 ephemeral 总线，验证跨实例 Typing/Presence 扇出与同实例自跳过。
 /// </summary>
+[Collection("MeterListenerSerial")]
 public sealed class EphemeralDualGatewayInProcessTests
 {
     [Fact]

@@ -13,5 +13,7 @@ internal enum SessionCloseReason : byte
     OutboundQueueFull,
     SendTimedOut,
     SessionRevoked,
-    TransportError
+    TransportError,
+    /// <summary>全局入站缓冲预算耗尽。</summary>
+    InboundBudgetExceeded
 }

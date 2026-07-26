@@ -3,17 +3,21 @@ using ChatApp.Realtime.Abstractions.Events;
 using ChatApp.Realtime.Integration.Serialization;
 using ChatApp.TcpGateway.Core.Messaging;
 using ChatApp.TcpGateway.Core.Messaging.Conversations;
+using ChatApp.TcpGateway.Core.Messaging.Relationships;
 using ChatApp.TcpGateway.Core.Protocol;
 using ChatApp.TcpGateway.Core.Serialization;
 using ChatApp.TcpGateway.Gateway.Diagnostics;
 using ChatApp.TcpGateway.Gateway.Networking.Buffers;
 using ChatApp.TcpGateway.Gateway.Networking.Sessions;
+using ChatApp.TcpGateway.Infrastructure.Serialization.Json;
 using ChatApp.TcpGateway.Networking.Sessions;
+using ChatApp.TcpGateway.Observability.Logging;
+using ChatApp.TcpGateway.Observability.Metrics;
 using Microsoft.Extensions.Logging;
 
 namespace ChatApp.TcpGateway.Gateway.Messaging;
 
-internal sealed partial class RealtimeEventDispatcher
+internal sealed class RealtimeEventDispatcher
 {
     private readonly UserSessionRegistry _userSessions;
     private readonly IPayloadCodec<ChatMessage> _chatMessageCodec;
@@ -29,6 +33,8 @@ internal sealed partial class RealtimeEventDispatcher
     private readonly IPayloadCodec<MemberLeftUpdate> _memberLeftUpdateCodec;
     private readonly IPayloadCodec<MemberRemovedUpdate> _memberRemovedUpdateCodec;
     private readonly IPayloadCodec<RoleChangedUpdate> _roleChangedUpdateCodec;
+    private readonly IPayloadCodec<RelationshipListChangedUpdate>? _relationshipListChangedCodec;
+    private readonly IPayloadCodec<AttachmentLifecycleUpdate>? _attachmentLifecycleCodec;
     private readonly GatewayMetrics _metrics;
     private readonly TimeProvider _timeProvider;
     private readonly ILogger<RealtimeEventDispatcher> _logger;
@@ -50,7 +56,9 @@ internal sealed partial class RealtimeEventDispatcher
         IPayloadCodec<RoleChangedUpdate> roleChangedUpdateCodec,
         GatewayMetrics metrics,
         TimeProvider timeProvider,
-        ILogger<RealtimeEventDispatcher> logger)
+        ILogger<RealtimeEventDispatcher> logger,
+        IPayloadCodec<RelationshipListChangedUpdate>? relationshipListChangedCodec = null,
+        IPayloadCodec<AttachmentLifecycleUpdate>? attachmentLifecycleCodec = null)
     {
         _userSessions = userSessions;
         _chatMessageCodec = chatMessageCodec;
@@ -66,6 +74,8 @@ internal sealed partial class RealtimeEventDispatcher
         _memberLeftUpdateCodec = memberLeftUpdateCodec;
         _memberRemovedUpdateCodec = memberRemovedUpdateCodec;
         _roleChangedUpdateCodec = roleChangedUpdateCodec;
+        _relationshipListChangedCodec = relationshipListChangedCodec;
+        _attachmentLifecycleCodec = attachmentLifecycleCodec;
         _metrics = metrics;
         _timeProvider = timeProvider;
         _logger = logger;
@@ -133,12 +143,21 @@ internal sealed partial class RealtimeEventDispatcher
                 DispatchRoleChanged(realtimeEvent);
                 break;
 
+            case RealtimeEventType.FriendRequestListChanged:
+            case RealtimeEventType.FriendListChanged:
+            case RealtimeEventType.BlockedListChanged:
+                DispatchRelationshipListChanged(realtimeEvent);
+                break;
+
+            case RealtimeEventType.AttachmentLifecycleChanged:
+                DispatchAttachmentLifecycle(realtimeEvent);
+                break;
+
             default:
                 _metrics.RealtimeEventHandled(queuedDeliveries: 0);
-                LogUnsupportedEvent(
-                    _logger,
+                _logger.RealtimeEventUnsupported(
                     realtimeEvent.EventId,
-                    realtimeEvent.Type);
+                    realtimeEvent.Type.ToString());
                 break;
         }
     }
@@ -147,7 +166,7 @@ internal sealed partial class RealtimeEventDispatcher
     {
         if (string.IsNullOrWhiteSpace(realtimeEvent.PayloadJson))
         {
-            RejectEvent(realtimeEvent, "missing-payload");
+            RejectEvent(realtimeEvent, RealtimeRejectReason.MissingPayload);
             return;
         }
 
@@ -160,7 +179,7 @@ internal sealed partial class RealtimeEventDispatcher
         }
         catch (JsonException)
         {
-            RejectEvent(realtimeEvent, "invalid-payload-json");
+            RejectEvent(realtimeEvent, RealtimeRejectReason.InvalidJson);
             return;
         }
 
@@ -170,7 +189,7 @@ internal sealed partial class RealtimeEventDispatcher
             (string.IsNullOrWhiteSpace(payload.Content)
              && payload.Attachments is not { Count: > 0 }))
         {
-            RejectEvent(realtimeEvent, "invalid-message-payload");
+            RejectEvent(realtimeEvent, RealtimeRejectReason.InvalidPayload);
             return;
         }
 
@@ -179,7 +198,7 @@ internal sealed partial class RealtimeEventDispatcher
                           payload.ConversationId);
         if (!isGroup && payload.ReceiverUserId <= 0)
         {
-            RejectEvent(realtimeEvent, "invalid-message-payload");
+            RejectEvent(realtimeEvent, RealtimeRejectReason.InvalidPayload);
             return;
         }
 
@@ -187,21 +206,13 @@ internal sealed partial class RealtimeEventDispatcher
         var isSenderEcho = payload.SenderUserId == realtimeEvent.TargetUserId;
         if (!isGroup && !isReceiverTarget && !isSenderEcho)
         {
-            RejectEvent(realtimeEvent, "invalid-message-payload");
+            RejectEvent(realtimeEvent, RealtimeRejectReason.InvalidPayload);
             return;
         }
 
         if (isGroup && realtimeEvent.TargetUserId <= 0)
         {
-            RejectEvent(realtimeEvent, "invalid-message-payload");
-            return;
-        }
-
-        var targets = _userSessions.GetSnapshot(
-            realtimeEvent.TargetUserId);
-        if (targets.Length == 0)
-        {
-            _metrics.RealtimeEventHandled(queuedDeliveries: 0);
+            RejectEvent(realtimeEvent, RealtimeRejectReason.InvalidPayload);
             return;
         }
 
@@ -219,16 +230,78 @@ internal sealed partial class RealtimeEventDispatcher
             ForwardedFromMessageId = payload.ForwardedFromMessageId,
             ForwardedFromSenderUserId = payload.ForwardedFromSenderUserId,
             ForwardedFromPreview = payload.ForwardedFromPreview,
+            MentionedUserIds = payload.MentionedUserIds,
+            MentionedRoles = payload.MentionedRoles,
             SentUtc = GetSentUtc(payload.ReceivedAtMs)
         };
+
+        var skipOriginSession = isSenderEcho || isGroup;
+
+        if (realtimeEvent.TargetUserIds is { Length: > 0 } targetUserIds)
+        {
+            // 群聊聚合事件：遍历多目标列表投递本机会话
+            using var aggregatedFrame = OutboundFrameFactory.Create(
+                PacketCommand.ChatMessage,
+                _chatMessageCodec,
+                message);
+
+            var aggregatedQueued = 0;
+            foreach (var userId in targetUserIds)
+            {
+                var userTargets = _userSessions.GetSnapshot(userId);
+                for (var i = 0; i < userTargets.Length; i++)
+                {
+                    var target = userTargets[i];
+                    if (skipOriginSession
+                        && !string.IsNullOrWhiteSpace(realtimeEvent.SessionId)
+                        && string.Equals(
+                            target.SessionId,
+                            realtimeEvent.SessionId,
+                            StringComparison.Ordinal))
+                    {
+                        continue;
+                    }
+
+                    if (target.TryQueue(aggregatedFrame))
+                        aggregatedQueued++;
+                }
+            }
+
+            _metrics.RealtimeEventHandled(aggregatedQueued);
+            _metrics.RealtimeAggregatedDispatch(
+                totalTargets: targetUserIds.Length,
+                queuedRecipients: aggregatedQueued);
+            return;
+        }
+
+        var targets = _userSessions.GetSnapshot(realtimeEvent.TargetUserId);
+        if (targets.Length == 0)
+        {
+            _metrics.RealtimeEventHandled(queuedDeliveries: 0);
+            return;
+        }
 
         using var outboundFrame = OutboundFrameFactory.Create(
             PacketCommand.ChatMessage,
             _chatMessageCodec,
             message);
 
-        var skipOriginSession = isSenderEcho || isGroup;
-        var queuedDeliveries = targets.Where(target => !skipOriginSession || string.IsNullOrWhiteSpace(realtimeEvent.SessionId) || !string.Equals(target.SessionId, realtimeEvent.SessionId, StringComparison.Ordinal)).Count(target => target.TryQueue(outboundFrame));
+        var queuedDeliveries = 0;
+        foreach (var target in targets)
+        {
+            if (skipOriginSession
+                && !string.IsNullOrWhiteSpace(realtimeEvent.SessionId)
+                && string.Equals(
+                    target.SessionId,
+                    realtimeEvent.SessionId,
+                    StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            if (target.TryQueue(outboundFrame))
+                queuedDeliveries++;
+        }
 
         _metrics.RealtimeEventHandled(queuedDeliveries);
     }
@@ -237,7 +310,7 @@ internal sealed partial class RealtimeEventDispatcher
     {
         if (string.IsNullOrWhiteSpace(realtimeEvent.PayloadJson))
         {
-            RejectEvent(realtimeEvent, "missing-payload");
+            RejectEvent(realtimeEvent, RealtimeRejectReason.MissingPayload);
             return;
         }
 
@@ -250,7 +323,7 @@ internal sealed partial class RealtimeEventDispatcher
         }
         catch (JsonException)
         {
-            RejectEvent(realtimeEvent, "invalid-payload-json");
+            RejectEvent(realtimeEvent, RealtimeRejectReason.InvalidJson);
             return;
         }
 
@@ -259,7 +332,7 @@ internal sealed partial class RealtimeEventDispatcher
             payload.SenderUserId <= 0 ||
             payload.RecalledAtMs <= 0)
         {
-            RejectEvent(realtimeEvent, "invalid-message-recalled-payload");
+            RejectEvent(realtimeEvent, RealtimeRejectReason.InvalidPayload);
             return;
         }
 
@@ -268,7 +341,7 @@ internal sealed partial class RealtimeEventDispatcher
                           payload.ConversationId);
         if (!isGroup && payload.ReceiverUserId <= 0)
         {
-            RejectEvent(realtimeEvent, "invalid-message-recalled-payload");
+            RejectEvent(realtimeEvent, RealtimeRejectReason.InvalidPayload);
             return;
         }
 
@@ -276,13 +349,13 @@ internal sealed partial class RealtimeEventDispatcher
         var isSenderEcho = payload.SenderUserId == realtimeEvent.TargetUserId;
         if (!isGroup && !isReceiverTarget && !isSenderEcho)
         {
-            RejectEvent(realtimeEvent, "invalid-message-recalled-payload");
+            RejectEvent(realtimeEvent, RealtimeRejectReason.InvalidPayload);
             return;
         }
 
         if (isGroup && realtimeEvent.TargetUserId <= 0)
         {
-            RejectEvent(realtimeEvent, "invalid-message-recalled-payload");
+            RejectEvent(realtimeEvent, RealtimeRejectReason.InvalidPayload);
             return;
         }
 
@@ -309,7 +382,22 @@ internal sealed partial class RealtimeEventDispatcher
             update);
 
         var skipOrigin = isSenderEcho || isGroup;
-        var queuedDeliveries = targets.Where(target => !skipOrigin || string.IsNullOrWhiteSpace(realtimeEvent.SessionId) || !string.Equals(target.SessionId, realtimeEvent.SessionId, StringComparison.Ordinal)).Count(target => target.TryQueue(outboundFrame));
+        var queuedDeliveries = 0;
+        foreach (var target in targets)
+        {
+            if (skipOrigin
+                && !string.IsNullOrWhiteSpace(realtimeEvent.SessionId)
+                && string.Equals(
+                    target.SessionId,
+                    realtimeEvent.SessionId,
+                    StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            if (target.TryQueue(outboundFrame))
+                queuedDeliveries++;
+        }
 
         _metrics.RealtimeEventHandled(queuedDeliveries);
     }
@@ -318,7 +406,7 @@ internal sealed partial class RealtimeEventDispatcher
     {
         if (string.IsNullOrWhiteSpace(realtimeEvent.PayloadJson))
         {
-            RejectEvent(realtimeEvent, "missing-payload");
+            RejectEvent(realtimeEvent, RealtimeRejectReason.MissingPayload);
             return;
         }
 
@@ -331,7 +419,7 @@ internal sealed partial class RealtimeEventDispatcher
         }
         catch (JsonException)
         {
-            RejectEvent(realtimeEvent, "invalid-payload-json");
+            RejectEvent(realtimeEvent, RealtimeRejectReason.InvalidJson);
             return;
         }
 
@@ -341,7 +429,7 @@ internal sealed partial class RealtimeEventDispatcher
             payload.EditVersion < 1 ||
             payload.EditedAtMs <= 0)
         {
-            RejectEvent(realtimeEvent, "invalid-message-edited-payload");
+            RejectEvent(realtimeEvent, RealtimeRejectReason.InvalidPayload);
             return;
         }
 
@@ -350,7 +438,7 @@ internal sealed partial class RealtimeEventDispatcher
                           payload.ConversationId);
         if (!isGroup && payload.ReceiverUserId <= 0)
         {
-            RejectEvent(realtimeEvent, "invalid-message-edited-payload");
+            RejectEvent(realtimeEvent, RealtimeRejectReason.InvalidPayload);
             return;
         }
 
@@ -358,13 +446,13 @@ internal sealed partial class RealtimeEventDispatcher
         var isSenderEcho = payload.SenderUserId == realtimeEvent.TargetUserId;
         if (!isGroup && !isReceiverTarget && !isSenderEcho)
         {
-            RejectEvent(realtimeEvent, "invalid-message-edited-payload");
+            RejectEvent(realtimeEvent, RealtimeRejectReason.InvalidPayload);
             return;
         }
 
         if (isGroup && realtimeEvent.TargetUserId <= 0)
         {
-            RejectEvent(realtimeEvent, "invalid-message-edited-payload");
+            RejectEvent(realtimeEvent, RealtimeRejectReason.InvalidPayload);
             return;
         }
 
@@ -416,7 +504,7 @@ internal sealed partial class RealtimeEventDispatcher
     {
         if (string.IsNullOrWhiteSpace(realtimeEvent.PayloadJson))
         {
-            RejectEvent(realtimeEvent, "missing-payload");
+            RejectEvent(realtimeEvent, RealtimeRejectReason.MissingPayload);
             return;
         }
 
@@ -428,7 +516,7 @@ internal sealed partial class RealtimeEventDispatcher
         }
         catch (JsonException)
         {
-            RejectEvent(realtimeEvent, "invalid-payload-json");
+            RejectEvent(realtimeEvent, RealtimeRejectReason.InvalidJson);
             return;
         }
 
@@ -440,7 +528,7 @@ internal sealed partial class RealtimeEventDispatcher
             payload.MessageReceiverUserId <= 0 ||
             payload.OccurredAtMs <= 0)
         {
-            RejectEvent(realtimeEvent, "invalid-reaction-added-payload");
+            RejectEvent(realtimeEvent, RealtimeRejectReason.InvalidPayload);
             return;
         }
 
@@ -448,7 +536,7 @@ internal sealed partial class RealtimeEventDispatcher
         var isSenderEcho = payload.MessageSenderUserId == realtimeEvent.TargetUserId;
         if (!isReceiverTarget && !isSenderEcho)
         {
-            RejectEvent(realtimeEvent, "invalid-reaction-added-payload");
+            RejectEvent(realtimeEvent, RealtimeRejectReason.InvalidPayload);
             return;
         }
 
@@ -500,7 +588,7 @@ internal sealed partial class RealtimeEventDispatcher
     {
         if (string.IsNullOrWhiteSpace(realtimeEvent.PayloadJson))
         {
-            RejectEvent(realtimeEvent, "missing-payload");
+            RejectEvent(realtimeEvent, RealtimeRejectReason.MissingPayload);
             return;
         }
 
@@ -512,7 +600,7 @@ internal sealed partial class RealtimeEventDispatcher
         }
         catch (JsonException)
         {
-            RejectEvent(realtimeEvent, "invalid-payload-json");
+            RejectEvent(realtimeEvent, RealtimeRejectReason.InvalidJson);
             return;
         }
 
@@ -524,7 +612,7 @@ internal sealed partial class RealtimeEventDispatcher
             payload.MessageReceiverUserId <= 0 ||
             payload.OccurredAtMs <= 0)
         {
-            RejectEvent(realtimeEvent, "invalid-reaction-removed-payload");
+            RejectEvent(realtimeEvent, RealtimeRejectReason.InvalidPayload);
             return;
         }
 
@@ -532,7 +620,7 @@ internal sealed partial class RealtimeEventDispatcher
         var isSenderEcho = payload.MessageSenderUserId == realtimeEvent.TargetUserId;
         if (!isReceiverTarget && !isSenderEcho)
         {
-            RejectEvent(realtimeEvent, "invalid-reaction-removed-payload");
+            RejectEvent(realtimeEvent, RealtimeRejectReason.InvalidPayload);
             return;
         }
 
@@ -584,7 +672,7 @@ internal sealed partial class RealtimeEventDispatcher
     {
         if (string.IsNullOrWhiteSpace(realtimeEvent.PayloadJson))
         {
-            RejectEvent(realtimeEvent, "missing-receipt-payload");
+            RejectEvent(realtimeEvent, RealtimeRejectReason.MissingPayload);
             return;
         }
 
@@ -597,7 +685,7 @@ internal sealed partial class RealtimeEventDispatcher
         }
         catch (JsonException)
         {
-            RejectEvent(realtimeEvent, "invalid-receipt-json");
+            RejectEvent(realtimeEvent, RealtimeRejectReason.InvalidJson);
             return;
         }
 
@@ -612,7 +700,7 @@ internal sealed partial class RealtimeEventDispatcher
                 payload.MessageId,
                 StringComparison.Ordinal))
         {
-            RejectEvent(realtimeEvent, "invalid-receipt-payload");
+            RejectEvent(realtimeEvent, RealtimeRejectReason.InvalidPayload);
             return;
         }
 
@@ -636,7 +724,12 @@ internal sealed partial class RealtimeEventDispatcher
             _messageReceiptUpdateCodec,
             update);
 
-        var queuedDeliveries = targets.Count(target => target.TryQueue(outboundFrame));
+        var queuedDeliveries = 0;
+        foreach (var target in targets)
+        {
+            if (target.TryQueue(outboundFrame))
+                queuedDeliveries++;
+        }
 
         _metrics.RealtimeEventHandled(queuedDeliveries);
     }
@@ -645,7 +738,7 @@ internal sealed partial class RealtimeEventDispatcher
     {
         if (string.IsNullOrWhiteSpace(realtimeEvent.PayloadJson))
         {
-            RejectEvent(realtimeEvent, "missing-conversation-payload");
+            RejectEvent(realtimeEvent, RealtimeRejectReason.MissingPayload);
             return;
         }
 
@@ -658,7 +751,7 @@ internal sealed partial class RealtimeEventDispatcher
         }
         catch (JsonException)
         {
-            RejectEvent(realtimeEvent, "invalid-conversation-json");
+            RejectEvent(realtimeEvent, RealtimeRejectReason.InvalidJson);
             return;
         }
 
@@ -666,7 +759,7 @@ internal sealed partial class RealtimeEventDispatcher
             || string.IsNullOrWhiteSpace(payload.ConversationId)
             || realtimeEvent.TargetUserId <= 0)
         {
-            RejectEvent(realtimeEvent, "invalid-conversation-payload");
+            RejectEvent(realtimeEvent, RealtimeRejectReason.InvalidPayload);
             return;
         }
 
@@ -710,7 +803,7 @@ internal sealed partial class RealtimeEventDispatcher
     {
         if (string.IsNullOrWhiteSpace(realtimeEvent.PayloadJson))
         {
-            RejectEvent(realtimeEvent, "missing-unread-payload");
+            RejectEvent(realtimeEvent, RealtimeRejectReason.MissingPayload);
             return;
         }
 
@@ -723,7 +816,7 @@ internal sealed partial class RealtimeEventDispatcher
         }
         catch (JsonException)
         {
-            RejectEvent(realtimeEvent, "invalid-unread-json");
+            RejectEvent(realtimeEvent, RealtimeRejectReason.InvalidJson);
             return;
         }
 
@@ -731,7 +824,7 @@ internal sealed partial class RealtimeEventDispatcher
             || string.IsNullOrWhiteSpace(payload.ConversationId)
             || realtimeEvent.TargetUserId <= 0)
         {
-            RejectEvent(realtimeEvent, "invalid-unread-payload");
+            RejectEvent(realtimeEvent, RealtimeRejectReason.InvalidPayload);
             return;
         }
 
@@ -768,7 +861,7 @@ internal sealed partial class RealtimeEventDispatcher
     {
         if (string.IsNullOrWhiteSpace(realtimeEvent.PayloadJson))
         {
-            RejectEvent(realtimeEvent, "missing-conversation-read-payload");
+            RejectEvent(realtimeEvent, RealtimeRejectReason.MissingPayload);
             return;
         }
 
@@ -780,7 +873,7 @@ internal sealed partial class RealtimeEventDispatcher
         }
         catch (JsonException)
         {
-            RejectEvent(realtimeEvent, "invalid-conversation-read-json");
+            RejectEvent(realtimeEvent, RealtimeRejectReason.InvalidJson);
             return;
         }
 
@@ -791,7 +884,7 @@ internal sealed partial class RealtimeEventDispatcher
             || payload.LastReadAtMs <= 0
             || realtimeEvent.TargetUserId <= 0)
         {
-            RejectEvent(realtimeEvent, "invalid-conversation-read-payload");
+            RejectEvent(realtimeEvent, RealtimeRejectReason.InvalidPayload);
             return;
         }
 
@@ -828,7 +921,7 @@ internal sealed partial class RealtimeEventDispatcher
     {
         if (string.IsNullOrWhiteSpace(realtimeEvent.PayloadJson))
         {
-            RejectEvent(realtimeEvent, "missing-payload");
+            RejectEvent(realtimeEvent, RealtimeRejectReason.MissingPayload);
             return;
         }
 
@@ -839,7 +932,7 @@ internal sealed partial class RealtimeEventDispatcher
         }
         catch (JsonException)
         {
-            RejectEvent(realtimeEvent, "invalid-payload-json");
+            RejectEvent(realtimeEvent, RealtimeRejectReason.InvalidJson);
             return;
         }
 
@@ -848,7 +941,7 @@ internal sealed partial class RealtimeEventDispatcher
             || payload.UserId <= 0
             || realtimeEvent.TargetUserId <= 0)
         {
-            RejectEvent(realtimeEvent, "invalid-member-joined-payload");
+            RejectEvent(realtimeEvent, RealtimeRejectReason.InvalidPayload);
             return;
         }
 
@@ -871,7 +964,7 @@ internal sealed partial class RealtimeEventDispatcher
     {
         if (string.IsNullOrWhiteSpace(realtimeEvent.PayloadJson))
         {
-            RejectEvent(realtimeEvent, "missing-payload");
+            RejectEvent(realtimeEvent, RealtimeRejectReason.MissingPayload);
             return;
         }
 
@@ -882,7 +975,7 @@ internal sealed partial class RealtimeEventDispatcher
         }
         catch (JsonException)
         {
-            RejectEvent(realtimeEvent, "invalid-payload-json");
+            RejectEvent(realtimeEvent, RealtimeRejectReason.InvalidJson);
             return;
         }
 
@@ -891,7 +984,7 @@ internal sealed partial class RealtimeEventDispatcher
             || payload.UserId <= 0
             || realtimeEvent.TargetUserId <= 0)
         {
-            RejectEvent(realtimeEvent, "invalid-member-left-payload");
+            RejectEvent(realtimeEvent, RealtimeRejectReason.InvalidPayload);
             return;
         }
 
@@ -911,7 +1004,7 @@ internal sealed partial class RealtimeEventDispatcher
     {
         if (string.IsNullOrWhiteSpace(realtimeEvent.PayloadJson))
         {
-            RejectEvent(realtimeEvent, "missing-payload");
+            RejectEvent(realtimeEvent, RealtimeRejectReason.MissingPayload);
             return;
         }
 
@@ -922,7 +1015,7 @@ internal sealed partial class RealtimeEventDispatcher
         }
         catch (JsonException)
         {
-            RejectEvent(realtimeEvent, "invalid-payload-json");
+            RejectEvent(realtimeEvent, RealtimeRejectReason.InvalidJson);
             return;
         }
 
@@ -931,7 +1024,7 @@ internal sealed partial class RealtimeEventDispatcher
             || payload.UserId <= 0
             || realtimeEvent.TargetUserId <= 0)
         {
-            RejectEvent(realtimeEvent, "invalid-member-removed-payload");
+            RejectEvent(realtimeEvent, RealtimeRejectReason.InvalidPayload);
             return;
         }
 
@@ -952,7 +1045,7 @@ internal sealed partial class RealtimeEventDispatcher
     {
         if (string.IsNullOrWhiteSpace(realtimeEvent.PayloadJson))
         {
-            RejectEvent(realtimeEvent, "missing-payload");
+            RejectEvent(realtimeEvent, RealtimeRejectReason.MissingPayload);
             return;
         }
 
@@ -963,7 +1056,7 @@ internal sealed partial class RealtimeEventDispatcher
         }
         catch (JsonException)
         {
-            RejectEvent(realtimeEvent, "invalid-payload-json");
+            RejectEvent(realtimeEvent, RealtimeRejectReason.InvalidJson);
             return;
         }
 
@@ -972,7 +1065,7 @@ internal sealed partial class RealtimeEventDispatcher
             || payload.UserId <= 0
             || realtimeEvent.TargetUserId <= 0)
         {
-            RejectEvent(realtimeEvent, "invalid-role-changed-payload");
+            RejectEvent(realtimeEvent, RealtimeRejectReason.InvalidPayload);
             return;
         }
 
@@ -991,6 +1084,152 @@ internal sealed partial class RealtimeEventDispatcher
                 ActorUserId = payload.ActorUserId,
                 OccurredAtMs = payload.OccurredAtMs
             });
+    }
+
+    /// <summary>
+    /// 关系列表变更下发（好友请求/好友/拉黑）。
+    /// payload 为 RealtimeDomainNotificationPayload，映射为统一的 RelationshipListChangedUpdate。
+    /// codec 未注入（测试场景）时静默跳过。
+    /// </summary>
+    private void DispatchRelationshipListChanged(RealtimeEvent realtimeEvent)
+    {
+        if (_relationshipListChangedCodec is null)
+        {
+            _metrics.RealtimeEventHandled(queuedDeliveries: 0);
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(realtimeEvent.PayloadJson))
+        {
+            RejectEvent(realtimeEvent, RealtimeRejectReason.MissingPayload);
+            return;
+        }
+
+        RealtimeDomainNotificationPayload? payload;
+        try
+        {
+            payload = JsonSerializer.Deserialize(
+                realtimeEvent.PayloadJson,
+                GatewayJsonSerializerContext.Default.RealtimeDomainNotificationPayload);
+        }
+        catch (JsonException)
+        {
+            RejectEvent(realtimeEvent, RealtimeRejectReason.InvalidJson);
+            return;
+        }
+
+        if (payload is null
+            || string.IsNullOrWhiteSpace(payload.Resource)
+            || string.IsNullOrWhiteSpace(payload.Action)
+            || realtimeEvent.TargetUserId <= 0)
+        {
+            RejectEvent(realtimeEvent, RealtimeRejectReason.InvalidPayload);
+            return;
+        }
+
+        var update = new RelationshipListChangedUpdate
+        {
+            Resource = payload.Resource,
+            Action = payload.Action,
+            ResourceId = payload.ResourceId,
+            ActorUserId = realtimeEvent.ActorUserId ?? 0,
+            Message = payload.Message,
+            OccurredAtMs = realtimeEvent.OccurredAtMs
+        };
+
+        var targets = _userSessions.GetSnapshot(realtimeEvent.TargetUserId);
+        if (targets.Length == 0)
+        {
+            _metrics.RealtimeEventHandled(queuedDeliveries: 0);
+            return;
+        }
+
+        using var outboundFrame = OutboundFrameFactory.Create(
+            PacketCommand.RelationshipListChanged,
+            _relationshipListChangedCodec,
+            update);
+
+        var queuedDeliveries = 0;
+        foreach (var target in targets)
+        {
+            if (target.TryQueue(outboundFrame))
+                queuedDeliveries++;
+        }
+
+        _metrics.RealtimeEventHandled(queuedDeliveries);
+    }
+
+    /// <summary>
+    /// 附件生命周期变更下发（UploadConfirmed/Scanning/Available/Rejected/Expired/ThumbnailUpdated）。
+    /// payload 为 <see cref="RealtimeAttachmentLifecyclePayload"/>，映射为
+    /// <see cref="AttachmentLifecycleUpdate"/>。目标为上传者本人。
+    /// codec 未注入（测试场景）时静默跳过。
+    /// </summary>
+    private void DispatchAttachmentLifecycle(RealtimeEvent realtimeEvent)
+    {
+        if (_attachmentLifecycleCodec is null)
+        {
+            _metrics.RealtimeEventHandled(queuedDeliveries: 0);
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(realtimeEvent.PayloadJson))
+        {
+            RejectEvent(realtimeEvent, RealtimeRejectReason.MissingPayload);
+            return;
+        }
+
+        RealtimeAttachmentLifecyclePayload? payload;
+        try
+        {
+            payload = JsonSerializer.Deserialize(
+                realtimeEvent.PayloadJson,
+                GatewayJsonSerializerContext.Default.RealtimeAttachmentLifecyclePayload);
+        }
+        catch (JsonException)
+        {
+            RejectEvent(realtimeEvent, RealtimeRejectReason.InvalidJson);
+            return;
+        }
+
+        if (payload is null
+            || string.IsNullOrWhiteSpace(payload.AttachmentId)
+            || realtimeEvent.TargetUserId <= 0)
+        {
+            RejectEvent(realtimeEvent, RealtimeRejectReason.InvalidPayload);
+            return;
+        }
+
+        var update = new AttachmentLifecycleUpdate
+        {
+            AttachmentId = payload.AttachmentId,
+            Status = payload.Status,
+            OccurredAtMs = payload.OccurredAtMs,
+            RejectReason = payload.RejectReason,
+            ThumbnailApiHint = payload.ThumbnailApiHint,
+            DownloadToken = payload.DownloadToken
+        };
+
+        var targets = _userSessions.GetSnapshot(realtimeEvent.TargetUserId);
+        if (targets.Length == 0)
+        {
+            _metrics.RealtimeEventHandled(queuedDeliveries: 0);
+            return;
+        }
+
+        using var outboundFrame = OutboundFrameFactory.Create(
+            PacketCommand.AttachmentLifecycleChanged,
+            _attachmentLifecycleCodec,
+            update);
+
+        var queuedDeliveries = 0;
+        foreach (var target in targets)
+        {
+            if (target.TryQueue(outboundFrame))
+                queuedDeliveries++;
+        }
+
+        _metrics.RealtimeEventHandled(queuedDeliveries);
     }
 
     private void DispatchMemberFrame<T>(
@@ -1027,7 +1266,7 @@ internal sealed partial class RealtimeEventDispatcher
     {
         if (string.IsNullOrWhiteSpace(realtimeEvent.SessionId))
         {
-            RejectEvent(realtimeEvent, "missing-session-id");
+            RejectEvent(realtimeEvent, RealtimeRejectReason.MissingSessionId);
             return;
         }
 
@@ -1066,32 +1305,12 @@ internal sealed partial class RealtimeEventDispatcher
 
     private void RejectEvent(
         RealtimeEvent realtimeEvent,
-        string reason)
+        RealtimeRejectReason reason)
     {
         _metrics.RealtimeEventRejected(reason);
-        LogRejectedEvent(
-            _logger,
+        _logger.RealtimeEventRejected(
             realtimeEvent.EventId,
-            realtimeEvent.Type,
+            realtimeEvent.Type.ToString(),
             reason);
     }
-
-    [LoggerMessage(
-        EventId = 40,
-        Level = LogLevel.Warning,
-        Message = "Rejected realtime event {EventId} ({EventType}); reason: {Reason}.")]
-    private static partial void LogRejectedEvent(
-        ILogger logger,
-        string eventId,
-        RealtimeEventType eventType,
-        string reason);
-
-    [LoggerMessage(
-        EventId = 41,
-        Level = LogLevel.Debug,
-        Message = "Realtime event {EventId} ({EventType}) has no TCP wire mapping and was acknowledged.")]
-    private static partial void LogUnsupportedEvent(
-        ILogger logger,
-        string eventId,
-        RealtimeEventType eventType);
 }

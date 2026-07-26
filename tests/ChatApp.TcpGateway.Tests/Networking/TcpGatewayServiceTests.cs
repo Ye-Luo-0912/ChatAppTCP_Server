@@ -53,7 +53,8 @@ public sealed class TcpGatewayServiceTests
             MaxPacketsPerSecond = 20,
             MaxInboundBytesPerSecond = 256 * 1024,
             MaxInboundPayloadBytes = PacketProtocol.MaxPayloadSize,
-            MaxChatAttachments = 32
+            MaxChatAttachments = 32,
+            RequireClientHello = false
         };
 
         using var metrics = new GatewayMetrics();

@@ -39,6 +39,7 @@ internal sealed class RealtimeAuthenticator(IAccessTokenStore tokenStore)
                 record.SessionId,
                 record.UserName,
                 record.DeviceIdHash,
+                record.DeviceId,
                 record.Roles);
         }
         catch (AuthenticationStoreUnavailableException)

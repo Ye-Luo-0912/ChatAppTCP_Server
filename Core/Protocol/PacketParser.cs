@@ -46,7 +46,7 @@ public static class PacketParser
             return PacketParseStatus.InvalidPacket;
         }
 
-        // P0-5：解析包头后立即按命令校验 Payload 上限，不等完整 Payload 到达。
+        // 解析包头后立即按命令校验 Payload 上限，不等完整 Payload 到达。
         // - 未定义命令 / 服务端→客户端命令 → GetMaxPayloadSize 返回 -1 → 立即拒绝
         // - 命令级长度超限 → 立即拒绝
         // 防止攻击者声明小命令（如 Heartbeat）却附带 80 KiB Payload 慢速发送占用缓冲。
@@ -74,7 +74,7 @@ public static class PacketParser
     /// <summary>
     /// 尝试从缓冲区头部读取命令字段（不消费缓冲区）。
     /// <para>
-    /// P0-5：用于在等待完整 Payload 前进行状态相关的早期校验
+    /// 用于在等待完整 Payload 前进行状态相关的早期校验
     ///（如未认证状态拒绝非认证命令），避免攻击者慢速发送大 Payload 占用资源。
     /// 仅在 Magic 匹配且缓冲区包含完整包头时返回 true。
     /// </para>

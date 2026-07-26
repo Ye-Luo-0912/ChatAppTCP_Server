@@ -218,7 +218,7 @@ public sealed class ResponseByteBudgetTests
     [Fact]
     public void ProtocolConstants_AreConsistent()
     {
-        // P0-6 契约：软上限 ≤ 硬上限 = MaxPayloadSize。
+        // 契约：软上限 ≤ 硬上限 = MaxPayloadSize。
         Assert.True(PacketProtocol.WireResponseSoftLimit <= PacketProtocol.WireResponseHardLimit);
         Assert.Equal(PacketProtocol.MaxPayloadSize, PacketProtocol.WireResponseHardLimit);
 

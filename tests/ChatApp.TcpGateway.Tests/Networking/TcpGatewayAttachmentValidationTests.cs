@@ -287,7 +287,8 @@ public sealed class TcpGatewayAttachmentValidationTests
                 MaxPacketsPerSecond = 40,
                 MaxInboundBytesPerSecond = 256 * 1024,
                 MaxInboundPayloadBytes = PacketProtocol.MaxPayloadSize,
-                MaxChatAttachments = ChatMessageLimits.MaxAttachments
+                MaxChatAttachments = ChatMessageLimits.MaxAttachments,
+                RequireClientHello = false
             };
 
             var messageBus = new CapturingRealtimeMessageBus();
@@ -463,6 +464,7 @@ public sealed class TcpGatewayAttachmentValidationTests
             long userId,
             ulong deviceIdHash,
             string sessionId,
+            string connectionLeaseId,
             TimeSpan ttl,
             CancellationToken cancellationToken) =>
             ValueTask.FromResult<string?>(null);
@@ -470,9 +472,17 @@ public sealed class TcpGatewayAttachmentValidationTests
         public ValueTask ReleaseIfOwnerAsync(
             long userId,
             ulong deviceIdHash,
-            string sessionId,
+            string connectionLeaseId,
             CancellationToken cancellationToken) =>
             ValueTask.CompletedTask;
+
+        public ValueTask<bool> RefreshIfOwnerAsync(
+            long userId,
+            ulong deviceIdHash,
+            string connectionLeaseId,
+            TimeSpan ttl,
+            CancellationToken cancellationToken) =>
+            ValueTask.FromResult(true);
     }
 
     private sealed class CapturingRealtimeMessageBus : IRealtimeMessageBus

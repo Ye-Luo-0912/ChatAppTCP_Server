@@ -68,7 +68,6 @@ builder.Services.AddGatewayObservability(
     builder.Configuration,
     realtimeIntegrationOptions.InstanceId);
 builder.Services.AddSingleton(TimeProvider.System);
-builder.Services.AddSingleton<GatewayMetrics>();
 builder.Services.AddSingleton<UserSessionRegistry>();
 builder.Services.AddSingleton<PresenceWatcherRegistry>();
 builder.Services.AddSingleton<TypingFanoutCoordinator>();

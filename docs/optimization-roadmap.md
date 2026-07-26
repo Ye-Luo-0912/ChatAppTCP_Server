@@ -2,9 +2,12 @@
 
 ## 当前完成的工程基线
 
-- .NET 11 Preview 6、Native AOT、集中依赖和严格分析器构建。
+- .NET 10 / SDK 10.0.301（与 Server、RealtimeServices 对齐，见 `docs/sdk-baseline.md`）、
+  集中依赖和严格分析器构建。默认发布为 **JIT + TieredPGO**（`PublishAot=false`）；
+  协议 JSON 走源生成 `JsonSerializerContext`，便于日后重新启用 Native AOT。
 - Pipe 背压、连接/速率/鉴权/空闲/发送超时和慢消费者隔离。
-- 出站帧池化、用户会话快照和“条数 + 字节数”双重队列预算。
+- 出站帧池化、用户会话快照和“条数 + 字节数”双重队列预算；全局入站预算
+  （`GlobalInboundBudget`）覆盖 Pipe 暂存与 lane 复制 payload。
 - JSON 编解码通过接口隔离，为后续二进制协议保留扩展点。
 - TCP 网关已接入同级 RealtimeServices 的 NATS/JetStream 集成模块。
 - 消息幂等持久化、事务 Outbox、每网关 durable consumer 和 ACK/NAK 已完成。
@@ -15,7 +18,10 @@
   keyset cursor，不使用 OFFSET。
 - TCP 已提供 MessageHistoryRequest(106) / MessageHistoryPage(107)；网关只采用
   已认证会话的 UserId。
-- 单页最多 100 条，响应正文预算 256 KiB，查询工作器为 8 路有界并发。
+- 单页最多 100 条，响应软预算 64 KiB（`WireResponseSoftLimit`）、硬上限
+  `MaxPayloadSize`（80 KiB），查询工作器为有界并发。
+- 群聊成员管理、撤回/编辑/反应、附件生命周期事件、Push Token 注册等协议面
+  已部分落地；持续扩展时优先拆分 `TcpGatewayService` / `RealtimeEventDispatcher`。
 - 真实跨进程探针已覆盖消息、已读回执、Outbox 和历史查询完整闭环。
 - 已新增持久消息全链路负载工具，输出固定内存直方图及 JSON/Markdown 报告。
 - History 查询队列深度和执行中数量已纳入运行时快照与 Meter 指标。
@@ -107,29 +113,32 @@ CPU、工作集、分配、Gen2/LOH、TCP 排队字节、JetStream pending/重�
 
 - 已实现跨平台 `ChatApp.Performance.Gate`：对编排器报告做失败闭环检查，拒绝缺失
   JetStream/Outbox 指标的报告；Linux 8 小时原始报告已复验通过。
-- Release 构建、全部测试、Native AOT 和数据库契约检查进入 CI。
+- Release 构建、全部测试和数据库契约检查进入 CI；Native AOT 发布为可选实验
+  （默认关闭，见 `AGENTS.md`），以 JIT/TieredPGO 吞吐测试决定是否重新启用。
 - 真实 NATS/PostgreSQL 探针进入集成测试；长时间压测和性能门禁进入 Linux 自托管定时任务。
 - 保存基准结果、门禁结果并比较历史版本，性能退化必须有明确说明。
-- .NET 11 正式版发布后升级 SDK/依赖，重跑 AOT、基准和浸泡测试。
+- .NET 11 稳定版发布后，与 Server/RealtimeServices **同步**升级 SDK/依赖并重跑基线
+  （当前基线为 .NET 10，见 `docs/sdk-baseline.md`）。
 
 ## 当前执行顺序
 
 1. 以 `Run-ConversationCombo.ps1` 与现有浸泡脚本在 Linux 正式机复跑，基于结果校准
    Prometheus 告警与会话阶段门禁阈值。
-2. 注册 Linux 自托管 CI runner，并把 Release、测试、AOT、真实依赖探针、定时浸泡和性能门禁接入；当前仓库未配置 Git 远程，因此这是环境接入任务。
+2. 注册 Linux 自托管 CI runner，并把 Release、测试、真实依赖探针、定时浸泡和性能门禁接入；当前仓库未配置 Git 远程，因此这是环境接入任务。
 3. 配置 Alertmanager 的实际通知通道与 OTLP Collector 的 Trace 汇聚，完成从指标发现到告警响应的闭环。
-4. .NET 11 正式版发布后升级 SDK/依赖并重跑完整基线；门禁稳定后进入群聊等扩展业务。
-
+4. 门禁稳定后继续拆分 oversized Gateway 类型，并按业务优先级扩展产品面。
 
 ## 性能门禁后进入的功能阶段
 
-会话列表、未读、按会话历史、多设备 SyncBootstrap 与事件契约（阶段 1–5）已完成。
+会话列表、未读、按会话历史、多设备 SyncBootstrap、群成员变更、撤回/编辑/反应与
+附件生命周期事件契约已部分完成。
 
 后续按业务优先级再评估：
 
-1. 群聊会话模型与成员变更事件。
-2. 撤回、编辑、附件元数据和推送通知。
+1. 群聊产品面补齐与权限边界 hardening。
+2. 推送通知端到端与附件元数据完整闭环。
 3. 好友列表等其它 RealtimeEvent 的完整 TCP 产品面。
+4. 将 `TcpGatewayService` / `RealtimeEventDispatcher` 拆成可独立测试的处理器模块。
 
 ## 二进制协议时机
 

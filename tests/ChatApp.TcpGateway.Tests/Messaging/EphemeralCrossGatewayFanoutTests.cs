@@ -15,6 +15,7 @@ using ChatApp.TcpGateway.Gateway.Networking.Sessions;
 using ChatApp.TcpGateway.Networking.Sessions;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
+using Xunit;
 using EphemeralPresenceTypingConsumerService = ChatApp.TcpGateway.Gateway.Messaging.EphemeralPresenceTypingConsumerService;
 
 namespace ChatApp.TcpGateway.Tests.Messaging;
@@ -22,6 +23,7 @@ namespace ChatApp.TcpGateway.Tests.Messaging;
 /// <summary>
 /// 模拟跨 Gateway：远端 OriginInstanceId 的 Typing 事件应扇出到本机目标会话。
 /// </summary>
+[Collection("MeterListenerSerial")]
 public sealed class EphemeralCrossGatewayFanoutTests
 {
     [Fact]

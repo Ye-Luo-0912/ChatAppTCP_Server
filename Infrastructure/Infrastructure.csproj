@@ -13,5 +13,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\Core\Core.csproj" />
+    <ProjectReference Include="..\Observability\ChatApp.TcpGateway.Observability.csproj" />
+    <ProjectReference Include="..\..\ChatApp.RealtimeServices\ChatApp.Realtime.Integration\ChatApp.Realtime.Integration.csproj" />
   </ItemGroup>
 </Project>

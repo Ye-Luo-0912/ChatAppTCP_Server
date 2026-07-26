@@ -10,3 +10,11 @@ riderModule.iml
 logs/
 *.log
 /.artifacts/
+
+# Local scratch / agent temp (do not commit)
+/scratch/
+.trae/
+_debug*.ps1
+_check_le.ps1
+_copy_bus.ps1
+_tmp_*

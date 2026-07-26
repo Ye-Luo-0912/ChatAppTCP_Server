@@ -4,7 +4,7 @@ using ChatApp.TcpGateway.Core.Serialization;
 namespace ChatApp.TcpGateway.Gateway.Networking.Buffers;
 
 /// <summary>
-/// P0-6：按字节预算截断分页响应。
+/// 按字节预算截断分页响应。
 /// <para>
 /// 后端分页不能只按条数截断，还要按序列化字节数截断，确保响应可装入单帧 TCP Payload。
 /// 使用二分查找确定不超过 <see cref="PacketProtocol.WireResponseSoftLimit"/> 的最大条目前缀，
@@ -26,7 +26,7 @@ internal static class ResponseByteBudget
     /// </para>
     /// <para>
     /// 当即使 k=1 也超过软上限时，退而检查 k=1 是否不超过硬上限；若不超过则返回 k=1，
-    /// 否则返回 k=0（空页，极端边界情况，P0-5 按命令 Payload 上限应能预防）。
+    /// 否则返回 k=0（空页，极端边界情况，按命令 Payload 上限应能预防）。
     /// </para>
     /// </summary>
     /// <typeparam name="T">响应类型。</typeparam>
@@ -91,7 +91,7 @@ internal static class ResponseByteBudget
                 return oneItem;
             }
 
-            // 即使 1 条也超硬上限：返回空页（极端边界，P0-5 应预防）。
+            // 即使 1 条也超硬上限：返回空页（极端边界，应预防）。
             return rebuildWithPrefix(response, 0);
         }
 

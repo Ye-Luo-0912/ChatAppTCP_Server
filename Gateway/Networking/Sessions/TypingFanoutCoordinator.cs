@@ -8,7 +8,7 @@ namespace ChatApp.TcpGateway.Gateway.Networking.Sessions;
 /// <summary>
 /// Typing 合并/限频/过期协调器。
 /// <para>
-/// P0-2 重写要点：
+/// 重写要点：
 /// <list type="bullet">
 /// <item>单 <see cref="PeriodicTimer"/> 驱动的分桶时间轮，不再为每个 typing 状态创建独立 <see cref="Task.Delay"/>；</item>
 /// <item>限频刷新只更新版本号与到期桶登记，不再丢失过期任务（修正旧实现刷新后无任务负责 typing=false 的确定性 bug）；</item>

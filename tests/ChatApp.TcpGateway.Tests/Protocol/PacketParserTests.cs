@@ -94,7 +94,7 @@ public sealed class PacketParserTests
         Assert.Equal(PacketParseStatus.InvalidPacket, status);
     }
 
-    // --- P0-5: 按命令校验 Payload 上限 ---
+    // --- 按命令校验 Payload 上限 ---
 
     [Fact]
     public void TryParseRejectsHeartbeatWithNonZeroPayload()
@@ -204,7 +204,7 @@ public sealed class PacketParserTests
         Assert.Equal(512, frame.Payload.Length);
     }
 
-    // --- P0-5: TryPeekCommand ---
+    // --- TryPeekCommand ---
 
     [Fact]
     public void TryPeekCommandReturnsCommandWithoutConsumingBuffer()

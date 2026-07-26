@@ -26,7 +26,7 @@ public sealed class OutboundFrameFactoryTests
             codec,
             response);
 
-        // P0-5 后 PacketParser.TryParse 拒绝服务端→客户端命令（GetMaxPayloadSize 返回 -1），
+        // 后 PacketParser.TryParse 拒绝服务端→客户端命令（GetMaxPayloadSize 返回 -1），
         // 因此这里直接读取包头验证，不走解析器。
         var span = outbound.Memory.Span;
         Assert.Equal(

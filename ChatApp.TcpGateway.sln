@@ -1,4 +1,4 @@
-﻿
+
 Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 18
 VisualStudioVersion = 18.6.11723.189
@@ -8,6 +8,8 @@ EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Core", "Core\Core.csproj", "{47AACD3B-06AB-4EEC-AFE5-6463865A628A}"
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Infrastructure", "Infrastructure\Infrastructure.csproj", "{E326AD11-F771-4184-809E-186C29C8D3CD}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ChatApp.TcpGateway.Observability", "Observability\ChatApp.TcpGateway.Observability.csproj", "{B1C2E3F4-5678-9012-ABCD-EF1234567890}"
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ChatApp.TcpGateway.Tests", "tests\ChatApp.TcpGateway.Tests\ChatApp.TcpGateway.Tests.csproj", "{8A3D0989-13CE-4A32-912B-1284305780A2}"
 EndProject
@@ -73,6 +75,18 @@ Global
 		{E326AD11-F771-4184-809E-186C29C8D3CD}.Release|x64.Build.0 = Release|Any CPU
 		{E326AD11-F771-4184-809E-186C29C8D3CD}.Release|x86.ActiveCfg = Release|Any CPU
 		{E326AD11-F771-4184-809E-186C29C8D3CD}.Release|x86.Build.0 = Release|Any CPU
+		{B1C2E3F4-5678-9012-ABCD-EF1234567890}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{B1C2E3F4-5678-9012-ABCD-EF1234567890}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{B1C2E3F4-5678-9012-ABCD-EF1234567890}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{B1C2E3F4-5678-9012-ABCD-EF1234567890}.Debug|x64.Build.0 = Debug|Any CPU
+		{B1C2E3F4-5678-9012-ABCD-EF1234567890}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{B1C2E3F4-5678-9012-ABCD-EF1234567890}.Debug|x86.Build.0 = Debug|Any CPU
+		{B1C2E3F4-5678-9012-ABCD-EF1234567890}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{B1C2E3F4-5678-9012-ABCD-EF1234567890}.Release|Any CPU.Build.0 = Release|Any CPU
+		{B1C2E3F4-5678-9012-ABCD-EF1234567890}.Release|x64.ActiveCfg = Release|Any CPU
+		{B1C2E3F4-5678-9012-ABCD-EF1234567890}.Release|x64.Build.0 = Release|Any CPU
+		{B1C2E3F4-5678-9012-ABCD-EF1234567890}.Release|x86.ActiveCfg = Release|Any CPU
+		{B1C2E3F4-5678-9012-ABCD-EF1234567890}.Release|x86.Build.0 = Release|Any CPU
 		{8A3D0989-13CE-4A32-912B-1284305780A2}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
 		{8A3D0989-13CE-4A32-912B-1284305780A2}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{8A3D0989-13CE-4A32-912B-1284305780A2}.Debug|x64.ActiveCfg = Debug|Any CPU

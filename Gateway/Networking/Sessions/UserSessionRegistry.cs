@@ -102,13 +102,22 @@ internal sealed class UserSessionRegistry
             if (bucket.Retired)
                 return [];
 
+            // 锁内 LINQ 改普通循环，避免闭包和枚举器分配。
             List<TcpClientSession>? victims = null;
-            foreach (var existing in from existing in bucket.Sessions.Values where !ReferenceEquals(existing, incoming)
-                         && existing.ConnectionId != incoming.ConnectionId where existing.DeviceIdHash == incoming.DeviceIdHash where !string.Equals(
-                         existing.SessionId,
-                         incoming.SessionId,
-                         StringComparison.Ordinal) select existing)
+            foreach (var existing in bucket.Sessions.Values)
             {
+                if (ReferenceEquals(existing, incoming))
+                    continue;
+                if (existing.ConnectionId == incoming.ConnectionId)
+                    continue;
+                if (existing.DeviceIdHash != incoming.DeviceIdHash)
+                    continue;
+                if (string.Equals(
+                        existing.SessionId,
+                        incoming.SessionId,
+                        StringComparison.Ordinal))
+                    continue;
+
                 victims ??= [];
                 victims.Add(existing);
             }

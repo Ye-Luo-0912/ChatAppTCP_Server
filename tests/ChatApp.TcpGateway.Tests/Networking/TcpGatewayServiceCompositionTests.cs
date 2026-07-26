@@ -29,7 +29,7 @@ namespace ChatApp.TcpGateway.Tests.Networking;
 public sealed class TcpGatewayServiceCompositionTests
 {
     [Fact]
-    public void GatewayServiceGraphResolvesAndSharesEphemeralRegistries()
+    public async Task GatewayServiceGraphResolvesAndSharesEphemeralRegistries()
     {
         var services = new ServiceCollection();
         services.AddLogging();
@@ -58,7 +58,7 @@ public sealed class TcpGatewayServiceCompositionTests
         services.AddHostedService<TcpGatewayService>();
         services.AddHostedService<EphemeralPresenceTypingConsumerService>();
 
-        using var provider = services.BuildServiceProvider(validateScopes: true);
+        await using var provider = services.BuildServiceProvider(validateScopes: true);
 
         Assert.Same(
             provider.GetRequiredService<PresenceWatcherRegistry>(),
@@ -90,11 +90,11 @@ public sealed class TcpGatewayServiceCompositionTests
 
     private sealed class NoopGlobalPresenceStore : IGlobalPresenceStore
     {
-        public Task SetOnlineAsync(long userId, string sessionId, CancellationToken ct = default) =>
-            Task.CompletedTask;
+        public Task<PresenceTransition> SetOnlineAsync(long userId, string sessionId, CancellationToken ct = default) =>
+            Task.FromResult(PresenceTransition.None);
 
-        public Task SetOfflineAsync(long userId, string sessionId, CancellationToken ct = default) =>
-            Task.CompletedTask;
+        public Task<PresenceTransition> SetOfflineAsync(long userId, string sessionId, CancellationToken ct = default) =>
+            Task.FromResult(PresenceTransition.None);
 
         public Task RefreshOnlineAsync(long userId, string sessionId, CancellationToken ct = default) =>
             Task.CompletedTask;

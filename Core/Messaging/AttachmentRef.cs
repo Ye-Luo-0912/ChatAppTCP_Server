@@ -31,5 +31,9 @@ public sealed class AttachmentRef
 public enum AttachmentWireStatus : short
 {
     Scanning = 0,
-    Available = 1
+    Available = 1,
+    UploadConfirmed = 2,
+    Rejected = 3,
+    Expired = 4,
+    ThumbnailUpdated = 5
 }

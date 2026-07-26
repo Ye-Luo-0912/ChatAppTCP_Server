@@ -1,15 +1,23 @@
 using System.Text.Json.Serialization;
+using ChatApp.TcpGateway.Core.Authentication;
 using ChatApp.TcpGateway.Core.Messaging;
 using ChatApp.TcpGateway.Core.Messaging.Conversations;
 using ChatApp.TcpGateway.Core.Messaging.History;
+using ChatApp.TcpGateway.Core.Messaging.Push;
+using ChatApp.TcpGateway.Core.Messaging.Relationships;
 using ChatApp.TcpGateway.Core.Messaging.Sync;
+using ChatApp.TcpGateway.Core.Push;
+using ChatApp.Realtime.Abstractions.Events;
 using ChatApp.TcpGateway.Infrastructure.Authentication.Models;
 
 namespace ChatApp.TcpGateway.Infrastructure.Serialization.Json;
 
 [JsonSourceGenerationOptions(
     PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase,
-    PropertyNameCaseInsensitive = true,
+    // 协议 JSON 改为大小写敏感。早检只精确匹配小写 attachmentIds，
+    // 大小写不敏感会让其他大小写形式绕过早检后被正式反序列化接受。
+    // 明确协议版本：客户端必须使用 camelCase。
+    PropertyNameCaseInsensitive = false,
     WriteIndented = false,
     DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull)]
 [JsonSerializable(typeof(AuthenticationRequest))]
@@ -91,4 +99,19 @@ namespace ChatApp.TcpGateway.Infrastructure.Serialization.Json;
 [JsonSerializable(typeof(List<SyncCursorResetRequired>))]
 [JsonSerializable(typeof(SyncCursorResetReason))]
 [JsonSerializable(typeof(AccessTokenRecord))]
+[JsonSerializable(typeof(ProtocolErrorFrame))]
+[JsonSerializable(typeof(ClientHello))]
+[JsonSerializable(typeof(ServerHello))]
+[JsonSerializable(typeof(GoAway))]
+[JsonSerializable(typeof(ResumeResponse))]
+[JsonSerializable(typeof(RelationshipListChangedUpdate))]
+[JsonSerializable(typeof(AttachmentLifecycleUpdate))]
+[JsonSerializable(typeof(RealtimeAttachmentLifecyclePayload))]
+[JsonSerializable(typeof(RealtimeDomainNotificationPayload))]
+[JsonSerializable(typeof(RegisterPushTokenRequest))]
+[JsonSerializable(typeof(RegisterPushTokenResponse))]
+[JsonSerializable(typeof(UnregisterPushTokenRequest))]
+[JsonSerializable(typeof(UnregisterPushTokenResponse))]
+[JsonSerializable(typeof(PushTokenRecord))]
+[JsonSerializable(typeof(ResumeContext))]
 public partial class GatewayJsonSerializerContext : JsonSerializerContext;

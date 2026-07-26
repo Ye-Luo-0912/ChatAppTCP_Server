@@ -6,8 +6,10 @@ using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Threading.Channels;
 using ChatApp.Realtime.Abstractions.Events;
 using ChatApp.Realtime.Abstractions.Messaging;
+using ChatApp.Realtime.Abstractions.Routing;
 using ChatApp.Realtime.Integration;
 using ChatApp.Realtime.Integration.Configuration;
 using ChatApp.Realtime.Integration.Ephemeral;
@@ -15,16 +17,21 @@ using ChatApp.TcpGateway.Core.Authentication;
 using ChatApp.TcpGateway.Core.Messaging;
 using ChatApp.TcpGateway.Core.Messaging.Conversations;
 using ChatApp.TcpGateway.Core.Messaging.History;
+using ChatApp.TcpGateway.Core.Messaging.Push;
 using ChatApp.TcpGateway.Core.Messaging.Sync;
+using ChatApp.TcpGateway.Core.Push;
 using ChatApp.TcpGateway.Core.Protocol;
 using ChatApp.TcpGateway.Core.Serialization;
+using ChatApp.TcpGateway.Core.Server;
 using ChatApp.TcpGateway.Gateway.Configuration;
-using ChatApp.TcpGateway.Gateway.Diagnostics;
 using ChatApp.TcpGateway.Gateway.Messaging;
 using ChatApp.TcpGateway.Gateway.Networking.Buffers;
 using ChatApp.TcpGateway.Gateway.Networking.Sessions;
 using ChatApp.TcpGateway.Infrastructure.Serialization.Json;
 using ChatApp.TcpGateway.Networking.Sessions;
+using ChatApp.TcpGateway.Observability.Logging;
+using ChatApp.TcpGateway.Observability.Metrics;
+using ChatApp.TcpGateway.Observability.Tracing;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -51,7 +58,7 @@ using RealtimeConversationSyncWatermark =
 
 namespace ChatApp.TcpGateway.Gateway.Networking;
 
-internal sealed partial class TcpGatewayService : BackgroundService
+internal sealed class TcpGatewayService : BackgroundService
 {
     private readonly TcpGatewayOptions _options;
     private readonly IRealtimeAuthenticator _authenticator;
@@ -110,14 +117,38 @@ internal sealed partial class TcpGatewayService : BackgroundService
     private readonly PipeOptions _pipeOptions;
     private readonly SemaphoreSlim _connectionSlots;
     private readonly ConcurrentDictionary<uint, TcpClientSession> _sessions = new();
+    // 全局内存预算与过载保护
+    private readonly ConnectionAdmissionTracker _admissionTracker;
+    private readonly GlobalOutboundBudget _globalOutboundBudget;
+    private readonly GlobalInboundBudget _globalInboundBudget;
     private readonly ConcurrentDictionary<uint, Task> _clientTasks = new();
     private readonly UserSessionRegistry _userSessions;
     private readonly PresenceWatcherRegistry _presenceWatchers;
     private readonly TypingFanoutCoordinator _typingFanout;
+    // Presence watcher 全局路由目录：分片模式下用于定向投递 Presence 事件。
+    // 测试场景下可为 null，回退为 NullWatcherGatewayDirectory（广播模式）。
+    private readonly IWatcherGatewayDirectory _watcherDirectory;
+    // 协议握手、断线重连、Error/GoAway 帧所需依赖。
+    // 通过 DI 注入；测试场景下可为 null，新功能路径会跳过。
+    private readonly IServerIdentity? _serverIdentity;
+    private readonly IResumeTokenStore? _resumeTokenStore;
+    private readonly IPayloadCodec<ClientHello>? _clientHelloCodec;
+    private readonly IPayloadCodec<ServerHello>? _serverHelloCodec;
+    private readonly IPayloadCodec<GoAway>? _goAwayCodec;
+    private readonly IPayloadCodec<ResumeResponse>? _resumeResponseCodec;
+    private readonly IPayloadCodec<ProtocolErrorFrame>? _protocolErrorFrameCodec;
+    private readonly IDirectConversationAuthorizer? _directConversationAuthorizer;
+    private readonly IPushTokenStore? _pushTokenStore;
+    private readonly JsonPayloadCodec<RegisterPushTokenRequest>? _registerPushTokenRequestCodec;
+    private readonly JsonPayloadCodec<RegisterPushTokenResponse>? _registerPushTokenResponseCodec;
+    private readonly JsonPayloadCodec<UnregisterPushTokenRequest>? _unregisterPushTokenRequestCodec;
+    private readonly JsonPayloadCodec<UnregisterPushTokenResponse>? _unregisterPushTokenResponseCodec;
 
     private readonly TaskCompletionSource _listenerReady = new(
         TaskCreationOptions.RunContinuationsAsynchronously);
     private Socket? _listener;
+    private CancellationTokenSource? _acceptLoopCts;
+    private int _isDraining;
     private uint _connectionId;
 
     public TcpGatewayService(
@@ -159,7 +190,17 @@ internal sealed partial class TcpGatewayService : BackgroundService
         GatewayMetrics metrics,
         TimeProvider timeProvider,
         ILogger<TcpGatewayService> logger,
-        ILogger<TcpClientSession> sessionLogger)
+        ILogger<TcpClientSession> sessionLogger,
+        IServerIdentity? serverIdentity = null,
+        IResumeTokenStore? resumeTokenStore = null,
+        IPayloadCodec<ClientHello>? clientHelloCodec = null,
+        IPayloadCodec<ServerHello>? serverHelloCodec = null,
+        IPayloadCodec<GoAway>? goAwayCodec = null,
+        IPayloadCodec<ResumeResponse>? resumeResponseCodec = null,
+        IPayloadCodec<ProtocolErrorFrame>? protocolErrorFrameCodec = null,
+        IDirectConversationAuthorizer? directConversationAuthorizer = null,
+        IPushTokenStore? pushTokenStore = null,
+        IWatcherGatewayDirectory? watcherDirectory = null)
     {
         _options = options.Value;
         _authenticator = authenticator;
@@ -236,6 +277,24 @@ internal sealed partial class TcpGatewayService : BackgroundService
         _timeProvider = timeProvider;
         _logger = logger;
         _sessionLogger = sessionLogger;
+        _serverIdentity = serverIdentity;
+        _resumeTokenStore = resumeTokenStore;
+        _clientHelloCodec = clientHelloCodec;
+        _serverHelloCodec = serverHelloCodec;
+        _goAwayCodec = goAwayCodec;
+        _resumeResponseCodec = resumeResponseCodec;
+        _protocolErrorFrameCodec = protocolErrorFrameCodec;
+        _directConversationAuthorizer = directConversationAuthorizer;
+        _pushTokenStore = pushTokenStore;
+        _watcherDirectory = watcherDirectory ?? NullWatcherGatewayDirectory.Instance;
+        _registerPushTokenRequestCodec = new JsonPayloadCodec<RegisterPushTokenRequest>(
+            GatewayJsonSerializerContext.Default.RegisterPushTokenRequest);
+        _registerPushTokenResponseCodec = new JsonPayloadCodec<RegisterPushTokenResponse>(
+            GatewayJsonSerializerContext.Default.RegisterPushTokenResponse);
+        _unregisterPushTokenRequestCodec = new JsonPayloadCodec<UnregisterPushTokenRequest>(
+            GatewayJsonSerializerContext.Default.UnregisterPushTokenRequest);
+        _unregisterPushTokenResponseCodec = new JsonPayloadCodec<UnregisterPushTokenResponse>(
+            GatewayJsonSerializerContext.Default.UnregisterPushTokenResponse);
 
         _pipeOptions = new PipeOptions(
             pool: MemoryPool<byte>.Shared,
@@ -249,6 +308,17 @@ internal sealed partial class TcpGatewayService : BackgroundService
         _connectionSlots = new SemaphoreSlim(
             _options.MaxConnections,
             _options.MaxConnections);
+
+        // 初始化全局内存预算与过载保护
+        _admissionTracker = new ConnectionAdmissionTracker(
+            _options.MaxUnauthenticatedConnections,
+            _options.MaxConnectionsPerIp,
+            _options.MaxAuthenticationAttemptsPerIp,
+            _options.AuthenticationRateWindow);
+        _globalOutboundBudget = new GlobalOutboundBudget(
+            _options.GlobalMaxOutboundQueuedBytes);
+        _globalInboundBudget = new GlobalInboundBudget(
+            _options.GlobalMaxInboundBufferedBytes);
     }
 
     public override async Task StartAsync(CancellationToken cancellationToken)
@@ -257,6 +327,57 @@ internal sealed partial class TcpGatewayService : BackgroundService
         await _listenerReady.Task
             .WaitAsync(cancellationToken)
             .ConfigureAwait(false);
+    }
+
+    public override async Task StopAsync(CancellationToken cancellationToken)
+    {
+        // 1. 先进入 draining：停止接入新连接，再通知已有连接排空。
+        Interlocked.Exchange(ref _isDraining, 1);
+        try
+        {
+            _acceptLoopCts?.Cancel();
+        }
+        catch (ObjectDisposedException)
+        {
+            // Accept loop 可能已结束。
+        }
+
+        var listener = Interlocked.Exchange(ref _listener, null);
+        listener?.Dispose();
+
+        // 2. 优雅停机：通知所有活跃连接重连其他实例。
+        if (_goAwayCodec is not null && !_sessions.IsEmpty)
+        {
+            var drainTimeout = _options.GoAwayDrainTimeout;
+            var goAway = new GoAway
+            {
+                RetryAfterMs = (int)drainTimeout.TotalMilliseconds,
+                Reason = "shutdown",
+                ServerHint = null
+            };
+
+            foreach (var session in _sessions.Values)
+            {
+                using var frame = OutboundFrameFactory.Create(
+                    PacketCommand.GoAway,
+                    _goAwayCodec,
+                    goAway);
+                session.TryQueue(frame);
+            }
+
+            // 等待客户端断开或超时（期间不再 Accept）。
+            try
+            {
+                await Task.Delay(drainTimeout, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                // 停机令牌已取消，立即进入强制关闭流程。
+            }
+        }
+
+        await base.StopAsync(cancellationToken).ConfigureAwait(false);
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -293,18 +414,66 @@ internal sealed partial class TcpGatewayService : BackgroundService
         Volatile.Write(ref _listener, listener);
         _listenerReady.TrySetResult();
 
-        LogGatewayStarted(_logger, endpoint, _options.MaxConnections);
+        using var acceptLoopCts = CancellationTokenSource.CreateLinkedTokenSource(
+            executionToken);
+        Volatile.Write(ref _acceptLoopCts, acceptLoopCts);
+
+        _logger.GatewayStarted(endpoint, _options.MaxConnections);
         var heartbeatTask = RunHeartbeatLoopAsync(executionToken);
-        // P0-2: Typing 时间轮 pump 与发射消费由本机宿主驱动，替代旧的每状态 Task.Delay 过期。
+        // Typing 时间轮 pump 与发射消费由本机宿主驱动，替代旧的每状态 Task.Delay 过期。
         var typingFanoutTask = RunTypingFanoutLoopAsync(executionToken);
 
         try
         {
             while (!executionToken.IsCancellationRequested)
             {
-                var socket = await listener
-                    .AcceptAsync(executionToken)
-                    .ConfigureAwait(false);
+                if (Volatile.Read(ref _isDraining) != 0 ||
+                    acceptLoopCts.IsCancellationRequested)
+                {
+                    // 已停止接入：等待 StopAsync 完成 GoAway 排空后再由 base.StopAsync 取消 executionToken。
+                    try
+                    {
+                        await Task.Delay(Timeout.Infinite, executionToken)
+                            .ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException)
+                        when (executionToken.IsCancellationRequested)
+                    {
+                    }
+
+                    break;
+                }
+
+                Socket socket;
+                try
+                {
+                    socket = await listener
+                        .AcceptAsync(acceptLoopCts.Token)
+                        .ConfigureAwait(false);
+                }
+                catch (ObjectDisposedException)
+                {
+                    // StopAsync 已关闭 listener；转入排空等待。
+                    continue;
+                }
+                catch (OperationCanceledException)
+                    when (acceptLoopCts.IsCancellationRequested &&
+                          !executionToken.IsCancellationRequested)
+                {
+                    // Accept 已取消但仍在 draining；转入排空等待。
+                    continue;
+                }
+                catch (SocketException) when (Volatile.Read(ref _isDraining) != 0 ||
+                                              acceptLoopCts.IsCancellationRequested)
+                {
+                    continue;
+                }
+
+                if (Volatile.Read(ref _isDraining) != 0)
+                {
+                    socket.Dispose();
+                    continue;
+                }
 
                 if (!await _connectionSlots.WaitAsync(0, CancellationToken.None))
                 {
@@ -325,11 +494,12 @@ internal sealed partial class TcpGatewayService : BackgroundService
         catch (Exception exception)
         {
             Environment.ExitCode = 1;
-            LogGatewayFatal(_logger, exception);
+            _logger.GatewayFatal(exception);
             throw;
         }
         finally
         {
+            Volatile.Write(ref _acceptLoopCts, null);
             await execution.CancelAsync();
             Volatile.Write(ref _listener, null);
             listener.Dispose();
@@ -347,7 +517,7 @@ internal sealed partial class TcpGatewayService : BackgroundService
 
             await heartbeatTask.ConfigureAwait(false);
             await typingFanoutTask.ConfigureAwait(false);
-            LogGatewayStopped(_logger);
+            _logger.GatewayStopped();
         }
     }
 
@@ -360,6 +530,42 @@ internal sealed partial class TcpGatewayService : BackgroundService
 
     private async ValueTask StartClientAsync(Socket socket, CancellationToken stoppingToken)
     {
+        // 提取远程 IP 用于准入检查。
+        string remoteIp = "unknown";
+        try
+        {
+            if (socket.RemoteEndPoint is IPEndPoint ep)
+                remoteIp = ep.Address.ToString();
+        }
+        catch
+        {
+            // 获取失败时用 "unknown" 作为 key，仍受全局未认证限制。
+        }
+
+        // 连接准入检查（未认证数 + 每 IP 连接数 + 每 IP 认证失败率）。
+        var admission = _admissionTracker.TryAdmit(remoteIp);
+        if (admission != AdmissionResult.Admitted)
+        {
+            _metrics.ConnectionRejected();
+            switch (admission)
+            {
+                case AdmissionResult.RejectedUnauthenticatedLimit:
+                    _metrics.ConnectionRejectedUnauthLimit();
+                    break;
+                case AdmissionResult.RejectedPerIpConnectionLimit:
+                    _metrics.ConnectionRejectedPerIpLimit();
+                    break;
+                case AdmissionResult.RejectedPerIpAuthRateLimit:
+                    _metrics.AuthenticationRejectedPerIpRate();
+                    break;
+            }
+            socket.Dispose();
+            _connectionSlots.Release();
+            return;
+        }
+
+        _metrics.UnauthenticatedConnectionAccepted();
+
         try
         {
             socket.NoDelay = true;
@@ -377,13 +583,17 @@ internal sealed partial class TcpGatewayService : BackgroundService
                 _options.SendTimeout,
                 _timeProvider,
                 _metrics,
-                _sessionLogger);
+                _sessionLogger,
+                _globalOutboundBudget,
+                _options.AuthenticationTimeout);
 
             if (!_sessions.TryAdd(connectionId, session))
             {
                 session.Close(SessionCloseReason.TransportError);
                 await session.DisposeAsync().ConfigureAwait(false);
                 _connectionSlots.Release();
+                _admissionTracker.Release(remoteIp, wasAuthenticated: false);
+                _metrics.UnauthenticatedConnectionClosed();
                 return;
             }
 
@@ -391,6 +601,7 @@ internal sealed partial class TcpGatewayService : BackgroundService
 
             var clientTask = HandleClientAsync(
                 session,
+                remoteIp,
                 stoppingToken);
             _clientTasks[connectionId] = clientTask;
 
@@ -411,23 +622,49 @@ internal sealed partial class TcpGatewayService : BackgroundService
         {
             socket.Dispose();
             _connectionSlots.Release();
+            _admissionTracker.Release(remoteIp, wasAuthenticated: false);
+            _metrics.UnauthenticatedConnectionClosed();
             throw;
         }
     }
 
     private async Task HandleClientAsync(
         TcpClientSession session,
+        string remoteIp,
         CancellationToken cancellationToken)
     {
+        // 链接 Session lifetime token 与宿主 stopping token。
+        // 连接关闭时取消所有业务调用，避免后端资源继续被占用。
+        using var sessionCts = CancellationTokenSource.CreateLinkedTokenSource(
+            session.LifetimeToken, cancellationToken);
+        var sessionToken = sessionCts.Token;
+
+        // 每会话命令调度器。将命令分发到 OrderedWrite/Query/Ephemeral 三条 lane，
+        // 避免慢请求阻塞同连接的其他命令（队头阻塞）。
+        // Control 命令（Auth/Heartbeat/PresenceUnwatch）由读循环内联处理。
+        var scheduler = new SessionCommandScheduler(
+            (command, token) => ProcessScheduledCommandAsync(
+                command, session, remoteIp, token),
+            _options.CommandSchedulerOrderedWriteCapacity,
+            _options.CommandSchedulerQueryCapacity,
+            _options.CommandSchedulerEphemeralCapacity,
+            sessionToken,
+            ex => _logger.TransportFailed(GatewayTransportOperation.ClientProcessing, session.ConnectionId, ex));
+
         var pipe = new Pipe(_pipeOptions);
+        var pipeLease = new SessionInboundPipeLease(_globalInboundBudget);
         var fillTask = FillPipeAsync(
             session,
             pipe.Writer,
-            cancellationToken);
+            pipeLease,
+            sessionToken);
         var readTask = ReadPipeAsync(
             pipe.Reader,
             session,
-            cancellationToken);
+            remoteIp,
+            scheduler,
+            pipeLease,
+            sessionToken);
 
         try
         {
@@ -449,14 +686,15 @@ internal sealed partial class TcpGatewayService : BackgroundService
         }
         catch (Exception exception)
         {
-            LogClientProcessingError(
-                _logger,
+            _logger.TransportFailed(
+                GatewayTransportOperation.ClientProcessing,
                 session.ConnectionId,
                 exception);
             session.Close(SessionCloseReason.TransportError);
         }
         finally
         {
+            pipeLease.ReleaseAll();
             session.Close(
                 cancellationToken.IsCancellationRequested
                     ? SessionCloseReason.ApplicationStopping
@@ -476,29 +714,39 @@ internal sealed partial class TcpGatewayService : BackgroundService
             {
                 try
                 {
+                    // 使用 ConnectionLeaseId 作为所有权令牌释放租约。
                     await _deviceSessionLeaseStore
                         .ReleaseIfOwnerAsync(
                             session.UserId,
                             deviceHash,
-                            session.SessionId,
+                            session.ConnectionLeaseId,
                             CancellationToken.None)
                         .ConfigureAwait(false);
                 }
                 catch (Exception exception)
                 {
-                    LogSessionRevokePublishFailed(
-                        _logger,
+                    _logger.SessionRevocationFailed(
                         session.ConnectionId,
                         session.SessionId,
                         exception);
                 }
             }
 
+            // 释放准入跟踪器槽位。
+            var wasAuthenticated = session.UserId > 0;
+            _admissionTracker.Release(remoteIp, wasAuthenticated);
+            if (!wasAuthenticated)
+                _metrics.UnauthenticatedConnectionClosed();
+
             if (_sessions.TryRemove(session.ConnectionId, out _))
             {
                 _metrics.ConnectionClosed();
                 _connectionSlots.Release();
             }
+
+            // 先停止命令调度器（等待 lane 消费者退出并归还租用缓冲区），
+            // 再释放 Session。避免 Session 释放后调度器仍访问其字段。
+            await scheduler.DisposeAsync().ConfigureAwait(false);
 
             await session.DisposeAsync().ConfigureAwait(false);
         }
@@ -507,6 +755,7 @@ internal sealed partial class TcpGatewayService : BackgroundService
     private async Task FillPipeAsync(
         TcpClientSession session,
         PipeWriter writer,
+        SessionInboundPipeLease pipeLease,
         CancellationToken cancellationToken)
     {
         Exception? completionError = null;
@@ -524,6 +773,12 @@ internal sealed partial class TcpGatewayService : BackgroundService
                 if (bytesRead == 0)
                 {
                     session.Close(SessionCloseReason.RemoteClosed);
+                    break;
+                }
+
+                if (!pipeLease.TryReserve(bytesRead))
+                {
+                    session.Close(SessionCloseReason.InboundBudgetExceeded);
                     break;
                 }
 
@@ -553,6 +808,9 @@ internal sealed partial class TcpGatewayService : BackgroundService
     private async Task ReadPipeAsync(
         PipeReader reader,
         TcpClientSession session,
+        string remoteIp,
+        SessionCommandScheduler scheduler,
+        SessionInboundPipeLease pipeLease,
         CancellationToken cancellationToken)
     {
         Exception? completionError = null;
@@ -564,20 +822,51 @@ internal sealed partial class TcpGatewayService : BackgroundService
                 var result = await reader
                     .ReadAsync(cancellationToken)
                     .ConfigureAwait(false);
-                var buffer = result.Buffer;
+                var readBuffer = result.Buffer;
+                var buffer = readBuffer;
+
+                // 跟踪已消费位置。Inline 命令处理后更新此位置；
+                // 入队命令在复制 payload 后也更新此位置，使 Pipe 可立即回收内存。
+                var consumed = buffer.Start;
 
                 while (session.IsConnected)
                 {
-                    // P0-5：未认证状态下，在等待完整 Payload 前立即拒绝非认证命令。
+                    // 未认证状态下，在等待完整 Payload 前立即拒绝非认证命令。
                     // 攻击者可能声明 ChatMessage（上限 64 KiB）等命令并慢速发送，
                     // 旧实现在完整 Payload 到达后才由 ProcessPacketAsync 拒绝，浪费缓冲与连接。
                     if (!session.IsAuthenticated &&
-                        PacketParser.TryPeekCommand(buffer, out var peekedCommand) &&
-                        !PacketProtocol.IsAuthenticationCommand(peekedCommand))
+                        PacketParser.TryPeekCommand(buffer, out var peekedCommand))
                     {
-                        _metrics.ProtocolError();
-                        session.Close(SessionCloseReason.ProtocolViolation);
-                        return;
+                        // RequireClientHello=true 时，认证前必须先完成 ClientHello 握手。
+                        // ClientHello / AuthenticationRequest / Resume 均在 Inline lane 串行处理，
+                        // 同一 TCP 段内多帧也不会乱序越过握手状态机。
+                        if (_options.RequireClientHello &&
+                            peekedCommand == PacketCommand.AuthenticationRequest &&
+                            !session.HasCompletedHandshake)
+                        {
+                            _metrics.ProtocolError();
+                            SendProtocolError(
+                                session,
+                                ProtocolErrorCode.ProtocolViolation,
+                                "ClientHello required before authentication",
+                                fatal: true,
+                                originCommand: (ushort)peekedCommand);
+                            session.Close(SessionCloseReason.ProtocolViolation);
+                            return;
+                        }
+
+                        if (!PacketProtocol.IsAuthenticationCommand(peekedCommand))
+                        {
+                            _metrics.ProtocolError();
+                            SendProtocolError(
+                                session,
+                                ProtocolErrorCode.ProtocolViolation,
+                                "command not allowed before authentication",
+                                fatal: true,
+                                originCommand: (ushort)peekedCommand);
+                            session.Close(SessionCloseReason.ProtocolViolation);
+                            return;
+                        }
                     }
 
                     var parseStatus = PacketParser.TryParse(
@@ -592,12 +881,17 @@ internal sealed partial class TcpGatewayService : BackgroundService
                     if (parseStatus == PacketParseStatus.InvalidPacket)
                     {
                         _metrics.ProtocolError();
+                        SendProtocolError(
+                            session,
+                            ProtocolErrorCode.ProtocolViolation,
+                            "invalid packet structure",
+                            fatal: true);
                         session.Close(
                             SessionCloseReason.ProtocolViolation);
                         return;
                     }
 
-                    var payloadLength = frame.Payload.Length;
+                    var payloadLength = (int)frame.Payload.Length;
                     if (!InboundPayloadEarlyValidator.IsPayloadWithinLimit(
                             payloadLength,
                             _options.MaxInboundPayloadBytes))
@@ -608,37 +902,155 @@ internal sealed partial class TcpGatewayService : BackgroundService
                     }
 
                     var frameByteCount = PacketProtocol.HeaderSize +
-                                         (int)payloadLength;
+                                         payloadLength;
+                    var packetCost = PacketProtocol.GetCommandCost(frame.Command);
                     if (!session.RecordInboundTraffic(
                             _options.MaxPacketsPerSecond,
                             _options.MaxInboundBytesPerSecond,
-                            frameByteCount))
+                            frameByteCount,
+                            packetCost))
                     {
-                        session.Close(
-                            SessionCloseReason.RateLimitExceeded);
-                        return;
+                        // 限流为可重试错误：跳过当前帧，不关闭连接。
+                        // 客户端收到 RateLimited + RetryAfter 后应退避重试。
+                        _metrics.ProtocolError();
+                        SendProtocolError(
+                            session,
+                            ProtocolErrorCode.RateLimited,
+                            "inbound rate limit exceeded",
+                            retryAfterMs: 1000,
+                            originCommand: (ushort)frame.Command);
+                        consumed = buffer.Start;
+                        continue;
                     }
 
                     _metrics.PacketReceived();
 
-                    try
+                    // 按 lane 分类调度。
+                    var lane = ClassifyCommandLane(frame.Command);
+
+                    if (lane == CommandLane.Inline)
                     {
-                        await ProcessPacketAsync(
-                                frame,
-                                session,
-                                cancellationToken)
-                            .ConfigureAwait(false);
+                        // Control 命令内联处理：ClientHello/Auth/Heartbeat/PresenceUnwatch。
+                        // 握手、认证、恢复必须在同一读循环内严格串行，禁止入 OrderedWrite。
+                        try
+                        {
+                            await ProcessPacketAsync(
+                                    frame,
+                                    session,
+                                    remoteIp,
+                                    cancellationToken)
+                                .ConfigureAwait(false);
+                        }
+                        catch (JsonException)
+                        {
+                            _metrics.ProtocolError();
+                            session.Close(
+                                SessionCloseReason.ProtocolViolation);
+                            return;
+                        }
                     }
-                    catch (JsonException)
+                    else if (lane == CommandLane.Ephemeral)
                     {
-                        _metrics.ProtocolError();
-                        session.Close(
-                            SessionCloseReason.ProtocolViolation);
-                        return;
+                        // 复制出 Pipe 前预留全局入站预算（所有权从 Pipe 转到 lane 缓冲）。
+                        if (!_globalInboundBudget.TryReserve(payloadLength))
+                        {
+                            session.Close(SessionCloseReason.InboundBudgetExceeded);
+                            return;
+                        }
+
+                        // Ephemeral 命令（Typing）使用普通分配 + DropOldest。
+                        var buffer2 = payloadLength > 0
+                            ? new byte[payloadLength]
+                            : Array.Empty<byte>();
+
+                        if (payloadLength > 0)
+                            frame.Payload.CopyTo(buffer2);
+
+                        var command = new SessionCommand
+                        {
+                            Command = frame.Command,
+                            RentedBuffer = buffer2,
+                            PayloadLength = payloadLength,
+                            IsPooled = false,
+                            ReservedInboundBytes = payloadLength,
+                            InboundBudget = _globalInboundBudget
+                        };
+
+                        // TryEnqueueEphemeral 非阻塞：返回 false 仅在调度器已关闭时。
+                        if (!scheduler.TryEnqueueEphemeral(command))
+                        {
+                            _globalInboundBudget.Release(payloadLength);
+                            return;
+                        }
                     }
+                    else
+                    {
+                        if (!_globalInboundBudget.TryReserve(payloadLength))
+                        {
+                            session.Close(SessionCloseReason.InboundBudgetExceeded);
+                            return;
+                        }
+
+                        // 复制 payload 到 ArrayPool 租用缓冲区，立即释放 Pipe。
+                        var rented = payloadLength > 0
+                            ? ArrayPool<byte>.Shared.Rent(payloadLength)
+                            : Array.Empty<byte>();
+
+                        if (payloadLength > 0)
+                            frame.Payload.CopyTo(rented);
+
+                        var command = new SessionCommand
+                        {
+                            Command = frame.Command,
+                            RentedBuffer = rented,
+                            PayloadLength = payloadLength,
+                            IsPooled = true,
+                            ReservedInboundBytes = payloadLength,
+                            InboundBudget = _globalInboundBudget
+                        };
+
+                        try
+                        {
+                            if (lane == CommandLane.Query)
+                            {
+                                await scheduler.EnqueueQueryAsync(
+                                        command, cancellationToken)
+                                    .ConfigureAwait(false);
+                            }
+                            else
+                            {
+                                await scheduler.EnqueueOrderedAsync(
+                                        command, cancellationToken)
+                                    .ConfigureAwait(false);
+                            }
+                        }
+                        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                        {
+                            // 会话关闭中，归还缓冲区与入站预算并退出。
+                            if (rented.Length > 0)
+                                ArrayPool<byte>.Shared.Return(rented);
+                            _globalInboundBudget.Release(payloadLength);
+                            throw;
+                        }
+                        catch (ChannelClosedException)
+                        {
+                            // 调度器已关闭，归还缓冲区与入站预算并退出。
+                            if (rented.Length > 0)
+                                ArrayPool<byte>.Shared.Return(rented);
+                            _globalInboundBudget.Release(payloadLength);
+                            return;
+                        }
+                    }
+
+                    // 标记此帧已消费（Pipe 可回收对应内存）。
+                    consumed = buffer.Start;
                 }
 
-                reader.AdvanceTo(buffer.Start, buffer.End);
+                var consumedBytes = (int)readBuffer
+                    .Slice(readBuffer.Start, consumed)
+                    .Length;
+                pipeLease.Release(consumedBytes);
+                reader.AdvanceTo(consumed, buffer.End);
 
                 if (result.IsCanceled)
                 {
@@ -668,15 +1080,93 @@ internal sealed partial class TcpGatewayService : BackgroundService
         }
     }
 
+    /// <summary>
+    /// 命令调度 lane 分类。
+    /// Control 命令内联处理；Query 与 OrderedWrite 分到不同 lane 并行处理；
+    /// Ephemeral（Typing）使用 DropOldest，允许丢弃旧帧只保留最新状态。
+    /// </summary>
+    private static CommandLane ClassifyCommandLane(PacketCommand command)
+    {
+        return command switch
+        {
+            // Control：读循环内联处理（同步或必须串行）。ClientHello 必须在握手完成前串行处理。
+            PacketCommand.ClientHello => CommandLane.Inline,
+            PacketCommand.AuthenticationRequest => CommandLane.Inline,
+            PacketCommand.Heartbeat => CommandLane.Inline,
+            PacketCommand.PresenceUnwatch => CommandLane.Inline,
+
+            // Ephemeral：DropOldest，允许丢弃旧帧。Typing 只关心最新状态。
+            PacketCommand.TypingNotify => CommandLane.Ephemeral,
+
+            // Query：与 OrderedWrite 并行，单消费者串行。
+            PacketCommand.MessageHistoryRequest => CommandLane.Query,
+            PacketCommand.ConversationListRequest => CommandLane.Query,
+            PacketCommand.SyncBootstrapRequest => CommandLane.Query,
+            PacketCommand.ListGroupMembersRequest => CommandLane.Query,
+            PacketCommand.PresenceQuery => CommandLane.Query,
+
+            // 其余写操作：OrderedWrite，保持顺序。
+            _ => CommandLane.OrderedWrite
+        };
+    }
+
+    /// <summary>
+    /// 调度器消费者回调。从租用缓冲区构造 PacketFrame，
+    /// 调用既有 ProcessPacketAsync，并捕获异常关闭会话。
+    /// </summary>
+    private async ValueTask ProcessScheduledCommandAsync(
+        SessionCommand command,
+        TcpClientSession session,
+        string remoteIp,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            var frame = new PacketFrame(
+                command.Command,
+                command.AsPayloadSequence());
+            await ProcessPacketAsync(
+                    frame,
+                    session,
+                    remoteIp,
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (JsonException)
+        {
+            _metrics.ProtocolError();
+            session.Close(SessionCloseReason.ProtocolViolation);
+        }
+        catch (SocketException)
+        {
+            session.Close(SessionCloseReason.TransportError);
+        }
+        catch (Exception ex)
+        {
+            _logger.TransportFailed(
+                GatewayTransportOperation.ClientProcessing,
+                session.ConnectionId,
+                ex);
+            session.Close(SessionCloseReason.TransportError);
+        }
+    }
+
     private async ValueTask ProcessPacketAsync(
         PacketFrame frame,
         TcpClientSession session,
+        string remoteIp,
         CancellationToken cancellationToken)
     {
         if (!session.IsAuthenticated &&
-            frame.Command != PacketCommand.AuthenticationRequest)
+            frame.Command != PacketCommand.AuthenticationRequest &&
+            frame.Command != PacketCommand.ClientHello)
         {
             _metrics.ProtocolError();
+            SendProtocolError(session, ProtocolErrorCode.AuthRequired, "authentication required");
             session.Close(SessionCloseReason.ProtocolViolation);
             return;
         }
@@ -689,6 +1179,16 @@ internal sealed partial class TcpGatewayService : BackgroundService
                 await HandleAuthenticationAsync(
                         frame.Payload,
                         session,
+                        remoteIp,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+                break;
+
+            case PacketCommand.ClientHello:
+                await HandleClientHelloAsync(
+                        frame.Payload,
+                        session,
+                        remoteIp,
                         cancellationToken)
                     .ConfigureAwait(false);
                 break;
@@ -807,7 +1307,8 @@ internal sealed partial class TcpGatewayService : BackgroundService
                 break;
 
             case PacketCommand.TypingNotify:
-                HandleTypingNotify(frame.Payload, session);
+                await HandleTypingNotifyAsync(frame.Payload, session, cancellationToken)
+                    .ConfigureAwait(false);
                 break;
 
             case PacketCommand.PresenceQuery:
@@ -816,17 +1317,30 @@ internal sealed partial class TcpGatewayService : BackgroundService
                 break;
 
             case PacketCommand.PresenceUnwatch:
-                HandlePresenceUnwatch(frame.Payload, session);
+                await HandlePresenceUnwatchAsync(frame.Payload, session, cancellationToken)
+                    .ConfigureAwait(false);
+                break;
+
+            case PacketCommand.RegisterPushTokenRequest:
+                await HandleRegisterPushTokenRequestAsync(
+                        frame.Payload,
+                        session,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+                break;
+
+            case PacketCommand.UnregisterPushTokenRequest:
+                await HandleUnregisterPushTokenRequestAsync(
+                        frame.Payload,
+                        session,
+                        cancellationToken)
+                    .ConfigureAwait(false);
                 break;
 
             case PacketCommand.Heartbeat:
-                using (var acknowledgement =
-                       OutboundFrameFactory.CreateEmpty(
-                           PacketCommand.HeartbeatAcknowledgement))
-                {
-                    session.TryQueue(acknowledgement);
-                }
-
+                // 使用静态 pinned Heartbeat ACK 帧，避免每次重复分配。
+                // TryQueue 内部 TryRetain 增加 ref count，SendLoop 发送后 Dispose 减少 ref count。
+                session.TryQueue(OutboundFrameFactory.GetHeartbeatAck());
                 break;
 
             default:
@@ -839,6 +1353,7 @@ internal sealed partial class TcpGatewayService : BackgroundService
     private async ValueTask HandleAuthenticationAsync(
         ReadOnlySequence<byte> payload,
         TcpClientSession session,
+        string remoteIp,
         CancellationToken cancellationToken)
     {
         if (session.IsAuthenticated)
@@ -848,10 +1363,25 @@ internal sealed partial class TcpGatewayService : BackgroundService
             return;
         }
 
+        // 连接状态机：RequireClientHello 时必须先完成握手（含 Resume 路径），再接受认证。
+        if (_options.RequireClientHello && !session.HasCompletedHandshake)
+        {
+            _metrics.ProtocolError();
+            SendProtocolError(
+                session,
+                ProtocolErrorCode.ProtocolViolation,
+                "ClientHello required before authentication",
+                fatal: true,
+                originCommand: (ushort)PacketCommand.AuthenticationRequest);
+            session.Close(SessionCloseReason.ProtocolViolation);
+            return;
+        }
+
         var request = _authenticationRequestCodec.Deserialize(payload);
         if (request is null ||
             string.IsNullOrWhiteSpace(request.AccessToken))
         {
+            _admissionTracker.RecordAuthenticationFailure(remoteIp);
             SendAuthenticationFailure(
                 session,
                 "AccessToken 为空",
@@ -882,6 +1412,7 @@ internal sealed partial class TcpGatewayService : BackgroundService
 
         if (!result.Succeeded)
         {
+            _admissionTracker.RecordAuthenticationFailure(remoteIp);
             SendAuthenticationFailure(
                 session,
                 result.ErrorMessage ?? "Token 无效或已过期",
@@ -889,10 +1420,15 @@ internal sealed partial class TcpGatewayService : BackgroundService
             return;
         }
 
+        // 认证成功，递减未认证计数，释放槽位给新连接。
+        _admissionTracker.MarkAuthenticated();
+        _metrics.UnauthenticatedConnectionClosed();
+
         session.Authenticate(
             result.UserId,
             result.SessionId,
-            result.DeviceIdHash);
+            result.DeviceIdHash,
+            result.DeviceId);
         var becameOnline = _userSessions.Add(session);
         if (becameOnline && _options.EnableEphemeralPresenceAndTyping)
             await PublishPresenceChangedAsync(result.UserId, isOnline: true, cancellationToken)
@@ -909,14 +1445,236 @@ internal sealed partial class TcpGatewayService : BackgroundService
             Success = true,
             UserId = result.UserId,
             SessionId = session.SessionId,
-            DeviceIdHash = result.DeviceIdHash
+            DeviceIdHash = result.DeviceIdHash,
+            DeviceId = result.DeviceId
         };
+
+        // 颁发 ResumeToken 供后续断线重连使用。
+        if (_options.EnableResume && _resumeTokenStore is not null)
+        {
+            try
+            {
+                response.ResumeToken = await _resumeTokenStore.IssueAsync(
+                    new ResumeContext
+                    {
+                        UserId = result.UserId,
+                        SessionId = session.SessionId ?? $"tcp-{session.ConnectionId}",
+                        ConnectionLeaseId = session.ConnectionLeaseId,
+                        DeviceId = result.DeviceId,
+                        DeviceIdHash = result.DeviceIdHash
+                    },
+                    _options.ResumeTokenTtl,
+                    cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.TransportFailed(
+                GatewayTransportOperation.ClientProcessing,
+                session.ConnectionId,
+                ex);
+            }
+        }
 
         using var responseFrame = OutboundFrameFactory.Create(
             PacketCommand.AuthenticationResponse,
             _authenticationResponseCodec,
             response);
         session.TryQueue(responseFrame);
+    }
+
+    private async ValueTask HandleClientHelloAsync(
+        ReadOnlySequence<byte> payload,
+        TcpClientSession session,
+        string remoteIp,
+        CancellationToken cancellationToken)
+    {
+        // 重复 ClientHello 视为协议违例：已认证或已完成握手的会话不应再次发起握手。
+        if (session.IsAuthenticated || session.HasCompletedHandshake)
+        {
+            _metrics.ProtocolError();
+            session.Close(SessionCloseReason.ProtocolViolation);
+            return;
+        }
+
+        // 依赖未注入（测试场景）时静默跳过握手，回退到旧 v1 行为。
+        if (_clientHelloCodec is null || _serverHelloCodec is null || _serverIdentity is null)
+        {
+            return;
+        }
+
+        var hello = _clientHelloCodec.Deserialize(payload);
+        if (hello is null)
+        {
+            SendProtocolError(session, ProtocolErrorCode.InvalidPayload, "invalid ClientHello");
+            session.Close(SessionCloseReason.ProtocolViolation);
+            return;
+        }
+
+        // 协议版本协商：客户端版本须 <= 服务端当前版本。
+        if (hello.ProtocolVersion > PacketProtocol.CurrentProtocolVersion)
+        {
+            SendProtocolError(
+                session,
+                ProtocolErrorCode.UnsupportedVersion,
+                $"unsupported protocol version {hello.ProtocolVersion}",
+                fatal: true);
+            session.Close(SessionCloseReason.ProtocolViolation);
+            return;
+        }
+
+        // 断线重连：客户端携带 ResumeToken 时尝试恢复。
+        if (_options.EnableResume && !string.IsNullOrWhiteSpace(hello.ResumeToken))
+        {
+            var resumed = await TryResumeSessionAsync(
+                hello.ResumeToken!,
+                session,
+                remoteIp,
+                cancellationToken).ConfigureAwait(false);
+
+            if (resumed)
+                return; // 恢复成功，ResumeResponse 已发送。
+
+            // 恢复失败：记录准入失败用于限流统计，再发送 Error 帧，客户端应走完整认证流程。
+            _admissionTracker.RecordAuthenticationFailure(remoteIp);
+            SendProtocolError(
+                session,
+                ProtocolErrorCode.ResumeFailed,
+                "resume token invalid or expired");
+            // 继续发送 ServerHello，客户端可选择重新认证。
+        }
+
+        // 发送 ServerHello 握手响应。
+        var serverHello = new ServerHello
+        {
+            ProtocolVersion = PacketProtocol.CurrentProtocolVersion,
+            FeatureBits = _serverIdentity.FeatureBits,
+            ServerDeviceId = _serverIdentity.ServerDeviceId,
+            ServerTimeMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+            HeartbeatIntervalMs = (int)_options.IdleTimeout.TotalMilliseconds / 2,
+            MaxPayloadBytes = _options.MaxInboundPayloadBytes,
+            ResumeSupported = _options.EnableResume,
+            PayloadFormat = "json"
+        };
+
+        using var helloFrame = OutboundFrameFactory.Create(
+            PacketCommand.ServerHello,
+            _serverHelloCodec,
+            serverHello);
+        session.TryQueue(helloFrame);
+        session.MarkHandshakeCompleted();
+    }
+
+    private async ValueTask<bool> TryResumeSessionAsync(
+        string resumeToken,
+        TcpClientSession session,
+        string remoteIp,
+        CancellationToken cancellationToken)
+    {
+        // 依赖未注入时直接返回 false（不应进入此路径，外层已检查）。
+        if (_resumeTokenStore is null || _resumeResponseCodec is null)
+        {
+            return false;
+        }
+
+        ResumeContext? context;
+        try
+        {
+            context = await _resumeTokenStore
+                .TryValidateAsync(resumeToken, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.DependencyOperationFailed(
+                GatewayDependency.Redis,
+                GatewayDependencyOperation.ResumeTokenLookup,
+                ex);
+            return false;
+        }
+
+        if (context is null)
+            return false;
+
+        // 恢复会话：复用原 UserId/SessionId/DeviceId。
+        session.Authenticate(
+            context.UserId,
+            context.SessionId,
+            context.DeviceIdHash,
+            context.DeviceId);
+        session.MarkHandshakeCompleted();
+
+        _admissionTracker.MarkAuthenticated();
+        _metrics.UnauthenticatedConnectionClosed();
+
+        if (_userSessions.Add(session) && _options.EnableEphemeralPresenceAndTyping)
+        {
+            await PublishPresenceChangedAsync(context.UserId, isOnline: true, cancellationToken)
+                .ConfigureAwait(false);
+        }
+
+        // 设备租约接管：原 ConnectionLeaseId 已随旧连接释放，这里用新 Session 的 ConnectionLeaseId 重新获取。
+        try
+        {
+            await _deviceSessionLeaseStore.TakeOverAsync(
+                context.UserId,
+                context.DeviceIdHash ?? 0,
+                context.SessionId,
+                session.ConnectionLeaseId,
+                _options.IdleTimeout + TimeSpan.FromMinutes(5),
+                cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.TransportFailed(
+                GatewayTransportOperation.ClientProcessing,
+                session.ConnectionId,
+                ex);
+        }
+
+        // 颁发新的 ResumeToken（旧 Token 已被消费）。
+        string? newToken = null;
+        if (_options.EnableResume)
+        {
+            try
+            {
+                newToken = await _resumeTokenStore.IssueAsync(
+                    new ResumeContext
+                    {
+                        UserId = context.UserId,
+                        SessionId = context.SessionId,
+                        ConnectionLeaseId = session.ConnectionLeaseId,
+                        DeviceId = context.DeviceId,
+                        DeviceIdHash = context.DeviceIdHash
+                    },
+                    _options.ResumeTokenTtl,
+                    cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.TransportFailed(
+                GatewayTransportOperation.ClientProcessing,
+                session.ConnectionId,
+                ex);
+            }
+        }
+
+        var response = new ResumeResponse
+        {
+            Success = true,
+            ResumeToken = newToken,
+            UserId = context.UserId,
+            SessionId = context.SessionId,
+            DeviceId = context.DeviceId,
+            LastConversationSequence = null // 后续可从同步服务查询
+        };
+
+        using var responseFrame = OutboundFrameFactory.Create(
+            PacketCommand.ResumeResponse,
+            _resumeResponseCodec,
+            response);
+        session.TryQueue(responseFrame);
+
+        return true;
     }
 
     private async ValueTask ReplaceSameDeviceSessionsAsync(
@@ -942,19 +1700,20 @@ internal sealed partial class TcpGatewayService : BackgroundService
         string? previousSessionId;
         try
         {
+            // 传入 ConnectionLeaseId 作为所有权令牌。
             previousSessionId = await _deviceSessionLeaseStore
                 .TakeOverAsync(
                     incoming.UserId,
                     deviceHash,
                     incoming.SessionId,
+                    incoming.ConnectionLeaseId,
                     leaseTtl,
                     cancellationToken)
                 .ConfigureAwait(false);
         }
         catch (Exception exception)
         {
-            LogSessionRevokePublishFailed(
-                _logger,
+            _logger.SessionRevocationFailed(
                 incoming.ConnectionId,
                 incoming.SessionId,
                 exception);
@@ -993,8 +1752,7 @@ internal sealed partial class TcpGatewayService : BackgroundService
         }
         catch (Exception exception)
         {
-            LogSessionRevokePublishFailed(
-                _logger,
+            _logger.SessionRevocationFailed(
                 incoming.ConnectionId,
                 previousSessionId,
                 exception);
@@ -1032,8 +1790,7 @@ internal sealed partial class TcpGatewayService : BackgroundService
         }
         catch (Exception exception)
         {
-            LogSessionRevokePublishFailed(
-                _logger,
+            _logger.SessionRevocationFailed(
                 victim.ConnectionId,
                 victim.SessionId,
                 exception);
@@ -1068,6 +1825,41 @@ internal sealed partial class TcpGatewayService : BackgroundService
             session.Close(
                 SessionCloseReason.AuthenticationRejected);
         }
+    }
+
+    /// <summary>
+    /// 发送协议级 Error 帧（PacketCommand.Error = 500）。
+    /// 依赖未注入（测试场景）时静默跳过，仅记录指标。
+    /// </summary>
+    private void SendProtocolError(
+        TcpClientSession session,
+        ProtocolErrorCode code,
+        string? message = null,
+        bool fatal = false,
+        int? retryAfterMs = null,
+        ushort? originCommand = null)
+    {
+        // 测试场景下 _protocolErrorFrameCodec 可能为 null，跳过 Error 帧发送。
+        if (_protocolErrorFrameCodec is null)
+        {
+            return;
+        }
+
+        var error = new ProtocolErrorFrame
+        {
+            Code = code,
+            Fatal = fatal || code.IsFatal(),
+            RetryAfterMs = retryAfterMs,
+            Message = message,
+            OriginCommand = originCommand
+        };
+
+        using var frame = OutboundFrameFactory.Create(
+            PacketCommand.Error,
+            _protocolErrorFrameCodec,
+            error);
+        // Critical 等级：使用 TryQueue 保证发送（满时关闭连接）。
+        session.TryQueue(frame, closeAfterSend: fatal ? SessionCloseReason.ProtocolViolation : null);
     }
 
     private async ValueTask HandleChatMessageAsync(
@@ -1169,6 +1961,8 @@ internal sealed partial class TcpGatewayService : BackgroundService
             ForwardedFromPreview = string.IsNullOrWhiteSpace(message.ForwardedFromPreview)
                 ? null
                 : TruncateForwardedPreview(message.ForwardedFromPreview),
+            MentionedUserIds = NormalizeMentionedUserIds(message.MentionedUserIds, isGroup, sender.UserId),
+            MentionedRoles = NormalizeMentionedRoles(message.MentionedRoles, isGroup),
             ReceivedAtMs = _timeProvider
                 .GetUtcNow()
                 .ToUnixTimeMilliseconds()
@@ -1197,8 +1991,9 @@ internal sealed partial class TcpGatewayService : BackgroundService
         catch (Exception exception)
         {
             _metrics.MessagePublishFailed();
-            LogMessagePublishFailed(
-                _logger,
+            _metrics.CommandFailed(PacketCommand.ChatMessage);
+            _logger.CommandFailed(
+                PacketCommand.ChatMessage,
                 sender.ConnectionId,
                 commandId,
                 exception);
@@ -1266,8 +2061,9 @@ internal sealed partial class TcpGatewayService : BackgroundService
         catch (Exception exception)
         {
             _metrics.ReceiptPublishFailed();
-            LogReceiptPublishFailed(
-                _logger,
+            _metrics.CommandFailed(PacketCommand.MessageReceipt);
+            _logger.CommandFailed(
+                PacketCommand.MessageReceipt,
                 receiver.ConnectionId,
                 commandId,
                 exception);
@@ -1391,7 +2187,7 @@ internal sealed partial class TcpGatewayService : BackgroundService
                     MessageId = page.NextCursor.MessageId
                 };
 
-            // P0-6：按字节预算截断，确保响应可装入单帧 TCP Payload。
+            // 按字节预算截断，确保响应可装入单帧 TCP Payload。
             // 截断时以第 k 条（最后保留条目）派生新 NextCursor，HasMore=true。
             var response = ResponseByteBudget.Truncate(
                 new MessageHistoryResponse
@@ -1443,8 +2239,9 @@ internal sealed partial class TcpGatewayService : BackgroundService
         catch (Exception exception)
         {
             _metrics.HistoryQueryFailed();
-            LogHistoryQueryFailed(
-                _logger,
+            _metrics.CommandFailed(PacketCommand.MessageHistoryRequest);
+            _logger.CommandFailed(
+                PacketCommand.MessageHistoryRequest,
                 session.ConnectionId,
                 requestId,
                 exception);
@@ -1561,7 +2358,7 @@ internal sealed partial class TcpGatewayService : BackgroundService
                     ConversationId = page.NextCursor.ConversationId
                 };
 
-            // P0-6：按字节预算截断，确保响应可装入单帧 TCP Payload。
+            // 按字节预算截断，确保响应可装入单帧 TCP Payload。
             // 截断时以第 k 条（最后保留条目）派生新 NextCursor，HasMore=true。
             var response = ResponseByteBudget.Truncate(
                 new ConversationListResponse
@@ -1615,8 +2412,9 @@ internal sealed partial class TcpGatewayService : BackgroundService
         catch (Exception exception)
         {
             _metrics.HistoryQueryFailed();
-            LogConversationListQueryFailed(
-                _logger,
+            _metrics.CommandFailed(PacketCommand.ConversationListRequest);
+            _logger.CommandFailed(
+                PacketCommand.ConversationListRequest,
                 session.ConnectionId,
                 requestId,
                 exception);
@@ -1708,8 +2506,9 @@ internal sealed partial class TcpGatewayService : BackgroundService
         }
         catch (Exception exception)
         {
-            LogConversationMarkReadFailed(
-                _logger,
+            _metrics.CommandFailed(PacketCommand.ConversationMarkReadRequest);
+            _logger.CommandFailed(
+                PacketCommand.ConversationMarkReadRequest,
                 session.ConnectionId,
                 requestId,
                 exception);
@@ -1799,8 +2598,9 @@ internal sealed partial class TcpGatewayService : BackgroundService
         }
         catch (Exception exception)
         {
-            LogConversationSetPrefsFailed(
-                _logger,
+            _metrics.CommandFailed(PacketCommand.ConversationSetPrefsRequest);
+            _logger.CommandFailed(
+                PacketCommand.ConversationSetPrefsRequest,
                 session.ConnectionId,
                 requestId,
                 exception);
@@ -1989,7 +2789,7 @@ internal sealed partial class TcpGatewayService : BackgroundService
                 })
                 .ToArray();
 
-            // P0-6：按字节预算截断 SyncBootstrap 响应。
+            // 按字节预算截断 SyncBootstrap 响应。
             var conversationsBudget = PacketProtocol.WireResponseSoftLimit / 2;
             var perCatchUpBudget = mappedCatchUps.Length > 0
                 ? (PacketProtocol.WireResponseSoftLimit - conversationsBudget) / mappedCatchUps.Length
@@ -2088,8 +2888,9 @@ internal sealed partial class TcpGatewayService : BackgroundService
         catch (Exception exception)
         {
             _metrics.HistoryQueryFailed();
-            LogSyncBootstrapQueryFailed(
-                _logger,
+            _metrics.CommandFailed(PacketCommand.SyncBootstrapRequest);
+            _logger.CommandFailed(
+                PacketCommand.SyncBootstrapRequest,
                 session.ConnectionId,
                 requestId,
                 exception);
@@ -2177,7 +2978,12 @@ internal sealed partial class TcpGatewayService : BackgroundService
         }
         catch (Exception ex)
         {
-            LogCreateGroupFailed(_logger, request.RequestId, ex);
+            _metrics.CommandFailed(PacketCommand.CreateGroupRequest);
+            _logger.CommandFailed(
+                PacketCommand.CreateGroupRequest,
+                session.ConnectionId,
+                request.RequestId,
+                ex);
             SendCreateGroupResponse(session, new CreateGroupResponse
             {
                 RequestId = request.RequestId,
@@ -2215,6 +3021,7 @@ internal sealed partial class TcpGatewayService : BackgroundService
 
         await SendGroupCommandAsync(
                 session,
+                PacketCommand.AddGroupMembersRequest,
                 new Realtime.Abstractions.Conversations.GroupConversationCommand
                 {
                     RequestId = request.RequestId,
@@ -2266,6 +3073,7 @@ internal sealed partial class TcpGatewayService : BackgroundService
 
         await SendGroupCommandAsync(
                 session,
+                PacketCommand.RemoveGroupMemberRequest,
                 new Realtime.Abstractions.Conversations.GroupConversationCommand
                 {
                     RequestId = request.RequestId,
@@ -2315,6 +3123,7 @@ internal sealed partial class TcpGatewayService : BackgroundService
 
         await SendGroupCommandAsync(
                 session,
+                PacketCommand.LeaveGroupRequest,
                 new Realtime.Abstractions.Conversations.GroupConversationCommand
                 {
                     RequestId = request.RequestId,
@@ -2364,6 +3173,7 @@ internal sealed partial class TcpGatewayService : BackgroundService
 
         await SendGroupCommandAsync(
                 session,
+                PacketCommand.ChangeMemberRoleRequest,
                 new Realtime.Abstractions.Conversations.GroupConversationCommand
                 {
                     RequestId = request.RequestId,
@@ -2414,6 +3224,7 @@ internal sealed partial class TcpGatewayService : BackgroundService
 
         await SendGroupCommandAsync(
                 session,
+                PacketCommand.ListGroupMembersRequest,
                 new Realtime.Abstractions.Conversations.GroupConversationCommand
                 {
                     RequestId = request.RequestId,
@@ -2439,6 +3250,7 @@ internal sealed partial class TcpGatewayService : BackgroundService
 
     private async ValueTask SendGroupCommandAsync<TResponse>(
         TcpClientSession session,
+        PacketCommand requestCommand,
         Realtime.Abstractions.Conversations.GroupConversationCommand command,
         Func<Realtime.Abstractions.Conversations.GroupConversationResult, TResponse> map,
         PacketCommand responseCommand,
@@ -2453,7 +3265,12 @@ internal sealed partial class TcpGatewayService : BackgroundService
         }
         catch (Exception ex)
         {
-            LogGroupCommandFailed(_logger, command.RequestId, ex);
+            _metrics.CommandFailed(requestCommand);
+            _logger.CommandFailed(
+                requestCommand,
+                session.ConnectionId,
+                command.RequestId,
+                ex);
             SendGroupMutateResponse(
                 session,
                 responseCommand,
@@ -2579,8 +3396,9 @@ internal sealed partial class TcpGatewayService : BackgroundService
         }
         catch (Exception exception)
         {
-            LogMessageRecallFailed(
-                _logger,
+            _metrics.CommandFailed(PacketCommand.MessageRecallRequest);
+            _logger.CommandFailed(
+                PacketCommand.MessageRecallRequest,
                 session.ConnectionId,
                 requestId,
                 exception);
@@ -2683,8 +3501,9 @@ internal sealed partial class TcpGatewayService : BackgroundService
         }
         catch (Exception exception)
         {
-            LogMessageEditFailed(
-                _logger,
+            _metrics.CommandFailed(PacketCommand.MessageEditRequest);
+            _logger.CommandFailed(
+                PacketCommand.MessageEditRequest,
                 session.ConnectionId,
                 requestId,
                 exception);
@@ -2786,8 +3605,9 @@ internal sealed partial class TcpGatewayService : BackgroundService
         }
         catch (Exception exception)
         {
-            LogAddReactionFailed(
-                _logger,
+            _metrics.CommandFailed(PacketCommand.AddReactionRequest);
+            _logger.CommandFailed(
+                PacketCommand.AddReactionRequest,
                 session.ConnectionId,
                 requestId,
                 exception);
@@ -2878,8 +3698,9 @@ internal sealed partial class TcpGatewayService : BackgroundService
         }
         catch (Exception exception)
         {
-            LogRemoveReactionFailed(
-                _logger,
+            _metrics.CommandFailed(PacketCommand.RemoveReactionRequest);
+            _logger.CommandFailed(
+                PacketCommand.RemoveReactionRequest,
                 session.ConnectionId,
                 requestId,
                 exception);
@@ -2948,37 +3769,44 @@ internal sealed partial class TcpGatewayService : BackgroundService
     /// 默认关闭（<see cref="TcpGatewayOptions.EnableEphemeralPresenceAndTyping"/>）。
     /// 要求 ConversationId 与双方用户匹配（私聊成员校验）。
     /// </summary>
-    private void HandleTypingNotify(
+    private async ValueTask HandleTypingNotifyAsync(
         ReadOnlySequence<byte> payload,
-        TcpClientSession session)
+        TcpClientSession session,
+        CancellationToken cancellationToken)
     {
         if (!_options.EnableEphemeralPresenceAndTyping)
             return;
 
         var notify = _typingNotifyCodec.Deserialize(payload);
-        if (notify is null
-            || notify.TargetUserId <= 0
-            || notify.TargetUserId == session.UserId)
-        {
+        if (notify is null || string.IsNullOrWhiteSpace(notify.ConversationId))
             return;
-        }
 
-        if (!TryAuthorizeDirectConversation(
+        // 从 conversationId 推导 TargetUserId，忽略客户端提交的 TargetUserId。
+        if (!TryResolveDirectConversationTarget(
                 notify.ConversationId,
                 session.UserId,
-                notify.TargetUserId,
-                out var conversationId))
+                out var conversationId,
+                out var targetUserId))
         {
             return;
         }
 
-        // P0-2: 发射路径由协调器统一管理。TryAccept 内部决定是否发射：
+        // 授权校验：检查双方是否好友或同属一会话，且未被拉黑。
+        // 授权器未注入（测试场景）时跳过校验，回退到仅会话 ID 解析行为。
+        if (_directConversationAuthorizer is not null)
+        {
+            var allowed = await _directConversationAuthorizer
+                .AuthorizeAsync(session.UserId, targetUserId, cancellationToken)
+                .ConfigureAwait(false);
+            if (!allowed)
+                return;
+        }
+
+        // 发射路径由协调器统一管理。TryAccept 内部决定是否发射：
         // 限频命中、全局/单用户槽位超限、无活跃 typing 的 isTyping=false 均不发射。
-        // 本机扇出与 ephemeral 发布由 RunTypingEmissionConsumerAsync 消费 ReadEmissionsAsync 完成，
-        // 过期由时间轮 pump 负责，不再为此处创建独立 Task.Delay。
         _typingFanout.TryAccept(
             session.UserId,
-            notify.TargetUserId,
+            targetUserId,
             conversationId,
             notify.IsTyping);
     }
@@ -3008,7 +3836,13 @@ internal sealed partial class TcpGatewayService : BackgroundService
         }
         catch (Exception ex)
         {
-            LogEphemeralTypingPublishFailed(_logger, evt.TargetUserId, ex);
+            _metrics.DependencyOperationFailed(
+                GatewayDependency.RealtimeService,
+                GatewayDependencyOperation.EphemeralTypingPublish);
+            _logger.DependencyOperationFailed(
+                GatewayDependency.RealtimeService,
+                GatewayDependencyOperation.EphemeralTypingPublish,
+                ex);
         }
     }
 
@@ -3034,11 +3868,11 @@ internal sealed partial class TcpGatewayService : BackgroundService
             _typingUpdateCodec,
             update);
         foreach (var target in targets)
-            target.TryQueue(frame);
+            target.TryQueueEphemeral(frame);
     }
 
     /// <summary>
-    /// P0-2: Typing 时间轮 pump 与发射消费统一由本任务驱动。
+    /// Typing 时间轮 pump 与发射消费统一由本任务驱动。
     /// pump 按 tick 推进过期扫描；消费方从 <see cref="TypingFanoutCoordinator.ReadEmissionsAsync"/>
     /// 拉取合并后的最新状态执行本机扇出与 ephemeral 发布。
     /// </summary>
@@ -3097,10 +3931,10 @@ internal sealed partial class TcpGatewayService : BackgroundService
                 }
                 catch (Exception ex)
                 {
-                    LogTypingFanoutFailed(
-                        _logger,
-                        emission.SenderUserId,
-                        emission.ConversationId,
+                    _metrics.EphemeralEventDropped("typing_fanout_failed");
+                    _logger.DependencyOperationFailed(
+                        GatewayDependency.RealtimeService,
+                        GatewayDependencyOperation.EphemeralTypingPublish,
                         ex);
                 }
             }
@@ -3112,21 +3946,45 @@ internal sealed partial class TcpGatewayService : BackgroundService
         }
     }
 
-    private static bool TryAuthorizeDirectConversation(
+    /// <summary>
+    /// 从 conversationId 解析私聊会话的另一方用户 Id。
+    /// <para>
+    /// 以 conversationId 为权威源，忽略客户端提交的 TargetUserId：
+    /// <list type="bullet">
+    /// <item>解析 dm:lo:hi 格式，校验 sender（session.UserId）必须是会话成员。</item>
+    /// <item>target 为会话另一方，防止客户端伪造 TargetUserId 向任意用户发送 Typing。</item>
+    /// </list>
+    /// 后续可在此处插入 membership/block 缓存查询，检查会话存在性、成员关系、拉黑状态。
+    /// </para>
+    /// </summary>
+    private static bool TryResolveDirectConversationTarget(
         string? conversationId,
-        long userA,
-        long userB,
-        out string normalizedId)
+        long senderUserId,
+        out string normalizedId,
+        out long targetUserId)
     {
         normalizedId = string.Empty;
-        if (string.IsNullOrWhiteSpace(conversationId))
+        targetUserId = 0;
+
+        if (string.IsNullOrWhiteSpace(conversationId) || senderUserId <= 0)
             return false;
 
-        var expected = Realtime.Abstractions.Conversations.ConversationId.CreateDirect(userA, userB);
-        if (!string.Equals(conversationId.Trim(), expected, StringComparison.Ordinal))
+        var trimmed = conversationId.Trim();
+        if (!Realtime.Abstractions.Conversations.ConversationId.TryParseDirect(
+                trimmed,
+                out var userLo,
+                out var userHi))
+        {
+            return false;
+        }
+
+        // sender 必须是会话成员。
+        if (senderUserId != userLo && senderUserId != userHi)
             return false;
 
-        normalizedId = expected;
+        // target 为另一方。
+        targetUserId = senderUserId == userLo ? userHi : userLo;
+        normalizedId = trimmed;
         return true;
     }
 
@@ -3171,20 +4029,87 @@ internal sealed partial class TcpGatewayService : BackgroundService
                     },
                     cancellationToken)
                 .ConfigureAwait(false);
-            allowedIds =
-            [
-                .. auth.AllowedUserIds
-                    .Where(static id => id > 0)
-                    .Distinct()
-            ];
+
+            // 授权结果与原始请求集合做交集。
+            // 授权服务若返回请求范围外的用户（实现 bug 或协议变更），Gateway 不得订阅或返回其在线状态。
+            // 此处使用 HashSet 做 O(1) 交集，保留 requested 顺序以便客户端映射。
+            if (auth.AllowedUserIds is null || auth.AllowedUserIds.Count == 0)
+            {
+                allowedIds = [];
+            }
+            else if (requested.Length == 0)
+            {
+                allowedIds = [];
+            }
+            else
+            {
+                var requestedSet = requested.Length <= 64
+                    ? null
+                    : new HashSet<long>(requested);
+                var result = new List<long>(Math.Min(requested.Length, auth.AllowedUserIds.Count));
+                foreach (var id in auth.AllowedUserIds)
+                {
+                    if (id <= 0)
+                        continue;
+                    // 交集：id 必须在 requested 中。
+                    if (requestedSet is not null)
+                    {
+                        if (requestedSet.Contains(id) && !result.Contains(id))
+                            result.Add(id);
+                    }
+                    else
+                    {
+                        // 小集合线性扫描避免 HashSet 分配。
+                        var found = false;
+                        foreach (var rid in requested)
+                        {
+                            if (rid == id)
+                            {
+                                found = true;
+                                break;
+                            }
+                        }
+                        if (found && !result.Contains(id))
+                            result.Add(id);
+                    }
+                }
+                allowedIds = result.ToArray();
+            }
         }
         catch (Exception ex)
         {
-            LogPresenceAuthorizeFailed(_logger, session.UserId, ex);
+            _metrics.PresenceQueryFailed();
+            _logger.DependencyOperationFailed(
+                GatewayDependency.Redis,
+                GatewayDependencyOperation.PresenceAuthorize,
+                ex);
             allowedIds = [];
         }
 
         _presenceWatchers.WatchMany(allowedIds, session.UserId);
+
+        // 分片路由：将被观察用户与本实例的对应关系登记到全局 watcher 目录，
+        // 供 Presence 事件发布方定向投递。失败不阻断查询响应。
+        if (allowedIds.Length > 0)
+        {
+            try
+            {
+                await _watcherDirectory
+                    .RegisterWatchersAsync(
+                        session.UserId,
+                        allowedIds,
+                        _integrationOptions.InstanceId,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.DependencyOperationFailed(
+                    GatewayDependency.Redis,
+                    GatewayDependencyOperation.WatcherDirectoryQuery,
+                    ex);
+            }
+        }
 
         IReadOnlyDictionary<long, bool> onlineMap;
         try
@@ -3224,9 +4149,10 @@ internal sealed partial class TcpGatewayService : BackgroundService
         session.TryQueue(outbound);
     }
 
-    private void HandlePresenceUnwatch(
+    private async ValueTask HandlePresenceUnwatchAsync(
         ReadOnlySequence<byte> payload,
-        TcpClientSession session)
+        TcpClientSession session,
+        CancellationToken cancellationToken)
     {
         if (!_options.EnableEphemeralPresenceAndTyping)
             return;
@@ -3242,6 +4168,254 @@ internal sealed partial class TcpGatewayService : BackgroundService
             .Take(100)
             .ToArray();
         _presenceWatchers.UnwatchMany(userIds, selfUserId);
+
+        // 分片路由：从全局 watcher 目录注销对应关系。失败不阻断客户端请求。
+        if (userIds.Length > 0)
+        {
+            try
+            {
+                await _watcherDirectory
+                    .UnregisterWatchersAsync(
+                        selfUserId,
+                        userIds,
+                        _integrationOptions.InstanceId,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.DependencyOperationFailed(
+                    GatewayDependency.Redis,
+                    GatewayDependencyOperation.WatcherDirectoryQuery,
+                    ex);
+            }
+        }
+    }
+
+    /// <summary>
+    /// 注册设备推送令牌。按 (userId, deviceIdHash) 幂等覆盖；超出每用户上限时按最旧淘汰。
+    /// deviceIdHash 取自认证会话，忽略客户端传入；token 字符串长度上限由 <see cref="PushTokenLimits"/> 限制。
+    /// </summary>
+    private async ValueTask HandleRegisterPushTokenRequestAsync(
+        ReadOnlySequence<byte> payload,
+        TcpClientSession session,
+        CancellationToken cancellationToken)
+    {
+        if (_pushTokenStore is null || _registerPushTokenRequestCodec is null)
+        {
+            _metrics.ProtocolError();
+            session.Close(SessionCloseReason.ProtocolViolation);
+            return;
+        }
+
+        var request = _registerPushTokenRequestCodec.Deserialize(payload);
+        if (request is null)
+        {
+            _metrics.ProtocolError();
+            session.Close(SessionCloseReason.ProtocolViolation);
+            return;
+        }
+
+        var requestId = string.IsNullOrWhiteSpace(request.RequestId)
+            ? Guid.CreateVersion7().ToString("N")
+            : request.RequestId;
+        if (requestId.Length > PushTokenLimits.MaxRequestIdLength
+            || !Enum.IsDefined(request.Platform)
+            || request.Platform == 0
+            || string.IsNullOrWhiteSpace(request.Token)
+            || request.Token.Length > PushTokenLimits.MaxTokenLength
+            || (request.AppDeviceLabel is { Length: > PushTokenLimits.MaxAppDeviceLabelLength })
+            || session.DeviceIdHash is null or 0)
+        {
+            SendRegisterPushTokenResponse(
+                session,
+                new RegisterPushTokenResponse
+                {
+                    RequestId = requestId.Length <= PushTokenLimits.MaxRequestIdLength
+                        ? requestId
+                        : string.Empty,
+                    Succeeded = false,
+                    ErrorCode = "invalid_push_token_request",
+                    ErrorMessage = "推送令牌注册请求参数无效。"
+                });
+            return;
+        }
+
+        try
+        {
+            var activeCount = await _pushTokenStore
+                .RegisterAsync(
+                    session.UserId,
+                    session.DeviceIdHash!.Value,
+                    request.Platform,
+                    request.Token,
+                    string.IsNullOrWhiteSpace(request.AppDeviceLabel)
+                        ? null
+                        : request.AppDeviceLabel,
+                    cancellationToken)
+                .ConfigureAwait(false);
+
+            SendRegisterPushTokenResponse(
+                session,
+                new RegisterPushTokenResponse
+                {
+                    RequestId = requestId,
+                    Succeeded = true,
+                    ActiveTokenCount = activeCount
+                });
+        }
+        catch (OperationCanceledException)
+            when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception exception)
+        {
+            _metrics.CommandFailed(PacketCommand.RegisterPushTokenRequest);
+            _logger.CommandFailed(
+                PacketCommand.RegisterPushTokenRequest,
+                session.ConnectionId,
+                requestId,
+                exception);
+            SendRegisterPushTokenResponse(
+                session,
+                new RegisterPushTokenResponse
+                {
+                    RequestId = requestId,
+                    Succeeded = false,
+                    ErrorCode = "push_token_store_unavailable",
+                    ErrorMessage = "推送令牌存储暂不可用。"
+                });
+        }
+    }
+
+    /// <summary>
+    /// 注销推送令牌。未传 Token 时按当前连接 deviceIdHash 注销该设备全部令牌；
+    /// 传 Token 时按字符串精确注销（可跨设备，适合平台令牌失效场景）。
+    /// </summary>
+    private async ValueTask HandleUnregisterPushTokenRequestAsync(
+        ReadOnlySequence<byte> payload,
+        TcpClientSession session,
+        CancellationToken cancellationToken)
+    {
+        if (_pushTokenStore is null || _unregisterPushTokenRequestCodec is null)
+        {
+            _metrics.ProtocolError();
+            session.Close(SessionCloseReason.ProtocolViolation);
+            return;
+        }
+
+        var request = _unregisterPushTokenRequestCodec.Deserialize(payload);
+        if (request is null)
+        {
+            _metrics.ProtocolError();
+            session.Close(SessionCloseReason.ProtocolViolation);
+            return;
+        }
+
+        var requestId = string.IsNullOrWhiteSpace(request.RequestId)
+            ? Guid.CreateVersion7().ToString("N")
+            : request.RequestId;
+        if (requestId.Length > PushTokenLimits.MaxRequestIdLength
+            || (request.Token is { Length: > PushTokenLimits.MaxTokenLength })
+            || (string.IsNullOrWhiteSpace(request.Token) && session.DeviceIdHash is null or 0))
+        {
+            SendUnregisterPushTokenResponse(
+                session,
+                new UnregisterPushTokenResponse
+                {
+                    RequestId = requestId.Length <= PushTokenLimits.MaxRequestIdLength
+                        ? requestId
+                        : string.Empty,
+                    Succeeded = false,
+                    ErrorCode = "invalid_push_token_request",
+                    ErrorMessage = "推送令牌注销请求参数无效。"
+                });
+            return;
+        }
+
+        try
+        {
+            int activeCount;
+            if (!string.IsNullOrWhiteSpace(request.Token))
+            {
+                activeCount = await _pushTokenStore
+                    .UnregisterByTokenAsync(
+                        session.UserId,
+                        request.Token,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            else
+            {
+                activeCount = await _pushTokenStore
+                    .UnregisterByDeviceAsync(
+                        session.UserId,
+                        session.DeviceIdHash!.Value,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+            }
+
+            SendUnregisterPushTokenResponse(
+                session,
+                new UnregisterPushTokenResponse
+                {
+                    RequestId = requestId,
+                    Succeeded = true,
+                    ActiveTokenCount = activeCount
+                });
+        }
+        catch (OperationCanceledException)
+            when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception exception)
+        {
+            _metrics.CommandFailed(PacketCommand.UnregisterPushTokenRequest);
+            _logger.CommandFailed(
+                PacketCommand.UnregisterPushTokenRequest,
+                session.ConnectionId,
+                requestId,
+                exception);
+            SendUnregisterPushTokenResponse(
+                session,
+                new UnregisterPushTokenResponse
+                {
+                    RequestId = requestId,
+                    Succeeded = false,
+                    ErrorCode = "push_token_store_unavailable",
+                    ErrorMessage = "推送令牌存储暂不可用。"
+                });
+        }
+    }
+
+    private void SendRegisterPushTokenResponse(
+        TcpClientSession session,
+        RegisterPushTokenResponse response)
+    {
+        if (_registerPushTokenResponseCodec is null)
+            return;
+
+        using var frame = OutboundFrameFactory.Create(
+            PacketCommand.RegisterPushTokenResponse,
+            _registerPushTokenResponseCodec,
+            response);
+        session.TryQueue(frame);
+    }
+
+    private void SendUnregisterPushTokenResponse(
+        TcpClientSession session,
+        UnregisterPushTokenResponse response)
+    {
+        if (_unregisterPushTokenResponseCodec is null)
+            return;
+
+        using var frame = OutboundFrameFactory.Create(
+            PacketCommand.UnregisterPushTokenResponse,
+            _unregisterPushTokenResponseCodec,
+            response);
+        session.TryQueue(frame);
     }
 
     private async Task PublishPresenceChangedAsync(
@@ -3249,16 +4423,23 @@ internal sealed partial class TcpGatewayService : BackgroundService
         bool isOnline,
         CancellationToken cancellationToken)
     {
+        // 只在全局状态转换（0->1 或 1->0）时广播与发布跨网关事件。
+        // 旧实现每实例本地首连/断开都无条件广播，导致多实例登录时互相覆盖、误报下线。
+        PresenceTransition transition;
         if (isOnline)
-            await _globalPresence
+            transition = await _globalPresence
                 .SetOnlineAsync(userId, _integrationOptions.InstanceId, cancellationToken)
                 .ConfigureAwait(false);
         else
-            await _globalPresence
+            transition = await _globalPresence
                 .SetOfflineAsync(userId, _integrationOptions.InstanceId, cancellationToken)
                 .ConfigureAwait(false);
 
-        BroadcastPresenceChangedLocal(userId, isOnline);
+        if (transition == PresenceTransition.None)
+            return;
+
+        var globalIsOnline = transition == PresenceTransition.WentOnline;
+        BroadcastPresenceChangedLocal(userId, globalIsOnline);
 
         try
         {
@@ -3268,14 +4449,20 @@ internal sealed partial class TcpGatewayService : BackgroundService
                     {
                         OriginInstanceId = _integrationOptions.InstanceId,
                         UserId = userId,
-                        IsOnline = isOnline
+                        IsOnline = globalIsOnline
                     },
                     cancellationToken)
                 .ConfigureAwait(false);
         }
         catch (Exception ex)
         {
-            LogEphemeralPresencePublishFailed(_logger, userId, ex);
+            _metrics.DependencyOperationFailed(
+                GatewayDependency.RealtimeService,
+                GatewayDependencyOperation.EphemeralPresencePublish);
+            _logger.DependencyOperationFailed(
+                GatewayDependency.RealtimeService,
+                GatewayDependencyOperation.EphemeralPresencePublish,
+                ex);
         }
     }
 
@@ -3298,7 +4485,7 @@ internal sealed partial class TcpGatewayService : BackgroundService
         foreach (var watcherId in watchers)
         {
             foreach (var watcherSession in _userSessions.GetSnapshot(watcherId))
-                watcherSession.TryQueue(frame);
+                watcherSession.TryQueueEphemeral(frame);
         }
     }
 
@@ -3366,6 +4553,60 @@ internal sealed partial class TcpGatewayService : BackgroundService
         return trimmed.Length <= ChatMessageLimits.MaxForwardedFromPreviewLength
             ? trimmed
             : trimmed[..ChatMessageLimits.MaxForwardedFromPreviewLength];
+    }
+
+    /// <summary>
+    /// 规整 @ 用户 Id 列表：非群聊返回 null；去重、去自提及非正 Id；超额截断。
+    /// </summary>
+    internal static List<long>? NormalizeMentionedUserIds(
+        IReadOnlyList<long>? raw,
+        bool isGroup,
+        long senderUserId)
+    {
+        if (!isGroup || raw is null || raw.Count == 0)
+            return null;
+
+        var seen = new HashSet<long>();
+        var result = new List<long>(Math.Min(raw.Count, ChatMessageLimits.MaxMentionedUserIds));
+        foreach (var id in raw)
+        {
+            if (id <= 0 || id == senderUserId)
+                continue;
+            if (seen.Add(id))
+                result.Add(id);
+            if (result.Count >= ChatMessageLimits.MaxMentionedUserIds)
+                break;
+        }
+
+        return result.Count == 0 ? null : result;
+    }
+
+    /// <summary>
+    /// 规整 @ 角色列表：非群聊返回 null；去空白项与重复项；按长度与数量上限截断。
+    /// </summary>
+    internal static List<string>? NormalizeMentionedRoles(
+        IReadOnlyList<string>? raw,
+        bool isGroup)
+    {
+        if (!isGroup || raw is null || raw.Count == 0)
+            return null;
+
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var result = new List<string>(Math.Min(raw.Count, ChatMessageLimits.MaxMentionedRoles));
+        foreach (var role in raw)
+        {
+            if (string.IsNullOrWhiteSpace(role))
+                continue;
+            var trimmed = role.Trim();
+            if (trimmed.Length > ChatMessageLimits.MaxMentionedRoleLength)
+                trimmed = trimmed[..ChatMessageLimits.MaxMentionedRoleLength];
+            if (seen.Add(trimmed))
+                result.Add(trimmed);
+            if (result.Count >= ChatMessageLimits.MaxMentionedRoles)
+                break;
+        }
+
+        return result.Count == 0 ? null : result;
     }
 
     // 20（long 含符号最大位数）+ 1（':'）+ clientMessageId 最大 UTF8 字节数 + 余量。
@@ -3446,6 +4687,9 @@ internal sealed partial class TcpGatewayService : BackgroundService
         using var timer = new PeriodicTimer(
             _options.HeartbeatScanInterval,
             _timeProvider);
+        // 限制并发 Redis 往返，避免 10k 连接串行扫心跳。
+        const int maxRefreshConcurrency = 32;
+        using var refreshGate = new SemaphoreSlim(maxRefreshConcurrency, maxRefreshConcurrency);
 
         try
         {
@@ -3453,7 +4697,13 @@ internal sealed partial class TcpGatewayService : BackgroundService
                        .WaitForNextTickAsync(cancellationToken)
                        .ConfigureAwait(false))
             {
-                foreach (var session in _sessions.Values)
+                _admissionTracker.SweepExpiredEntries(DateTimeOffset.UtcNow);
+
+                var sessions = _sessions.Values.ToArray();
+                var presenceRefreshUsers = new HashSet<long>();
+                var refreshTasks = new List<Task>(sessions.Length);
+
+                foreach (var session in sessions)
                 {
                     if (!session.IsAuthenticated &&
                         session.ConnectionAge >
@@ -3468,14 +4718,46 @@ internal sealed partial class TcpGatewayService : BackgroundService
                         session.Close(
                             SessionCloseReason.IdleTimedOut);
                     }
-                    else if (_options.EnableEphemeralPresenceAndTyping
-                             && session is { IsAuthenticated: true, UserId: > 0 }
-                             && _userSessions.GetSnapshot(session.UserId).Length > 0)
+                    else if (session is { IsAuthenticated: true, UserId: > 0 }
+                             && session.DeviceIdHash is { } deviceHash
+                             && _options.ReplaceSameDeviceSession)
                     {
-                        _ = _globalPresence.RefreshOnlineAsync(
-                            session.UserId,
-                            _integrationOptions.InstanceId,
-                            CancellationToken.None);
+                        var leaseTtl = _options.IdleTimeout + TimeSpan.FromMinutes(5);
+                        var userId = session.UserId;
+                        var leaseId = session.ConnectionLeaseId;
+                        refreshTasks.Add(RefreshLeaseWithGateAsync(
+                            refreshGate,
+                            userId,
+                            deviceHash,
+                            leaseId,
+                            leaseTtl,
+                            cancellationToken));
+
+                        if (_options.EnableEphemeralPresenceAndTyping
+                            && presenceRefreshUsers.Add(userId)
+                            && _userSessions.GetSnapshot(userId).Length > 0)
+                        {
+                            refreshTasks.Add(RefreshPresenceWithGateAsync(
+                                refreshGate,
+                                userId,
+                                cancellationToken));
+                        }
+                    }
+                }
+
+                if (refreshTasks.Count > 0)
+                {
+                    try
+                    {
+                        await Task.WhenAll(refreshTasks).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                    {
+                        throw;
+                    }
+                    catch
+                    {
+                        // 单个刷新失败已在内部记录；不中断心跳循环。
                     }
                 }
             }
@@ -3484,6 +4766,75 @@ internal sealed partial class TcpGatewayService : BackgroundService
             when (cancellationToken.IsCancellationRequested)
         {
             // Normal host shutdown.
+        }
+    }
+
+    private async Task RefreshLeaseWithGateAsync(
+        SemaphoreSlim gate,
+        long userId,
+        ulong deviceHash,
+        string leaseId,
+        TimeSpan leaseTtl,
+        CancellationToken cancellationToken)
+    {
+        await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await _deviceSessionLeaseStore
+                .RefreshIfOwnerAsync(
+                    userId,
+                    deviceHash,
+                    leaseId,
+                    leaseTtl,
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception exception)
+        {
+            _logger.DependencyOperationFailed(
+                GatewayDependency.Redis,
+                GatewayDependencyOperation.DeviceLeaseRefresh,
+                exception);
+        }
+        finally
+        {
+            gate.Release();
+        }
+    }
+
+    private async Task RefreshPresenceWithGateAsync(
+        SemaphoreSlim gate,
+        long userId,
+        CancellationToken cancellationToken)
+    {
+        await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await _globalPresence
+                .RefreshOnlineAsync(
+                    userId,
+                    _integrationOptions.InstanceId,
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception exception)
+        {
+            _logger.DependencyOperationFailed(
+                GatewayDependency.Redis,
+                GatewayDependencyOperation.PresenceRefresh,
+                exception);
+        }
+        finally
+        {
+            gate.Release();
         }
     }
 
@@ -3498,211 +4849,6 @@ internal sealed partial class TcpGatewayService : BackgroundService
             }
         }
     }
-
-    [LoggerMessage(
-        EventId = 40,
-        Level = LogLevel.Warning,
-        Message = "创建群失败 RequestId={RequestId}")]
-    private static partial void LogCreateGroupFailed(
-        ILogger logger,
-        string requestId,
-        Exception exception);
-
-    [LoggerMessage(
-        EventId = 41,
-        Level = LogLevel.Warning,
-        Message = "群操作失败 RequestId={RequestId}")]
-    private static partial void LogGroupCommandFailed(
-        ILogger logger,
-        string requestId,
-        Exception exception);
-
-    [LoggerMessage(
-        EventId = 1,
-        Level = LogLevel.Information,
-        Message = "TCP gateway listening on {Endpoint}; maximum connections: {MaxConnections}.")]
-    private static partial void LogGatewayStarted(
-        ILogger logger,
-        IPEndPoint endpoint,
-        int maxConnections);
-
-    [LoggerMessage(
-        EventId = 2,
-        Level = LogLevel.Information,
-        Message = "TCP gateway stopped.")]
-    private static partial void LogGatewayStopped(ILogger logger);
-
-    [LoggerMessage(
-        EventId = 3,
-        Level = LogLevel.Error,
-        Message = "Connection {ConnectionId} failed during processing.")]
-    private static partial void LogClientProcessingError(
-        ILogger logger,
-        uint connectionId,
-        Exception exception);
-    [LoggerMessage(
-        EventId = 4,
-        Level = LogLevel.Critical,
-        Message = "TCP gateway stopped due to a fatal error.")]
-    private static partial void LogGatewayFatal(
-        ILogger logger,
-        Exception exception);
-
-    [LoggerMessage(
-        EventId = 5,
-        Level = LogLevel.Warning,
-        Message = "Connection {ConnectionId} could not publish message command {CommandId}.")]
-    private static partial void LogMessagePublishFailed(
-        ILogger logger,
-        uint connectionId,
-        string commandId,
-        Exception exception);
-
-    [LoggerMessage(
-        EventId = 6,
-        Level = LogLevel.Warning,
-        Message = "Connection {ConnectionId} could not publish receipt command {CommandId}.")]
-    private static partial void LogReceiptPublishFailed(
-        ILogger logger,
-        uint connectionId,
-        string commandId,
-        Exception exception);
-    [LoggerMessage(
-        EventId = 7,
-        Level = LogLevel.Warning,
-        Message = "Connection {ConnectionId} could not query message history for request {RequestId}.")]
-    private static partial void LogHistoryQueryFailed(
-        ILogger logger,
-        uint connectionId,
-        string requestId,
-        Exception exception);
-
-    [LoggerMessage(
-        EventId = 12,
-        Level = LogLevel.Warning,
-        Message = "Connection {ConnectionId} could not publish session revoke for session {SessionId}.")]
-    private static partial void LogSessionRevokePublishFailed(
-        ILogger logger,
-        uint connectionId,
-        string sessionId,
-        Exception exception);
-
-    [LoggerMessage(
-        EventId = 8,
-        Level = LogLevel.Warning,
-        Message = "Connection {ConnectionId} could not query conversation list for request {RequestId}.")]
-    private static partial void LogConversationListQueryFailed(
-        ILogger logger,
-        uint connectionId,
-        string requestId,
-        Exception exception);
-
-    [LoggerMessage(
-        EventId = 9,
-        Level = LogLevel.Warning,
-        Message = "Connection {ConnectionId} could not mark conversation read for request {RequestId}.")]
-    private static partial void LogConversationMarkReadFailed(
-        ILogger logger,
-        uint connectionId,
-        string requestId,
-        Exception exception);
-
-    [LoggerMessage(
-        EventId = 11,
-        Level = LogLevel.Warning,
-        Message = "Connection {ConnectionId} could not set conversation prefs for request {RequestId}.")]
-    private static partial void LogConversationSetPrefsFailed(
-        ILogger logger,
-        uint connectionId,
-        string requestId,
-        Exception exception);
-
-    [LoggerMessage(
-        EventId = 12,
-        Level = LogLevel.Warning,
-        Message = "Connection {ConnectionId} could not recall message for request {RequestId}.")]
-    private static partial void LogMessageRecallFailed(
-        ILogger logger,
-        uint connectionId,
-        string requestId,
-        Exception exception);
-
-    [LoggerMessage(
-        EventId = 62,
-        Level = LogLevel.Warning,
-        Message = "Connection {ConnectionId} could not edit message for request {RequestId}.")]
-    private static partial void LogMessageEditFailed(
-        ILogger logger,
-        uint connectionId,
-        string requestId,
-        Exception exception);
-
-    [LoggerMessage(
-        EventId = 63,
-        Level = LogLevel.Warning,
-        Message = "Connection {ConnectionId} could not add reaction for request {RequestId}.")]
-    private static partial void LogAddReactionFailed(
-        ILogger logger,
-        uint connectionId,
-        string requestId,
-        Exception exception);
-
-    [LoggerMessage(
-        EventId = 64,
-        Level = LogLevel.Warning,
-        Message = "Connection {ConnectionId} could not remove reaction for request {RequestId}.")]
-    private static partial void LogRemoveReactionFailed(
-        ILogger logger,
-        uint connectionId,
-        string requestId,
-        Exception exception);
-
-    [LoggerMessage(
-        EventId = 10,
-        Level = LogLevel.Warning,
-        Message = "Connection {ConnectionId} could not query sync bootstrap for request {RequestId}.")]
-    private static partial void LogSyncBootstrapQueryFailed(
-        ILogger logger,
-        uint connectionId,
-        string requestId,
-        Exception exception);
-
-    [LoggerMessage(
-        EventId = 13,
-        Level = LogLevel.Debug,
-        Message = "Typing 发射扇出失败 Sender={SenderUserId} Conversation={ConversationId}")]
-    private static partial void LogTypingFanoutFailed(
-        ILogger logger,
-        long senderUserId,
-        string conversationId,
-        Exception exception);
-
-    [LoggerMessage(
-        EventId = 14,
-        Level = LogLevel.Debug,
-        Message = "Ephemeral Typing 发布失败 Target={TargetUserId}")]
-    private static partial void LogEphemeralTypingPublishFailed(
-        ILogger logger,
-        long targetUserId,
-        Exception exception);
-
-    [LoggerMessage(
-        EventId = 15,
-        Level = LogLevel.Warning,
-        Message = "Presence 好友鉴权失败，返回空快照 UserId={UserId}")]
-    private static partial void LogPresenceAuthorizeFailed(
-        ILogger logger,
-        long userId,
-        Exception exception);
-
-    [LoggerMessage(
-        EventId = 16,
-        Level = LogLevel.Debug,
-        Message = "Ephemeral Presence 发布失败 UserId={UserId}")]
-    private static partial void LogEphemeralPresencePublishFailed(
-        ILogger logger,
-        long userId,
-        Exception exception);
 
     private sealed record ClientTaskContext(
         ConcurrentDictionary<uint, Task> Tasks,

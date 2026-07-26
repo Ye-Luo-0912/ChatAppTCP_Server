@@ -72,6 +72,60 @@ public sealed class RealtimeIntegrationOptionsTests
         Assert.Equal("chatapp-tcp-gateway", options.ClientName);
     }
 
+    // ---- 第三阶段：分片路由配置 ----
+
+    [Fact]
+    public void RoutingMode_DefaultsToBroadcast_ForBackwardCompatibility()
+    {
+        var options = new RealtimeIntegrationOptions();
+
+        Assert.Equal(EventRoutingMode.Broadcast, options.RoutingMode);
+    }
+
+    [Fact]
+    public void ShardedSubjectPatterns_HaveExpectedDefaults()
+    {
+        var options = new RealtimeIntegrationOptions();
+
+        Assert.Equal("chat.realtime-events.{0}", options.RealtimeEventsShardSubjectPattern);
+        Assert.Equal("chat.ephemeral.typing.{0}", options.EphemeralTypingShardSubjectPattern);
+        Assert.Equal("chat.ephemeral.presence.{0}", options.EphemeralPresenceShardSubjectPattern);
+    }
+
+    [Fact]
+    public void RoutingMode_CanBeOverriddenToSharded_ViaConfiguration()
+    {
+        var configuration = new ConfigurationBuilder()
+            .AddCommandLine(["--RealtimeIntegration:RoutingMode=Sharded"])
+            .Build();
+
+        var options = configuration
+            .GetRequiredSection("RealtimeIntegration")
+            .Get<RealtimeIntegrationOptions>();
+
+        Assert.NotNull(options);
+        Assert.Equal(EventRoutingMode.Sharded, options.RoutingMode);
+    }
+
+    [Fact]
+    public void ShardedSubjectPatterns_CanBeOverridden_ViaConfiguration()
+    {
+        var configuration = new ConfigurationBuilder()
+            .AddCommandLine([
+                "--RealtimeIntegration:RealtimeEventsShardSubjectPattern=chat.rt.{0}",
+                "--RealtimeIntegration:EphemeralTypingShardSubjectPattern=chat.tp.{0}"
+            ])
+            .Build();
+
+        var options = configuration
+            .GetRequiredSection("RealtimeIntegration")
+            .Get<RealtimeIntegrationOptions>();
+
+        Assert.NotNull(options);
+        Assert.Equal("chat.rt.{0}", options.RealtimeEventsShardSubjectPattern);
+        Assert.Equal("chat.tp.{0}", options.EphemeralTypingShardSubjectPattern);
+    }
+
     private static string FindRepositoryRoot(string startDirectory)
     {
         var current = new DirectoryInfo(startDirectory);

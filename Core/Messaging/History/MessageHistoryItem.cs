@@ -27,4 +27,10 @@ public sealed class MessageHistoryItem
     public string? ForwardedFromMessageId { get; init; }
     public long? ForwardedFromSenderUserId { get; init; }
     public string? ForwardedFromPreview { get; init; }
+
+    /// <summary>@提到的用户 Id 列表（群聊场景下使用）。</summary>
+    public IReadOnlyList<long>? MentionedUserIds { get; init; }
+
+    /// <summary>@提到的角色（如 "all"、"admin"）；目前仅供展示，无强校验。</summary>
+    public IReadOnlyList<string>? MentionedRoles { get; init; }
 }

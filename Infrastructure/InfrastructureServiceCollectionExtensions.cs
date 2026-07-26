@@ -1,12 +1,20 @@
+using ChatApp.Realtime.Abstractions.Routing;
 using ChatApp.TcpGateway.Core.Authentication;
 using ChatApp.TcpGateway.Core.Messaging;
 using ChatApp.TcpGateway.Core.Messaging.Conversations;
 using ChatApp.TcpGateway.Core.Messaging.History;
+using ChatApp.TcpGateway.Core.Messaging.Push;
+using ChatApp.TcpGateway.Core.Messaging.Relationships;
 using ChatApp.TcpGateway.Core.Messaging.Sync;
+using ChatApp.TcpGateway.Core.Push;
 using ChatApp.TcpGateway.Core.Serialization;
+using ChatApp.TcpGateway.Core.Server;
 using ChatApp.TcpGateway.Infrastructure.Authentication;
 using ChatApp.TcpGateway.Infrastructure.Caching;
+using ChatApp.TcpGateway.Infrastructure.Push;
+using ChatApp.TcpGateway.Infrastructure.Routing;
 using ChatApp.TcpGateway.Infrastructure.Serialization.Json;
+using ChatApp.TcpGateway.Infrastructure.Server;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 
@@ -24,7 +32,13 @@ public static class InfrastructureServiceCollectionExtensions
 
         services.AddSingleton<IAccessTokenStore, RedisAccessTokenStore>();
         services.AddSingleton<IDeviceSessionLeaseStore, RedisDeviceSessionLeaseStore>();
+        services.AddSingleton<IResumeTokenStore, RedisResumeTokenStore>();
         services.AddSingleton<IRealtimeAuthenticator, RealtimeAuthenticator>();
+        services.AddSingleton<IServerIdentity, ServerIdentity>();
+        services.AddSingleton<IDirectConversationAuthorizer, CachedDirectConversationAuthorizer>();
+        services.AddSingleton<IPushTokenStore, RedisPushTokenStore>();
+        services.AddSingleton<IGatewayDirectory, RedisGatewayDirectory>();
+        services.AddSingleton<IWatcherGatewayDirectory, RedisWatcherGatewayDirectory>();
 
         services.AddSingleton<IPayloadCodec<AuthenticationRequest>>(
             static _ => new JsonPayloadCodec<AuthenticationRequest>(
@@ -140,6 +154,29 @@ public static class InfrastructureServiceCollectionExtensions
         services.AddSingleton<IPayloadCodec<SyncBootstrapResponse>>(
             static _ => new JsonPayloadCodec<SyncBootstrapResponse>(
                 GatewayJsonSerializerContext.Default.SyncBootstrapResponse));
+
+        // 协议握手与连接管理
+        services.AddSingleton<IPayloadCodec<ClientHello>>(
+            static _ => new JsonPayloadCodec<ClientHello>(
+                GatewayJsonSerializerContext.Default.ClientHello));
+        services.AddSingleton<IPayloadCodec<ServerHello>>(
+            static _ => new JsonPayloadCodec<ServerHello>(
+                GatewayJsonSerializerContext.Default.ServerHello));
+        services.AddSingleton<IPayloadCodec<GoAway>>(
+            static _ => new JsonPayloadCodec<GoAway>(
+                GatewayJsonSerializerContext.Default.GoAway));
+        services.AddSingleton<IPayloadCodec<ResumeResponse>>(
+            static _ => new JsonPayloadCodec<ResumeResponse>(
+                GatewayJsonSerializerContext.Default.ResumeResponse));
+        services.AddSingleton<IPayloadCodec<ProtocolErrorFrame>>(
+            static _ => new JsonPayloadCodec<ProtocolErrorFrame>(
+                GatewayJsonSerializerContext.Default.ProtocolErrorFrame));
+        services.AddSingleton<IPayloadCodec<RelationshipListChangedUpdate>>(
+            static _ => new JsonPayloadCodec<RelationshipListChangedUpdate>(
+                GatewayJsonSerializerContext.Default.RelationshipListChangedUpdate));
+        services.AddSingleton<IPayloadCodec<AttachmentLifecycleUpdate>>(
+            static _ => new JsonPayloadCodec<AttachmentLifecycleUpdate>(
+                GatewayJsonSerializerContext.Default.AttachmentLifecycleUpdate));
 
         return services;
     }

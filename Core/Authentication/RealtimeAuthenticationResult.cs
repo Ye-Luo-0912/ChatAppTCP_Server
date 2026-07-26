@@ -8,6 +8,12 @@ public sealed record RealtimeAuthenticationResult
     public string? SessionId { get; init; }
     public string? UserName { get; init; }
     public ulong? DeviceIdHash { get; init; }
+
+    /// <summary>
+    /// 来自 Token 的服务器签发设备标识（权威身份）。
+    /// </summary>
+    public string? DeviceId { get; init; }
+
     public IReadOnlyList<string> Roles { get; init; } = [];
     public string? ErrorMessage { get; init; }
 
@@ -26,7 +32,8 @@ public sealed record RealtimeAuthenticationResult
         string? sessionId,
         string? userName,
         ulong? deviceIdHash,
-        IReadOnlyList<string>? roles) =>
+        string? deviceId = null,
+        IReadOnlyList<string>? roles = null) =>
         new()
         {
             Succeeded = true,
@@ -35,6 +42,7 @@ public sealed record RealtimeAuthenticationResult
             SessionId = sessionId,
             UserName = userName,
             DeviceIdHash = deviceIdHash,
+            DeviceId = deviceId,
             Roles = roles ?? []
         };
 }

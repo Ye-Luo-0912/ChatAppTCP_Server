@@ -7,6 +7,7 @@ using ChatApp.TcpGateway.Gateway.Configuration;
 using ChatApp.TcpGateway.Gateway.Networking.Buffers;
 using ChatApp.TcpGateway.Gateway.Networking.Sessions;
 using ChatApp.TcpGateway.Infrastructure.Serialization.Json;
+using ChatApp.TcpGateway.Observability.Logging;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -17,7 +18,7 @@ namespace ChatApp.TcpGateway.Gateway.Messaging;
 /// 订阅 NATS Core ephemeral Typing/Presence，扇出到本机会话。
 /// 无 queue group：每个 Gateway 实例都收到全量事件。
 /// </summary>
-internal sealed partial class EphemeralPresenceTypingConsumerService : BackgroundService
+internal sealed class EphemeralPresenceTypingConsumerService : BackgroundService
 {
     private readonly IRealtimeMessageBus _messageBus;
     private readonly RealtimeIntegrationOptions _integrationOptions;
@@ -50,7 +51,7 @@ internal sealed partial class EphemeralPresenceTypingConsumerService : Backgroun
     {
         if (!_gatewayOptions.EnableEphemeralPresenceAndTyping)
         {
-            LogDisabled(_logger);
+            _logger.EphemeralDisabled();
             return;
         }
 
@@ -86,7 +87,10 @@ internal sealed partial class EphemeralPresenceTypingConsumerService : Backgroun
             }
             catch (Exception ex)
             {
-                LogTypingSubscribeFailed(_logger, ex);
+                _logger.RealtimeSubscriptionFailed(
+                    RealtimeSubscriptionKind.EphemeralTyping,
+                    TimeSpan.FromSeconds(2),
+                    ex);
                 await Task.Delay(TimeSpan.FromSeconds(2), stoppingToken).ConfigureAwait(false);
             }
         }
@@ -119,7 +123,10 @@ internal sealed partial class EphemeralPresenceTypingConsumerService : Backgroun
             }
             catch (Exception ex)
             {
-                LogPresenceSubscribeFailed(_logger, ex);
+                _logger.RealtimeSubscriptionFailed(
+                    RealtimeSubscriptionKind.EphemeralPresence,
+                    TimeSpan.FromSeconds(2),
+                    ex);
                 await Task.Delay(TimeSpan.FromSeconds(2), stoppingToken).ConfigureAwait(false);
             }
         }
@@ -143,7 +150,7 @@ internal sealed partial class EphemeralPresenceTypingConsumerService : Backgroun
             _typingUpdateCodec,
             update);
         foreach (var target in targets)
-            target.TryQueue(frame);
+            target.TryQueueEphemeral(frame);
     }
 
     private void FanoutPresence(EphemeralPresenceEvent evt)
@@ -165,25 +172,7 @@ internal sealed partial class EphemeralPresenceTypingConsumerService : Backgroun
         foreach (var watcherId in watchers)
         {
             foreach (var session in _userSessions.GetSnapshot(watcherId))
-                session.TryQueue(frame);
+                session.TryQueueEphemeral(frame);
         }
     }
-
-    [LoggerMessage(
-        EventId = 70,
-        Level = LogLevel.Information,
-        Message = "Ephemeral Presence/Typing 已关闭，跳过 NATS Core 订阅")]
-    private static partial void LogDisabled(ILogger logger);
-
-    [LoggerMessage(
-        EventId = 71,
-        Level = LogLevel.Warning,
-        Message = "Ephemeral Typing 订阅异常，将重试")]
-    private static partial void LogTypingSubscribeFailed(ILogger logger, Exception exception);
-
-    [LoggerMessage(
-        EventId = 72,
-        Level = LogLevel.Warning,
-        Message = "Ephemeral Presence 订阅异常，将重试")]
-    private static partial void LogPresenceSubscribeFailed(ILogger logger, Exception exception);
 }

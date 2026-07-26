@@ -1,3 +1,4 @@
+using ChatApp.TcpGateway.Observability.Logging;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -5,7 +6,7 @@ using StackExchange.Redis;
 
 namespace ChatApp.TcpGateway.Infrastructure.Caching;
 
-public sealed partial class RedisConnectionProvider(
+public sealed class RedisConnectionProvider(
     IOptions<RedisOptions> options,
     ILogger<RedisConnectionProvider> logger)
     : IHostedService, IAsyncDisposable
@@ -28,7 +29,7 @@ public sealed partial class RedisConnectionProvider(
         connection.ConnectionFailed += OnConnectionFailed;
         connection.ConnectionRestored += OnConnectionRestored;
         Volatile.Write(ref _connection, connection);
-        LogConnectionInitialized();
+        _logger.DependencyConnected(GatewayDependency.Redis);
     }
 
     public async Task StopAsync(CancellationToken cancellationToken)
@@ -61,34 +62,14 @@ public sealed partial class RedisConnectionProvider(
     }
 
     private void OnConnectionFailed(object? sender, ConnectionFailedEventArgs args) =>
-        LogConnectionFailed(
-            args.EndPoint,
-            args.FailureType,
+        _logger.DependencyDisconnected(
+            GatewayDependency.Redis,
+            args.EndPoint?.ToString(),
+            args.FailureType.ToString(),
             args.Exception);
 
     private void OnConnectionRestored(object? sender, ConnectionFailedEventArgs args) =>
-        LogConnectionRestored(args.EndPoint);
-
-    [LoggerMessage(
-        EventId = 1,
-        Level = LogLevel.Information,
-        Message = "Redis/Garnet connection initialized.")]
-    private partial void LogConnectionInitialized();
-
-    [LoggerMessage(
-        EventId = 2,
-        Level = LogLevel.Error,
-        Message = "Redis/Garnet connection failed at {Endpoint}: {FailureType}.")]
-    private partial void LogConnectionFailed(
-        System.Net.EndPoint? endpoint,
-        ConnectionFailureType failureType,
-        Exception? exception);
-
-    [LoggerMessage(
-        EventId = 3,
-        Level = LogLevel.Information,
-        Message = "Redis/Garnet connection restored at {Endpoint}.")]
-    private partial void LogConnectionRestored(System.Net.EndPoint? endpoint);
+        _logger.DependencyRestored(
+            GatewayDependency.Redis,
+            args.EndPoint?.ToString());
 }
-
-

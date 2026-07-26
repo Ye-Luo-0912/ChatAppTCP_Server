@@ -2,12 +2,13 @@ using System.Text.Json;
 using ChatApp.TcpGateway.Infrastructure.Authentication.Models;
 using ChatApp.TcpGateway.Infrastructure.Caching;
 using ChatApp.TcpGateway.Infrastructure.Serialization.Json;
+using ChatApp.TcpGateway.Observability.Logging;
 using Microsoft.Extensions.Logging;
 using StackExchange.Redis;
 
 namespace ChatApp.TcpGateway.Infrastructure.Authentication;
 
-internal sealed partial class RedisAccessTokenStore(
+internal sealed class RedisAccessTokenStore(
     RedisConnectionProvider connectionProvider,
     ILogger<RedisAccessTokenStore> logger)
     : IAccessTokenStore
@@ -31,7 +32,10 @@ internal sealed partial class RedisAccessTokenStore(
         }
         catch (RedisException exception)
         {
-            LogLookupFailed(exception);
+            logger.DependencyUnavailable(
+                GatewayDependency.Redis,
+                GatewayDependencyOperation.AccessTokenLookup,
+                exception);
             throw new AuthenticationStoreUnavailableException(
                 "The authentication store is unavailable.",
                 exception);
@@ -64,20 +68,11 @@ internal sealed partial class RedisAccessTokenStore(
         }
         catch (JsonException exception)
         {
-            LogInvalidRecord(exception);
+            logger.DependencyDataInvalid(
+                GatewayDependency.Redis,
+                GatewayDependencyOperation.AccessTokenLookup,
+                exception);
             return null;
         }
     }
-
-    [LoggerMessage(
-        EventId = 10,
-        Level = LogLevel.Error,
-        Message = "Access-token lookup failed.")]
-    private partial void LogLookupFailed(Exception exception);
-
-    [LoggerMessage(
-        EventId = 11,
-        Level = LogLevel.Warning,
-        Message = "Invalid access-token record encountered.")]
-    private partial void LogInvalidRecord(Exception exception);
 }

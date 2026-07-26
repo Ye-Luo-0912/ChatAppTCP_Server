@@ -1,11 +1,14 @@
 using ChatApp.Realtime.Integration;
 using ChatApp.TcpGateway.Gateway.Diagnostics;
+using ChatApp.TcpGateway.Observability.Logging;
+using ChatApp.TcpGateway.Observability.Metrics;
+using ChatApp.TcpGateway.Observability.Tracing;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
 namespace ChatApp.TcpGateway.Gateway.Messaging;
 
-internal sealed partial class RealtimeEventConsumerService : BackgroundService
+internal sealed class RealtimeEventConsumerService : BackgroundService
 {
     private static readonly TimeSpan DeliveryRetryDelay =
         TimeSpan.FromSeconds(1);
@@ -33,7 +36,7 @@ internal sealed partial class RealtimeEventConsumerService : BackgroundService
         var latency = await _messageBus
             .PingAsync(cancellationToken)
             .ConfigureAwait(false);
-        LogMessageBusReady(_logger, latency.TotalMilliseconds);
+        _logger.RealtimeBusReady(latency.TotalMilliseconds);
 
         await base.StartAsync(cancellationToken)
             .ConfigureAwait(false);
@@ -63,8 +66,8 @@ internal sealed partial class RealtimeEventConsumerService : BackgroundService
                 retryAttempt++;
                 var retryDelay = TimeSpan.FromSeconds(
                     Math.Min(30, 1 << Math.Min(retryAttempt - 1, 5)));
-                LogSubscriptionFailed(
-                    _logger,
+                _logger.RealtimeSubscriptionFailed(
+                    RealtimeSubscriptionKind.DurableEvents,
                     retryDelay,
                     exception);
                 await Task.Delay(retryDelay, stoppingToken)
@@ -100,8 +103,7 @@ internal sealed partial class RealtimeEventConsumerService : BackgroundService
             catch (Exception exception)
             {
                 GatewayTelemetry.RecordException(activity, exception);
-                LogDeliveryFailed(
-                    _logger,
+                _logger.RealtimeDeliveryFailed(
                     delivery.Event.EventId,
                     delivery.DeliveryCount,
                     exception);
@@ -125,46 +127,9 @@ internal sealed partial class RealtimeEventConsumerService : BackgroundService
         catch (Exception exception)
             when (!cancellationToken.IsCancellationRequested)
         {
-            LogNakFailed(
-                _logger,
+            _logger.RealtimeNakFailed(
                 delivery.Event.EventId,
                 exception);
         }
     }
-
-    [LoggerMessage(
-        EventId = 30,
-        Level = LogLevel.Information,
-        Message = "Realtime message bus is ready; ping latency: {LatencyMilliseconds:F2} ms.")]
-    private static partial void LogMessageBusReady(
-        ILogger logger,
-        double latencyMilliseconds);
-
-    [LoggerMessage(
-        EventId = 31,
-        Level = LogLevel.Warning,
-        Message = "Realtime event subscription failed; retrying after {RetryDelay}.")]
-    private static partial void LogSubscriptionFailed(
-        ILogger logger,
-        TimeSpan retryDelay,
-        Exception exception);
-
-    [LoggerMessage(
-        EventId = 32,
-        Level = LogLevel.Error,
-        Message = "Realtime event {EventId} delivery failed at attempt {DeliveryCount}; requesting redelivery.")]
-    private static partial void LogDeliveryFailed(
-        ILogger logger,
-        string eventId,
-        ulong? deliveryCount,
-        Exception exception);
-
-    [LoggerMessage(
-        EventId = 33,
-        Level = LogLevel.Error,
-        Message = "Realtime event {EventId} NAK failed; JetStream AckWait will control redelivery.")]
-    private static partial void LogNakFailed(
-        ILogger logger,
-        string eventId,
-        Exception exception);
 }

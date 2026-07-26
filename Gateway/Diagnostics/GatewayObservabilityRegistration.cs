@@ -1,4 +1,6 @@
 using ChatApp.Realtime.Integration;
+using ChatApp.TcpGateway.Observability.Metrics;
+using ChatApp.TcpGateway.Observability.Tracing;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
@@ -23,6 +25,8 @@ public static class GatewayObservabilityRegistration
             throw new InvalidOperationException("Observability configuration is invalid.");
 
         services.AddSingleton(Options.Create(options));
+        services.AddSingleton<GatewayMetrics>();
+
         services
             .AddOpenTelemetry()
             .ConfigureResource(resource => resource.AddService(

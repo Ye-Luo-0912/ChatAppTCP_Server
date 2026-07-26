@@ -6,9 +6,7 @@ namespace ChatApp.TcpGateway.Core.Messaging;
 /// </summary>
 public sealed class TypingNotify
 {
-    public long TargetUserId { get; set; }
-
-    /// <summary>私聊会话 Id（dm:lo:hi）；服务端校验发送方与目标均为会话成员。</summary>
+    /// <summary>私聊会话 Id（dm:lo:hi）；服务端以此为权威源解析目标用户并校验发送方为会话成员。</summary>
     public string? ConversationId { get; set; }
 
     public bool IsTyping { get; set; }

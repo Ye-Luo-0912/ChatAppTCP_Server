@@ -10,4 +10,13 @@ public static class ChatMessageLimits
     public const int MaxReplyPreviewLength = 256;
     public const int MaxForwardedFromMessageIdLength = 64;
     public const int MaxForwardedFromPreviewLength = 256;
+
+    /// <summary>单条消息 @ 用户数上限（仅群聊生效）。</summary>
+    public const int MaxMentionedUserIds = 50;
+
+    /// <summary>单个 @ 角色字符串长度上限（如 "all"、"admin"）。</summary>
+    public const int MaxMentionedRoleLength = 32;
+
+    /// <summary>单条消息 @ 角色数上限。</summary>
+    public const int MaxMentionedRoles = 10;
 }

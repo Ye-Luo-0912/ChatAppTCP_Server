@@ -5,6 +5,12 @@ public enum PacketCommand : ushort
     Heartbeat = 0,
     AuthenticationRequest = 1,
     AuthenticationResponse = 2,
+    // 协议握手与连接管理
+    ClientHello = 3,
+    ServerHello = 4,
+    GoAway = 5,
+    ResumeRequest = 6,
+    ResumeResponse = 7,
     ChatMessage = 101,
     MessageAcknowledgement = 102,
     MessageReceipt = 103,
@@ -57,6 +63,12 @@ public enum PacketCommand : ushort
     MemberRemoved = 150,
     RoleChanged = 151,
     ConversationRead = 152,
+    RelationshipListChanged = 153,
+    AttachmentLifecycleChanged = 154,
+    RegisterPushTokenRequest = 155,
+    RegisterPushTokenResponse = 156,
+    UnregisterPushTokenRequest = 157,
+    UnregisterPushTokenResponse = 158,
     HeartbeatAcknowledgement = 1000,
     Error = 500
 }

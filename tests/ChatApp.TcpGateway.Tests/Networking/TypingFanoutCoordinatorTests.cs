@@ -79,7 +79,7 @@ public sealed class TypingFanoutCoordinatorTests
     [Fact]
     public void PumpExpired_RefreshExtendsExpiry_StrandingRegression()
     {
-        // P0-2 核心回归：限频刷新只更新版本号与 ExpireAt，旧到期条目因版本不匹配失效，
+        // 核心回归：限频刷新只更新版本号与 ExpireAt，旧到期条目因版本不匹配失效，
         // 新到期条目须在刷新后的 ExpireAt 才发射 false。
         // 旧实现（每状态 Task.Delay）刷新后无任务负责 typing=false；本测试锁定时间轮修正。
         // 同时锁定 bucket leftover 搁置修正：刷新条目与原条目落同一 bucket 时，

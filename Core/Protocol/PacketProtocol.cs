@@ -8,7 +8,7 @@ public static class PacketProtocol
     public const int HeaderSize = sizeof(uint) + sizeof(ushort) + sizeof(int);
     public const int MaxPayloadSize = 80 * 1024;
 
-    // P0-6：单一协议常量源 —— 分页条数上限与响应字节预算。
+    // 单一协议常量源 —— 分页条数上限与响应字节预算。
     // 后端分页不能只按条数截断，还要按序列化字节数截断，确保响应可装入单帧 TCP Payload。
     public const int HistoryPageMaxItems = 100;
     public const int ConversationListMaxItems = 100;
@@ -29,7 +29,7 @@ public static class PacketProtocol
     /// <summary>
     /// 返回指定命令允许的 Payload 上限（字节）。
     /// <para>
-    /// P0-5：解析包头后立即校验，不等完整 Payload 到达。
+    /// 解析包头后立即校验，不等完整 Payload 到达。
     /// <list type="bullet">
     /// <item>仅客户端可发送的命令返回正数上限；</item>
     /// <item>服务端→客户端命令和未定义命令返回 -1，解析器立即拒绝；</item>
@@ -42,6 +42,9 @@ public static class PacketProtocol
         // 连接控制
         PacketCommand.Heartbeat => 0,
         PacketCommand.AuthenticationRequest => 4 * 1024,
+
+        // 协议握手
+        PacketCommand.ClientHello => 4 * 1024,
 
         // 消息相关
         PacketCommand.ChatMessage => 64 * 1024,
@@ -75,13 +78,68 @@ public static class PacketProtocol
         PacketCommand.PresenceQuery => 4 * 1024,
         PacketCommand.PresenceUnwatch => 4 * 1024,
 
+        // 离线推送：令牌字符串最大 1 KiB + 元数据
+        PacketCommand.RegisterPushTokenRequest => 2 * 1024,
+        PacketCommand.UnregisterPushTokenRequest => 2 * 1024,
+
         // 服务端→客户端命令和未定义命令：客户端不允许发送
         _ => -1,
     };
 
     /// <summary>
-    /// 判断命令是否为认证命令（唯一允许在未认证状态发送的命令）。
+    /// 当前协议版本。握手时与服务端协商，客户端必须发送 ≤ 此值的版本。
+    /// </summary>
+    public const ushort CurrentProtocolVersion = 1;
+
+    /// <summary>
+    /// 判断命令是否为握手前命令（允许在未认证状态发送）。
+    /// 包含 ClientHello 和 AuthenticationRequest。
     /// </summary>
     public static bool IsAuthenticationCommand(PacketCommand command) =>
-        command == PacketCommand.AuthenticationRequest;
+        command == PacketCommand.AuthenticationRequest ||
+        command == PacketCommand.ClientHello;
+
+    /// <summary>
+    /// 返回命令的令牌桶消耗权重（包令牌数）。
+    /// 昂贵命令消耗更多令牌，限制其突发频率，保护数据库与下游服务。
+    /// 字节令牌仍按实际帧字节数消耗，此处仅加权包维度。
+    /// </summary>
+    public static int GetCommandCost(PacketCommand command) => command switch
+    {
+        // 免费/极低成本：控制帧与瞬态帧，不涉及持久化
+        PacketCommand.Heartbeat => 1,
+        PacketCommand.ClientHello => 1,
+        PacketCommand.MessageReceipt => 1,
+        PacketCommand.TypingNotify => 1,
+        PacketCommand.PresenceUnwatch => 1,
+
+        // 中等成本：单次 Redis/DB 写或读
+        PacketCommand.AuthenticationRequest => 2,
+        PacketCommand.PresenceQuery => 2,
+        PacketCommand.ConversationMarkReadRequest => 2,
+        PacketCommand.AddReactionRequest => 2,
+        PacketCommand.RemoveReactionRequest => 2,
+        PacketCommand.MessageRecallRequest => 2,
+        PacketCommand.MessageEditRequest => 2,
+        PacketCommand.RegisterPushTokenRequest => 2,
+        PacketCommand.UnregisterPushTokenRequest => 1,
+
+        // 高成本：消息写入 + fanout，或分页查询
+        PacketCommand.ChatMessage => 4,
+        PacketCommand.MessageHistoryRequest => 4,
+        PacketCommand.ConversationListRequest => 4,
+        PacketCommand.ConversationSetPrefsRequest => 4,
+        PacketCommand.LeaveGroupRequest => 4,
+        PacketCommand.RemoveGroupMemberRequest => 4,
+        PacketCommand.ChangeMemberRoleRequest => 4,
+        PacketCommand.ListGroupMembersRequest => 4,
+
+        // 极高成本：多对话批量同步或群组创建
+        PacketCommand.SyncBootstrapRequest => 8,
+        PacketCommand.CreateGroupRequest => 8,
+        PacketCommand.AddGroupMembersRequest => 8,
+
+        // 未列举的命令按默认成本 1
+        _ => 1
+    };
 }

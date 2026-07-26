@@ -45,7 +45,8 @@ chat.message-history.query 的 Core NATS request/reply 完成。
 ## 序列化扩展
 
 业务层只依赖 IPayloadCodec<T>。当前 JsonPayloadCodec<T> 使用
-JsonSerializerContext，Native AOT 不需要运行时反射。
+JsonSerializerContext（源生成 JsonTypeInfo）。默认发布为 JIT + TieredPGO；
+Native AOT 可选，见 [AGENTS.md](AGENTS.md)。
 
 增加二进制协议时：
 
