@@ -925,8 +925,8 @@ internal sealed class TcpGatewayService : BackgroundService
 
                     _metrics.PacketReceived();
 
-                    // 按 lane 分类调度。
-                    var lane = ClassifyCommandLane(frame.Command);
+                    // 按 lane 分类调度。委托 CommandCatalog（单一事实源）。
+                    var lane = CommandCatalog.GetLane(frame.Command);
 
                     if (lane == CommandLane.Inline)
                     {
@@ -1081,36 +1081,6 @@ internal sealed class TcpGatewayService : BackgroundService
     }
 
     /// <summary>
-    /// 命令调度 lane 分类。
-    /// Control 命令内联处理；Query 与 OrderedWrite 分到不同 lane 并行处理；
-    /// Ephemeral（Typing）使用 DropOldest，允许丢弃旧帧只保留最新状态。
-    /// </summary>
-    private static CommandLane ClassifyCommandLane(PacketCommand command)
-    {
-        return command switch
-        {
-            // Control：读循环内联处理（同步或必须串行）。ClientHello 必须在握手完成前串行处理。
-            PacketCommand.ClientHello => CommandLane.Inline,
-            PacketCommand.AuthenticationRequest => CommandLane.Inline,
-            PacketCommand.Heartbeat => CommandLane.Inline,
-            PacketCommand.PresenceUnwatch => CommandLane.Inline,
-
-            // Ephemeral：DropOldest，允许丢弃旧帧。Typing 只关心最新状态。
-            PacketCommand.TypingNotify => CommandLane.Ephemeral,
-
-            // Query：与 OrderedWrite 并行，单消费者串行。
-            PacketCommand.MessageHistoryRequest => CommandLane.Query,
-            PacketCommand.ConversationListRequest => CommandLane.Query,
-            PacketCommand.SyncBootstrapRequest => CommandLane.Query,
-            PacketCommand.ListGroupMembersRequest => CommandLane.Query,
-            PacketCommand.PresenceQuery => CommandLane.Query,
-
-            // 其余写操作：OrderedWrite，保持顺序。
-            _ => CommandLane.OrderedWrite
-        };
-    }
-
-    /// <summary>
     /// 调度器消费者回调。从租用缓冲区构造 PacketFrame，
     /// 调用既有 ProcessPacketAsync，并捕获异常关闭会话。
     /// </summary>
@@ -1161,9 +1131,10 @@ internal sealed class TcpGatewayService : BackgroundService
         string remoteIp,
         CancellationToken cancellationToken)
     {
+        // 鉴权前置：未认证会话只能处理 PreAuthentication/PreHandshake 命令。
+        // 委托 CommandCatalog，避免字面量枚举比较遗漏新增握手命令。
         if (!session.IsAuthenticated &&
-            frame.Command != PacketCommand.AuthenticationRequest &&
-            frame.Command != PacketCommand.ClientHello)
+            !CommandCatalog.IsPreAuthentication(frame.Command))
         {
             _metrics.ProtocolError();
             SendProtocolError(session, ProtocolErrorCode.AuthRequired, "authentication required");
