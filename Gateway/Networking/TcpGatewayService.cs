@@ -4689,21 +4689,32 @@ internal sealed class TcpGatewayService : BackgroundService
                         session.Close(
                             SessionCloseReason.IdleTimedOut);
                     }
-                    else if (session is { IsAuthenticated: true, UserId: > 0 }
-                             && session.DeviceIdHash is { } deviceHash
-                             && _options.ReplaceSameDeviceSession)
+                    else if (session is { IsAuthenticated: true, UserId: > 0 })
                     {
-                        var leaseTtl = _options.IdleTimeout + TimeSpan.FromMinutes(5);
                         var userId = session.UserId;
-                        var leaseId = session.ConnectionLeaseId;
-                        refreshTasks.Add(RefreshLeaseWithGateAsync(
-                            refreshGate,
-                            userId,
-                            deviceHash,
-                            leaseId,
-                            leaseTtl,
-                            cancellationToken));
 
+                        // 设备租约刷新：独立条件。
+                        // 仅当启用同设备替换且会话携带 DeviceIdHash 时才续期租约。
+                        // 缺少 DeviceIdHash 的已认证连接不持有设备租约，不应续期。
+                        if (_options.ReplaceSameDeviceSession
+                            && session.DeviceIdHash is { } deviceHash)
+                        {
+                            var leaseTtl = _options.IdleTimeout + TimeSpan.FromMinutes(5);
+                            var leaseId = session.ConnectionLeaseId;
+                            refreshTasks.Add(RefreshLeaseWithGateAsync(
+                                refreshGate,
+                                userId,
+                                deviceHash,
+                                leaseId,
+                                leaseTtl,
+                                cancellationToken));
+                        }
+
+                        // Presence 刷新：独立条件，按用户去重。
+                        // 不应依赖 ReplaceSameDeviceSession 或 DeviceIdHash：
+                        // 关闭同设备替换或无 DeviceIdHash 的已认证连接仍需续期 Redis 全局在线状态，
+                        // 否则 TTL（5 分钟）过期后用户会被误判离线。
+                        // 同一用户多设备会话只刷新一次（presenceRefreshUsers 去重）。
                         if (_options.EnableEphemeralPresenceAndTyping
                             && presenceRefreshUsers.Add(userId)
                             && _userSessions.GetSnapshot(userId).Length > 0)
