@@ -29,10 +29,19 @@ internal sealed class PresenceWatcherRegistry
         if (watchedUserId <= 0 || watcherUserId <= 0 || watchedUserId == watcherUserId)
             return;
 
-        var expireAt = _timeProvider.GetUtcNow().Add(_watchTtl).ToUnixTimeMilliseconds();
+        var now = _timeProvider.GetUtcNow();
+        var expireAt = now.Add(_watchTtl).ToUnixTimeMilliseconds();
+        var nowMs = now.ToUnixTimeMilliseconds();
         var mine = _watching.GetOrAdd(
             watcherUserId,
             static _ => new ConcurrentDictionary<long, long>());
+
+        // 容量检查前清理当前 watcher 的过期订阅，释放额度。
+        // 过期记录仅在对应被观察用户触发 GetWatchers 时被动清理，
+        // 长期在线但事件稀少的 watcher 可能被过期项占满 maxWatchesPerUser 限额，
+        // 导致新订阅被永久拒绝。
+        SweepExpiredForWatcher(watcherUserId, mine, nowMs);
+
         if (!mine.ContainsKey(watchedUserId) && mine.Count >= Math.Max(1, maxWatchesPerUser))
             return;
 
@@ -41,6 +50,31 @@ internal sealed class PresenceWatcherRegistry
             watchedUserId,
             static _ => new ConcurrentDictionary<long, long>());
         set[watcherUserId] = expireAt;
+    }
+
+    /// <summary>
+    /// 清理指定 watcher 的过期订阅，同步从反向索引 <see cref="_watchers"/> 移除。
+    /// </summary>
+    private void SweepExpiredForWatcher(
+        long watcherUserId,
+        ConcurrentDictionary<long, long> mine,
+        long nowMs)
+    {
+        foreach (var pair in mine)
+        {
+            if (pair.Value <= 0 || pair.Value >= nowMs)
+                continue;
+
+            if (!mine.TryRemove(pair.Key, out _))
+                continue;
+
+            if (_watchers.TryGetValue(pair.Key, out var set))
+            {
+                set.TryRemove(watcherUserId, out _);
+                if (set.IsEmpty)
+                    _watchers.TryRemove(pair.Key, out _);
+            }
+        }
     }
 
     public void WatchMany(
