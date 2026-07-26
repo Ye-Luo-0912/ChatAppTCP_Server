@@ -1,7 +1,6 @@
-using System.Net.Sockets;
+﻿using System.Net.Sockets;
 using ChatApp.TcpGateway.Gateway.Diagnostics;
 using ChatApp.TcpGateway.Gateway.Networking.Sessions;
-using ChatApp.TcpGateway.Networking.Sessions;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace ChatApp.TcpGateway.Tests.Networking;

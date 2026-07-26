@@ -1,4 +1,4 @@
-using System.Diagnostics.Metrics;
+﻿using System.Diagnostics.Metrics;
 using System.Net.Sockets;
 using System.Runtime.CompilerServices;
 using ChatApp.Realtime.Abstractions.Conversations;
@@ -12,7 +12,6 @@ using ChatApp.Realtime.Integration.Ephemeral;
 using ChatApp.TcpGateway.Gateway.Configuration;
 using ChatApp.TcpGateway.Gateway.Diagnostics;
 using ChatApp.TcpGateway.Gateway.Networking.Sessions;
-using ChatApp.TcpGateway.Networking.Sessions;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using Xunit;
@@ -53,6 +52,7 @@ public sealed class EphemeralCrossGatewayFanoutTests
             Options.Create(new TcpGatewayOptions { EnableEphemeralPresenceAndTyping = true }),
             registry,
             new PresenceWatcherRegistry(),
+            metrics,
             NullLogger<EphemeralPresenceTypingConsumerService>.Instance);
 
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(3));

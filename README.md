@@ -93,9 +93,9 @@ AccessToken 缓存键保持现有约定：
 
 ## 构建与验证
 
-.NET 11 当前仍是预览版，global.json 固定为
-11.0.100-preview.6.26359.118。正式生产部署应在 .NET 11 正式版发布后重新
-验证，或者暂时使用 .NET 10 LTS。
+基线 SDK 见 `global.json`：固定为 .NET 10 SDK 10.0.301（`allowPrerelease: false`），
+目标框架 `net10.0`。所有项目（Core / Infrastructure / Observability / Gateway / Host / Tests）
+共享同一 SDK 与 TFM，不引入 preview。
 
     dotnet restore ChatApp.TcpGateway.sln
     dotnet build ChatApp.TcpGateway.sln -c Release

@@ -1,4 +1,4 @@
-namespace ChatApp.TcpGateway.Networking.Sessions;
+namespace ChatApp.TcpGateway.Gateway.Networking.Sessions;
 
 internal enum SessionCloseReason : byte
 {

@@ -2,12 +2,11 @@ using System.Net.Sockets;
 using System.Threading.Channels;
 using ChatApp.TcpGateway.Gateway.Diagnostics;
 using ChatApp.TcpGateway.Gateway.Networking.Buffers;
-using ChatApp.TcpGateway.Gateway.Networking.Sessions;
 using ChatApp.TcpGateway.Observability.Logging;
 using ChatApp.TcpGateway.Observability.Metrics;
 using Microsoft.Extensions.Logging;
 
-namespace ChatApp.TcpGateway.Networking.Sessions;
+namespace ChatApp.TcpGateway.Gateway.Networking.Sessions;
 
 internal sealed class TcpClientSession : IAsyncDisposable
 {

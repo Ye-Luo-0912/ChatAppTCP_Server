@@ -1,5 +1,4 @@
-using ChatApp.TcpGateway.Gateway.Networking.Sessions;
-using ChatApp.TcpGateway.Networking.Sessions;
+﻿using ChatApp.TcpGateway.Gateway.Networking.Sessions;
 
 namespace ChatApp.TcpGateway.Tests.Networking;
 

@@ -8,6 +8,7 @@ using ChatApp.TcpGateway.Gateway.Networking.Buffers;
 using ChatApp.TcpGateway.Gateway.Networking.Sessions;
 using ChatApp.TcpGateway.Infrastructure.Serialization.Json;
 using ChatApp.TcpGateway.Observability.Logging;
+using ChatApp.TcpGateway.Observability.Metrics;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -25,6 +26,7 @@ internal sealed class EphemeralPresenceTypingConsumerService : BackgroundService
     private readonly TcpGatewayOptions _gatewayOptions;
     private readonly UserSessionRegistry _userSessions;
     private readonly PresenceWatcherRegistry _presenceWatchers;
+    private readonly GatewayMetrics _metrics;
     private readonly ILogger<EphemeralPresenceTypingConsumerService> _logger;
     private readonly JsonPayloadCodec<TypingUpdate> _typingUpdateCodec = new(
         GatewayJsonSerializerContext.Default.TypingUpdate);
@@ -37,6 +39,7 @@ internal sealed class EphemeralPresenceTypingConsumerService : BackgroundService
         IOptions<TcpGatewayOptions> gatewayOptions,
         UserSessionRegistry userSessions,
         PresenceWatcherRegistry presenceWatchers,
+        GatewayMetrics metrics,
         ILogger<EphemeralPresenceTypingConsumerService> logger)
     {
         _messageBus = messageBus;
@@ -44,6 +47,7 @@ internal sealed class EphemeralPresenceTypingConsumerService : BackgroundService
         _gatewayOptions = gatewayOptions.Value;
         _userSessions = userSessions;
         _presenceWatchers = presenceWatchers;
+        _metrics = metrics;
         _logger = logger;
     }
 
@@ -157,7 +161,10 @@ internal sealed class EphemeralPresenceTypingConsumerService : BackgroundService
     {
         var watchers = _presenceWatchers.GetWatchers(evt.UserId);
         if (watchers.Length == 0)
+        {
+            _metrics.PresenceFanoutSkipped();
             return;
+        }
 
         var update = new PresenceChanged
         {
@@ -169,10 +176,15 @@ internal sealed class EphemeralPresenceTypingConsumerService : BackgroundService
             PacketCommand.PresenceChanged,
             _presenceChangedCodec,
             update);
+        var recipientCount = 0;
         foreach (var watcherId in watchers)
         {
             foreach (var session in _userSessions.GetSnapshot(watcherId))
+            {
                 session.TryQueueEphemeral(frame);
+                recipientCount++;
+            }
         }
+        _metrics.PresenceFanoutDelivered(recipientCount);
     }
 }

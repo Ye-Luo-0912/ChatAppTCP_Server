@@ -1,7 +1,15 @@
 using ChatApp.Realtime.Integration.Configuration;
 using ChatApp.Realtime.Integration.DependencyInjection;
+using ChatApp.TcpGateway.Gateway.Commands.Conversations;
+using ChatApp.TcpGateway.Gateway.Commands.Groups;
+using ChatApp.TcpGateway.Gateway.Commands.Messaging;
+using ChatApp.TcpGateway.Gateway.Commands.Presence;
+using ChatApp.TcpGateway.Gateway.Commands.Push;
+using ChatApp.TcpGateway.Gateway.Commands.Queries;
+using ChatApp.TcpGateway.Gateway.Commands.Reactions;
 using ChatApp.TcpGateway.Gateway.Configuration;
 using ChatApp.TcpGateway.Gateway.Diagnostics;
+using ChatApp.TcpGateway.Gateway.Dispatching;
 using ChatApp.TcpGateway.Gateway.Networking.Sessions;
 using ChatApp.TcpGateway.Infrastructure;
 using ChatApp.TcpGateway.Infrastructure.Caching;
@@ -76,6 +84,16 @@ builder.Services.AddSingleton<RealtimeEventDispatcher>();
 builder.Services.AddGatewayInfrastructure();
 builder.Services.AddChatAppRealtimeIntegration(
     realtimeIntegrationOptions);
+// 命令处理器与分发器
+builder.Services.AddSingleton<PushTokenCommandHandler>();
+builder.Services.AddSingleton<ReactionCommandHandler>();
+builder.Services.AddSingleton<MessagingCommandHandler>();
+builder.Services.AddSingleton<HistoryQueryCommandHandler>();
+builder.Services.AddSingleton<ConversationPrefsCommandHandler>();
+builder.Services.AddSingleton<GroupCommandHandler>();
+builder.Services.AddSingleton<TypingCommandHandler>();
+builder.Services.AddSingleton<PresenceCommandHandler>();
+builder.Services.AddSingleton<CommandDispatcher>();
 builder.Services.AddHostedService<RealtimeEventConsumerService>();
 builder.Services.AddHostedService<EphemeralPresenceTypingConsumerService>();
 builder.Services.AddHostedService<TcpGatewayService>();

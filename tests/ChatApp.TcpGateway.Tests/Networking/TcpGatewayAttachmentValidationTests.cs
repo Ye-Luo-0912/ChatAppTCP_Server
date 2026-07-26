@@ -5,20 +5,30 @@ using System.Net.Sockets;
 using ChatApp.Realtime.Abstractions.Conversations;
 using ChatApp.Realtime.Abstractions.Events;
 using ChatApp.Realtime.Abstractions.Messaging;
+using ChatApp.Realtime.Abstractions.Routing;
 using ChatApp.Realtime.Abstractions.Sync;
 using ChatApp.Realtime.Integration;
+using ChatApp.Realtime.Integration.Configuration;
 using ChatApp.TcpGateway.Core.Authentication;
 using ChatApp.TcpGateway.Core.Messaging;
 using ChatApp.TcpGateway.Core.Messaging.Conversations;
 using ChatApp.TcpGateway.Core.Messaging.History;
+using ChatApp.TcpGateway.Core.Messaging.Push;
 using ChatApp.TcpGateway.Core.Messaging.Sync;
 using ChatApp.TcpGateway.Core.Protocol;
+using ChatApp.TcpGateway.Gateway.Commands.Conversations;
+using ChatApp.TcpGateway.Gateway.Commands.Groups;
+using ChatApp.TcpGateway.Gateway.Commands.Messaging;
+using ChatApp.TcpGateway.Gateway.Commands.Presence;
+using ChatApp.TcpGateway.Gateway.Commands.Push;
+using ChatApp.TcpGateway.Gateway.Commands.Queries;
+using ChatApp.TcpGateway.Gateway.Commands.Reactions;
 using ChatApp.TcpGateway.Gateway.Configuration;
 using ChatApp.TcpGateway.Gateway.Diagnostics;
+using ChatApp.TcpGateway.Gateway.Dispatching;
 using ChatApp.TcpGateway.Gateway.Networking.Sessions;
+using ChatApp.TcpGateway.Infrastructure.Push;
 using ChatApp.TcpGateway.Infrastructure.Serialization.Json;
-using ChatApp.TcpGateway.Networking;
-using ChatApp.TcpGateway.Networking.Sessions;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using RealtimeHistory = ChatApp.Realtime.Abstractions.Messaging.History;
@@ -332,63 +342,205 @@ public sealed class TcpGatewayAttachmentValidationTests
                 GatewayJsonSerializerContext.Default.MessageEditRequest);
             var messageEditAcknowledgementCodec = new JsonPayloadCodec<MessageEditAcknowledgement>(
                 GatewayJsonSerializerContext.Default.MessageEditAcknowledgement);
-            var addReactionRequestCodec = new JsonPayloadCodec<AddReactionRequest>(
-                GatewayJsonSerializerContext.Default.AddReactionRequest);
-            var addReactionAcknowledgementCodec = new JsonPayloadCodec<AddReactionAcknowledgement>(
-                GatewayJsonSerializerContext.Default.AddReactionAcknowledgement);
-            var removeReactionRequestCodec = new JsonPayloadCodec<RemoveReactionRequest>(
-                GatewayJsonSerializerContext.Default.RemoveReactionRequest);
-            var removeReactionAcknowledgementCodec = new JsonPayloadCodec<RemoveReactionAcknowledgement>(
-                GatewayJsonSerializerContext.Default.RemoveReactionAcknowledgement);
             var syncBootstrapRequestCodec = new JsonPayloadCodec<SyncBootstrapRequest>(
                 GatewayJsonSerializerContext.Default.SyncBootstrapRequest);
             var syncBootstrapResponseCodec = new JsonPayloadCodec<SyncBootstrapResponse>(
                 GatewayJsonSerializerContext.Default.SyncBootstrapResponse);
 
             var metrics = new GatewayMetrics();
-            var service = new TcpGatewayService(
-                Options.Create(options),
-                new FakeAuthenticator(),
-                authenticationRequestCodec,
-                authenticationResponseCodec,
+
+            // 共享依赖（同时用于 service 构造与 handler 构造）
+            var integrationOptions = new RealtimeIntegrationOptions
+            {
+                InstanceId = "test-gateway-attach"
+            };
+            var globalPresence = new NoopGlobalPresenceStore();
+            var userSessions = new UserSessionRegistry();
+            var presenceWatchers = new PresenceWatcherRegistry();
+            var typingFanout = new TypingFanoutCoordinator(TimeProvider.System);
+            var pushStore = new InMemoryPushTokenStore();
+
+            // Push handler 专用 codec
+            var registerPushRequestCodec = new JsonPayloadCodec<RegisterPushTokenRequest>(
+                GatewayJsonSerializerContext.Default.RegisterPushTokenRequest);
+            var registerPushResponseCodec = new JsonPayloadCodec<RegisterPushTokenResponse>(
+                GatewayJsonSerializerContext.Default.RegisterPushTokenResponse);
+            var unregisterPushRequestCodec = new JsonPayloadCodec<UnregisterPushTokenRequest>(
+                GatewayJsonSerializerContext.Default.UnregisterPushTokenRequest);
+            var unregisterPushResponseCodec = new JsonPayloadCodec<UnregisterPushTokenResponse>(
+                GatewayJsonSerializerContext.Default.UnregisterPushTokenResponse);
+
+            // Reaction handler 专用 codec
+            var addReactionRequestCodec = new JsonPayloadCodec<AddReactionRequest>(
+                GatewayJsonSerializerContext.Default.AddReactionRequest);
+            var addReactionAckCodec = new JsonPayloadCodec<AddReactionAcknowledgement>(
+                GatewayJsonSerializerContext.Default.AddReactionAcknowledgement);
+            var removeReactionRequestCodec = new JsonPayloadCodec<RemoveReactionRequest>(
+                GatewayJsonSerializerContext.Default.RemoveReactionRequest);
+            var removeReactionAckCodec = new JsonPayloadCodec<RemoveReactionAcknowledgement>(
+                GatewayJsonSerializerContext.Default.RemoveReactionAcknowledgement);
+
+            // Group handler 专用 codec
+            var createGroupRequestCodec = new JsonPayloadCodec<CreateGroupRequest>(
+                GatewayJsonSerializerContext.Default.CreateGroupRequest);
+            var createGroupResponseCodec = new JsonPayloadCodec<CreateGroupResponse>(
+                GatewayJsonSerializerContext.Default.CreateGroupResponse);
+            var addGroupMembersRequestCodec = new JsonPayloadCodec<AddGroupMembersRequest>(
+                GatewayJsonSerializerContext.Default.AddGroupMembersRequest);
+            var addGroupMembersResponseCodec = new JsonPayloadCodec<AddGroupMembersResponse>(
+                GatewayJsonSerializerContext.Default.AddGroupMembersResponse);
+            var removeGroupMemberRequestCodec = new JsonPayloadCodec<RemoveGroupMemberRequest>(
+                GatewayJsonSerializerContext.Default.RemoveGroupMemberRequest);
+            var removeGroupMemberResponseCodec = new JsonPayloadCodec<RemoveGroupMemberResponse>(
+                GatewayJsonSerializerContext.Default.RemoveGroupMemberResponse);
+            var leaveGroupRequestCodec = new JsonPayloadCodec<LeaveGroupRequest>(
+                GatewayJsonSerializerContext.Default.LeaveGroupRequest);
+            var leaveGroupResponseCodec = new JsonPayloadCodec<LeaveGroupResponse>(
+                GatewayJsonSerializerContext.Default.LeaveGroupResponse);
+            var changeMemberRoleRequestCodec = new JsonPayloadCodec<ChangeMemberRoleRequest>(
+                GatewayJsonSerializerContext.Default.ChangeMemberRoleRequest);
+            var changeMemberRoleResponseCodec = new JsonPayloadCodec<ChangeMemberRoleResponse>(
+                GatewayJsonSerializerContext.Default.ChangeMemberRoleResponse);
+            var listGroupMembersRequestCodec = new JsonPayloadCodec<ListGroupMembersRequest>(
+                GatewayJsonSerializerContext.Default.ListGroupMembersRequest);
+            var listGroupMembersResponseCodec = new JsonPayloadCodec<ListGroupMembersResponse>(
+                GatewayJsonSerializerContext.Default.ListGroupMembersResponse);
+
+            // Typing / Presence handler 专用 codec
+            var typingNotifyCodec = new JsonPayloadCodec<TypingNotify>(
+                GatewayJsonSerializerContext.Default.TypingNotify);
+            var presenceQueryRequestCodec = new JsonPayloadCodec<PresenceQueryRequest>(
+                GatewayJsonSerializerContext.Default.PresenceQueryRequest);
+            var presenceUnwatchRequestCodec = new JsonPayloadCodec<PresenceUnwatchRequest>(
+                GatewayJsonSerializerContext.Default.PresenceUnwatchRequest);
+            var presenceSnapshotResponseCodec = new JsonPayloadCodec<PresenceSnapshotResponse>(
+                GatewayJsonSerializerContext.Default.PresenceSnapshotResponse);
+
+            // TcpGatewayService 直接消费的 codec（DI 注入路径在此测试中以手工构造替代）
+            var typingUpdateCodec = new JsonPayloadCodec<TypingUpdate>(
+                GatewayJsonSerializerContext.Default.TypingUpdate);
+            var presenceChangedCodec = new JsonPayloadCodec<PresenceChanged>(
+                GatewayJsonSerializerContext.Default.PresenceChanged);
+
+            // 8 个 handler。本测试只断言 Messaging 路径（ChatMessage 附件校验），
+            // 但 CommandDispatcher 构造函数要求全部 8 个 handler 实例。
+            var pushHandler = new PushTokenCommandHandler(
+                registerPushRequestCodec,
+                registerPushResponseCodec,
+                unregisterPushRequestCodec,
+                unregisterPushResponseCodec,
+                metrics,
+                NullLogger<PushTokenCommandHandler>.Instance,
+                pushStore);
+            var reactionHandler = new ReactionCommandHandler(
+                messageBus,
+                addReactionRequestCodec,
+                addReactionAckCodec,
+                removeReactionRequestCodec,
+                removeReactionAckCodec,
+                metrics,
+                TimeProvider.System,
+                NullLogger<ReactionCommandHandler>.Instance);
+            var messagingHandler = new MessagingCommandHandler(
+                messageBus,
                 chatMessageCodec,
                 acknowledgementCodec,
                 receiptRequestCodec,
                 receiptAcknowledgementCodec,
+                messageRecallRequestCodec,
+                messageRecallAcknowledgementCodec,
+                messageEditRequestCodec,
+                messageEditAcknowledgementCodec,
+                metrics,
+                TimeProvider.System,
+                NullLogger<MessagingCommandHandler>.Instance,
+                Options.Create(options));
+            var historyQueryHandler = new HistoryQueryCommandHandler(
+                messageBus,
                 historyRequestCodec,
                 historyResponseCodec,
                 historyItemCodec,
                 conversationListRequestCodec,
                 conversationListResponseCodec,
                 conversationListItemCodec,
+                syncBootstrapRequestCodec,
+                syncBootstrapResponseCodec,
+                metrics,
+                NullLogger<HistoryQueryCommandHandler>.Instance);
+            var conversationPrefsHandler = new ConversationPrefsCommandHandler(
+                messageBus,
                 conversationMarkReadRequestCodec,
                 conversationMarkReadResponseCodec,
                 conversationSetPrefsRequestCodec,
                 conversationSetPrefsResponseCodec,
-                messageRecallRequestCodec,
-                messageRecallAcknowledgementCodec,
-                messageEditRequestCodec,
-                messageEditAcknowledgementCodec,
-                addReactionRequestCodec,
-                addReactionAcknowledgementCodec,
-                removeReactionRequestCodec,
-                removeReactionAcknowledgementCodec,
-                syncBootstrapRequestCodec,
-                syncBootstrapResponseCodec,
+                metrics,
+                NullLogger<ConversationPrefsCommandHandler>.Instance);
+            var groupHandler = new GroupCommandHandler(
                 messageBus,
-                new ChatApp.Realtime.Integration.Configuration.RealtimeIntegrationOptions
-                {
-                    InstanceId = "test-gateway-attach"
-                },
+                createGroupRequestCodec,
+                createGroupResponseCodec,
+                addGroupMembersRequestCodec,
+                addGroupMembersResponseCodec,
+                removeGroupMemberRequestCodec,
+                removeGroupMemberResponseCodec,
+                leaveGroupRequestCodec,
+                leaveGroupResponseCodec,
+                changeMemberRoleRequestCodec,
+                changeMemberRoleResponseCodec,
+                listGroupMembersRequestCodec,
+                listGroupMembersResponseCodec,
+                metrics,
+                NullLogger<GroupCommandHandler>.Instance);
+            var typingHandler = new TypingCommandHandler(
+                typingNotifyCodec,
+                typingFanout,
+                directConversationAuthorizer: null,
+                Options.Create(options),
+                NullLogger<TypingCommandHandler>.Instance);
+            var presenceHandler = new PresenceCommandHandler(
+                Options.Create(options),
+                messageBus,
+                integrationOptions,
+                globalPresence,
+                userSessions,
+                presenceWatchers,
+                NullWatcherGatewayDirectory.Instance,
+                presenceQueryRequestCodec,
+                presenceUnwatchRequestCodec,
+                presenceSnapshotResponseCodec,
+                metrics,
+                NullLogger<PresenceCommandHandler>.Instance);
+
+            var dispatcher = new CommandDispatcher(
+                pushHandler,
+                reactionHandler,
+                messagingHandler,
+                historyQueryHandler,
+                conversationPrefsHandler,
+                groupHandler,
+                typingHandler,
+                presenceHandler);
+
+            var service = new TcpGatewayService(
+                Options.Create(options),
+                new FakeAuthenticator(),
+                authenticationRequestCodec,
+                authenticationResponseCodec,
+                acknowledgementCodec,
+                typingUpdateCodec,
+                presenceChangedCodec,
+                messageBus,
+                integrationOptions,
                 new NoopLeaseStore(),
-                new NoopGlobalPresenceStore(),
-                new UserSessionRegistry(),
-                new PresenceWatcherRegistry(),
-                new TypingFanoutCoordinator(TimeProvider.System),
+                globalPresence,
+                userSessions,
+                presenceWatchers,
+                typingFanout,
                 metrics,
                 TimeProvider.System,
                 NullLogger<TcpGatewayService>.Instance,
-                NullLogger<TcpClientSession>.Instance);
+                NullLogger<TcpClientSession>.Instance,
+                commandDispatcher: dispatcher);
 
             await service.StartAsync(CancellationToken.None);
             return new GatewayHarness(

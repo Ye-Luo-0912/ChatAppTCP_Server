@@ -1,5 +1,4 @@
-using System.Collections.Concurrent;
-using ChatApp.TcpGateway.Networking.Sessions;
+﻿using System.Collections.Concurrent;
 
 namespace ChatApp.TcpGateway.Gateway.Networking.Sessions;
 

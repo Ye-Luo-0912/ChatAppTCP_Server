@@ -155,6 +155,81 @@ public static class InfrastructureServiceCollectionExtensions
             static _ => new JsonPayloadCodec<SyncBootstrapResponse>(
                 GatewayJsonSerializerContext.Default.SyncBootstrapResponse));
 
+        // 离线推送令牌（PushTokenCommandHandler 使用）
+        services.AddSingleton<IPayloadCodec<RegisterPushTokenRequest>>(
+            static _ => new JsonPayloadCodec<RegisterPushTokenRequest>(
+                GatewayJsonSerializerContext.Default.RegisterPushTokenRequest));
+        services.AddSingleton<IPayloadCodec<RegisterPushTokenResponse>>(
+            static _ => new JsonPayloadCodec<RegisterPushTokenResponse>(
+                GatewayJsonSerializerContext.Default.RegisterPushTokenResponse));
+        services.AddSingleton<IPayloadCodec<UnregisterPushTokenRequest>>(
+            static _ => new JsonPayloadCodec<UnregisterPushTokenRequest>(
+                GatewayJsonSerializerContext.Default.UnregisterPushTokenRequest));
+        services.AddSingleton<IPayloadCodec<UnregisterPushTokenResponse>>(
+            static _ => new JsonPayloadCodec<UnregisterPushTokenResponse>(
+                GatewayJsonSerializerContext.Default.UnregisterPushTokenResponse));
+
+        // 群组命令（GroupCommandHandler 使用）
+        services.AddSingleton<IPayloadCodec<CreateGroupRequest>>(
+            static _ => new JsonPayloadCodec<CreateGroupRequest>(
+                GatewayJsonSerializerContext.Default.CreateGroupRequest));
+        services.AddSingleton<IPayloadCodec<CreateGroupResponse>>(
+            static _ => new JsonPayloadCodec<CreateGroupResponse>(
+                GatewayJsonSerializerContext.Default.CreateGroupResponse));
+        services.AddSingleton<IPayloadCodec<AddGroupMembersRequest>>(
+            static _ => new JsonPayloadCodec<AddGroupMembersRequest>(
+                GatewayJsonSerializerContext.Default.AddGroupMembersRequest));
+        services.AddSingleton<IPayloadCodec<AddGroupMembersResponse>>(
+            static _ => new JsonPayloadCodec<AddGroupMembersResponse>(
+                GatewayJsonSerializerContext.Default.AddGroupMembersResponse));
+        services.AddSingleton<IPayloadCodec<RemoveGroupMemberRequest>>(
+            static _ => new JsonPayloadCodec<RemoveGroupMemberRequest>(
+                GatewayJsonSerializerContext.Default.RemoveGroupMemberRequest));
+        services.AddSingleton<IPayloadCodec<RemoveGroupMemberResponse>>(
+            static _ => new JsonPayloadCodec<RemoveGroupMemberResponse>(
+                GatewayJsonSerializerContext.Default.RemoveGroupMemberResponse));
+        services.AddSingleton<IPayloadCodec<LeaveGroupRequest>>(
+            static _ => new JsonPayloadCodec<LeaveGroupRequest>(
+                GatewayJsonSerializerContext.Default.LeaveGroupRequest));
+        services.AddSingleton<IPayloadCodec<LeaveGroupResponse>>(
+            static _ => new JsonPayloadCodec<LeaveGroupResponse>(
+                GatewayJsonSerializerContext.Default.LeaveGroupResponse));
+        services.AddSingleton<IPayloadCodec<ChangeMemberRoleRequest>>(
+            static _ => new JsonPayloadCodec<ChangeMemberRoleRequest>(
+                GatewayJsonSerializerContext.Default.ChangeMemberRoleRequest));
+        services.AddSingleton<IPayloadCodec<ChangeMemberRoleResponse>>(
+            static _ => new JsonPayloadCodec<ChangeMemberRoleResponse>(
+                GatewayJsonSerializerContext.Default.ChangeMemberRoleResponse));
+        services.AddSingleton<IPayloadCodec<ListGroupMembersRequest>>(
+            static _ => new JsonPayloadCodec<ListGroupMembersRequest>(
+                GatewayJsonSerializerContext.Default.ListGroupMembersRequest));
+        services.AddSingleton<IPayloadCodec<ListGroupMembersResponse>>(
+            static _ => new JsonPayloadCodec<ListGroupMembersResponse>(
+                GatewayJsonSerializerContext.Default.ListGroupMembersResponse));
+
+        // Typing / Presence（TypingCommandHandler / PresenceCommandHandler 使用）
+        services.AddSingleton<IPayloadCodec<TypingNotify>>(
+            static _ => new JsonPayloadCodec<TypingNotify>(
+                GatewayJsonSerializerContext.Default.TypingNotify));
+        services.AddSingleton<IPayloadCodec<PresenceQueryRequest>>(
+            static _ => new JsonPayloadCodec<PresenceQueryRequest>(
+                GatewayJsonSerializerContext.Default.PresenceQueryRequest));
+        services.AddSingleton<IPayloadCodec<PresenceUnwatchRequest>>(
+            static _ => new JsonPayloadCodec<PresenceUnwatchRequest>(
+                GatewayJsonSerializerContext.Default.PresenceUnwatchRequest));
+        services.AddSingleton<IPayloadCodec<PresenceSnapshotResponse>>(
+            static _ => new JsonPayloadCodec<PresenceSnapshotResponse>(
+                GatewayJsonSerializerContext.Default.PresenceSnapshotResponse));
+
+        // SessionLifecycleCoordinator 与 TypingFanout 消费路径使用：
+        // PresenceChanged 用于本机 watcher 扇出；TypingUpdate 用于本机 Typing 扇出。
+        services.AddSingleton<IPayloadCodec<PresenceChanged>>(
+            static _ => new JsonPayloadCodec<PresenceChanged>(
+                GatewayJsonSerializerContext.Default.PresenceChanged));
+        services.AddSingleton<IPayloadCodec<TypingUpdate>>(
+            static _ => new JsonPayloadCodec<TypingUpdate>(
+                GatewayJsonSerializerContext.Default.TypingUpdate));
+
         // 协议握手与连接管理
         services.AddSingleton<IPayloadCodec<ClientHello>>(
             static _ => new JsonPayloadCodec<ClientHello>(

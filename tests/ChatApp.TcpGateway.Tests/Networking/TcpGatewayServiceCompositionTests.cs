@@ -1,4 +1,4 @@
-using System.Net;
+﻿using System.Net;
 using System.Runtime.CompilerServices;
 using ChatApp.Realtime.Abstractions.Conversations;
 using ChatApp.Realtime.Abstractions.Events;
@@ -13,7 +13,6 @@ using ChatApp.TcpGateway.Gateway.Diagnostics;
 using ChatApp.TcpGateway.Gateway.Networking.Sessions;
 using ChatApp.TcpGateway.Infrastructure;
 using ChatApp.TcpGateway.Infrastructure.Caching;
-using ChatApp.TcpGateway.Networking.Sessions;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;

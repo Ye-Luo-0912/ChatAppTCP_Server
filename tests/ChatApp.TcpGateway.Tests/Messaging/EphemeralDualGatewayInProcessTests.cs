@@ -1,4 +1,4 @@
-using System.Diagnostics.Metrics;
+﻿using System.Diagnostics.Metrics;
 using System.Net.Sockets;
 using System.Runtime.CompilerServices;
 using System.Threading.Channels;
@@ -13,7 +13,6 @@ using ChatApp.Realtime.Integration.Ephemeral;
 using ChatApp.TcpGateway.Gateway.Configuration;
 using ChatApp.TcpGateway.Gateway.Diagnostics;
 using ChatApp.TcpGateway.Gateway.Networking.Sessions;
-using ChatApp.TcpGateway.Networking.Sessions;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using Xunit;
@@ -44,13 +43,13 @@ public sealed class EphemeralDualGatewayInProcessTests
         var registryB = new UserSessionRegistry();
         Assert.True(registryB.Add(target));
 
-        using var consumerA = CreateConsumer(bus, "gateway-a", new UserSessionRegistry(), new PresenceWatcherRegistry());
-        using var consumerB = CreateConsumer(bus, "gateway-b", registryB, new PresenceWatcherRegistry());
+        using var consumerA = CreateConsumer(bus, "gateway-a", new UserSessionRegistry(), new PresenceWatcherRegistry(), metrics);
+        using var consumerB = CreateConsumer(bus, "gateway-b", registryB, new PresenceWatcherRegistry(), metrics);
 
         using var enqueueCounter = new OutboundEnqueueCounter();
         var baseline = enqueueCounter.PositiveEnqueues;
 
-        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
         await consumerA.StartAsync(cts.Token);
         await consumerB.StartAsync(cts.Token);
         await Task.Delay(50, cts.Token);
@@ -83,7 +82,7 @@ public sealed class EphemeralDualGatewayInProcessTests
         var registry = new UserSessionRegistry();
         Assert.True(registry.Add(target));
 
-        using var consumer = CreateConsumer(bus, "gateway-a", registry, new PresenceWatcherRegistry());
+        using var consumer = CreateConsumer(bus, "gateway-a", registry, new PresenceWatcherRegistry(), metrics);
         using var enqueueCounter = new OutboundEnqueueCounter();
         var baseline = enqueueCounter.PositiveEnqueues;
 
@@ -122,8 +121,8 @@ public sealed class EphemeralDualGatewayInProcessTests
         var watchersB = new PresenceWatcherRegistry();
         watchersB.Watch(watchedUserId: 42, watcherUserId: 7);
 
-        using var consumerA = CreateConsumer(bus, "gateway-a", new UserSessionRegistry(), new PresenceWatcherRegistry());
-        using var consumerB = CreateConsumer(bus, "gateway-b", registryB, watchersB);
+        using var consumerA = CreateConsumer(bus, "gateway-a", new UserSessionRegistry(), new PresenceWatcherRegistry(), metrics);
+        using var consumerB = CreateConsumer(bus, "gateway-b", registryB, watchersB, metrics);
 
         using var enqueueCounter = new OutboundEnqueueCounter();
         var baseline = enqueueCounter.PositiveEnqueues;
@@ -152,13 +151,15 @@ public sealed class EphemeralDualGatewayInProcessTests
         IRealtimeMessageBus bus,
         string instanceId,
         UserSessionRegistry sessions,
-        PresenceWatcherRegistry watchers) =>
+        PresenceWatcherRegistry watchers,
+        GatewayMetrics metrics) =>
         new(
             bus,
             new RealtimeIntegrationOptions { InstanceId = instanceId },
             Options.Create(new TcpGatewayOptions { EnableEphemeralPresenceAndTyping = true }),
             sessions,
             watchers,
+            metrics,
             NullLogger<EphemeralPresenceTypingConsumerService>.Instance);
 
     private static async Task<bool> WaitForEnqueueAsync(

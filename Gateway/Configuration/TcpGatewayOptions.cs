@@ -22,6 +22,35 @@ public sealed class TcpGatewayOptions
     public int MaxPacketsPerSecond { get; set; } = 200;
 
     /// <summary>
+    /// 心跳分桶数量。每个 tick 只扫描一个桶，将原本每
+    /// <see cref="HeartbeatScanInterval"/> 全量扫描的脉冲打散为 N 次小扫描。
+    /// <para>
+    /// 默认 30：与默认 30s 扫描间隔配合，每秒扫描一个桶，Redis 负载从锯齿脉冲变为平滑流量。
+    /// 设为 1 时退化为全量扫描（兼容旧行为，仅用于对照测试）。
+    /// </para>
+    /// </summary>
+    public int HeartbeatBucketCount { get; set; } = 30;
+
+    /// <summary>
+    /// 心跳刷新并发上限（设备租约 + Presence 刷新共享）。
+    /// <para>
+    /// 默认 32：足够吸收单桶内的刷新任务而不压垮 Redis。
+    /// 取代原 HeartbeatCoordinator 中硬编码的 MaxRefreshConcurrency 常量。
+    /// </para>
+    /// </summary>
+    public int HeartbeatRefreshConcurrency { get; set; } = 32;
+
+    /// <summary>
+    /// 心跳刷新 jitter 比率（0~1）。每个刷新任务在提交前追加
+    /// <c>HeartbeatScanInterval / BucketCount * JitterRatio</c> 范围内的随机延迟，
+    /// 避免同桶内任务同步触发 Redis 造成抖动。
+    /// <para>
+    /// 默认 0.2（±20% 的桶间隔）。设为 0 时禁用 jitter。
+    /// </para>
+    /// </summary>
+    public double HeartbeatRefreshJitterRatio { get; set; } = 0.2;
+
+    /// <summary>
     /// 每连接入站帧字节速率上限（含 10 字节包头），按 1 秒滑动窗口计数。
     /// </summary>
     public long MaxInboundBytesPerSecond { get; set; } = 512 * 1024;
@@ -180,6 +209,9 @@ public sealed class TcpGatewayOptions
         AuthenticationTimeout > TimeSpan.Zero &&
         IdleTimeout > AuthenticationTimeout &&
         HeartbeatScanInterval > TimeSpan.Zero &&
+        HeartbeatBucketCount > 0 &&
+        HeartbeatRefreshConcurrency > 0 &&
+        HeartbeatRefreshJitterRatio is >= 0 and <= 1 &&
         SendTimeout > TimeSpan.Zero &&
         MaxPacketsPerSecond > 0 &&
         MaxInboundBytesPerSecond > 0 &&

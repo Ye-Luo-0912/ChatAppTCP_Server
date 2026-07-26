@@ -1,4 +1,4 @@
-using System.Net.Sockets;
+﻿using System.Net.Sockets;
 using System.Runtime.CompilerServices;
 using ChatApp.Realtime.Abstractions.Conversations;
 using ChatApp.Realtime.Abstractions.Events;
@@ -10,7 +10,6 @@ using ChatApp.TcpGateway.Core.Messaging.Conversations;
 using ChatApp.TcpGateway.Gateway.Diagnostics;
 using ChatApp.TcpGateway.Gateway.Networking.Sessions;
 using ChatApp.TcpGateway.Infrastructure.Serialization.Json;
-using ChatApp.TcpGateway.Networking.Sessions;
 using Microsoft.Extensions.Logging.Abstractions;
 using RealtimeEventConsumerService = ChatApp.TcpGateway.Gateway.Messaging.RealtimeEventConsumerService;
 using RealtimeEventDispatcher = ChatApp.TcpGateway.Gateway.Messaging.RealtimeEventDispatcher;

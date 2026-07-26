@@ -1,4 +1,4 @@
-using System.Diagnostics.Metrics;
+﻿using System.Diagnostics.Metrics;
 using System.Net.Sockets;
 using System.Text.Json;
 using ChatApp.Realtime.Abstractions.Events;
@@ -8,7 +8,6 @@ using ChatApp.TcpGateway.Gateway.Diagnostics;
 using ChatApp.TcpGateway.Gateway.Messaging;
 using ChatApp.TcpGateway.Gateway.Networking.Sessions;
 using ChatApp.TcpGateway.Infrastructure.Serialization.Json;
-using ChatApp.TcpGateway.Networking.Sessions;
 using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
 using RealtimeEventDispatcher = ChatApp.TcpGateway.Gateway.Messaging.RealtimeEventDispatcher;

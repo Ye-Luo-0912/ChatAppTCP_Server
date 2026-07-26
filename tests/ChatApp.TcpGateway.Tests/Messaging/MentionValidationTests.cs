@@ -1,5 +1,5 @@
 using ChatApp.TcpGateway.Core.Protocol;
-using ChatApp.TcpGateway.Gateway.Networking;
+using ChatApp.TcpGateway.Gateway.Commands.Messaging;
 
 namespace ChatApp.TcpGateway.Tests.Messaging;
 
@@ -10,7 +10,7 @@ public sealed class MentionValidationTests
     [Fact]
     public void MentionedUserIds_Null_When_NotGroup()
     {
-        var result = TcpGatewayService.NormalizeMentionedUserIds(
+        var result = MessagingCommandHandler.NormalizeMentionedUserIds(
             [1002L, 1003L],
             isGroup: false,
             senderUserId: 1001);
@@ -21,7 +21,7 @@ public sealed class MentionValidationTests
     [Fact]
     public void MentionedUserIds_Null_When_InputNull()
     {
-        var result = TcpGatewayService.NormalizeMentionedUserIds(
+        var result = MessagingCommandHandler.NormalizeMentionedUserIds(
             raw: null,
             isGroup: true,
             senderUserId: 1001);
@@ -32,7 +32,7 @@ public sealed class MentionValidationTests
     [Fact]
     public void MentionedUserIds_Null_When_InputEmpty()
     {
-        var result = TcpGatewayService.NormalizeMentionedUserIds(
+        var result = MessagingCommandHandler.NormalizeMentionedUserIds(
             Array.Empty<long>(),
             isGroup: true,
             senderUserId: 1001);
@@ -43,7 +43,7 @@ public sealed class MentionValidationTests
     [Fact]
     public void MentionedUserIds_RemovesSelfMention()
     {
-        var result = TcpGatewayService.NormalizeMentionedUserIds(
+        var result = MessagingCommandHandler.NormalizeMentionedUserIds(
             [1002L, 1001, 1003],
             isGroup: true,
             senderUserId: 1001);
@@ -55,7 +55,7 @@ public sealed class MentionValidationTests
     [Fact]
     public void MentionedUserIds_RemovesNonPositiveIds()
     {
-        var result = TcpGatewayService.NormalizeMentionedUserIds(
+        var result = MessagingCommandHandler.NormalizeMentionedUserIds(
             [1002L, 0, -1, 1003],
             isGroup: true,
             senderUserId: 1001);
@@ -67,7 +67,7 @@ public sealed class MentionValidationTests
     [Fact]
     public void MentionedUserIds_Deduplicates()
     {
-        var result = TcpGatewayService.NormalizeMentionedUserIds(
+        var result = MessagingCommandHandler.NormalizeMentionedUserIds(
             [1002L, 1003, 1002, 1004, 1003],
             isGroup: true,
             senderUserId: 1001);
@@ -83,7 +83,7 @@ public sealed class MentionValidationTests
         for (var i = 1; i <= ChatMessageLimits.MaxMentionedUserIds + 10; i++)
             raw.Add(2000L + i);
 
-        var result = TcpGatewayService.NormalizeMentionedUserIds(
+        var result = MessagingCommandHandler.NormalizeMentionedUserIds(
             raw,
             isGroup: true,
             senderUserId: 1001);
@@ -95,7 +95,7 @@ public sealed class MentionValidationTests
     [Fact]
     public void MentionedUserIds_Null_When_AllFilteredOut()
     {
-        var result = TcpGatewayService.NormalizeMentionedUserIds(
+        var result = MessagingCommandHandler.NormalizeMentionedUserIds(
             [1001L, 0, -1],
             isGroup: true,
             senderUserId: 1001);
@@ -106,7 +106,7 @@ public sealed class MentionValidationTests
     [Fact]
     public void MentionedUserIds_PreservesOrder()
     {
-        var result = TcpGatewayService.NormalizeMentionedUserIds(
+        var result = MessagingCommandHandler.NormalizeMentionedUserIds(
             [1005L, 1002, 1004, 1003],
             isGroup: true,
             senderUserId: 1001);
@@ -120,7 +120,7 @@ public sealed class MentionValidationTests
     [Fact]
     public void MentionedRoles_Null_When_NotGroup()
     {
-        var result = TcpGatewayService.NormalizeMentionedRoles(
+        var result = MessagingCommandHandler.NormalizeMentionedRoles(
             ["all", "admin"],
             isGroup: false);
 
@@ -130,7 +130,7 @@ public sealed class MentionValidationTests
     [Fact]
     public void MentionedRoles_Null_When_InputNull()
     {
-        var result = TcpGatewayService.NormalizeMentionedRoles(
+        var result = MessagingCommandHandler.NormalizeMentionedRoles(
             raw: null,
             isGroup: true);
 
@@ -140,7 +140,7 @@ public sealed class MentionValidationTests
     [Fact]
     public void MentionedRoles_Null_When_InputEmpty()
     {
-        var result = TcpGatewayService.NormalizeMentionedRoles(
+        var result = MessagingCommandHandler.NormalizeMentionedRoles(
             Array.Empty<string>(),
             isGroup: true);
 
@@ -150,7 +150,7 @@ public sealed class MentionValidationTests
     [Fact]
     public void MentionedRoles_TrimsWhitespace()
     {
-        var result = TcpGatewayService.NormalizeMentionedRoles(
+        var result = MessagingCommandHandler.NormalizeMentionedRoles(
             ["  all  ", "admin"],
             isGroup: true);
 
@@ -161,7 +161,7 @@ public sealed class MentionValidationTests
     [Fact]
     public void MentionedRoles_RemovesBlankEntries()
     {
-        var result = TcpGatewayService.NormalizeMentionedRoles(
+        var result = MessagingCommandHandler.NormalizeMentionedRoles(
             ["all", "  ", "", "admin"],
             isGroup: true);
 
@@ -172,7 +172,7 @@ public sealed class MentionValidationTests
     [Fact]
     public void MentionedRoles_Deduplicates()
     {
-        var result = TcpGatewayService.NormalizeMentionedRoles(
+        var result = MessagingCommandHandler.NormalizeMentionedRoles(
             ["all", "admin", "all", "admin"],
             isGroup: true);
 
@@ -184,7 +184,7 @@ public sealed class MentionValidationTests
     public void MentionedRoles_TruncatesLongEntryToLimit()
     {
         var longRole = new string('a', ChatMessageLimits.MaxMentionedRoleLength + 10);
-        var result = TcpGatewayService.NormalizeMentionedRoles(
+        var result = MessagingCommandHandler.NormalizeMentionedRoles(
             [longRole],
             isGroup: true);
 
@@ -200,7 +200,7 @@ public sealed class MentionValidationTests
         for (var i = 0; i < ChatMessageLimits.MaxMentionedRoles + 5; i++)
             raw.Add($"role{i}");
 
-        var result = TcpGatewayService.NormalizeMentionedRoles(
+        var result = MessagingCommandHandler.NormalizeMentionedRoles(
             raw,
             isGroup: true);
 
@@ -211,7 +211,7 @@ public sealed class MentionValidationTests
     [Fact]
     public void MentionedRoles_Null_When_AllFilteredOut()
     {
-        var result = TcpGatewayService.NormalizeMentionedRoles(
+        var result = MessagingCommandHandler.NormalizeMentionedRoles(
             ["  ", ""],
             isGroup: true);
 
@@ -221,7 +221,7 @@ public sealed class MentionValidationTests
     [Fact]
     public void MentionedRoles_DeduplicatesAfterTrim()
     {
-        var result = TcpGatewayService.NormalizeMentionedRoles(
+        var result = MessagingCommandHandler.NormalizeMentionedRoles(
             ["all", "  all  ", "ALL"],
             isGroup: true);
 
