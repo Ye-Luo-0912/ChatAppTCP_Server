@@ -26,6 +26,9 @@ internal sealed class TcpClientSession : IAsyncDisposable
     // 每 Session 一个可复用发送超时 Timer，避免每次发送创建 LinkedCts + CancelAfter。
     private readonly ITimer _sendTimeoutTimer;
     private int _sendInProgress; // 0 = idle, 1 = sending
+    // 当前发送的 deadline（UtcTicks）。仅在 _sendInProgress=1 时有效。
+    // 跨发送代次的旧 Timer 回调通过比较此值识别自己已过期，避免误关后续发送。
+    private long _sendDeadlineTicks;
 
     // 鉴权超时精确 Deadline，不依赖定时扫描。
     private readonly ITimer _authDeadlineTimer;
@@ -77,16 +80,25 @@ internal sealed class TcpClientSession : IAsyncDisposable
                 FullMode = BoundedChannelFullMode.Wait
             });
 
-        // 创建可复用发送超时 Timer。到期时检查 _sendInProgress，
-        // 若仍为 1 说明发送超时，直接关闭连接。
+        // 创建可复用发送超时 Timer。到期时双重校验：
+        //   1) _sendInProgress 仍为 1（发送未完成）
+        //   2) 当前单调时钟已过 _sendDeadlineTicks
+        // deadline 校验防止跨发送代次的旧回调误判：
+        // 旧回调触发时 _sendDeadlineTicks 已被后续发送覆盖为更晚的值，
+        // now < deadline，不会误关连接。
         _sendTimeoutTimer = timeProvider.CreateTimer(
             static state =>
             {
                 var session = (TcpClientSession)state!;
-                if (Interlocked.CompareExchange(
-                        ref session._sendInProgress, 0, 1) == 1)
+                if (Volatile.Read(ref session._sendInProgress) == 1
+                    && session._timeProvider.GetUtcNow().UtcTicks
+                       >= Volatile.Read(ref session._sendDeadlineTicks))
                 {
-                    session.Close(SessionCloseReason.SendTimedOut);
+                    if (Interlocked.CompareExchange(
+                            ref session._sendInProgress, 0, 1) == 1)
+                    {
+                        session.Close(SessionCloseReason.SendTimedOut);
+                    }
                 }
             },
             this,
@@ -496,7 +508,10 @@ internal sealed class TcpClientSession : IAsyncDisposable
         CancellationToken lifetimeToken)
     {
         // 使用可复用 Timer 替代每次创建 LinkedCts + CancelAfter。
-        // Timer 到期时回调检查 _sendInProgress，若仍为 1 则 Close(SendTimedOut)。
+        // 顺序：先设 deadline，再标记发送中，最后启动 Timer。
+        // 先设 deadline 确保回调看到 _sendInProgress=1 时 deadline 已更新为本代次的值。
+        Volatile.Write(ref _sendDeadlineTicks,
+            _timeProvider.GetUtcNow().UtcTicks + _sendTimeout.Ticks);
         Interlocked.Exchange(ref _sendInProgress, 1);
         _sendTimeoutTimer.Change(_sendTimeout, Timeout.InfiniteTimeSpan);
 
