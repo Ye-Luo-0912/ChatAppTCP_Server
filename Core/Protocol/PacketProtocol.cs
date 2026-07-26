@@ -29,62 +29,12 @@ public static class PacketProtocol
     /// <summary>
     /// 返回指定命令允许的 Payload 上限（字节）。
     /// <para>
-    /// 解析包头后立即校验，不等完整 Payload 到达。
-    /// <list type="bullet">
-    /// <item>仅客户端可发送的命令返回正数上限；</item>
-    /// <item>服务端→客户端命令和未定义命令返回 -1，解析器立即拒绝；</item>
-    /// <item>所有正数上限均 ≤ <see cref="MaxPayloadSize"/>。</item>
-    /// </list>
+    /// 解析包头后立即校验，不等完整 Payload 到达。委托 <see cref="CommandCatalog"/>，
+    /// 后者是命令元数据的单一事实源；新增命令只需在 catalog 中登记。
     /// </para>
     /// </summary>
-    public static int GetMaxPayloadSize(PacketCommand command) => command switch
-    {
-        // 连接控制
-        PacketCommand.Heartbeat => 0,
-        PacketCommand.AuthenticationRequest => 4 * 1024,
-
-        // 协议握手
-        PacketCommand.ClientHello => 4 * 1024,
-
-        // 消息相关
-        PacketCommand.ChatMessage => 64 * 1024,
-        PacketCommand.MessageReceipt => 1024,
-        PacketCommand.MessageHistoryRequest => 4 * 1024,
-        PacketCommand.MessageRecallRequest => 1024,
-        PacketCommand.MessageEditRequest => 64 * 1024,
-
-        // 会话相关
-        PacketCommand.ConversationListRequest => 4 * 1024,
-        PacketCommand.ConversationMarkReadRequest => 4 * 1024,
-        PacketCommand.ConversationSetPrefsRequest => 4 * 1024,
-
-        // Reaction
-        PacketCommand.AddReactionRequest => 1024,
-        PacketCommand.RemoveReactionRequest => 1024,
-
-        // 同步
-        PacketCommand.SyncBootstrapRequest => 16 * 1024,
-
-        // 群组
-        PacketCommand.CreateGroupRequest => 16 * 1024,
-        PacketCommand.AddGroupMembersRequest => 16 * 1024,
-        PacketCommand.RemoveGroupMemberRequest => 4 * 1024,
-        PacketCommand.LeaveGroupRequest => 4 * 1024,
-        PacketCommand.ChangeMemberRoleRequest => 4 * 1024,
-        PacketCommand.ListGroupMembersRequest => 4 * 1024,
-
-        // Presence / Typing
-        PacketCommand.TypingNotify => 512,
-        PacketCommand.PresenceQuery => 4 * 1024,
-        PacketCommand.PresenceUnwatch => 4 * 1024,
-
-        // 离线推送：令牌字符串最大 1 KiB + 元数据
-        PacketCommand.RegisterPushTokenRequest => 2 * 1024,
-        PacketCommand.UnregisterPushTokenRequest => 2 * 1024,
-
-        // 服务端→客户端命令和未定义命令：客户端不允许发送
-        _ => -1,
-    };
+    public static int GetMaxPayloadSize(PacketCommand command) =>
+        CommandCatalog.GetMaxPayload(command);
 
     /// <summary>
     /// 当前协议版本。握手时与服务端协商，客户端必须发送 ≤ 此值的版本。
@@ -93,53 +43,16 @@ public static class PacketProtocol
 
     /// <summary>
     /// 判断命令是否为握手前命令（允许在未认证状态发送）。
-    /// 包含 ClientHello 和 AuthenticationRequest。
+    /// 包含 ClientHello 和 AuthenticationRequest。委托 <see cref="CommandCatalog"/>。
     /// </summary>
     public static bool IsAuthenticationCommand(PacketCommand command) =>
-        command == PacketCommand.AuthenticationRequest ||
-        command == PacketCommand.ClientHello;
+        CommandCatalog.IsPreAuthentication(command);
 
     /// <summary>
     /// 返回命令的令牌桶消耗权重（包令牌数）。
     /// 昂贵命令消耗更多令牌，限制其突发频率，保护数据库与下游服务。
-    /// 字节令牌仍按实际帧字节数消耗，此处仅加权包维度。
+    /// 字节令牌仍按实际帧字节数消耗，此处仅加权包维度。委托 <see cref="CommandCatalog"/>。
     /// </summary>
-    public static int GetCommandCost(PacketCommand command) => command switch
-    {
-        // 免费/极低成本：控制帧与瞬态帧，不涉及持久化
-        PacketCommand.Heartbeat => 1,
-        PacketCommand.ClientHello => 1,
-        PacketCommand.MessageReceipt => 1,
-        PacketCommand.TypingNotify => 1,
-        PacketCommand.PresenceUnwatch => 1,
-
-        // 中等成本：单次 Redis/DB 写或读
-        PacketCommand.AuthenticationRequest => 2,
-        PacketCommand.PresenceQuery => 2,
-        PacketCommand.ConversationMarkReadRequest => 2,
-        PacketCommand.AddReactionRequest => 2,
-        PacketCommand.RemoveReactionRequest => 2,
-        PacketCommand.MessageRecallRequest => 2,
-        PacketCommand.MessageEditRequest => 2,
-        PacketCommand.RegisterPushTokenRequest => 2,
-        PacketCommand.UnregisterPushTokenRequest => 1,
-
-        // 高成本：消息写入 + fanout，或分页查询
-        PacketCommand.ChatMessage => 4,
-        PacketCommand.MessageHistoryRequest => 4,
-        PacketCommand.ConversationListRequest => 4,
-        PacketCommand.ConversationSetPrefsRequest => 4,
-        PacketCommand.LeaveGroupRequest => 4,
-        PacketCommand.RemoveGroupMemberRequest => 4,
-        PacketCommand.ChangeMemberRoleRequest => 4,
-        PacketCommand.ListGroupMembersRequest => 4,
-
-        // 极高成本：多对话批量同步或群组创建
-        PacketCommand.SyncBootstrapRequest => 8,
-        PacketCommand.CreateGroupRequest => 8,
-        PacketCommand.AddGroupMembersRequest => 8,
-
-        // 未列举的命令按默认成本 1
-        _ => 1
-    };
+    public static int GetCommandCost(PacketCommand command) =>
+        CommandCatalog.GetCost(command);
 }
