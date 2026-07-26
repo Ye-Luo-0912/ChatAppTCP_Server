@@ -70,11 +70,14 @@ internal sealed class SessionCommandScheduler : IAsyncDisposable
             });
 
         // Ephemeral：Wait + 手动 DropOldest，以便在丢弃时释放入站预算。
+        // SingleReader=false：TryEnqueueEphemeral 在队列满时会通过 Reader.TryRead 丢弃最旧帧
+        // 并释放其入站预算，与 RunLaneAsync 的消费循环形成第二个 reader。
+        // 声明 SingleReader=true 会违背 Channel 的单消费者约定，因此显式设为 false。
         _ephemeralChannel = Channel.CreateBounded<SessionCommand>(
             new BoundedChannelOptions(ephemeralCapacity)
             {
                 FullMode = BoundedChannelFullMode.Wait,
-                SingleReader = true,
+                SingleReader = false,
                 SingleWriter = true
             });
 
