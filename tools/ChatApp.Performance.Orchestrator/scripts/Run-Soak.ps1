@@ -5,6 +5,7 @@ param(
     [ValidateRange(1, 1024)] [int] $PipelineConcurrency = 32,
     [ValidateRange(1, 1048576)] [int] $PipelinePayloadBytes = 512,
     [ValidateRange(1, 100000)] [int] $TcpConnections = 1000,
+    [ValidateSet('Pipelines','DirectSocket')] [string] $InboundTransportMode = 'DirectSocket',
     [ValidateSet('PersistentSendLoop','OnDemandSendPump')] [string] $OutboundSendMode = 'PersistentSendLoop',
     [int] $OnDemandSendWorkerCount = 0,
     [int] $OnDemandSendBurstLimit = 16,
@@ -30,6 +31,7 @@ $arguments = @{
     PipelineConcurrency = $PipelineConcurrency
     PipelinePayloadBytes = $PipelinePayloadBytes
     TcpConnections = $TcpConnections
+    InboundTransportMode = $InboundTransportMode
     OutboundSendMode = $OutboundSendMode
     OnDemandSendWorkerCount = $OnDemandSendWorkerCount
     OnDemandSendBurstLimit = $OnDemandSendBurstLimit

@@ -82,7 +82,9 @@ internal sealed partial class HistoryQueryCommandHandler
                 .Select(static watermark => new RealtimeConversationSyncWatermark
                 {
                     ConversationId = watermark.ConversationId,
-                    AfterReceivedAtMs = watermark.AfterReceivedAtMs,
+                    // v1 wire 字段仍名为 afterReceivedAtMs；Realtime 内部已统一为
+                    // changed_at_ms 水位，避免编辑/撤回/Reaction 被增量同步漏掉。
+                    AfterChangedAtMs = watermark.AfterReceivedAtMs,
                     AfterMessageId = watermark.AfterMessageId
                 })
                 .ToArray()
@@ -180,8 +182,9 @@ internal sealed partial class HistoryQueryCommandHandler
                     ConversationId = reset.ConversationId,
                     Reason = (SyncCursorResetReason)(byte)reset.Reason,
                     TipMessageId = reset.TipMessageId,
-                    TipReceivedAtMs = reset.TipReceivedAtMs,
-                    ClientAfterReceivedAtMs = reset.ClientAfterReceivedAtMs,
+                    // 保持 v1 JSON 字段兼容；值的语义已经升级为 changed_at_ms。
+                    TipReceivedAtMs = reset.TipChangedAtMs,
+                    ClientAfterReceivedAtMs = reset.ClientAfterChangedAtMs,
                     ClientAfterMessageId = reset.ClientAfterMessageId
                 })
                 .ToArray();

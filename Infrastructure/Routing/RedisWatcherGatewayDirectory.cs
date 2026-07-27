@@ -34,6 +34,7 @@ internal sealed class RedisWatcherGatewayDirectory(
 {
     private const string KeyPrefix = "pw:";
     private const string FieldSeparator = ":";
+    private const string ActiveShardsKey = "watchers:__active_shards__";
 
     // HINCRBY key field 1; PEXPIRE key ttl。返回当前 field 数量。
     // 引用计数：同 watcher+instance 的多次 Register 累加计数。
@@ -174,6 +175,15 @@ internal sealed class RedisWatcherGatewayDirectory(
 
             batch.Execute();
             await Task.WhenAll(tasks).WaitAsync(cancellationToken).ConfigureAwait(false);
+            var expiresAt = DateTimeOffset.UtcNow
+                .AddMilliseconds(DefaultTtlMs)
+                .ToUnixTimeMilliseconds();
+            await db.SortedSetAddAsync(
+                    ActiveShardsKey,
+                    instanceId,
+                    expiresAt)
+                .WaitAsync(cancellationToken)
+                .ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -221,6 +231,43 @@ internal sealed class RedisWatcherGatewayDirectory(
                 GatewayDependency.Redis,
                 GatewayDependencyOperation.WatcherDirectoryQuery,
                 ex);
+        }
+    }
+
+    public async Task<IReadOnlyList<string>> ListActiveShardsAsync(
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            var db = connectionProvider.Database;
+            var members = await db.SortedSetRangeByScoreAsync(
+                    ActiveShardsKey,
+                    nowMs,
+                    double.PositiveInfinity,
+                    Exclude.Start)
+                .WaitAsync(cancellationToken)
+                .ConfigureAwait(false);
+            if (members.Length == 0)
+                return Array.Empty<string>();
+
+            var result = new string[members.Length];
+            for (var i = 0; i < members.Length; i++)
+                result[i] = members[i].ToString();
+            return result;
+        }
+        catch (OperationCanceledException)
+            when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            logger.DependencyOperationFailed(
+                GatewayDependency.Redis,
+                GatewayDependencyOperation.WatcherDirectoryQuery,
+                ex);
+            return Array.Empty<string>();
         }
     }
 

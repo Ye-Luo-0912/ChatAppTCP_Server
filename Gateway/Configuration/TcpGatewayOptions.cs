@@ -11,6 +11,14 @@ public sealed class TcpGatewayOptions
     public int ListenBacklog { get; set; } = 512;
     public int MaxConnections { get; set; } = 10_000;
     public int ReceiveBufferSize { get; set; } = 4 * 1024;
+
+    /// <summary>
+    /// 入站读取模式。DirectSocket 通过固定池化缓冲区直接执行增量协议解析；
+    /// Pipelines 保留为 A/B 基线与快速回退路径。
+    /// </summary>
+    public InboundTransportMode InboundTransportMode { get; set; } =
+        InboundTransportMode.DirectSocket;
+
     public long PipePauseWriterThreshold { get; set; } = 160 * 1024;
     public long PipeResumeWriterThreshold { get; set; } = 80 * 1024;
     public int OutboundQueueCapacity { get; set; } = 256;
@@ -142,9 +150,9 @@ public sealed class TcpGatewayOptions
     public long GlobalMaxOutboundQueuedBytes { get; set; } = 512 * 1024 * 1024;
 
     /// <summary>
-    /// 全局入站缓冲字节预算上限（所有连接 Pipe 暂存 + lane 复制/池化 payload 总和）。
+    /// 全局入站缓冲字节预算上限（所有连接 Socket/Pipe 暂存 + lane 复制/池化 payload 总和）。
     /// <para>
-    /// 默认 1 GiB。由 <c>GlobalInboundBudget</c> 在写入 Pipe / 复制到调度缓冲区前预留，
+    /// 默认 1 GiB。由 <c>GlobalInboundBudget</c> 在接收/写入 Pipe/复制到调度缓冲区前预留，
     /// 消费或断开时释放；超限时关闭连接以背压，避免配置上限形同虚设。
     /// 单连接 Pipe 暂停阈值仍由 <see cref="PipePauseWriterThreshold"/> 控制。
     /// </para>
@@ -207,7 +215,39 @@ public sealed class TcpGatewayOptions
     /// </summary>
     public int CommandSchedulerEphemeralCapacity { get; set; } = 4;
 
+    /// <summary>
+    /// 使用轻量 ActorRuntime 驱动 Ephemeral 入站命令。关闭时回退到
+    /// SessionCommandExecutor，便于灰度和 A/B。
+    /// </summary>
+    public bool UseActorRuntimeForEphemeralCommands { get; set; }
+
+    /// <summary>Ephemeral Actor Shard 数；0 表示按 CPU 自动选择 2 的幂。</summary>
+    public int EphemeralActorShardCount { get; set; }
+
+    /// <summary>每个 Ephemeral Actor Shard 的普通 Ingress 容量，必须为 2 的幂。</summary>
+    public int EphemeralActorIngressCapacity { get; set; } = 4096;
+
+    /// <summary>Ephemeral Actor 异步 I/O 并发数；0 表示 CPU×2。</summary>
+    public int EphemeralActorAsyncConcurrency { get; set; }
+
+    /// <summary>Ephemeral Actor 无消息后的回收时间。</summary>
+    public TimeSpan EphemeralActorIdleTimeout { get; set; } =
+        TimeSpan.FromSeconds(30);
+
+    /// <summary>单条 Ephemeral Actor 后端操作超时。</summary>
+    public TimeSpan EphemeralActorOperationTimeout { get; set; } =
+        TimeSpan.FromSeconds(10);
+
     // 协议握手与连接恢复配置
+
+    /// <summary>
+    /// 当前部署接受的最低客户端协议版本。可在协议淘汰期逐步提高，
+    /// 但必须位于编译期支持区间
+    /// [<see cref="PacketProtocol.MinProtocolVersion"/>,
+    /// <see cref="PacketProtocol.CurrentProtocolVersion"/>]。
+    /// </summary>
+    public ushort MinimumClientProtocolVersion { get; set; } =
+        PacketProtocol.MinProtocolVersion;
 
     /// <summary>
     /// 是否要求客户端在认证前先发送 ClientHello 握手。
@@ -257,6 +297,7 @@ public sealed class TcpGatewayOptions
         ListenBacklog > 0 &&
         MaxConnections > 0 &&
         ReceiveBufferSize >= 512 &&
+        Enum.IsDefined(InboundTransportMode) &&
         PipeResumeWriterThreshold > 0 &&
         PipePauseWriterThreshold > PipeResumeWriterThreshold &&
         OutboundQueueCapacity > 0 &&
@@ -282,8 +323,18 @@ public sealed class TcpGatewayOptions
         CommandSchedulerOrderedWriteCapacity > 0 &&
         CommandSchedulerQueryCapacity > 0 &&
         CommandSchedulerEphemeralCapacity > 0 &&
+        EphemeralActorShardCount >= 0 &&
+        (EphemeralActorShardCount == 0 ||
+         (EphemeralActorShardCount & (EphemeralActorShardCount - 1)) == 0) &&
+        EphemeralActorIngressCapacity > 0 &&
+        (EphemeralActorIngressCapacity & (EphemeralActorIngressCapacity - 1)) == 0 &&
+        EphemeralActorAsyncConcurrency >= 0 &&
+        EphemeralActorIdleTimeout > TimeSpan.Zero &&
+        EphemeralActorOperationTimeout > TimeSpan.Zero &&
         OnDemandSendWorkerCount >= 0 &&
         OnDemandSendBurstLimit > 0 &&
+        MinimumClientProtocolVersion >= PacketProtocol.MinProtocolVersion &&
+        MinimumClientProtocolVersion <= PacketProtocol.CurrentProtocolVersion &&
         ResumeTokenTtl > TimeSpan.Zero &&
         GoAwayDrainTimeout > TimeSpan.Zero &&
         RealtimeEventPartitionCount > 0;

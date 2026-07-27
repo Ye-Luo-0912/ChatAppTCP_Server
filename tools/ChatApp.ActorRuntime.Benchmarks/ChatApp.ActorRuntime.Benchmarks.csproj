@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>ChatApp.ActorRuntime.Benchmarks</AssemblyName>
+    <RootNamespace>ChatApp.ActorRuntime.Benchmarks</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\ActorRuntime\ChatApp.ActorRuntime.csproj" />
+  </ItemGroup>
+</Project>

@@ -16,9 +16,9 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <Compile Remove="Core\**;Infrastructure\**;Observability\**;tests\**;tools\**" />
-    <EmbeddedResource Remove="Core\**;Infrastructure\**;Observability\**;tests\**;tools\**" />
-    <None Remove="Core\**;Infrastructure\**;Observability\**;tests\**;tools\**" />
+    <Compile Remove="Core\**;Infrastructure\**;Observability\**;tests\**;tools\**;ActorRuntime\**" />
+    <EmbeddedResource Remove="Core\**;Infrastructure\**;Observability\**;tests\**;tools\**;ActorRuntime\**" />
+    <None Remove="Core\**;Infrastructure\**;Observability\**;tests\**;tools\**;ActorRuntime\**" />
   </ItemGroup>
 
   <ItemGroup>
@@ -32,6 +32,7 @@
     <ProjectReference Include="Core\Core.csproj" />
     <ProjectReference Include="Infrastructure\Infrastructure.csproj" />
     <ProjectReference Include="Observability\ChatApp.TcpGateway.Observability.csproj" />
+    <ProjectReference Include="ActorRuntime\ChatApp.ActorRuntime.csproj" />
     <ProjectReference Include="..\ChatApp.RealtimeServices\ChatApp.Realtime.Integration\ChatApp.Realtime.Integration.csproj" />
   </ItemGroup>
 

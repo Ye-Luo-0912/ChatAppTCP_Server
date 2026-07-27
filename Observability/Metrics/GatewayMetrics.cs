@@ -531,6 +531,44 @@ public sealed class GatewayMetrics : IDisposable
         }
     }
 
+    /// <summary>
+    /// 注册 Ephemeral ActorRuntime 的低基数运行时指标。
+    /// Observability 只接收 BCL provider，不依赖 ActorRuntime 项目。
+    /// </summary>
+    public void RegisterActorRuntimeObservers(
+        Func<long> activeActorsProvider,
+        Func<long> busyActorsProvider,
+        Func<long> pendingIngressProvider,
+        Func<long> pendingMailboxProvider,
+        Func<int> pendingAsyncProvider,
+        Func<long> totalProcessedProvider)
+    {
+        _meter.CreateObservableGauge(
+            "gateway.actor.active",
+            () => activeActorsProvider(),
+            unit: "{actors}");
+        _meter.CreateObservableGauge(
+            "gateway.actor.busy",
+            () => busyActorsProvider(),
+            unit: "{actors}");
+        _meter.CreateObservableGauge(
+            "gateway.actor.ingress.pending",
+            () => pendingIngressProvider(),
+            unit: "{messages}");
+        _meter.CreateObservableGauge(
+            "gateway.actor.mailbox.pending",
+            () => pendingMailboxProvider(),
+            unit: "{messages}");
+        _meter.CreateObservableGauge(
+            "gateway.actor.async.pending",
+            () => pendingAsyncProvider(),
+            unit: "{operations}");
+        _meter.CreateObservableGauge(
+            "gateway.actor.messages.processed",
+            () => totalProcessedProvider(),
+            unit: "{messages}");
+    }
+
     private static string GetFailureKindName(AuthenticationFailureKind kind) =>
         kind switch
         {

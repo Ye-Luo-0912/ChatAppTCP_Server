@@ -45,6 +45,9 @@ public enum ProtocolErrorCode : ushort
     /// <summary>Payload 超过该命令允许的上限。客户端应减小 payload 后重试。</summary>
     PayloadTooLarge = 21,
 
+    /// <summary>命令需要客户端尚未协商的能力。连接保持，客户端不得重试相同命令。</summary>
+    FeatureNotNegotiated = 22,
+
     /// <summary>服务端过载。客户端应按 <c>RetryAfterMs</c> 退避或重连其他实例。</summary>
     ServerOverloaded = 30,
 

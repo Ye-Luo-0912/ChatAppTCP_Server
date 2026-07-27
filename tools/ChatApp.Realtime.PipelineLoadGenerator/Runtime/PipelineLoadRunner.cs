@@ -395,7 +395,7 @@ internal sealed class PipelineLoadRunner
                 new ConversationSyncWatermark
                 {
                     ConversationId = conversationId,
-                    AfterReceivedAtMs = restored.ReceivedAtMs,
+                    AfterChangedAtMs = restored.ChangedAtMs,
                     AfterMessageId = messageId
                 }
             ]

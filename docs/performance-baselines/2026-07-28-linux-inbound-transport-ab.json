@@ -1,0 +1,83 @@
+{
+  "completedAtUtc": "2026-07-27T21:22:03.3071635Z",
+  "status": "passed",
+  "scope": "short reversible-default gate; not a soak or capacity ceiling",
+  "host": "Linux CachyOS x86_64 via ssh chatapp-linux",
+  "runtime": ".NET 10.0.10",
+  "configuration": {
+    "gatewayCount": 2,
+    "durationSecondsPerMode": 45,
+    "serviceWarmupSeconds": 10,
+    "tcpConnections": 1000,
+    "tcpMode": "heartbeat",
+    "messagesPerSecondPerConnection": 20,
+    "pipelineEnabled": false,
+    "outboundSendMode": "PersistentSendLoop",
+    "maximumThroughputRegressionPercent": 5,
+    "maximumP95RegressionPercent": 10,
+    "maximumP99RegressionPercent": 15,
+    "absoluteP95NoiseAllowanceMilliseconds": 1,
+    "absoluteP99NoiseAllowanceMilliseconds": 2
+  },
+  "gates": {
+    "pipelinesRunPassed": true,
+    "directSocketRunPassed": true,
+    "noFailedConnections": true,
+    "throughputWithinGate": true,
+    "p95WithinGate": true,
+    "p99WithinGate": true
+  },
+  "pipelines": {
+    "successfulConnections": 1000,
+    "failedConnections": 0,
+    "heartbeatsPerSecond": 19937.9444,
+    "p95Milliseconds": 5.926,
+    "p99Milliseconds": 8.7527,
+    "gatewayAverageCpuPercentTotal": 7.2060,
+    "gatewayMaximumWorkingSetBytesTotal": 347303936
+  },
+  "directSocket": {
+    "successfulConnections": 1000,
+    "failedConnections": 0,
+    "heartbeatsPerSecond": 19934.1177,
+    "p95Milliseconds": 6.7085,
+    "p99Milliseconds": 8.3160,
+    "gatewayAverageCpuPercentTotal": 5.9120,
+    "gatewayMaximumWorkingSetBytesTotal": 335687680
+  },
+  "directSocketChangePercent": {
+    "throughput": -0.0192,
+    "p95": 13.2045,
+    "p99": -4.9893,
+    "gatewayAverageCpu": -17.9582,
+    "gatewayMaximumWorkingSet": -3.3447
+  },
+  "postSwitchIntegration": {
+    "status": "passed",
+    "durationSeconds": 30,
+    "gatewayCount": 2,
+    "tcpSuccessfulConnections": 200,
+    "tcpFailedConnections": 0,
+    "tcpHeartbeatsPerSecond": 1991.0086,
+    "pipelineTargetPerSecond": 40,
+    "pipelineSucceeded": 1216,
+    "pipelineFailed": 0,
+    "pipelineThroughputPerSecond": 40.1209,
+    "pipelineP95Milliseconds": 253.5,
+    "pipelineP99Milliseconds": 364.5,
+    "jetStreamPendingFinal": 0,
+    "outboxPendingFinal": 0
+  },
+  "decision": {
+    "defaultInboundTransportMode": "DirectSocket",
+    "rollbackInboundTransportMode": "Pipelines",
+    "remainingBeforeRemovingRollback": [
+      "10000 idle connections",
+      "512-byte and 64-KiB chat payloads",
+      "slow-send and inbound-budget exhaustion",
+      "connection storm",
+      "8-24 hour soak",
+      "allocation, GC, and per-connection memory comparison"
+    ]
+  }
+}

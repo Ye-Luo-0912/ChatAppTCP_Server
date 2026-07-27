@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <AssemblyName>ChatApp.ActorRuntime</AssemblyName>
+    <RootNamespace>ChatApp.ActorRuntime</RootNamespace>
+    <IsAotCompatible>true</IsAotCompatible>
+    <!-- 高性能原语需要 unsafe 直接操作内存与 CAS 序列。 -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <!-- 仅依赖 BCL：不引用 Microsoft.Extensions.* / Gateway / Core / Infrastructure / Observability。
+         宿主负责 DI、HostedService、Metrics 适配。 -->
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- 测试需要访问 internal 原语（BoundedMpscRing/SpscRing/AsyncOperationExecutor 等）进行白盒测试。 -->
+    <InternalsVisibleTo Include="ChatApp.TcpGateway.Tests" />
+  </ItemGroup>
+
+</Project>

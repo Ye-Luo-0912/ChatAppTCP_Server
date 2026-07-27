@@ -22,7 +22,8 @@ internal sealed partial class DeadlineWheel : IAsyncDisposable
     public const int DefaultBucketCount = 1024;
 
     private readonly TimeProvider _timeProvider;
-    private readonly TimeSpan _tickInterval;
+    private readonly TimeSpan _tickInterval; // tick interval as TimeSpan (for PeriodicTimer)
+    private readonly long _tickIntervalTimestamp; // tick interval in TimeProvider timestamp units
     private readonly int _bucketCount;
     private readonly ILogger _logger;
 
@@ -49,13 +50,21 @@ internal sealed partial class DeadlineWheel : IAsyncDisposable
         ILogger? logger = null)
     {
         _timeProvider = timeProvider ?? TimeProvider.System;
-        _tickInterval = tickInterval ?? DefaultTickInterval;
+        var interval = tickInterval ?? DefaultTickInterval;
         _bucketCount = bucketCount ?? DefaultBucketCount;
         _logger = logger ?? NullLogger.Instance;
 
-        if (_tickInterval <= TimeSpan.Zero)
+        if (interval <= TimeSpan.Zero)
             throw new ArgumentOutOfRangeException(nameof(tickInterval));
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(_bucketCount, 0);
+
+        // 将 TimeSpan 转换为 TimeProvider 的 timestamp units。
+        // GetTimestamp() 返回的单位取决于 TimestampFrequency：
+        // - Windows QPC：通常 10 MHz（10,000,000 ticks/s）
+        // - Linux CLOCK_MONOTONIC：通常 1 GHz（1,000,000,000 ticks/s）
+        // TimeSpan.Ticks 固定为 10 MHz，两者不能直接混用。
+        _tickInterval = interval;
+        _tickIntervalTimestamp = ToTimestampUnits(interval);
 
         _buckets = new List<DeadlineEntry>[_bucketCount];
         for (var i = 0; i < _bucketCount; i++)
@@ -65,7 +74,14 @@ internal sealed partial class DeadlineWheel : IAsyncDisposable
         _lastSweptTick = CurrentTick - 1;
     }
 
-    private long CurrentTick => _timeProvider.GetTimestamp() / _tickInterval.Ticks;
+    /// <summary>
+    /// 将 TimeSpan 转换为 TimeProvider 的 timestamp units。
+    /// 必须使用 TimestampFrequency 换算，不能直接用 TimeSpan.Ticks。
+    /// </summary>
+    private long ToTimestampUnits(TimeSpan duration) =>
+        checked((long)(duration.TotalSeconds * _timeProvider.TimestampFrequency));
+
+    private long CurrentTick => _timeProvider.GetTimestamp() / _tickIntervalTimestamp;
 
     /// <summary>
     /// 启动时间轮驱动循环。重复调用幂等返回已存在的运行 Task。
@@ -97,14 +113,14 @@ internal sealed partial class DeadlineWheel : IAsyncDisposable
         ArgumentNullException.ThrowIfNull(callback);
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(delay, TimeSpan.Zero);
 
-        var deadlineTicks = _timeProvider.GetTimestamp() + delay.Ticks;
+        var deadlineTimestamp = _timeProvider.GetTimestamp() + ToTimestampUnits(delay);
 
         lock (_gate)
         {
             var id = ++_nextId;
-            var tick = deadlineTicks / _tickInterval.Ticks;
+            var tick = deadlineTimestamp / _tickIntervalTimestamp;
             var bucketIndex = (int)(tick % _bucketCount);
-            _buckets[bucketIndex].Add(new DeadlineEntry(id, deadlineTicks, callback));
+            _buckets[bucketIndex].Add(new DeadlineEntry(id, deadlineTimestamp, callback));
             Interlocked.Increment(ref _activeDeadlines);
             return new DeadlineRegistration(id);
         }
@@ -165,7 +181,7 @@ internal sealed partial class DeadlineWheel : IAsyncDisposable
     public void PumpExpired()
     {
         var now = _timeProvider.GetTimestamp();
-        var currentTick = now / _tickInterval.Ticks;
+        var currentTick = now / _tickIntervalTimestamp;
 
         List<DeadlineEntry> toFire = new();
 
@@ -205,7 +221,7 @@ internal sealed partial class DeadlineWheel : IAsyncDisposable
         }
     }
 
-    private void SweepBucketLocked(long tick, long nowTicks, List<DeadlineEntry> toFire)
+    private void SweepBucketLocked(long tick, long nowTimestamp, List<DeadlineEntry> toFire)
     {
         var bucket = _buckets[tick % _bucketCount];
         if (bucket.Count == 0)
@@ -221,7 +237,7 @@ internal sealed partial class DeadlineWheel : IAsyncDisposable
             if (_cancelled.Remove(entry.Id))
                 continue;
 
-            if (entry.DeadlineTicks > nowTicks)
+            if (entry.DeadlineTimestamp > nowTimestamp)
             {
                 // 未来到期（仅停顿导致桶被复用时出现）：重新挂到正确桶。
                 (leftover ??= new List<DeadlineEntry>()).Add(entry);
@@ -241,16 +257,16 @@ internal sealed partial class DeadlineWheel : IAsyncDisposable
         {
             foreach (var entry in leftover)
             {
-                var idx = (int)(entry.DeadlineTicks / _tickInterval.Ticks % _bucketCount);
+                var idx = (int)(entry.DeadlineTimestamp / _tickIntervalTimestamp % _bucketCount);
                 _buckets[idx].Add(entry);
             }
         }
     }
 
-    private void FullSweepLocked(long nowTicks, List<DeadlineEntry> toFire)
+    private void FullSweepLocked(long nowTimestamp, List<DeadlineEntry> toFire)
     {
         for (var i = 0; i < _bucketCount; i++)
-            SweepBucketLocked(_lastSweptTick + 1 + i, nowTicks, toFire);
+            SweepBucketLocked(_lastSweptTick + 1 + i, nowTimestamp, toFire);
     }
 
     public async ValueTask DisposeAsync()
@@ -282,7 +298,7 @@ internal sealed partial class DeadlineWheel : IAsyncDisposable
         _cts?.Dispose();
     }
 
-    private readonly record struct DeadlineEntry(long Id, long DeadlineTicks, Action Callback);
+    private readonly record struct DeadlineEntry(long Id, long DeadlineTimestamp, Action Callback);
 
     [LoggerMessage(
         EventId = 1,

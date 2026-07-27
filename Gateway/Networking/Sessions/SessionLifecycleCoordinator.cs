@@ -225,7 +225,6 @@ internal sealed partial class SessionLifecycleCoordinator
             context.SessionId,
             context.DeviceIdHash,
             context.DeviceId);
-        session.MarkHandshakeCompleted();
 
         if (_userSessions.Add(session) && _options.EnableEphemeralPresenceAndTyping)
         {

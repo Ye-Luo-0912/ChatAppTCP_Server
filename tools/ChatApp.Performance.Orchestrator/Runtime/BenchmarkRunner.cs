@@ -445,6 +445,12 @@ Console.WriteLine("Starting RealtimeServices...");
         int index,
         string logDirectory)
     {
+        var benchmarkConnections = Divide(
+            options.TcpConnections,
+            options.GatewayCount,
+            index);
+        var benchmarkAdmissionLimit = checked(
+            benchmarkConnections + 16);
         var environment = new Dictionary<string, string?>
         {
             ["DOTNET_ENVIRONMENT"] = "Development",
@@ -465,6 +471,12 @@ Console.WriteLine("Starting RealtimeServices...");
                 assemblyPath,
                 "--TcpGateway:ListenAddress=127.0.0.1",
                 $"--TcpGateway:Port={options.GatewayBasePort + index}",
+                // 本机负载全部来自 loopback。显式放宽基准专用 admission，
+                // 避免默认单 IP 上限把连接规模误判为传输性能回退。
+                $"--TcpGateway:MaxConnections={benchmarkAdmissionLimit}",
+                $"--TcpGateway:MaxConnectionsPerIp={benchmarkAdmissionLimit}",
+                $"--TcpGateway:MaxUnauthenticatedConnections={benchmarkAdmissionLimit}",
+                $"--TcpGateway:InboundTransportMode={options.InboundTransportMode}",
                 // 出站发送模式 A/B：注入 OutboundSendMode 与 OnDemandSendPump 相关参数。
                 // PersistentSendLoop 模式下 OnDemandSendWorkerCount/BurstLimit 被忽略，不影响行为。
                 $"--TcpGateway:OutboundSendMode={options.OutboundSendMode}",

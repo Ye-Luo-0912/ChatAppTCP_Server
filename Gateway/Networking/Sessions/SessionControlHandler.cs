@@ -197,7 +197,9 @@ internal sealed class SessionControlHandler
             SessionId = session.SessionId,
             DeviceIdHash = result.DeviceIdHash,
             DeviceId = result.DeviceId,
-            ResumeToken = resumeToken
+            ResumeToken = session.AllowsFeature(GatewayFeature.SessionResume)
+                ? resumeToken
+                : null
         };
 
         using var responseFrame = OutboundFrameFactory.Create(
@@ -235,10 +237,10 @@ internal sealed class SessionControlHandler
             return;
         }
 
-        // 协议版本协商：客户端版本须在 [MinProtocolVersion, CurrentProtocolVersion] 区间内。
-        // 高于 CurrentProtocolVersion：服务端不支持，致命错误。
-        // 低于 MinProtocolVersion：客户端过旧，需升级，致命错误。
-        if (hello.ProtocolVersion > PacketProtocol.CurrentProtocolVersion)
+        // 客户端发送其可用协议版本；服务端只接受当前部署支持区间内的版本。
+        // 选定版本直接沿用客户端版本，避免未来服务端 v2 向兼容 v1 客户端回显 v2。
+        var serverProtocolVersion = _serverIdentity.ProtocolVersion;
+        if (hello.ProtocolVersion > serverProtocolVersion)
         {
             SendProtocolError(
                 session,
@@ -249,19 +251,56 @@ internal sealed class SessionControlHandler
             return;
         }
 
-        if (hello.ProtocolVersion < PacketProtocol.MinProtocolVersion)
+        if (hello.ProtocolVersion < _options.MinimumClientProtocolVersion)
         {
             SendProtocolError(
                 session,
                 ProtocolErrorCode.UnsupportedVersion,
-                $"protocol version {hello.ProtocolVersion} below minimum supported {PacketProtocol.MinProtocolVersion}",
+                $"protocol version {hello.ProtocolVersion} below minimum supported " +
+                $"{_options.MinimumClientProtocolVersion}",
                 fatal: true);
             session.Close(SessionCloseReason.ProtocolViolation);
             return;
         }
 
-        // 断线重连：客户端携带 ResumeToken 时尝试恢复。
-        if (_options.EnableResume && !string.IsNullOrWhiteSpace(hello.ResumeToken))
+        var negotiatedProtocolVersion = hello.ProtocolVersion;
+        var serverFeatureBits = _serverIdentity.FeatureBits;
+        if (!_options.EnableResume)
+        {
+            serverFeatureBits &=
+                ~(uint)GatewayFeature.SessionResume;
+        }
+        if (!_options.EnableEphemeralPresenceAndTyping)
+        {
+            serverFeatureBits &=
+                ~(uint)GatewayFeature.PresenceAndTyping;
+        }
+
+        var negotiatedFeatureBits =
+            hello.FeatureBits & serverFeatureBits;
+        var strictCapabilities = GatewayFeatureSet.ContainsAll(
+            negotiatedFeatureBits,
+            GatewayFeature.CommandCapabilities);
+        var resumeNegotiated =
+            !strictCapabilities ||
+            GatewayFeatureSet.ContainsAll(
+                negotiatedFeatureBits,
+                GatewayFeature.SessionResume);
+
+        // 断线重连：严格能力模式要求先协商 SessionResume；
+        // 旧客户端未启用能力门控时继续兼容原有 resumeToken 行为。
+        if (_options.EnableResume &&
+            !string.IsNullOrWhiteSpace(hello.ResumeToken) &&
+            !resumeNegotiated)
+        {
+            SendProtocolError(
+                session,
+                ProtocolErrorCode.FeatureNotNegotiated,
+                "resume token requires negotiated SessionResume feature",
+                originCommand: (ushort)PacketCommand.ClientHello);
+        }
+        else if (_options.EnableResume &&
+                 !string.IsNullOrWhiteSpace(hello.ResumeToken))
         {
             // _resumeResponseCodec 未注入（测试场景）时跳过 Resume 尝试，回退到完整认证。
             ResumeLifecycleResult? resumeResult = null;
@@ -277,6 +316,9 @@ internal sealed class SessionControlHandler
                 // 恢复成功：admission 跟踪 + 发送 ResumeResponse。
                 _listenerHost.MarkAuthenticated();
                 _metrics.UnauthenticatedConnectionClosed();
+                session.CompleteHandshake(
+                    negotiatedProtocolVersion,
+                    negotiatedFeatureBits);
 
                 var resumeResponse = new ResumeResponse
                 {
@@ -306,20 +348,18 @@ internal sealed class SessionControlHandler
             // 继续发送 ServerHello，客户端可选择重新认证。
         }
 
-        // 发送 ServerHello 握手响应。
-        // FeatureBits 协商：取客户端声明位与服务端支持位的交集（按位与）。
-        // 当前服务端无强制能力位，协商结果 = 客户端声明位 ∩ 服务端支持位；
-        // 未来引入命令级能力协商时，解析器将根据协商结果决定是否接受特定命令。
-        var negotiatedFeatureBits = hello.FeatureBits & _serverIdentity.FeatureBits;
+        // 发送 ServerHello 握手响应。FeatureBits 为双方能力交集；
+        // CommandCapabilities 未进入交集时，命令门控保持 v1 兼容。
         var serverHello = new ServerHello
         {
-            ProtocolVersion = PacketProtocol.CurrentProtocolVersion,
+            ProtocolVersion = negotiatedProtocolVersion,
             FeatureBits = negotiatedFeatureBits,
             ServerDeviceId = _serverIdentity.ServerDeviceId,
             ServerTimeMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
             HeartbeatIntervalMs = (int)_options.IdleTimeout.TotalMilliseconds / 2,
             MaxPayloadBytes = _options.MaxInboundPayloadBytes,
-            ResumeSupported = _options.EnableResume,
+            ResumeSupported =
+                _options.EnableResume && resumeNegotiated,
             PayloadFormat = ProtocolPayloadFormat.Json
         };
 
@@ -328,7 +368,9 @@ internal sealed class SessionControlHandler
             _serverHelloCodec,
             serverHello);
         session.TryQueue(helloFrame);
-        session.MarkHandshakeCompleted();
+        session.CompleteHandshake(
+            negotiatedProtocolVersion,
+            negotiatedFeatureBits);
     }
 
     private void SendAuthenticationFailure(

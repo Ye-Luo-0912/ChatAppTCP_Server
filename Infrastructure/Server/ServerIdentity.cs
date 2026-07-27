@@ -13,7 +13,7 @@ public sealed class ServerIdentity : IServerIdentity
 
     public ushort ProtocolVersion => PacketProtocol.CurrentProtocolVersion;
 
-    public uint FeatureBits => 0;
+    public uint FeatureBits => (uint)GatewayFeatureSet.Implemented;
 
     /// <param name="serverDeviceId">
     /// 显式指定 ServerDeviceId（32 字符十六进制 GUID）。

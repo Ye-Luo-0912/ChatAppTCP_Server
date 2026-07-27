@@ -102,6 +102,26 @@ public sealed class InMemoryWatcherGatewayDirectory : IWatcherGatewayDirectory
         return Task.CompletedTask;
     }
 
+    public Task<IReadOnlyList<string>> ListActiveShardsAsync(
+        CancellationToken cancellationToken = default)
+    {
+        var instances = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var bucket in _store.Values)
+        {
+            foreach (var field in bucket.Keys)
+            {
+                var separator = field.IndexOf(':');
+                if (separator > 0)
+                    instances.Add(field[..separator]);
+            }
+        }
+
+        return Task.FromResult<IReadOnlyList<string>>(
+            instances.Count == 0
+                ? Array.Empty<string>()
+                : new List<string>(instances));
+    }
+
     /// <summary>
     /// 清空所有 watcher 路由记录。
     /// </summary>

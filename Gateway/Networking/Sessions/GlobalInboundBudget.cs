@@ -3,8 +3,9 @@ namespace ChatApp.TcpGateway.Gateway.Networking.Sessions;
 /// <summary>
 /// 全局入站缓冲字节预算。
 /// <para>
-/// 跟踪所有连接 Pipe 暂存字节与 Ordered/Query/Ephemeral lane 池化/复制 payload 的总和。
-/// 在写入 Pipe 或复制到调度缓冲区前 <see cref="TryReserve"/>；消费/归还后 <see cref="Release"/>。
+/// 跟踪所有连接 DirectSocket/Pipe 暂存字节与 Ordered/Query/Ephemeral lane
+/// 池化/复制 payload 的总和。在接收或复制到调度缓冲区前 <see cref="TryReserve"/>；
+/// 消费/归还后 <see cref="Release"/>。
 /// 超限时调用方应背压（暂停接收）或关闭连接，防止声称的全局上限形同虚设。
 /// </para>
 /// </summary>

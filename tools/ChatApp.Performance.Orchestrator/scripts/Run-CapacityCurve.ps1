@@ -5,6 +5,9 @@ param(
     [ValidateRange(1, 1024)] [int] $PipelineConcurrency = 32,
     [ValidateRange(1, 1048576)] [int] $PipelinePayloadBytes = 512,
     [ValidateRange(1, 100000)] [int] $TcpConnections = 1000,
+    [ValidateSet('connection','heartbeat','chat')] [string] $TcpMode = 'connection',
+    [ValidateRange(1, 100000)] [int] $TcpMessagesPerSecond = 10,
+    [ValidateRange(1, 80896)] [int] $TcpPayloadBytes = 128,
     [int] $GatewayBasePort = 18888,
     [int] $RealtimePort = 18080,
     [int] $NatsPort = 4222,
@@ -14,10 +17,12 @@ param(
     [string] $NatsImage = 'nats:2.10.26-alpine',
     [string] $PostgresImage = 'postgres:16.8',
     [string] $GarnetImage = 'ghcr.io/microsoft/garnet:1.0.84',
+    [ValidateSet('Pipelines','DirectSocket')] [string] $InboundTransportMode = 'DirectSocket',
     [ValidateSet('PersistentSendLoop','OnDemandSendPump')] [string] $OutboundSendMode = 'PersistentSendLoop',
     [int] $OnDemandSendWorkerCount = 0,
     [int] $OnDemandSendBurstLimit = 16,
     [string] $ReportDirectory,
+    [switch] $NoPipeline,
     [switch] $SkipBuild
 )
 
@@ -128,10 +133,14 @@ try {
                 '--warmup-seconds',"$WarmupSeconds",
                 '--duration-seconds',"$DurationSeconds",
                 '--sample-interval-ms','2000',
-                '--tcp-mode','connection','--tcp-connections',"$TcpConnections",
+                '--tcp-mode',"$TcpMode",
+                '--tcp-connections',"$TcpConnections",
+                '--tcp-messages-per-second',"$TcpMessagesPerSecond",
+                '--tcp-payload-bytes',"$TcpPayloadBytes",
                 '--pipeline-concurrency',"$PipelineConcurrency",
                 '--pipeline-operations-per-second',"$rate",
                 '--pipeline-payload-bytes',"$PipelinePayloadBytes",
+                '--inbound-transport-mode',"$InboundTransportMode",
                 '--outbound-send-mode',"$OutboundSendMode",
                 '--on-demand-send-worker-count',"$OnDemandSendWorkerCount",
                 '--on-demand-send-burst-limit',"$OnDemandSendBurstLimit",
@@ -141,6 +150,12 @@ try {
                 '--docker-container',$postgres,
                 '--docker-container',$garnet,
                 '--report-directory',$rateDirectory)
+            if ($TcpMode -ne 'connection') {
+                $orchestratorArgs += '--tcp-bootstrap-auth'
+            }
+            if ($NoPipeline) {
+                $orchestratorArgs += '--no-pipeline'
+            }
             & dotnet @orchestratorArgs
             $orchestratorExit = $LASTEXITCODE
 
@@ -151,14 +166,53 @@ try {
                 throw "Benchmark report was not created for rate $rate."
             }
             $report = Get-Content -LiteralPath $reportFile.FullName -Raw | ConvertFrom-Json
-            $pipeline = $report.LoadResults |
-                Where-Object Name -eq 'pipeline' |
-                Select-Object -First 1
-            if ($null -eq $pipeline) {
-                $errors = $report.Errors -join '; '
-                throw "Pipeline result was not created for rate $rate. $errors"
+            if ($NoPipeline) {
+                $tcpLoads = @($report.LoadResults |
+                    Where-Object Kind -like 'tcp-*')
+                if ($tcpLoads.Count -eq 0) {
+                    $errors = $report.Errors -join '; '
+                    throw "TCP result was not created for rate $rate. $errors"
+                }
+                $targetPerSecond = $TcpConnections * $TcpMessagesPerSecond
+                $succeeded = [long](($tcpLoads | Measure-Object Succeeded -Sum).Sum)
+                $failed = [long](($tcpLoads | Measure-Object Failed -Sum).Sum)
+                $errorRatePercent = if ($succeeded + $failed -eq 0) {
+                    0
+                } else {
+                    100.0 * $failed / ($succeeded + $failed)
+                }
+                $achievedPerSecond = [double](($tcpLoads |
+                    Measure-Object ThroughputPerSecond -Sum).Sum)
+                $completeP50Ms = [double](($tcpLoads |
+                    Measure-Object P50Milliseconds -Maximum).Maximum)
+                $completeP95Ms = [double](($tcpLoads |
+                    Measure-Object P95Milliseconds -Maximum).Maximum)
+                $completeP99Ms = [double](($tcpLoads |
+                    Measure-Object P99Milliseconds -Maximum).Maximum)
+                $historyP95Ms = 0
+                $messageOutboxP95Ms = 0
+                $receiptOutboxP95Ms = 0
+            } else {
+                $pipeline = $report.LoadResults |
+                    Where-Object Name -eq 'pipeline' |
+                    Select-Object -First 1
+                if ($null -eq $pipeline) {
+                    $errors = $report.Errors -join '; '
+                    throw "Pipeline result was not created for rate $rate. $errors"
+                }
+                $detail = Get-Content -LiteralPath $pipeline.SourceReport -Raw | ConvertFrom-Json
+                $targetPerSecond = $rate
+                $succeeded = [long]$pipeline.Succeeded
+                $failed = [long]$pipeline.Failed
+                $errorRatePercent = [double]$pipeline.ErrorRatePercent
+                $achievedPerSecond = [double]$pipeline.ThroughputPerSecond
+                $completeP50Ms = [double]$pipeline.P50Milliseconds
+                $completeP95Ms = [double]$pipeline.P95Milliseconds
+                $completeP99Ms = [double]$pipeline.P99Milliseconds
+                $historyP95Ms = [double]$detail.Latencies.history_query.P95Ms
+                $messageOutboxP95Ms = [double]$detail.Latencies.message_persisted_outbox.P95Ms
+                $receiptOutboxP95Ms = [double]$detail.Latencies.receipt_persisted_outbox.P95Ms
             }
-            $detail = Get-Content -LiteralPath $pipeline.SourceReport -Raw | ConvertFrom-Json
             $pgResource = $report.DockerResources |
                 Where-Object Container -eq $postgres |
                 Select-Object -First 1
@@ -173,19 +227,19 @@ try {
             }
 
             $results.Add([pscustomobject]@{
-                TargetPerSecond = $rate
+                TargetPerSecond = $targetPerSecond
                 Passed = [bool]$report.Succeeded -and $orchestratorExit -eq 0
-                Succeeded = [long]$pipeline.Succeeded
-                Failed = [long]$pipeline.Failed
-                ErrorRatePercent = [double]$pipeline.ErrorRatePercent
-                AchievedPerSecond = [double]$pipeline.ThroughputPerSecond
-                TargetAttainmentPercent = 100.0 * [double]$pipeline.ThroughputPerSecond / $rate
-                CompleteP50Ms = [double]$pipeline.P50Milliseconds
-                CompleteP95Ms = [double]$pipeline.P95Milliseconds
-                CompleteP99Ms = [double]$pipeline.P99Milliseconds
-                HistoryP95Ms = [double]$detail.Latencies.history_query.P95Ms
-                MessageOutboxP95Ms = [double]$detail.Latencies.message_persisted_outbox.P95Ms
-                ReceiptOutboxP95Ms = [double]$detail.Latencies.receipt_persisted_outbox.P95Ms
+                Succeeded = $succeeded
+                Failed = $failed
+                ErrorRatePercent = $errorRatePercent
+                AchievedPerSecond = $achievedPerSecond
+                TargetAttainmentPercent = 100.0 * $achievedPerSecond / $targetPerSecond
+                CompleteP50Ms = $completeP50Ms
+                CompleteP95Ms = $completeP95Ms
+                CompleteP99Ms = $completeP99Ms
+                HistoryP95Ms = $historyP95Ms
+                MessageOutboxP95Ms = $messageOutboxP95Ms
+                ReceiptOutboxP95Ms = $receiptOutboxP95Ms
                 JetStreamPendingFinal = Get-MetricSum $report.MetricsAfter 'chatapp_jetstream_pending{'
                 OutboxPendingFinal = Get-MetricSum $report.MetricsAfter 'realtime_outbox_pending{'
                 OutboxOldestAgeSecondsFinal = Get-MetricSum $report.MetricsAfter 'realtime_outbox_oldest_age_seconds{'
@@ -230,7 +284,12 @@ $summary = [pscustomobject]@{
         PipelineConcurrency = $PipelineConcurrency
         PipelinePayloadBytes = $PipelinePayloadBytes
         TcpConnections = $TcpConnections
+        TcpMode = $TcpMode
+        TcpMessagesPerSecond = $TcpMessagesPerSecond
+        TcpPayloadBytes = $TcpPayloadBytes
+        NoPipeline = [bool]$NoPipeline
         RateModel = 'bounded closed-loop pacing'
+        InboundTransportMode = $InboundTransportMode
         OutboundSendMode = $OutboundSendMode
         OnDemandSendWorkerCount = $OnDemandSendWorkerCount
         OnDemandSendBurstLimit = $OnDemandSendBurstLimit
@@ -246,7 +305,7 @@ $markdownPath = Join-Path $curveDirectory 'capacity-curve-report.md'
     [Text.UTF8Encoding]::new($false))
 
 $lines = [Collections.Generic.List[string]]::new()
-$lines.Add('# Pipeline capacity curve')
+$lines.Add($(if ($NoPipeline) { '# TCP capacity run' } else { '# Pipeline capacity curve' }))
 $lines.Add('')
 $lines.Add("Window: $($startedAt.ToString('O')) - $($completedAt.ToString('O'))")
 $lines.Add('')

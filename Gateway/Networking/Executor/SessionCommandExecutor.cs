@@ -38,6 +38,7 @@ internal sealed class SessionCommandExecutor : IAsyncDisposable
     private readonly ConcurrentDictionary<uint, ConnectionQueue> _queues = new();
     private readonly SemaphoreSlim? _perUserGate;
     private readonly CancellationTokenSource _cts;
+    private CancellationTokenSource? _linkedCts;
     private Task[] _workers = Array.Empty<Task>();
     private bool _disposed;
 
@@ -48,7 +49,7 @@ internal sealed class SessionCommandExecutor : IAsyncDisposable
     /// <param name="workerCount">全局 worker 数。</param>
     /// <param name="burstLimit">单连接单次调度处理的命令上限，防止单连接独占 worker。</param>
     /// <param name="perConnectionCapacity">每连接队列容量。满了 TryEnqueue 返回 false。</param>
-    /// <param name="globalCapacity">全局 ready channel 容量（待调度的连接数上限）。</param>
+    /// <param name="globalCapacity">全局 ready channel 容量（待调度的连接数上限）。保留参数用于兼容，实际使用无界 ready channel。</param>
     /// <param name="commandTimeout">命令处理超时。Zero 表示不启用。</param>
     /// <param name="perUserConcurrency">每用户并发上限。0 表示不限制。</param>
     /// <param name="onFatalError">命令处理致命异常回调（如关闭会话）。</param>
@@ -77,13 +78,16 @@ internal sealed class SessionCommandExecutor : IAsyncDisposable
         _onFatalError = onFatalError;
         _logger = logger ?? NullLogger.Instance;
 
-        _ready = Channel.CreateBounded<uint>(
-            new BoundedChannelOptions(globalCapacity)
+        // Ready channel 使用无界：每连接通过 CAS Active 保证最多一个节点在 ready queue 中，
+        // 因此 ready queue 实际大小 ≤ 已注册连接数，不会无限制增长。
+        // 这避免了 BoundedChannel 满时 TryWrite 失败导致的丢失唤醒问题。
+        // globalCapacity 参数保留用于未来限流策略，当前不应用。
+        _ready = Channel.CreateUnbounded<uint>(
+            new UnboundedChannelOptions
             {
                 SingleReader = false,
                 SingleWriter = false,
-                AllowSynchronousContinuations = false,
-                FullMode = BoundedChannelFullMode.Wait
+                AllowSynchronousContinuations = false
             });
 
         _perUserGate = perUserConcurrency > 0
@@ -111,8 +115,8 @@ internal sealed class SessionCommandExecutor : IAsyncDisposable
         {
             while (queue.Commands.TryDequeue(out var command))
             {
-                queue.Count--;
-                ReleaseCommandResources(in command);
+                Interlocked.Decrement(ref queue.Count);
+                SessionCommandResources.Release(in command);
             }
         }
     }
@@ -126,13 +130,16 @@ internal sealed class SessionCommandExecutor : IAsyncDisposable
         if (!_queues.TryGetValue(connectionId, out var queue))
             return false;
 
-        // ConcurrentQueue 无界，通过 _perConnectionCapacity 在外层包装限流。
-        // 容量检查与 Enqueue 不需要原子（生产者间串行由调用方保证，这里容忍轻微超限）。
-        if (queue.Count >= _perConnectionCapacity)
+        // 容量检查与 Enqueue 之间用 Interlocked 维护 Count 保证线程安全。
+        // 多生产者可能并发入队同一连接，Count 必须原子操作避免 lost update。
+        // 允许轻微超限（Check-then-Act 非原子），但不会严重偏离容量。
+        if (Interlocked.Increment(ref queue.Count) > _perConnectionCapacity)
+        {
+            Interlocked.Decrement(ref queue.Count);
             return false;
+        }
 
         queue.Commands.Enqueue(command);
-        queue.Count++;
 
         // CAS _active: 0→1。成功表示此前无 worker 处理该连接，需通知 ready channel。
         // 失败表示已有 worker 在处理，它会在 burst 循环中 drain 到空，无需额外唤醒。
@@ -146,19 +153,12 @@ internal sealed class SessionCommandExecutor : IAsyncDisposable
         if (Interlocked.CompareExchange(ref queue.Active, 1, 0) != 0)
             return;
 
-        // ready channel 满时 TryWrite 失败：回退 Active 并重试一次。
-        // 若仍失败，依赖 worker burst 末尾的"清除后重检"路径补发。
-        if (_ready.Writer.TryWrite(queue.ConnectionId))
-            return;
-
-        Interlocked.Exchange(ref queue.Active, 0);
-
-        // 短路重试：可能 worker 在 TryWrite 失败前已排空队列。
-        if (queue.Commands.IsEmpty)
-            return;
-
-        if (Interlocked.CompareExchange(ref queue.Active, 1, 0) == 0)
-            _ready.Writer.TryWrite(queue.ConnectionId);
+        // 无界 ready channel：TryWrite 不会因容量满而失败。
+        // 仅在 channel 已关闭（停机）时返回 false，此时回退 Active 即可。
+        if (!_ready.Writer.TryWrite(queue.ConnectionId))
+        {
+            Interlocked.Exchange(ref queue.Active, 0);
+        }
     }
 
     /// <summary>
@@ -169,11 +169,13 @@ internal sealed class SessionCommandExecutor : IAsyncDisposable
         if (_workers.Length > 0)
             return Task.CompletedTask;
 
-        var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _cts.Token);
+        _linkedCts = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken,
+            _cts.Token);
         _workers = new Task[_workerCount];
         for (var i = 0; i < _workerCount; i++)
         {
-            _workers[i] = RunWorkerAsync(linked.Token);
+            _workers[i] = RunWorkerAsync(_linkedCts.Token);
         }
         return Task.CompletedTask;
     }
@@ -210,8 +212,8 @@ internal sealed class SessionCommandExecutor : IAsyncDisposable
         {
             while (queue.Commands.TryDequeue(out var command))
             {
-                queue.Count--;
-                ReleaseCommandResources(in command);
+                Interlocked.Decrement(ref queue.Count);
+                SessionCommandResources.Release(in command);
             }
         }
         _queues.Clear();
@@ -262,32 +264,46 @@ internal sealed class SessionCommandExecutor : IAsyncDisposable
             if (!queue.Commands.TryDequeue(out var command))
                 break;
 
-            queue.Count--;
+            Interlocked.Decrement(ref queue.Count);
 
-            // per-User 并发上限：仅 Query lane 使用。OrderedWrite lane 构造时 perUserConcurrency=0 不触发。
-            if (_perUserGate is not null)
+            try
             {
-                await _perUserGate.WaitAsync(cancellationToken).ConfigureAwait(false);
-                try
+                // per-User 并发上限：仅 Query lane 使用。OrderedWrite lane 构造时 perUserConcurrency=0 不触发。
+                if (_perUserGate is not null)
+                {
+                    await _perUserGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+                    try
+                    {
+                        await ProcessCommandAsync(command, cancellationToken)
+                            .ConfigureAwait(false);
+                    }
+                    finally
+                    {
+                        _perUserGate.Release();
+                    }
+                }
+                else
                 {
                     await ProcessCommandAsync(command, cancellationToken)
                         .ConfigureAwait(false);
                 }
-                finally
-                {
-                    _perUserGate.Release();
-                }
             }
-            else
+            catch (OperationCanceledException)
+                when (cancellationToken.IsCancellationRequested)
             {
-                await ProcessCommandAsync(command, cancellationToken)
-                    .ConfigureAwait(false);
+                throw;
+            }
+            catch (Exception exception)
+            {
+                // 单条命令失败不能让 ConnectionQueue 永久保持 Active=1。
+                _onFatalError?.Invoke(exception);
             }
 
             processed++;
         }
 
         // burst 结束：如果队列还有命令（达到 burstLimit），重新入 ready channel 继续处理。
+        // 无界 ready channel 不会 TryWrite 失败（除非 channel 已关闭，此时连接也在停机）。
         if (!queue.Commands.IsEmpty)
         {
             _ready.Writer.TryWrite(queue.ConnectionId);
@@ -321,7 +337,7 @@ internal sealed class SessionCommandExecutor : IAsyncDisposable
             }
             finally
             {
-                ReleaseCommandResources(in command);
+                SessionCommandResources.Release(in command);
             }
             return;
         }
@@ -334,7 +350,7 @@ internal sealed class SessionCommandExecutor : IAsyncDisposable
         }
         finally
         {
-            ReleaseCommandResources(in command);
+            SessionCommandResources.Release(in command);
         }
     }
 
@@ -366,23 +382,16 @@ internal sealed class SessionCommandExecutor : IAsyncDisposable
         {
             while (queue.Commands.TryDequeue(out var command))
             {
-                queue.Count--;
-                ReleaseCommandResources(in command);
+                Interlocked.Decrement(ref queue.Count);
+                SessionCommandResources.Release(in command);
             }
         }
         _queues.Clear();
 
         _cts.Dispose();
+        _linkedCts?.Dispose();
+        _linkedCts = null;
         _perUserGate?.Dispose();
-    }
-
-    private static void ReleaseCommandResources(in SessionCommand command)
-    {
-        if (command.IsPooled && command.RentedBuffer.Length > 0)
-            System.Buffers.ArrayPool<byte>.Shared.Return(command.RentedBuffer);
-
-        if (command.ReservedInboundBytes > 0 && command.InboundBudget is not null)
-            command.InboundBudget.Release(command.ReservedInboundBytes);
     }
 
     private sealed class ConnectionQueue

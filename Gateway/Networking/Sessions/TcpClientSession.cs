@@ -1,5 +1,6 @@
 using System.Net.Sockets;
 using System.Threading.Channels;
+using ChatApp.TcpGateway.Core.Protocol;
 using ChatApp.TcpGateway.Gateway.Networking.Buffers;
 using ChatApp.TcpGateway.Gateway.Networking.Executor;
 using ChatApp.TcpGateway.Observability.Metrics;
@@ -35,9 +36,16 @@ internal sealed partial class TcpClientSession : IAsyncDisposable
     // OnDemandSendPump 模式专用：共享出站 pump 协调器。
     // PersistentSendLoop 模式下为 null，TryQueue/TryQueueEphemeral 不调用 TryScheduleSend。
     private readonly OutboundPumpCoordinator? _outboundPump;
-    // OnDemandSendPump 调度标志：0 = 未调度，1 = 已入 ready queue 待 pump。
-    // 入队时 CAS 0→1 成功才 TrySchedule；pump 结束时 CAS 1→0 + re-check 防止丢失唤醒。
-    private int _sendScheduled;
+    // OnDemandSendPump 三态调度状态机，CAS 驱动：
+    //   Idle(0)    → Queued(1)：enqueuer CAS 成功后 TrySchedule 入 ready queue
+    //   Queued(1)   → Running(2)：worker 出队后 CAS 取得发送所有权
+    //   Running(2)  → Queued(1)：pump 结束但仍有 pending work，重新入队（不经过 Idle）
+    //   Running(2)  → Idle(0)：pump 结束且无 pending work，转空闲后重检防丢失唤醒
+    // 关键规则：Session 在 Running 状态下不会自行重新排队；任意时刻最多一个 worker 持有发送所有权。
+    private const int SendStateIdle = 0;
+    private const int SendStateQueued = 1;
+    private const int SendStateRunning = 2;
+    private int _sendState;
 
     // Ephemeral latest-state mailbox：按 EphemeralKey 分槽，同 key 覆盖旧帧保留最新状态。
     // Typing key = (KindTyping, hash(conversationId))，Presence key = (KindPresence, userId)。
@@ -75,6 +83,8 @@ internal sealed partial class TcpClientSession : IAsyncDisposable
     private bool _bucketInitialized;
     private int _authenticated;
     private int _handshakeCompleted;
+    private int _negotiatedProtocolVersion;
+    private int _negotiatedFeatureBits;
     private int _closeState;
     private int _closeReason;
 
@@ -175,9 +185,41 @@ internal sealed partial class TcpClientSession : IAsyncDisposable
     /// </summary>
     public bool HasCompletedHandshake => Volatile.Read(ref _handshakeCompleted) != 0;
 
-    /// <summary>标记 ClientHello 握手已完成。</summary>
-    public void MarkHandshakeCompleted() =>
+    /// <summary>握手选定的协议版本；未握手的兼容连接为 0。</summary>
+    public ushort NegotiatedProtocolVersion =>
+        (ushort)Volatile.Read(ref _negotiatedProtocolVersion);
+
+    /// <summary>ClientHello 与 ServerHello 的能力位交集。</summary>
+    public uint NegotiatedFeatureBits =>
+        unchecked((uint)Volatile.Read(ref _negotiatedFeatureBits));
+
+    /// <summary>
+    /// 发布协议协商结果并标记握手完成。结果字段先写、完成标记最后写，
+    /// 使异步命令 worker 读取到完成状态时一定能看到完整协商快照。
+    /// </summary>
+    public void CompleteHandshake(
+        ushort protocolVersion,
+        uint featureBits)
+    {
+        Volatile.Write(ref _negotiatedProtocolVersion, protocolVersion);
+        Volatile.Write(
+            ref _negotiatedFeatureBits,
+            unchecked((int)featureBits));
         Volatile.Write(ref _handshakeCompleted, 1);
+    }
+
+    /// <summary>
+    /// 判断扩展能力是否可用。未启用命令能力门控的旧客户端保持兼容；
+    /// 启用后要求协商结果包含全部指定能力位。
+    /// </summary>
+    public bool AllowsFeature(GatewayFeature required)
+    {
+        var featureBits = NegotiatedFeatureBits;
+        return !GatewayFeatureSet.ContainsAll(
+                   featureBits,
+                   GatewayFeature.CommandCapabilities) ||
+               GatewayFeatureSet.ContainsAll(featureBits, required);
+    }
 
     public long UserId { get; private set; }
 

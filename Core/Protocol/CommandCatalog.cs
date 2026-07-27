@@ -31,8 +31,9 @@ internal enum ConnectionPhase : byte
 /// 命令调度 lane 分类。
 /// <para>
 /// Control 命令（Auth/Heartbeat/PresenceUnwatch）由读循环内联处理；
-/// Ephemeral 命令（Typing）由读循环内联处理（V2：消除每连接 Ephemeral Channel）；
-/// OrderedWrite/Query 通过全局 <c>SessionCommandExecutor</c>（共享 worker 池）异步处理。
+/// Ephemeral 命令（Typing）通过全局 <c>SessionCommandExecutor</c>（共享 worker 池）异步处理，
+/// 避免 Typing 授权器缓存 Miss 时的远程 I/O 阻塞 TCP Read Loop；
+/// OrderedWrite/Query 同样通过全局 <c>SessionCommandExecutor</c> 异步处理。
 /// </para>
 /// </summary>
 internal enum CommandLane : byte
@@ -71,6 +72,12 @@ internal readonly record struct CommandDescriptor(
     /// </para>
     /// </summary>
     public bool Deprecated { get; init; }
+
+    /// <summary>
+    /// 客户端启用 <see cref="GatewayFeature.CommandCapabilities"/> 后，
+    /// 执行该命令前必须协商的扩展能力。默认无要求，保持核心命令兼容。
+    /// </summary>
+    public GatewayFeature RequiredFeature { get; init; }
 }
 
 /// <summary>
@@ -161,13 +168,19 @@ internal static class CommandCatalog
             ConnectionPhase.Authenticated, CommandLane.Inline, -1, 1),
         PacketCommand.SyncBootstrapRequest => new(
             PacketCommand.SyncBootstrapRequest, CommandDirection.ClientToServer,
-            ConnectionPhase.Authenticated, CommandLane.Query, 16 * 1024, 8),
+            ConnectionPhase.Authenticated, CommandLane.Query, 16 * 1024, 8)
+        {
+            RequiredFeature = GatewayFeature.ConversationSync
+        },
         PacketCommand.SyncBootstrapResponse => new(
             PacketCommand.SyncBootstrapResponse, CommandDirection.ServerToClient,
             ConnectionPhase.Authenticated, CommandLane.Inline, -1, 1),
         PacketCommand.ConversationSetPrefsRequest => new(
             PacketCommand.ConversationSetPrefsRequest, CommandDirection.ClientToServer,
-            ConnectionPhase.Authenticated, CommandLane.OrderedWrite, 4 * 1024, 4),
+            ConnectionPhase.Authenticated, CommandLane.OrderedWrite, 4 * 1024, 4)
+        {
+            RequiredFeature = GatewayFeature.ConversationPreferences
+        },
         PacketCommand.ConversationSetPrefsResponse => new(
             PacketCommand.ConversationSetPrefsResponse, CommandDirection.ServerToClient,
             ConnectionPhase.Authenticated, CommandLane.Inline, -1, 1),
@@ -175,7 +188,10 @@ internal static class CommandCatalog
         // Recall / Edit
         PacketCommand.MessageRecallRequest => new(
             PacketCommand.MessageRecallRequest, CommandDirection.ClientToServer,
-            ConnectionPhase.Authenticated, CommandLane.OrderedWrite, 1024, 2),
+            ConnectionPhase.Authenticated, CommandLane.OrderedWrite, 1024, 2)
+        {
+            RequiredFeature = GatewayFeature.MessageMutation
+        },
         PacketCommand.MessageRecallAck => new(
             PacketCommand.MessageRecallAck, CommandDirection.ServerToClient,
             ConnectionPhase.Authenticated, CommandLane.Inline, -1, 1),
@@ -184,7 +200,10 @@ internal static class CommandCatalog
             ConnectionPhase.Authenticated, CommandLane.Inline, -1, 1),
         PacketCommand.MessageEditRequest => new(
             PacketCommand.MessageEditRequest, CommandDirection.ClientToServer,
-            ConnectionPhase.Authenticated, CommandLane.OrderedWrite, 64 * 1024, 2),
+            ConnectionPhase.Authenticated, CommandLane.OrderedWrite, 64 * 1024, 2)
+        {
+            RequiredFeature = GatewayFeature.MessageMutation
+        },
         PacketCommand.MessageEditAck => new(
             PacketCommand.MessageEditAck, CommandDirection.ServerToClient,
             ConnectionPhase.Authenticated, CommandLane.Inline, -1, 1),
@@ -195,13 +214,19 @@ internal static class CommandCatalog
         // Typing / Presence
         PacketCommand.TypingNotify => new(
             PacketCommand.TypingNotify, CommandDirection.ClientToServer,
-            ConnectionPhase.Authenticated, CommandLane.Ephemeral, 512, 1),
+            ConnectionPhase.Authenticated, CommandLane.Ephemeral, 512, 1)
+        {
+            RequiredFeature = GatewayFeature.PresenceAndTyping
+        },
         PacketCommand.TypingUpdate => new(
             PacketCommand.TypingUpdate, CommandDirection.ServerToClient,
             ConnectionPhase.Authenticated, CommandLane.Inline, -1, 1),
         PacketCommand.PresenceQuery => new(
             PacketCommand.PresenceQuery, CommandDirection.ClientToServer,
-            ConnectionPhase.Authenticated, CommandLane.Query, 4 * 1024, 2),
+            ConnectionPhase.Authenticated, CommandLane.Query, 4 * 1024, 2)
+        {
+            RequiredFeature = GatewayFeature.PresenceAndTyping
+        },
         PacketCommand.PresenceSnapshot => new(
             PacketCommand.PresenceSnapshot, CommandDirection.ServerToClient,
             ConnectionPhase.Authenticated, CommandLane.Inline, -1, 1),
@@ -210,12 +235,18 @@ internal static class CommandCatalog
             ConnectionPhase.Authenticated, CommandLane.Inline, -1, 1),
         PacketCommand.PresenceUnwatch => new(
             PacketCommand.PresenceUnwatch, CommandDirection.ClientToServer,
-            ConnectionPhase.Authenticated, CommandLane.Inline, 4 * 1024, 1),
+            ConnectionPhase.Authenticated, CommandLane.Inline, 4 * 1024, 1)
+        {
+            RequiredFeature = GatewayFeature.PresenceAndTyping
+        },
 
         // Reaction
         PacketCommand.AddReactionRequest => new(
             PacketCommand.AddReactionRequest, CommandDirection.ClientToServer,
-            ConnectionPhase.Authenticated, CommandLane.OrderedWrite, 1024, 2),
+            ConnectionPhase.Authenticated, CommandLane.OrderedWrite, 1024, 2)
+        {
+            RequiredFeature = GatewayFeature.MessageReactions
+        },
         PacketCommand.AddReactionAck => new(
             PacketCommand.AddReactionAck, CommandDirection.ServerToClient,
             ConnectionPhase.Authenticated, CommandLane.Inline, -1, 1),
@@ -224,7 +255,10 @@ internal static class CommandCatalog
             ConnectionPhase.Authenticated, CommandLane.Inline, -1, 1),
         PacketCommand.RemoveReactionRequest => new(
             PacketCommand.RemoveReactionRequest, CommandDirection.ClientToServer,
-            ConnectionPhase.Authenticated, CommandLane.OrderedWrite, 1024, 2),
+            ConnectionPhase.Authenticated, CommandLane.OrderedWrite, 1024, 2)
+        {
+            RequiredFeature = GatewayFeature.MessageReactions
+        },
         PacketCommand.RemoveReactionAck => new(
             PacketCommand.RemoveReactionAck, CommandDirection.ServerToClient,
             ConnectionPhase.Authenticated, CommandLane.Inline, -1, 1),
@@ -235,37 +269,55 @@ internal static class CommandCatalog
         // 群组
         PacketCommand.CreateGroupRequest => new(
             PacketCommand.CreateGroupRequest, CommandDirection.ClientToServer,
-            ConnectionPhase.Authenticated, CommandLane.OrderedWrite, 16 * 1024, 8),
+            ConnectionPhase.Authenticated, CommandLane.OrderedWrite, 16 * 1024, 8)
+        {
+            RequiredFeature = GatewayFeature.GroupManagement
+        },
         PacketCommand.CreateGroupResponse => new(
             PacketCommand.CreateGroupResponse, CommandDirection.ServerToClient,
             ConnectionPhase.Authenticated, CommandLane.Inline, -1, 1),
         PacketCommand.AddGroupMembersRequest => new(
             PacketCommand.AddGroupMembersRequest, CommandDirection.ClientToServer,
-            ConnectionPhase.Authenticated, CommandLane.OrderedWrite, 16 * 1024, 8),
+            ConnectionPhase.Authenticated, CommandLane.OrderedWrite, 16 * 1024, 8)
+        {
+            RequiredFeature = GatewayFeature.GroupManagement
+        },
         PacketCommand.AddGroupMembersResponse => new(
             PacketCommand.AddGroupMembersResponse, CommandDirection.ServerToClient,
             ConnectionPhase.Authenticated, CommandLane.Inline, -1, 1),
         PacketCommand.RemoveGroupMemberRequest => new(
             PacketCommand.RemoveGroupMemberRequest, CommandDirection.ClientToServer,
-            ConnectionPhase.Authenticated, CommandLane.OrderedWrite, 4 * 1024, 4),
+            ConnectionPhase.Authenticated, CommandLane.OrderedWrite, 4 * 1024, 4)
+        {
+            RequiredFeature = GatewayFeature.GroupManagement
+        },
         PacketCommand.RemoveGroupMemberResponse => new(
             PacketCommand.RemoveGroupMemberResponse, CommandDirection.ServerToClient,
             ConnectionPhase.Authenticated, CommandLane.Inline, -1, 1),
         PacketCommand.LeaveGroupRequest => new(
             PacketCommand.LeaveGroupRequest, CommandDirection.ClientToServer,
-            ConnectionPhase.Authenticated, CommandLane.OrderedWrite, 4 * 1024, 4),
+            ConnectionPhase.Authenticated, CommandLane.OrderedWrite, 4 * 1024, 4)
+        {
+            RequiredFeature = GatewayFeature.GroupManagement
+        },
         PacketCommand.LeaveGroupResponse => new(
             PacketCommand.LeaveGroupResponse, CommandDirection.ServerToClient,
             ConnectionPhase.Authenticated, CommandLane.Inline, -1, 1),
         PacketCommand.ChangeMemberRoleRequest => new(
             PacketCommand.ChangeMemberRoleRequest, CommandDirection.ClientToServer,
-            ConnectionPhase.Authenticated, CommandLane.OrderedWrite, 4 * 1024, 4),
+            ConnectionPhase.Authenticated, CommandLane.OrderedWrite, 4 * 1024, 4)
+        {
+            RequiredFeature = GatewayFeature.GroupManagement
+        },
         PacketCommand.ChangeMemberRoleResponse => new(
             PacketCommand.ChangeMemberRoleResponse, CommandDirection.ServerToClient,
             ConnectionPhase.Authenticated, CommandLane.Inline, -1, 1),
         PacketCommand.ListGroupMembersRequest => new(
             PacketCommand.ListGroupMembersRequest, CommandDirection.ClientToServer,
-            ConnectionPhase.Authenticated, CommandLane.Query, 4 * 1024, 4),
+            ConnectionPhase.Authenticated, CommandLane.Query, 4 * 1024, 4)
+        {
+            RequiredFeature = GatewayFeature.GroupManagement
+        },
         PacketCommand.ListGroupMembersResponse => new(
             PacketCommand.ListGroupMembersResponse, CommandDirection.ServerToClient,
             ConnectionPhase.Authenticated, CommandLane.Inline, -1, 1),
@@ -294,13 +346,19 @@ internal static class CommandCatalog
         // 离线推送
         PacketCommand.RegisterPushTokenRequest => new(
             PacketCommand.RegisterPushTokenRequest, CommandDirection.ClientToServer,
-            ConnectionPhase.Authenticated, CommandLane.OrderedWrite, 2 * 1024, 2),
+            ConnectionPhase.Authenticated, CommandLane.OrderedWrite, 2 * 1024, 2)
+        {
+            RequiredFeature = GatewayFeature.PushTokenManagement
+        },
         PacketCommand.RegisterPushTokenResponse => new(
             PacketCommand.RegisterPushTokenResponse, CommandDirection.ServerToClient,
             ConnectionPhase.Authenticated, CommandLane.Inline, -1, 1),
         PacketCommand.UnregisterPushTokenRequest => new(
             PacketCommand.UnregisterPushTokenRequest, CommandDirection.ClientToServer,
-            ConnectionPhase.Authenticated, CommandLane.OrderedWrite, 2 * 1024, 1),
+            ConnectionPhase.Authenticated, CommandLane.OrderedWrite, 2 * 1024, 1)
+        {
+            RequiredFeature = GatewayFeature.PushTokenManagement
+        },
         PacketCommand.UnregisterPushTokenResponse => new(
             PacketCommand.UnregisterPushTokenResponse, CommandDirection.ServerToClient,
             ConnectionPhase.Authenticated, CommandLane.Inline, -1, 1),
@@ -353,4 +411,18 @@ internal static class CommandCatalog
     /// </summary>
     public static bool IsDeprecated(PacketCommand command) =>
         TryGetDescriptor(command)?.Deprecated ?? false;
+
+    /// <summary>
+    /// 判断命令是否满足协商能力。未协商 CommandCapabilities 时保持 v1 兼容；
+    /// 严格模式下只执行 RequiredFeature 已全部协商的命令。
+    /// </summary>
+    public static bool IsFeatureAllowed(
+        in CommandDescriptor descriptor,
+        uint negotiatedFeatureBits) =>
+        !GatewayFeatureSet.ContainsAll(
+            negotiatedFeatureBits,
+            GatewayFeature.CommandCapabilities) ||
+        GatewayFeatureSet.ContainsAll(
+            negotiatedFeatureBits,
+            descriptor.RequiredFeature);
 }

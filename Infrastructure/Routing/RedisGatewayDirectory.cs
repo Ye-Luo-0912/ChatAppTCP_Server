@@ -130,4 +130,118 @@ internal sealed class RedisGatewayDirectory(
 
         return result;
     }
+
+    public async Task<GatewayLookupResult> GetOnlineGatewaysWithStatusAsync(
+        long userId,
+        CancellationToken cancellationToken = default)
+    {
+        if (userId <= 0)
+        {
+            return new GatewayLookupResult(
+                GatewayLookupResultKind.UserOffline,
+                Array.Empty<string>());
+        }
+
+        try
+        {
+            var nowMs = timeProvider.GetUtcNow().ToUnixTimeMilliseconds();
+            var members = await connectionProvider.Database
+                .SortedSetRangeByScoreAsync(
+                    Key(userId),
+                    nowMs,
+                    double.PositiveInfinity,
+                    Exclude.Start)
+                .WaitAsync(cancellationToken)
+                .ConfigureAwait(false);
+            var gateways = ToStrings(members);
+            return new GatewayLookupResult(
+                gateways.Length > 0
+                    ? GatewayLookupResultKind.Success
+                    : GatewayLookupResultKind.UserOffline,
+                gateways);
+        }
+        catch (OperationCanceledException)
+            when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            logger.DependencyOperationFailed(
+                GatewayDependency.Redis,
+                GatewayDependencyOperation.GatewayDirectoryQuery,
+                ex);
+            return new GatewayLookupResult(
+                GatewayLookupResultKind.LookupFailure,
+                Array.Empty<string>());
+        }
+    }
+
+    public async Task<GatewayLookupManyResult> GetOnlineGatewaysManyWithStatusAsync(
+        IReadOnlyList<long> userIds,
+        CancellationToken cancellationToken = default)
+    {
+        if (userIds.Count == 0)
+        {
+            return new GatewayLookupManyResult(
+                GatewayLookupResultKind.Success,
+                new Dictionary<long, IReadOnlyList<string>>(0));
+        }
+
+        try
+        {
+            var nowMs = timeProvider.GetUtcNow().ToUnixTimeMilliseconds();
+            var db = connectionProvider.Database;
+            var batch = db.CreateBatch();
+            var tasks = new Task<RedisValue[]>[userIds.Count];
+            for (var i = 0; i < userIds.Count; i++)
+            {
+                tasks[i] = userIds[i] <= 0
+                    ? Task.FromResult(Array.Empty<RedisValue>())
+                    : batch.SortedSetRangeByScoreAsync(
+                        Key(userIds[i]),
+                        nowMs,
+                        double.PositiveInfinity,
+                        Exclude.Start);
+            }
+
+            batch.Execute();
+            var values = await Task.WhenAll(tasks)
+                .WaitAsync(cancellationToken)
+                .ConfigureAwait(false);
+            var map = new Dictionary<long, IReadOnlyList<string>>(userIds.Count);
+            for (var i = 0; i < userIds.Count; i++)
+                map[userIds[i]] = ToStrings(values[i]);
+
+            return new GatewayLookupManyResult(
+                GatewayLookupResultKind.Success,
+                map);
+        }
+        catch (OperationCanceledException)
+            when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            logger.DependencyOperationFailed(
+                GatewayDependency.Redis,
+                GatewayDependencyOperation.GatewayDirectoryQuery,
+                ex);
+            return new GatewayLookupManyResult(
+                GatewayLookupResultKind.LookupFailure,
+                new Dictionary<long, IReadOnlyList<string>>(0));
+        }
+    }
+
+    private static string[] ToStrings(RedisValue[] members)
+    {
+        if (members.Length == 0)
+            return Array.Empty<string>();
+
+        var result = new string[members.Length];
+        for (var i = 0; i < members.Length; i++)
+            result[i] = members[i].ToString();
+        return result;
+    }
 }

@@ -19,13 +19,16 @@ Long-term: publish shared Realtime contracts as a versioned package, or merge in
 ## Protocol invariants
 
 1. Fixed 10-byte packet header; payload codec is pluggable (`IPayloadCodec<T>`). Current wire format is camelCase JSON via source-generated `GatewayJsonSerializerContext`.
-2. Connection state machine (strict serial on the read loop **Inline** lane):
+2. `ClientHello.featureBits` is opt-in compatible: command-level feature enforcement applies only when
+   `CommandCapabilities` is negotiated. Keep `CommandCatalog.RequiredFeature` and
+   `GatewayFeatureSet.Implemented` synchronized; see `docs/protocol-capabilities.md`.
+3. Connection state machine (strict serial on the read loop **Inline** lane):
    - `ClientHello` → `ServerHello` (or Resume success → authenticated)
    - then `AuthenticationRequest` (unless Resume already authenticated)
    - business commands only after `IsAuthenticated`
-3. When `RequireClientHello=true` (default), `AuthenticationRequest` before handshake is a fatal protocol violation.
-4. `ClientHello`, `AuthenticationRequest`, `Heartbeat`, `PresenceUnwatch` are **Inline** — never OrderedWrite — so multi-frame TCP segments cannot reorder handshake vs auth.
-5. Soft response budget: `PacketProtocol.WireResponseSoftLimit` (64 KiB); hard: `MaxPayloadSize` (80 KiB).
+4. When `RequireClientHello=true` (default), `AuthenticationRequest` before handshake is a fatal protocol violation.
+5. `ClientHello`, `AuthenticationRequest`, `Heartbeat`, `PresenceUnwatch` are **Inline** — never OrderedWrite — so multi-frame TCP segments cannot reorder handshake vs auth.
+6. Soft response budget: `PacketProtocol.WireResponseSoftLimit` (64 KiB); hard: `MaxPayloadSize` (80 KiB).
 
 ## Build / test / publish
 

@@ -5,9 +5,10 @@
 - .NET 10 / SDK 10.0.301（与 Server、RealtimeServices 对齐，见 `docs/sdk-baseline.md`）、
   集中依赖和严格分析器构建。默认发布为 **JIT + TieredPGO**（`PublishAot=false`）；
   协议 JSON 走源生成 `JsonSerializerContext`，便于日后重新启用 Native AOT。
-- Pipe 背压、连接/速率/鉴权/空闲/发送超时和慢消费者隔离。
+- DirectSocket 固定池化缓冲区增量解析已成为默认入站路径；Pipelines 保留为配置回退。
+  连接/速率/鉴权/空闲/发送超时和慢消费者隔离继续生效。
 - 出站帧池化、用户会话快照和“条数 + 字节数”双重队列预算；全局入站预算
-  （`GlobalInboundBudget`）覆盖 Pipe 暂存与 lane 复制 payload。
+  （`GlobalInboundBudget`）覆盖 Socket/Pipe 暂存与 lane 池化 payload。
 - JSON 编解码通过接口隔离，为后续二进制协议保留扩展点。
 - TCP 网关已接入同级 RealtimeServices 的 NATS/JetStream 集成模块。
 - 消息幂等持久化、事务 Outbox、每网关 durable consumer 和 ACK/NAK 已完成。
@@ -70,6 +71,19 @@
   - 单元测试 225/225 通过；本机短时 A/B 验证通过（100 连接 20s + 50 连接 30s 10msg/s chat，
     两种模式吞吐 ~498/s 一致，OnDemandSendPump 线程数 50 vs PersistentSendLoop 52）。
   - `scratch/Run-RuntimeV2-Soak-Linux.ps1` 作为 Linux 长测 runbook，含前置依赖清单与对比建议。
+- **轻量 Actor Runtime 与 Ephemeral 流程接入已完成**：
+  - 新增 BCL-only `ActorRuntime/`，采用分片单消费者、有界 MPSC 入口、intrusive ready queue、
+    前 4 项内联 + `ArrayPool<T>` 溢出环形邮箱；核心热路径不使用 `Queue<T>`。
+  - 仅在数组槽位寻址局部使用 `Unsafe.Add`，不持有裸指针；保留托管内存生命周期与
+    `ArrayPool` 归还约束。
+  - FIFO 使用生产者 mailbox credit，满载同步返回背压；completion 使用独立高优先级入口，
+    deadline 可主动唤醒，`Drain` 覆盖入口、邮箱、busy actor 与异步操作。
+  - 所有 replace/drop/fault/stop 路径均有资源释放回调；异步操作异常、超时、停机均可恢复
+    suspended actor，避免入站预算与池化 payload 泄漏。
+  - `EphemeralCommandPipeline` 已接入 `SessionRuntime`，由
+    `UseActorRuntimeForEphemeralCommands` 控制新旧流程切换；当前配置启用，旧执行器仍可回退。
+  - 新增 Actor Runtime gauges、单元/集成测试和独立微基准项目；设计与实测数据见
+    `docs/actor-runtime.md`。
 - **性能修复轮（P0 热路径）已完成**：
   - **心跳分桶真正分桶扫描**：`HeartbeatBucketRegistry` 按 connectionId/userId 分桶注册，
     每 tick 只枚举一个桶（O(N/bucketCount)），不再 `_sessions.Values.ToArray()` 全量扫描。
@@ -125,22 +139,23 @@
     `CommandDescriptor` 新增 `Deprecated` 标志 + `CommandCatalog.IsDeprecated` 方法支持弃用命令策略
     （标记弃用的命令返回 `UnsupportedCommand` 错误帧引导客户端迁移）。`ResumeRequest` 在 Catalog 中
     清理为 `ServerToClient`（非独立 wire 命令，Resume 通过 `ClientHello.ResumeToken` 字段触发）。
-    最低支持版本、FeatureBits 强制检查、命令级能力协商仍列为后续。
+    后续已完成最低支持版本、FeatureBits 强制检查和命令级能力协商，详见
+    `docs/protocol-capabilities.md`。
   - 单元测试 227/227 通过；dotnet build 0 警告/错误。
 
-## Phase 3：直接 Socket 解析状态机合并条件
+## Phase 3：直接 Socket 增量解析（短测门禁已完成）
 
-当前 Runtime V2 保留 `System.IO.Pipelines` 作为入站读取基础设施。Phase 3 的目标是
-评估是否用直接 Socket 解析状态机替换 Pipe，进一步降低每连接内存与分配。**合并条件
-必须由 A/B 负载数据证明，而非凭经验判断。Pipelines 不是结构错误，它只是需要通过数据
-证明是否值得替换。**
+Runtime V2 已实现 `InboundTransportMode.DirectSocket` / `Pipelines` 双路径。DirectSocket
+使用每连接一个固定池化接收缓冲区；小帧和粘包原地解析，只有跨接收缓冲区的大 Payload
+才租最终数组，并将后续 Socket 字节直接读入该数组。两种路径共用状态校验、速率限制、
+lane 分发和资源释放逻辑。`Pipelines` 不是错误实现，仍作为生产快速回退路径保留。
 
 ### 目标状态机
 
 ```
 Receive
   ↓
-ReadHeader (10-byte scratch)
+ReadHeader (固定接收缓冲区内原地解析)
   ↓
 Validate Command / Direction / Payload Limit
   ↓
@@ -151,26 +166,44 @@ Inline or Queue
 Receive next frame
 ```
 
-每连接只保存：10-byte header scratch、current command、payload length、received length、
-optional rented payload buffer。
+每连接只保存：固定池化接收缓冲区、读写游标，以及仅跨缓冲大包需要的 optional rented
+payload buffer。入队后 payload 所有权直接转移给 `SessionCommand`，不再做第二次复制。
 
-### 必须做 A/B 的场景
+### 验证状态
+
+已完成：
+
+- 单元/集成回归覆盖半包 Header、分段认证、同一 TCP 写入内多帧粘包和 6 KiB 跨缓冲 Chat；
+- 本机 Release 构建 0 警告/错误，259/259 测试通过；
+- Linux 双 Gateway 短时 A/B：1000 个认证连接、每连接 20 heartbeat/s、每种模式 45 秒；
+  两轮均 1000/1000 连接成功、0 失败；
+- Pipelines / DirectSocket 吞吐为 19,937.94 / 19,934.12 heartbeat/s（-0.019%，持平），
+  p99 为 8.75 / 8.32 ms（-4.99%），Gateway 总平均 CPU 为 7.21% / 5.91%（-17.96%），
+  最大工作集为 331.2 / 320.1 MiB（-3.34%）；
+- DirectSocket 单轮 p95 为 6.71 ms，较 Pipelines 的 5.93 ms 增加 0.78 ms；低于预设
+  “相对 10% 或绝对 +1 ms 取较宽者”的短测噪声门槛。前一轮相同 TCP 负载中
+  DirectSocket p95 反而更低，未观察到稳定的尾延迟回退；
+- 短时门禁通过后，`DirectSocket` 已切为应用和性能工具默认值；配置
+  `TcpGateway:InboundTransportMode=Pipelines` 可立即回退。
+- 默认切换后的 Linux 真实集成短测通过：200 个认证 Heartbeat 连接全部成功，
+  持久 Pipeline 1,216/1,216 成功、40.12/s、p95/p99 253.5/364.5 ms，
+  JetStream/Outbox 最终积压均为 0。该测试同时发现并修复了 RealtimeServices
+  `ResolveSyncWatermarksAsync` 在 Npgsql `SequentialAccess` 下先读第 6 列再回读第 5 列的错误。
+
+收尾/发布前仍需与后续修改合并执行：
 
 - 10,000 空闲连接
-- 小包 Heartbeat
 - 512 B Chat
 - 64 KiB Chat
-- 半包 Header
-- 分段 Payload
 - 慢速发送攻击
-- 多帧同 TCP Segment
 - 全局入站预算耗尽
 - 连接风暴
 - 8～24 小时浸泡
+- allocation/sec、GC 和每连接内存的稳定窗口对比
 
 ### 合并条件
 
-直接状态机至少要证明（相对 Pipelines 基线）：
+最终删除 Pipelines 回退路径前，直接状态机还要证明（相对 Pipelines 基线）：
 
 1. 工作集下降
 2. 每连接内存下降
@@ -179,8 +212,9 @@ optional rented payload buffer。
 5. p95/p99 不退化
 6. 代码复杂度和漏洞面仍可接受
 
-否则最终 Runtime V2 可以保留 Pipe。Phase 3 在 Runtime V2 A/B soak
-（`PersistentSendLoop` / `OnDemandSendPump`）完成并决定默认发送模式后启动。
+当前结论是“默认启用、保留回退”，不是删除 Pipelines。长测与大包/攻击场景会和后续
+功能修改一起执行，避免每个小改动重复占用 Linux 长测窗口。脱敏结果见
+`docs/performance-baselines/2026-07-28-linux-inbound-transport-ab.json`。
 
 ## 下一轮主目标：全链路性能与稳定性门禁
 
@@ -208,10 +242,11 @@ History SQL 的两个分支扫描放大已经消除。固定速率曲线显示 1
 
 1. 用 `Run-ConversationCombo.ps1` 在 Linux 正式机复跑：会话历史翻页 + 列表/SyncBootstrap
    与 TCP chat 扇出/慢消费者并行；校准会话阶段 p95 阈值。须避开 Runtime V2 soak 时间窗。
-2. **进行中**：用生产近似的数据规模与资源限制复跑 8–24 小时浸泡，并校准告警阈值。
-   当前 Runtime V2 A/B soak（`PersistentSendLoop` + `OnDemandSendPump` 各 8h，1000 TCP / 80 pipeline/s）
-   正在 Linux 正式机执行；完成后按 working set / p95 / JetStream pending / Outbox pending
-   决定 `OnDemandSendPump` 是否合并为默认，并校准告警阈值。
+2. 用生产近似的数据规模与资源限制复跑 8–24 小时浸泡，并校准告警阈值。
+   首次 Runtime V2 8h 运行在 PersistentSendLoop 阶段退出（负载进程 code 137、
+   Gateway 提前退出，未形成有效长测结论）；随后两种发送模式各 30 分钟验证均通过。
+   当前 Linux 上无运行中的 soak。重跑前先修复长测进程存活/资源限制与失败取证，
+   再按 working set、p95、JetStream pending、Outbox pending 决定默认发送模式。
 3. 将版本化 JSON 的短期门禁接入定时 CI；硬件或拓扑变化时重建基线。
    （依赖 P1 CI 与发布门禁中的 Linux 自托管 runner 接入。）
 
@@ -278,17 +313,19 @@ CPU、工作集、分配、Gen2/LOH、TCP 排队字节、JetStream pending/重�
 
 ## 当前执行顺序
 
-1. **进行中**：Linux 正式机 Runtime V2 长时间 A/B soak（`Run-RuntimeV2-Soak-Linux.ps1`）。
-   两种 `OutboundSendMode`（`PersistentSendLoop` / `OnDemandSendPump`）各跑 8 小时（1000 TCP 连接、
-   80 pipeline/s），按 working set / private bytes / threads / GC gen0-2 / JetStream pending /
-   Outbox pending / p50/p95/p99 决定是否将 `OnDemandSendPump` 合并为默认。
-   预期单轮 A/B 总计约 16 小时（含 warmup 与 Performance.Gate 失败闭环检查）。
-2. **待办**：用 `Run-ConversationCombo.ps1` 在 Linux 正式机复跑：会话历史翻页 + 列表/SyncBootstrap
+1. **已完成**：DirectSocket 增量解析、双路径回退、259 项回归和 Linux 1000 连接短时 A/B；
+   默认值已从 Pipelines 切换为 DirectSocket。
+2. **后续修改完成后统一长测**：使用 DirectSocket 默认路径执行 8～24 小时 soak，同时保留
+   Pipelines 对照轮；覆盖 10k 空闲、Heartbeat、512 B/64 KiB Chat、慢速发送、预算耗尽和连接风暴。
+   - 2026-07-28 已在 Linux 后台启动 8 小时 DirectSocket + PersistentSendLoop soak；
+     1000 TCP 连接、80 pipeline ops/s、32 并发，先预热 300 秒。报告目录：
+     `.artifacts/performance/soak-directsocket-20260728`。进程结束且报告通过前不作为正式基线。
+3. **待办**：用 `Run-ConversationCombo.ps1` 在 Linux 正式机复跑：会话历史翻页 + 列表/SyncBootstrap
    与 TCP chat 扇出/慢消费者并行；校准会话阶段 p95 阈值。须避开 Runtime V2 soak 时间窗。
-3. **待办**：注册 Linux 自托管 CI runner，并把 Release、测试、真实依赖探针、定时浸泡和性能门禁接入；
+4. **待办**：注册 Linux 自托管 CI runner，并把 Release、测试、真实依赖探针、定时浸泡和性能门禁接入；
    当前仓库未配置 Git 远程，因此这是环境接入任务。
-4. **待办**：配置 Alertmanager 的实际通知通道与 OTLP Collector 的 Trace 汇聚，完成从指标发现到告警响应的闭环。
-5. **并行可推进**（无 Linux 资源冲突，soak 期间可同步推进）：
+5. **待办**：配置 Alertmanager 的实际通知通道与 OTLP Collector 的 Trace 汇聚，完成从指标发现到告警响应的闭环。
+6. **并行可推进**（无 Linux 资源冲突，soak 期间可同步推进）：
    - 按需继续拆分 oversized Gateway 类型（当前 `TcpGatewayService` 669 行、`GatewayMetrics` 492 行，
      均低于 600 行警戒线，非阻塞）。
    - 补充已迁移模块的单元测试：`OutboundPumpCoordinator` / `DeadlineWheel` / `SessionCommandExecutor`
@@ -298,7 +335,7 @@ CPU、工作集、分配、Gen2/LOH、TCP 排队字节、JetStream pending/重�
      **本轮已完成 P1 业务闭环**（详见"性能门禁后进入的功能阶段 > 已完成"）：Resume 水位恢复、
      群聊廉价校验、Push Token 原子化、Relationship 授权缓存失效、协议版本兼容性基础。
      剩余深度功能（Push Provider abstraction、附件完整闭环、Relationship TCP 产品面、
-     协议能力协商）仍按业务优先级评估。
+     Resume 可靠性压力场景）仍按业务优先级评估；协议能力协商已在本轮完成。
 
 ## 性能门禁后进入的功能阶段
 
@@ -309,14 +346,19 @@ CPU、工作集、分配、Gen2/LOH、TCP 排队字节、JetStream pending/重�
 
 1. **Resume 同步水位恢复**：`ResumeResponse.LastConversationSequence` 通过 SyncBootstrap
    `ServerTimeMs` 填充，不再是 null。配合 P0 的 epoch/fencing、Token 撤销、主动 Logout、
-   被踢设备不可 Resume 闭环。跨 Gateway 重连风暴测试与 Token 重放并发测试仍待补。
+   被踢设备不可 Resume 闭环。Gateway 已适配 Realtime 的 `changed_at_ms` 水位；
+   v1 JSON 字段名暂时保留 `afterReceivedAtMs` 以避免破坏客户端。跨 Gateway 重连风暴测试
+   与 Token 重放并发测试仍待补。
 2. **群聊廉价结构校验**：AddMembers/CreateGroup 成员数量/正 ID/去重、Title 长度、
    ChangeMemberRole 枚举合法性、RequestId/ConversationId 长度、OperationCanceledException 传播。
    权限矩阵/群主转让/最后 Owner 退群/Member 分页/RequestId 幂等/审计事件仍由 RealtimeServices 判定。
 3. **Push Token 注册原子化**：Lua 脚本合并 HSET+ZADD+淘汰+TTL，Hash tag 对齐 Cluster slot。
 4. **Relationship 授权缓存失效**：friendship/blocked-user 变更双向失效 Typing/Presence 缓存。
-5. **协议版本与兼容性基础**：GatewayFeature 常量、ServerHello.PayloadFormat 类型化字段、
-   CommandDescriptor.Deprecated 弃用策略、ResumeRequest Catalog 清理。
+5. **协议版本与兼容性深化**：除 GatewayFeature 常量、PayloadFormat、Deprecated 策略外，
+   已加入可配置最低客户端版本、实际版本/FeatureBits 交集、会话协商快照、
+   `CommandCapabilities` 兼容开关和命令级 `RequiredFeature` 门控。未协商扩展命令返回
+   非致命 `FeatureNotNegotiated`；DirectSocket/Pipelines × 两种出站模式均通过真实 TCP 测试。
+   Resume 成功路径也会保存协商状态；未来二进制位仍不对外回显。
 
 ### 后续按业务优先级再评估
 
@@ -333,8 +375,9 @@ CPU、工作集、分配、Gen2/LOH、TCP 排队字节、JetStream pending/重�
    消息撤回后附件保留策略。
 5. **Relationship 产品接口**：好友列表分页、好友请求列表、接受/拒绝、拉黑/取消拉黑、
    Relationship version/watermark。
-6. **协议版本与兼容性深化**：最低支持版本、FeatureBits 实际强制检查、命令级能力协商、
-   Deprecated command 策略落地（当前框架已就位，需在解析器中调用 `IsDeprecated` 拒绝）。
+6. ~~**协议版本与兼容性深化**：最低支持版本、FeatureBits 实际强制检查、命令级能力协商、
+   Deprecated command 策略落地。~~ **已完成**。下一次协议升级只在新增 v2/binary 功能时继续，
+   现阶段回到 Resume 可靠性、Push、附件和 Relationship 产品功能。
 7. ~~将 `TcpGatewayService` / `RealtimeEventDispatcher` 拆成可独立测试的处理器模块。~~
    **已完成**：`TcpGatewayService` 由 ~1800 行降至 669 行（抽取 `TcpListenerHost` /
    `SessionLifecycleCoordinator` / `TypingFanoutHost` / `SessionRuntime` / `HeartbeatCoordinator` /

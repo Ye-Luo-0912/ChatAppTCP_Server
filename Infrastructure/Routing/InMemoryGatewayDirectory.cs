@@ -78,6 +78,33 @@ public sealed class InMemoryGatewayDirectory : IGatewayDirectory
         return Task.FromResult<IReadOnlyDictionary<long, IReadOnlyList<string>>>(result);
     }
 
+    public Task<GatewayLookupResult> GetOnlineGatewaysWithStatusAsync(
+        long userId,
+        CancellationToken cancellationToken = default)
+    {
+        var gateways = GetOnlineGatewaysCore(
+            userId,
+            _timeProvider.GetUtcNow().ToUnixTimeMilliseconds());
+        return Task.FromResult(new GatewayLookupResult(
+            gateways.Count > 0
+                ? GatewayLookupResultKind.Success
+                : GatewayLookupResultKind.UserOffline,
+            gateways));
+    }
+
+    public async Task<GatewayLookupManyResult> GetOnlineGatewaysManyWithStatusAsync(
+        IReadOnlyList<long> userIds,
+        CancellationToken cancellationToken = default)
+    {
+        var map = await GetOnlineGatewaysManyAsync(
+                userIds,
+                cancellationToken)
+            .ConfigureAwait(false);
+        return new GatewayLookupManyResult(
+            GatewayLookupResultKind.Success,
+            map);
+    }
+
     private IReadOnlyList<string> GetOnlineGatewaysCore(long userId, long nowMs)
     {
         if (userId <= 0)

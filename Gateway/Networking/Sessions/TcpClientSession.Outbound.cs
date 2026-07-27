@@ -233,12 +233,12 @@ internal sealed partial class TcpClientSession
     /// <summary>
     /// OnDemandSendPump 模式：入队后唤醒共享 worker 池。
     /// <para>
-    /// 通过 CAS <see cref="_sendScheduled"/> 0→1 保证同一 session 同时只在 ready queue 中存在一份引用。
+    /// 三态状态机：CAS Idle→Queued 成功后 TrySchedule 入 ready queue。
     /// PersistentSendLoop 模式下 <see cref="_outboundPump"/> 为 null，本方法是 no-op。
     /// </para>
     /// <para>
-    /// 若 <see cref="OutboundPumpCoordinator.TrySchedule"/> 失败（coordinator 停机中），
-    /// 重置标志以避免状态泄漏；此时连接也将被 Close，残留帧由 <see cref="DrainOutboundOnClose"/> 清理。
+    /// 若 <see cref="OutboundPumpCoordinator.TrySchedule"/> 失败（coordinator 停机），
+    /// 回退 Queued→Idle 以避免状态泄漏；此时连接也将被 Close，残留帧由 <see cref="DrainOutboundOnClose"/> 清理。
     /// </para>
     /// </summary>
     private void TryScheduleSend()
@@ -246,13 +246,14 @@ internal sealed partial class TcpClientSession
         if (_outboundPump is null)
             return;
 
-        if (Interlocked.CompareExchange(ref _sendScheduled, 1, 0) != 0)
-            return; // 已调度，无需重复入队。
+        // Idle → Queued：仅当当前空闲时才入队，保证同 session 同时只在 ready queue 中存在一份引用。
+        if (Interlocked.CompareExchange(ref _sendState, SendStateQueued, SendStateIdle) != SendStateIdle)
+            return;
 
         if (!_outboundPump.TrySchedule(this))
         {
-            // ready channel 已关闭（停机）：重置标志，避免后续 TryScheduleSend 永远 CAS 失败。
-            Interlocked.Exchange(ref _sendScheduled, 0);
+            // ready channel 已关闭（停机）：回退 Queued→Idle，避免后续 TryScheduleSend 永远 CAS 失败。
+            Interlocked.Exchange(ref _sendState, SendStateIdle);
         }
     }
 
@@ -260,17 +261,21 @@ internal sealed partial class TcpClientSession
     /// OnDemandSendPump 模式：由 <see cref="OutboundPumpCoordinator"/> worker 调用，
     /// 处理最多 <paramref name="maxBurst"/> 个出站帧（durable FIFO + ephemeral mailbox）。
     /// <para>
-    /// 与 <see cref="SendLoopAsync"/> 的关键差异：
+    /// 三态状态机保证任意时刻一个 session 最多只有一个 worker 持有发送所有权：
     /// <list type="bullet">
-    /// <item>非阻塞 <c>TryRead</c> 而非 <c>ReadAllAsync</c>；空队列时立即返回 worker 给其他会话；</item>
-    /// <item>burst 上限防止单连接独占 worker；达到上限后会话重新入队（公平轮转）；</item>
-    /// <item>pump 结束时通过 CAS 1→0 + re-check 处理"清除标志与新入队"竞态。</item>
+    /// <item>worker 出队后 CAS Queued→Running 取得所有权；</item>
+    /// <item>pump 结束若仍有 pending work：CAS Running→Queued 并重新入队（不经过 Idle）；</item>
+    /// <item>pump 结束若无 pending work：CAS Running→Idle，然后重检防丢失唤醒。</item>
     /// </list>
     /// </para>
     /// </summary>
     public async ValueTask PumpOutboundAsync(int maxBurst, CancellationToken cancellationToken)
     {
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(maxBurst, 0);
+
+        // Queued → Running：取得发送所有权。若状态已变（停机回退等），让出 worker。
+        if (Interlocked.CompareExchange(ref _sendState, SendStateRunning, SendStateQueued) != SendStateQueued)
+            return;
 
         try
         {
@@ -319,14 +324,18 @@ internal sealed partial class TcpClientSession
                 }
             }
 
-            // Burst 上限达到且仍有待处理：重新入队让出 worker（公平轮转）。
-            // 保持 _sendScheduled=1，使 enqueuer 的 CAS 0→1 失败，避免并发重复入队。
+            // Burst 上限达到且仍有待处理：Running→Queued 重新入队（公平轮转）。
+            // 不经过 Idle：避免 enqueuer 在 Running→Idle→Queued 窗口内 CAS Idle→Queued 成功
+            // 并重复 TrySchedule。Running→Queued 使 enqueuer 的 Idle→Queued CAS 失败（状态非 Idle）。
             if (processed >= maxBurst && IsConnected && HasPendingWork())
             {
-                if (!_outboundPump!.TrySchedule(this))
+                if (Interlocked.CompareExchange(ref _sendState, SendStateQueued, SendStateRunning) == SendStateRunning)
                 {
-                    // coordinator 停机：重置标志，让后续路径（DisposeAsync）清理。
-                    Interlocked.Exchange(ref _sendScheduled, 0);
+                    if (!_outboundPump!.TrySchedule(this))
+                    {
+                        // coordinator 停机：回退 Queued→Idle，让后续路径（DisposeAsync）清理。
+                        Interlocked.Exchange(ref _sendState, SendStateIdle);
+                    }
                 }
                 return;
             }
@@ -355,26 +364,25 @@ internal sealed partial class TcpClientSession
         }
         finally
         {
-            // CAS 1→0：仅当标志仍为 1 时清除（无 enqueuer 在竞态窗口内设置过）。
-            // 这防止"清除标志与新入队"竞态：
-            // - enqueuer 的 CAS 0→1 若失败（flag=1），则不 schedule；
-            // - 我们清除 flag 后 re-check，若仍有待处理则 CAS 0→1 + schedule；
-            // - 恰好一方 0→1 CAS 成功，避免丢失唤醒与重复调度。
-            if (Interlocked.CompareExchange(ref _sendScheduled, 0, 1) == 1)
+            // pump 结束且无 pending work（或连接已关闭/异常）：Running→Idle。
+            // 仅当状态仍为 Running 时清除。若 pump 已转 Queued（burst 重入队路径），则不处理。
+            if (Interlocked.CompareExchange(ref _sendState, SendStateIdle, SendStateRunning) == SendStateRunning)
             {
+                // 清除后重检：enqueuer 可能在 Running→Idle 转换前入队，
+                // 其 CAS Idle→Queued 会失败（因为状态是 Running），
+                // 它依赖此处 Idle 后的 re-check 来补发 ready signal。
                 if (IsConnected && HasPendingWork())
                 {
-                    if (Interlocked.CompareExchange(ref _sendScheduled, 1, 0) == 0)
+                    if (Interlocked.CompareExchange(ref _sendState, SendStateQueued, SendStateIdle) == SendStateIdle)
                     {
                         if (!_outboundPump!.TrySchedule(this))
                         {
-                            Interlocked.Exchange(ref _sendScheduled, 0);
+                            Interlocked.Exchange(ref _sendState, SendStateIdle);
                         }
                     }
-                    // else: enqueuer 已通过自己的 CAS 0→1 完成 schedule。
+                    // else: enqueuer 已通过自己的 CAS Idle→Queued 完成 schedule。
                 }
             }
-            // else: enqueuer 已设 flag=1 并 schedule，无需处理。
 
             // 连接关闭期间 pump 退出：排空残留帧释放预算（与 DisposeAsync 幂等）。
             if (!IsConnected)

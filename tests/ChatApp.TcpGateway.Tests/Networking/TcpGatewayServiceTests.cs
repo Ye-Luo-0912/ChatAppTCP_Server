@@ -31,6 +31,7 @@ using ChatApp.TcpGateway.Gateway.Networking.Sessions;
 using ChatApp.TcpGateway.Infrastructure.Authentication;
 using ChatApp.TcpGateway.Infrastructure.Push;
 using ChatApp.TcpGateway.Infrastructure.Serialization.Json;
+using ChatApp.TcpGateway.Infrastructure.Server;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using RealtimeEventDispatcher = ChatApp.TcpGateway.Gateway.Messaging.RealtimeEventDispatcher;
@@ -43,9 +44,20 @@ namespace ChatApp.TcpGateway.Tests.Networking;
 public sealed class TcpGatewayServiceTests
 {
     [Theory(Timeout = 10_000)]
-    [InlineData(OutboundSendMode.PersistentSendLoop)]
-    [InlineData(OutboundSendMode.OnDemandSendPump)]
+    [InlineData(
+        InboundTransportMode.Pipelines,
+        OutboundSendMode.PersistentSendLoop)]
+    [InlineData(
+        InboundTransportMode.Pipelines,
+        OutboundSendMode.OnDemandSendPump)]
+    [InlineData(
+        InboundTransportMode.DirectSocket,
+        OutboundSendMode.PersistentSendLoop)]
+    [InlineData(
+        InboundTransportMode.DirectSocket,
+        OutboundSendMode.OnDemandSendPump)]
     public async Task PublishesIncomingMessageAndDispatchesPersistedEventOverTcp(
+        InboundTransportMode inboundTransportMode,
         OutboundSendMode outboundSendMode)
     {
         var port = ReserveLoopbackPort();
@@ -68,7 +80,9 @@ public sealed class TcpGatewayServiceTests
             MaxInboundBytesPerSecond = 256 * 1024,
             MaxInboundPayloadBytes = PacketProtocol.MaxPayloadSize,
             MaxChatAttachments = 32,
-            RequireClientHello = false,
+            RequireClientHello = true,
+            UseActorRuntimeForEphemeralCommands = true,
+            InboundTransportMode = inboundTransportMode,
             // A/B：同一场景同时验证 PersistentSendLoop（永久 SendLoop Task）
             // 与 OnDemandSendPump（共享 worker 池按需 pump）两条出站路径。
             OutboundSendMode = outboundSendMode
@@ -83,6 +97,12 @@ public sealed class TcpGatewayServiceTests
         var authenticationResponseCodec =
             new JsonPayloadCodec<AuthenticationResponse>(
                 GatewayJsonSerializerContext.Default.AuthenticationResponse);
+        var clientHelloCodec = new JsonPayloadCodec<ClientHello>(
+            GatewayJsonSerializerContext.Default.ClientHello);
+        var serverHelloCodec = new JsonPayloadCodec<ServerHello>(
+            GatewayJsonSerializerContext.Default.ServerHello);
+        var protocolErrorCodec = new JsonPayloadCodec<ProtocolErrorFrame>(
+            GatewayJsonSerializerContext.Default.ProtocolErrorFrame);
         var chatMessageCodec = new JsonPayloadCodec<ChatMessage>(
             GatewayJsonSerializerContext.Default.ChatMessage);
         var acknowledgementCodec =
@@ -335,6 +355,11 @@ public sealed class TcpGatewayServiceTests
             TimeProvider.System,
             NullLogger<TcpGatewayService>.Instance,
             NullLogger<TcpClientSession>.Instance,
+            serverIdentity: new ServerIdentity(
+                "00000000000000000000000000000001"),
+            clientHelloCodec: clientHelloCodec,
+            serverHelloCodec: serverHelloCodec,
+            protocolErrorFrameCodec: protocolErrorCodec,
             commandDispatcher: commandDispatcher);
 
         await service.StartAsync(CancellationToken.None);
@@ -350,26 +375,73 @@ public sealed class TcpGatewayServiceTests
                 timeout.Token);
             await using var stream = client.GetStream();
 
+            await NegotiateProtocolAsync(
+                stream,
+                clientHelloCodec,
+                serverHelloCodec,
+                fragmentFrame:
+                    inboundTransportMode ==
+                    InboundTransportMode.DirectSocket,
+                timeout.Token);
+
             await AuthenticateAsync(
                 stream,
                 authenticationRequestCodec,
                 authenticationResponseCodec,
+                fragmentFrame:
+                    inboundTransportMode ==
+                    InboundTransportMode.DirectSocket,
                 timeout.Token);
 
-            await WriteEmptyFrameAsync(
+            // 客户端只启用严格命令能力门控、未协商 PushTokenManagement。
+            // 网关必须在进入 OrderedWrite/业务 handler 前拒绝，同时保持连接可用。
+            await WriteFrameAsync(
+                stream,
+                PacketCommand.RegisterPushTokenRequest,
+                registerPushRequestCodec,
+                new RegisterPushTokenRequest
+                {
+                    RequestId = "missing-feature",
+                    Platform = PushPlatform.Fcm,
+                    Token = "feature-gate-test-token"
+                },
+                timeout.Token);
+            var capabilityErrorFrame = await ReadFrameAsync(
+                stream,
+                timeout.Token);
+            Assert.Equal(PacketCommand.Error, capabilityErrorFrame.Command);
+            var capabilityError = protocolErrorCodec.Deserialize(
+                new ReadOnlySequence<byte>(capabilityErrorFrame.Payload));
+            Assert.NotNull(capabilityError);
+            Assert.Equal(
+                ProtocolErrorCode.FeatureNotNegotiated,
+                capabilityError.Code);
+            Assert.False(capabilityError.Fatal);
+            Assert.Equal(
+                (ushort)PacketCommand.RegisterPushTokenRequest,
+                capabilityError.OriginCommand);
+
+            await WriteEmptyFramesAsync(
                 stream,
                 PacketCommand.Heartbeat,
+                count: 2,
                 timeout.Token);
-            var heartbeatFrame = await ReadFrameAsync(
-                stream,
-                timeout.Token);
-            Assert.Equal(
-                PacketCommand.HeartbeatAcknowledgement,
-                heartbeatFrame.Command);
+            for (var heartbeatIndex = 0;
+                 heartbeatIndex < 2;
+                 heartbeatIndex++)
+            {
+                var heartbeatFrame = await ReadFrameAsync(
+                    stream,
+                    timeout.Token);
+                Assert.Equal(
+                    PacketCommand.HeartbeatAcknowledgement,
+                    heartbeatFrame.Command);
+            }
 
             var clientMessageId = Guid
                 .CreateVersion7()
                 .ToString("N");
+            var messageContent = new string('x', 6 * 1024);
             await WriteFrameAsync(
                 stream,
                 PacketCommand.ChatMessage,
@@ -378,9 +450,14 @@ public sealed class TcpGatewayServiceTests
                 {
                     MessageId = clientMessageId,
                     TargetUserId = 42,
-                    Content = "hello through JetStream"
+                    Content = messageContent
                 },
-                timeout.Token);
+                timeout.Token,
+                fragmentSize:
+                    inboundTransportMode ==
+                    InboundTransportMode.DirectSocket
+                        ? 257
+                        : 0);
 
             var acknowledgementFrame = await ReadFrameAsync(
                 stream,
@@ -557,6 +634,7 @@ public sealed class TcpGatewayServiceTests
         Stream stream,
         JsonPayloadCodec<AuthenticationRequest> requestCodec,
         JsonPayloadCodec<AuthenticationResponse> responseCodec,
+        bool fragmentFrame,
         CancellationToken cancellationToken)
     {
         await WriteFrameAsync(
@@ -568,7 +646,8 @@ public sealed class TcpGatewayServiceTests
                 AccessToken = "valid-token",
                 DeviceIdHash = 7
             },
-            cancellationToken);
+            cancellationToken,
+            fragmentSize: fragmentFrame ? 3 : 0);
 
         var authenticationFrame = await ReadFrameAsync(
             stream,
@@ -584,6 +663,49 @@ public sealed class TcpGatewayServiceTests
         Assert.True(response.Success);
         Assert.Equal(42, response.UserId);
         Assert.Equal("integration-test", response.SessionId);
+    }
+
+    private static async Task NegotiateProtocolAsync(
+        Stream stream,
+        JsonPayloadCodec<ClientHello> clientHelloCodec,
+        JsonPayloadCodec<ServerHello> serverHelloCodec,
+        bool fragmentFrame,
+        CancellationToken cancellationToken)
+    {
+        await WriteFrameAsync(
+            stream,
+            PacketCommand.ClientHello,
+            clientHelloCodec,
+            new ClientHello
+            {
+                ProtocolVersion = PacketProtocol.CurrentProtocolVersion,
+                FeatureBits =
+                    (uint)(GatewayFeature.CommandCapabilities |
+                           GatewayFeature.BinaryPayload |
+                           GatewayFeature.Compression |
+                           GatewayFeature.StreamingChat |
+                           GatewayFeature.PresenceAndTyping),
+                InstallationId = "tcp-integration-test"
+            },
+            cancellationToken,
+            fragmentSize: fragmentFrame ? 3 : 0);
+
+        var serverHelloFrame = await ReadFrameAsync(
+            stream,
+            cancellationToken);
+        Assert.Equal(PacketCommand.ServerHello, serverHelloFrame.Command);
+
+        var serverHello = serverHelloCodec.Deserialize(
+            new ReadOnlySequence<byte>(serverHelloFrame.Payload));
+        Assert.NotNull(serverHello);
+        Assert.Equal(
+            PacketProtocol.CurrentProtocolVersion,
+            serverHello.ProtocolVersion);
+        Assert.Equal(
+            (uint)GatewayFeature.CommandCapabilities,
+            serverHello.FeatureBits);
+        Assert.False(serverHello.ResumeSupported);
+        Assert.Equal(ProtocolPayloadFormat.Json, serverHello.PayloadFormat);
     }
 
     private static RealtimeEvent CreateMessageReceivedEvent(
@@ -650,7 +772,8 @@ public sealed class TcpGatewayServiceTests
         PacketCommand command,
         JsonPayloadCodec<T> codec,
         T value,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        int fragmentSize = 0)
     {
         var payload = new ArrayBufferWriter<byte>();
         codec.Serialize(payload, value);
@@ -664,17 +787,43 @@ public sealed class TcpGatewayServiceTests
         payload.WrittenSpan.CopyTo(
             frame.AsSpan(PacketProtocol.HeaderSize));
 
-        await stream.WriteAsync(frame, cancellationToken);
+        if (fragmentSize <= 0)
+        {
+            await stream.WriteAsync(frame, cancellationToken);
+            return;
+        }
+
+        for (var offset = 0; offset < frame.Length;)
+        {
+            var count = Math.Min(fragmentSize, frame.Length - offset);
+            await stream.WriteAsync(
+                frame.AsMemory(offset, count),
+                cancellationToken);
+            await stream.FlushAsync(cancellationToken);
+            offset += count;
+            if (offset < frame.Length)
+                await Task.Delay(1, cancellationToken);
+        }
     }
 
-    private static async ValueTask WriteEmptyFrameAsync(
+    private static async ValueTask WriteEmptyFramesAsync(
         Stream stream,
         PacketCommand command,
+        int count,
         CancellationToken cancellationToken)
     {
-        var header = new byte[PacketProtocol.HeaderSize];
-        PacketParser.WriteHeader(header, command, payloadLength: 0);
-        await stream.WriteAsync(header, cancellationToken);
+        var frames = new byte[PacketProtocol.HeaderSize * count];
+        for (var index = 0; index < count; index++)
+        {
+            PacketParser.WriteHeader(
+                frames.AsSpan(
+                    index * PacketProtocol.HeaderSize,
+                    PacketProtocol.HeaderSize),
+                command,
+                payloadLength: 0);
+        }
+
+        await stream.WriteAsync(frames, cancellationToken);
     }
 
     private static async ValueTask<ReceivedFrame> ReadFrameAsync(

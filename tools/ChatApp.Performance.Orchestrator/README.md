@@ -82,6 +82,22 @@ JSON/Markdown，并在 finally 中只删除本次创建的容器。默认使用 
 实际速率和达成率；高档位的目标未达成不能解释为开放环形负载的服务端排队量。每档
 持久链路基准会显式把 RealtimeServices 配置为 JetStream，确保全新 NATS 能创建 streams。
 
+## 入站解析短时 A/B
+
+`Run-InboundTransportAB.ps1` 使用相同配置依次运行 `Pipelines` 与 `DirectSocket`。默认负载为
+1000 个认证连接、每连接 20 heartbeat/s；该短测禁用持久 Pipeline 负载，隔离入站解析差异。
+门禁要求两轮均成功、零连接失败，且 DirectSocket 吞吐下降不超过 5%、p95/p99 不超过
+允许的短测波动：
+
+```powershell
+.\tools\ChatApp.Performance.Orchestrator\scripts\Run-InboundTransportAB.ps1 `
+  -DurationSeconds 60 -WarmupSeconds 10 `
+  -TcpConnections 1000 -TcpMessagesPerSecond 20 -SkipBuild
+```
+
+结果写入独立的 `inbound-transport-ab-*` 目录。短测适合决定是否启用可回退的默认值；
+长期稳定性和容量结论仍需运行 soak/capacity 测试。
+
 ## 依赖故障注入
 
 脚本为每个场景创建全新的 NATS、PostgreSQL 和 Garnet 容器，在持久链路负载已经启动后

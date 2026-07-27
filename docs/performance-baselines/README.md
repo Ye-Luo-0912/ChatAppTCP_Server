@@ -14,4 +14,8 @@ p50/p95/p99、错误率、消息积压/失败计数、进程与依赖资源，�
   200 ms 轮询兜底的优化后基线。两者均为 2 个 Gateway、1000 个 TCP 长连接、
   8 路持久链路并发和单节点 NATS/PostgreSQL/Garnet；
 - 2026-07-20-local-single-node-capacity-curve.json：32 路并发的固定速率曲线、
-  5 分钟 120/s 持续确认、短期门禁和初始运行预算。
+  5 分钟 120/s 持续确认、短期门禁和初始运行预算；
+- 2026-07-22-linux-remote-resilience.json：Linux 8 小时持久链路 soak 与 JetStream
+  三副本硬重启恢复摘要；
+- 2026-07-28-linux-inbound-transport-ab.json：Pipelines/DirectSocket 双 Gateway、
+  1000 认证连接 × 每连接 20 heartbeat/s 的短时可回退默认值门禁。

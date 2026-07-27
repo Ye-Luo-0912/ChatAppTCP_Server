@@ -16,46 +16,28 @@ public static class PacketParser
             return PacketParseStatus.NeedMoreData;
         }
 
-        // 连续 FirstSpan 快路径：绝大多数完整 TCP 段无需复制 10 字节头。
-        // stackalloc 不得赋给跨分支存活的 Span（CS8352），因此在分支内直接读字段。
-        uint magic;
-        ushort commandRaw;
+        PacketCommand command;
         int payloadLength;
+        PacketParseStatus headerStatus;
         if (buffer.FirstSpan.Length >= PacketProtocol.HeaderSize)
         {
-            var header = buffer.FirstSpan[..PacketProtocol.HeaderSize];
-            magic = BinaryPrimitives.ReadUInt32LittleEndian(header);
-            commandRaw = BinaryPrimitives.ReadUInt16LittleEndian(
-                header[PacketProtocol.CommandOffset..]);
-            payloadLength = BinaryPrimitives.ReadInt32LittleEndian(
-                header[PacketProtocol.LengthOffset..]);
+            headerStatus = TryParseHeader(
+                buffer.FirstSpan,
+                out command,
+                out payloadLength);
         }
         else
         {
             Span<byte> headerCopy = stackalloc byte[PacketProtocol.HeaderSize];
             buffer.Slice(0, PacketProtocol.HeaderSize).CopyTo(headerCopy);
-            magic = BinaryPrimitives.ReadUInt32LittleEndian(headerCopy);
-            commandRaw = BinaryPrimitives.ReadUInt16LittleEndian(
-                headerCopy[PacketProtocol.CommandOffset..]);
-            payloadLength = BinaryPrimitives.ReadInt32LittleEndian(
-                headerCopy[PacketProtocol.LengthOffset..]);
+            headerStatus = TryParseHeader(
+                headerCopy,
+                out command,
+                out payloadLength);
         }
 
-        if (magic != PacketProtocol.MagicNumber || payloadLength < 0)
-        {
-            return PacketParseStatus.InvalidPacket;
-        }
-
-        // 解析包头后立即按命令校验 Payload 上限，不等完整 Payload 到达。
-        // - 未定义命令 / 服务端→客户端命令 → GetMaxPayloadSize 返回 -1 → 立即拒绝
-        // - 命令级长度超限 → 立即拒绝
-        // 防止攻击者声明小命令（如 Heartbeat）却附带 80 KiB Payload 慢速发送占用缓冲。
-        var command = (PacketCommand)commandRaw;
-        var maxPayloadForCommand = PacketProtocol.GetMaxPayloadSize(command);
-        if (maxPayloadForCommand < 0 || payloadLength > maxPayloadForCommand)
-        {
-            return PacketParseStatus.InvalidPacket;
-        }
+        if (headerStatus != PacketParseStatus.Success)
+            return headerStatus;
 
         var frameLength = PacketProtocol.HeaderSize + payloadLength;
         if (buffer.Length < frameLength)
@@ -69,6 +51,41 @@ public static class PacketParser
 
         buffer = buffer.Slice(frameLength);
         return PacketParseStatus.Success;
+    }
+
+    /// <summary>
+    /// 只解析并校验固定 10 字节包头，不等待 Payload。供 Pipelines 与 DirectSocket
+    /// 共用同一个命令方向、Magic 和命令级长度校验入口。
+    /// </summary>
+    public static PacketParseStatus TryParseHeader(
+        ReadOnlySpan<byte> buffer,
+        out PacketCommand command,
+        out int payloadLength)
+    {
+        command = default;
+        payloadLength = 0;
+        if (buffer.Length < PacketProtocol.HeaderSize)
+            return PacketParseStatus.NeedMoreData;
+
+        var magic = BinaryPrimitives.ReadUInt32LittleEndian(buffer);
+        if (magic != PacketProtocol.MagicNumber)
+            return PacketParseStatus.InvalidPacket;
+
+        command = (PacketCommand)
+            BinaryPrimitives.ReadUInt16LittleEndian(
+                buffer[PacketProtocol.CommandOffset..]);
+        payloadLength = BinaryPrimitives.ReadInt32LittleEndian(
+            buffer[PacketProtocol.LengthOffset..]);
+        if (payloadLength < 0)
+            return PacketParseStatus.InvalidPacket;
+
+        // 未定义/服务端命令为 -1；命令级超限在读取 Payload 前立即拒绝。
+        var maxPayloadForCommand =
+            PacketProtocol.GetMaxPayloadSize(command);
+        return maxPayloadForCommand < 0 ||
+               payloadLength > maxPayloadForCommand
+            ? PacketParseStatus.InvalidPacket
+            : PacketParseStatus.Success;
     }
 
     /// <summary>

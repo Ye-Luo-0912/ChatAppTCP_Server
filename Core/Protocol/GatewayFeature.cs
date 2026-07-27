@@ -6,8 +6,8 @@ namespace ChatApp.TcpGateway.Core.Protocol;
 /// <para>
 /// wire 格式为 <see cref="uint"/>，本枚举仅作为类型化解释；
 /// 实际协商仍按位运算（<c>(uint)GatewayFeature.X</c>）。
-/// 当前未强制任何能力位；未来引入命令级能力协商时，
-/// 解析器将根据协商结果决定是否接受特定命令。
+/// 客户端显式协商 <see cref="CommandCapabilities"/> 后，网关才按命令所需能力位
+/// 执行严格门控；未声明该位的 v1 客户端保持原有兼容行为。
 /// </para>
 /// </summary>
 [Flags]
@@ -33,6 +33,68 @@ public enum GatewayFeature : uint
     /// 预留给未来大消息流式传输场景。
     /// </summary>
     StreamingChat = 1 << 2,
+
+    /// <summary>
+    /// 启用命令级能力门控。客户端声明此位后，只能发送其余已协商能力覆盖的扩展命令。
+    /// 未声明此位时保持 v1 全命令兼容语义。
+    /// </summary>
+    CommandCapabilities = 1 << 3,
+
+    /// <summary>支持通过 ClientHello.resumeToken 恢复会话。</summary>
+    SessionResume = 1 << 4,
+
+    /// <summary>支持 SyncBootstrap 增量同步。</summary>
+    ConversationSync = 1 << 5,
+
+    /// <summary>支持会话偏好设置。</summary>
+    ConversationPreferences = 1 << 6,
+
+    /// <summary>支持消息撤回与编辑。</summary>
+    MessageMutation = 1 << 7,
+
+    /// <summary>支持输入状态与在线状态查询/订阅。</summary>
+    PresenceAndTyping = 1 << 8,
+
+    /// <summary>支持消息 Reaction。</summary>
+    MessageReactions = 1 << 9,
+
+    /// <summary>支持群组管理命令。</summary>
+    GroupManagement = 1 << 10,
+
+    /// <summary>支持离线推送 Token 注册与注销。</summary>
+    PushTokenManagement = 1 << 11,
+}
+
+/// <summary>
+/// 网关能力集合。集中区分已经实现的能力与仅保留 wire 编号的未来能力。
+/// </summary>
+public static class GatewayFeatureSet
+{
+    /// <summary>当前服务端已实现、可在 ServerHello 中协商的能力。</summary>
+    public const GatewayFeature Implemented =
+        GatewayFeature.CommandCapabilities |
+        GatewayFeature.SessionResume |
+        GatewayFeature.ConversationSync |
+        GatewayFeature.ConversationPreferences |
+        GatewayFeature.MessageMutation |
+        GatewayFeature.PresenceAndTyping |
+        GatewayFeature.MessageReactions |
+        GatewayFeature.GroupManagement |
+        GatewayFeature.PushTokenManagement;
+
+    /// <summary>协议已经分配的全部能力位，包括尚未实现的预留位。</summary>
+    public const GatewayFeature Known =
+        GatewayFeature.BinaryPayload |
+        GatewayFeature.Compression |
+        GatewayFeature.StreamingChat |
+        Implemented;
+
+    /// <summary>判断位掩码是否包含指定能力集合。</summary>
+    public static bool ContainsAll(uint featureBits, GatewayFeature required)
+    {
+        var requiredBits = (uint)required;
+        return (featureBits & requiredBits) == requiredBits;
+    }
 }
 
 /// <summary>

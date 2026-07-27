@@ -19,6 +19,7 @@
     <ProjectReference Include="..\..\Core\Core.csproj" />
     <ProjectReference Include="..\..\Infrastructure\Infrastructure.csproj" />
     <ProjectReference Include="..\..\Observability\ChatApp.TcpGateway.Observability.csproj" />
+    <ProjectReference Include="..\..\ActorRuntime\ChatApp.ActorRuntime.csproj" />
     <ProjectReference Include="..\..\tools\ChatApp.Realtime.PipelineLoadGenerator\ChatApp.Realtime.PipelineLoadGenerator.csproj" />
   </ItemGroup>
 </Project>

@@ -79,13 +79,21 @@ internal sealed class HeartbeatBucketRegistry
         {
             var userBucket = (int)((ulong)session.UserId % (uint)_bucketCount);
             var bucket = _userBuckets[userBucket];
-            // 原子递减：仅当结果 ≤ 0 时移除。并发场景下使用 AddOrUpdate + TryRemove 保证最终一致。
+            // 原子递减并条件删除，防止引用计数删除竞态：
+            // 线程 A 递减到 0 → 线程 B 把 0 递增到 1 → 线程 A 执行 TryRemove
+            // 会错误移除仍有在线连接的用户。使用 ICollection.Remove(KeyValuePair)
+            // 仅当 value 匹配时才删除（原子 CAS 语义）。
             var newCount = bucket.AddOrUpdate(
                 session.UserId,
                 addValue: 0,
                 updateValueFactory: (_, c) => c > 0 ? c - 1 : 0);
             if (newCount <= 0)
-                bucket.TryRemove(session.UserId, out _);
+            {
+                // 条件删除：仅当 value 仍为 0 时才移除。
+                // 若在递减与删除之间有新连接 RegisterUser 把 0→1，则不删除。
+                ((ICollection<KeyValuePair<long, int>>)bucket)
+                    .Remove(new KeyValuePair<long, int>(session.UserId, 0));
+            }
         }
     }
 

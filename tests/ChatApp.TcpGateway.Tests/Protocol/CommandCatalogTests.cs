@@ -204,4 +204,84 @@ public class CommandCatalogTests
     {
         Assert.Equal(expected, CommandCatalog.GetCost(command));
     }
+
+    [Fact]
+    public void RequiredFeaturesAreSingleImplementedBits()
+    {
+        foreach (var command in Enum.GetValues<PacketCommand>())
+        {
+            var descriptor = CommandCatalog.TryGetDescriptor(command);
+            Assert.NotNull(descriptor);
+
+            var required = descriptor.Value.RequiredFeature;
+            if (required == GatewayFeature.None)
+                continue;
+
+            var bits = (uint)required;
+            Assert.True(
+                System.Numerics.BitOperations.IsPow2(bits),
+                $"{command} 必须只依赖单个能力位");
+            Assert.True(
+                GatewayFeatureSet.ContainsAll(
+                    (uint)GatewayFeatureSet.Implemented,
+                    required),
+                $"{command} 不能依赖服务端尚未实现的能力 {required}");
+        }
+    }
+
+    [Theory]
+    [InlineData(
+        PacketCommand.SyncBootstrapRequest,
+        GatewayFeature.ConversationSync)]
+    [InlineData(
+        PacketCommand.ConversationSetPrefsRequest,
+        GatewayFeature.ConversationPreferences)]
+    [InlineData(
+        PacketCommand.MessageEditRequest,
+        GatewayFeature.MessageMutation)]
+    [InlineData(
+        PacketCommand.PresenceQuery,
+        GatewayFeature.PresenceAndTyping)]
+    [InlineData(
+        PacketCommand.AddReactionRequest,
+        GatewayFeature.MessageReactions)]
+    [InlineData(
+        PacketCommand.CreateGroupRequest,
+        GatewayFeature.GroupManagement)]
+    [InlineData(
+        PacketCommand.RegisterPushTokenRequest,
+        GatewayFeature.PushTokenManagement)]
+    public void ExtensionCommandsDeclareExpectedFeature(
+        PacketCommand command,
+        GatewayFeature expected)
+    {
+        var descriptor = CommandCatalog.TryGetDescriptor(command);
+        Assert.NotNull(descriptor);
+        Assert.Equal(expected, descriptor.Value.RequiredFeature);
+    }
+
+    [Fact]
+    public void FeatureGateKeepsLegacyCompatibilityAndEnforcesStrictClients()
+    {
+        var descriptor = CommandCatalog
+            .TryGetDescriptor(PacketCommand.CreateGroupRequest);
+        Assert.NotNull(descriptor);
+        var value = descriptor.Value;
+
+        Assert.True(CommandCatalog.IsFeatureAllowed(
+            in value,
+            negotiatedFeatureBits: 0));
+
+        var strictOnly =
+            (uint)GatewayFeature.CommandCapabilities;
+        Assert.False(CommandCatalog.IsFeatureAllowed(
+            in value,
+            strictOnly));
+
+        var strictWithGroup =
+            strictOnly | (uint)GatewayFeature.GroupManagement;
+        Assert.True(CommandCatalog.IsFeatureAllowed(
+            in value,
+            strictWithGroup));
+    }
 }

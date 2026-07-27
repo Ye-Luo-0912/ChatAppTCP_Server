@@ -34,6 +34,7 @@ internal sealed record BenchmarkOptions(
     int PipelinePayloadBytes,
     TimeSpan PipelineOperationTimeout,
     long PipelineBaseUserId,
+    string InboundTransportMode,
     string OutboundSendMode,
     int OnDemandSendWorkerCount,
     int OnDemandSendBurstLimit,
@@ -55,6 +56,7 @@ internal sealed record BenchmarkOptions(
         "[--no-pipeline] [--pipeline-concurrency 4] [--pipeline-operations-per-second 0] " +
         "[--pipeline-payload-bytes 128] [--pipeline-operation-timeout-seconds 15] " +
         "[--pipeline-base-user-id 9200000000] " +
+        "[--inbound-transport-mode Pipelines|DirectSocket] " +
         "[--outbound-send-mode PersistentSendLoop|OnDemandSendPump] " +
         "[--on-demand-send-worker-count 0] [--on-demand-send-burst-limit 16] " +
         "[--docker-container NAME] " +
@@ -93,6 +95,7 @@ internal sealed record BenchmarkOptions(
         var pipelinePayloadBytes = 128;
         var pipelineOperationTimeoutSeconds = 15;
         long pipelineBaseUserId = 9_200_000_000;
+        var inboundTransportMode = "DirectSocket";
         // 出站发送模式 A/B：默认 PersistentSendLoop（与历史基线一致），
         // 切换为 OnDemandSendPump 时编排器会注入额外 TcpGateway 配置覆盖项。
         var outboundSendMode = "PersistentSendLoop";
@@ -206,6 +209,9 @@ internal sealed record BenchmarkOptions(
                 case "--pipeline-base-user-id":
                     pipelineBaseUserId = ParseLong(value, option);
                     break;
+                case "--inbound-transport-mode":
+                    inboundTransportMode = value;
+                    break;
                 case "--outbound-send-mode":
                     outboundSendMode = value;
                     break;
@@ -280,6 +286,9 @@ internal sealed record BenchmarkOptions(
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(pipelinePayloadBytes);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(pipelineOperationTimeoutSeconds);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(pipelineBaseUserId);
+        if (inboundTransportMode is not ("Pipelines" or "DirectSocket"))
+            throw new ArgumentException(
+                "--inbound-transport-mode must be Pipelines or DirectSocket.");
         // 校验出站模式 A/B 参数。
         if (outboundSendMode is not ("PersistentSendLoop" or "OnDemandSendPump"))
             throw new ArgumentException(
@@ -319,6 +328,7 @@ internal sealed record BenchmarkOptions(
             pipelinePayloadBytes,
             TimeSpan.FromSeconds(pipelineOperationTimeoutSeconds),
             pipelineBaseUserId,
+            inboundTransportMode,
             outboundSendMode,
             onDemandSendWorkerCount,
             onDemandSendBurstLimit,

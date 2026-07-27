@@ -100,10 +100,11 @@ internal sealed class TcpGatewayService : BackgroundService
     // 全局 DeadlineWheel：替代每连接 Auth/Send Timer。所有连接共享一个时间轮 + 单 PeriodicTimer。
     private readonly DeadlineWheel _deadlineWheel;
 
-    // 全局命令执行器：替代每连接 OrderedWrite/Query Channel + Consumer Task。
+    // 全局命令执行器：替代每连接 OrderedWrite/Query/Ephemeral Channel + Consumer Task。
     // 共享 worker 池，按 connectionId 串行保序，跨连接并行。
     private readonly SessionCommandExecutor _orderedWriteExecutor;
     private readonly SessionCommandExecutor _queryExecutor;
+    private readonly EphemeralCommandPipeline _ephemeralPipeline;
 
     // OnDemandSendPump 模式专用：共享出站 pump 协调器（ready queue + worker 池）。
     // PersistentSendLoop 模式下为 null，每连接保留永久 SendLoop Task。
@@ -273,6 +274,14 @@ internal sealed class TcpGatewayService : BackgroundService
             onFatalError: null,
             logger: _logger);
 
+        // Ephemeral lane 可切换到轻量 ActorRuntime；旧 SessionCommandExecutor 保留为 A/B 回退。
+        _ephemeralPipeline = new EphemeralCommandPipeline(
+            _options,
+            ProcessScheduledCommandAsync,
+            _metrics,
+            _timeProvider,
+            _logger);
+
         // OnDemandSendPump 模式：创建共享出站 pump 协调器。
         // PersistentSendLoop 模式（默认）保持 null，每连接保留永久 SendLoop Task。
         // ready queue 容量 ≥ MaxConnections，保证每连接至多一份引用时不会阻塞 TrySchedule。
@@ -293,6 +302,16 @@ internal sealed class TcpGatewayService : BackgroundService
             outboundPumpReadyQueueProvider: _outboundPump is null ? null : () => _outboundPump.ReadyQueueCount,
             outboundPumpTotalScheduledProvider: _outboundPump is null ? null : () => _outboundPump.TotalScheduled,
             outboundPumpWorkerCountProvider: _outboundPump is null ? null : () => _outboundPump.WorkerCount);
+        if (_ephemeralPipeline.UsesActorRuntime)
+        {
+            _metrics.RegisterActorRuntimeObservers(
+                activeActorsProvider: () => _ephemeralPipeline.Snapshot.ActiveActors,
+                busyActorsProvider: () => _ephemeralPipeline.Snapshot.BusyActors,
+                pendingIngressProvider: () => _ephemeralPipeline.Snapshot.PendingIngress,
+                pendingMailboxProvider: () => _ephemeralPipeline.Snapshot.PendingMailbox,
+                pendingAsyncProvider: () => _ephemeralPipeline.Snapshot.PendingAsyncOperations,
+                totalProcessedProvider: () => _ephemeralPipeline.Snapshot.TotalProcessed);
+        }
 
         // 每连接数据面运行时：内部创建并注入协议级回调。
         // ProcessPacketAsync / SendProtocolError / RejectOversizedPayload 仍由本 service 持有，
@@ -303,6 +322,7 @@ internal sealed class TcpGatewayService : BackgroundService
             _globalInboundBudget,
             _orderedWriteExecutor,
             _queryExecutor,
+            _ephemeralPipeline,
             _metrics,
             _logger,
             ProcessPacketAsync,
@@ -364,11 +384,13 @@ internal sealed class TcpGatewayService : BackgroundService
             stoppingToken);
         var executionToken = execution.Token;
 
-        // 启动全局执行器（OrderedWrite/Query 共享 worker 池）与 DeadlineWheel。
+        // 启动全局执行器（OrderedWrite/Query/Ephemeral 共享 worker 池）与 DeadlineWheel。
         // 在心跳与 listener 启动前就绪，避免首个连接到达时执行器未启动。
         await _orderedWriteExecutor.StartAsync(executionToken)
             .ConfigureAwait(false);
         await _queryExecutor.StartAsync(executionToken)
+            .ConfigureAwait(false);
+        await _ephemeralPipeline.StartAsync(executionToken)
             .ConfigureAwait(false);
         var deadlineWheelTask = _deadlineWheel.StartAsync(executionToken);
 
@@ -426,6 +448,8 @@ internal sealed class TcpGatewayService : BackgroundService
                 .ConfigureAwait(false);
             await _queryExecutor.StopAsync(CancellationToken.None)
                 .ConfigureAwait(false);
+            await _ephemeralPipeline.StopAsync(CancellationToken.None)
+                .ConfigureAwait(false);
 
             // OnDemandSendPump：停止共享出站 worker 池。
             // 须在所有 session.Close 后调用，确保 in-flight pump 已退出。
@@ -456,6 +480,7 @@ internal sealed class TcpGatewayService : BackgroundService
         // StopAsync 已在 ExecuteAsync finally 中等待 worker 退出，此处仅释放 CTS 等托管资源。
         _orderedWriteExecutor.DisposeAsync().AsTask().GetAwaiter().GetResult();
         _queryExecutor.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        _ephemeralPipeline.DisposeAsync().AsTask().GetAwaiter().GetResult();
         _deadlineWheel.DisposeAsync().AsTask().GetAwaiter().GetResult();
         _outboundPump?.Dispose();
         base.Dispose();
@@ -495,10 +520,11 @@ internal sealed class TcpGatewayService : BackgroundService
                 idleTimeout: _options.IdleTimeout,
                 outboundPump: _outboundPump);
 
-            // 注册连接到全局执行器（OrderedWrite/Query 共享 worker 池）。
+            // 注册连接到全局执行器（OrderedWrite/Query/Ephemeral 共享 worker 池）。
             // 未认证会话 UserId=0，认证成功后执行器不依赖此字段重新路由（按 connectionId 串行）。
             _orderedWriteExecutor.TryRegisterConnection(connectionId, session.UserId);
             _queryExecutor.TryRegisterConnection(connectionId, session.UserId);
+            _ephemeralPipeline.TryRegisterConnection(connectionId, session.UserId);
 
             // 注册到心跳分桶注册表（连接桶，按 connectionId 分桶用于租约刷新）。
             // 用户桶在认证成功后由 ProcessPacketAsync 的 auth 转换钩子注册。
@@ -510,6 +536,7 @@ internal sealed class TcpGatewayService : BackgroundService
                 // 丢弃队列中残留命令并释放缓冲区与入站预算。
                 _orderedWriteExecutor.UnregisterConnection(connectionId);
                 _queryExecutor.UnregisterConnection(connectionId);
+                _ephemeralPipeline.UnregisterConnection(connectionId);
                 _heartbeatBuckets.Unregister(session);
                 session.Close(SessionCloseReason.TransportError);
                 await session.DisposeAsync().ConfigureAwait(false);
@@ -577,6 +604,7 @@ internal sealed class TcpGatewayService : BackgroundService
                 // 必须在 session.DisposeAsync 之后执行，确保 in-flight 命令已完成或取消。
                 _orderedWriteExecutor.UnregisterConnection(session.ConnectionId);
                 _queryExecutor.UnregisterConnection(session.ConnectionId);
+                _ephemeralPipeline.UnregisterConnection(session.ConnectionId);
 
                 // 注销心跳分桶注册表（连接桶 + 用户桶引用计数递减）。
                 _heartbeatBuckets.Unregister(session);
@@ -731,29 +759,29 @@ internal sealed class TcpGatewayService : BackgroundService
     /// 避免后端资源继续被占用。执行器 token 仅用于 worker 池停机。
     /// </para>
     /// </summary>
-    private ValueTask ProcessScheduledCommandAsync(
+    private async ValueTask ProcessScheduledCommandAsync(
         SessionCommand command,
         CancellationToken cancellationToken)
     {
         // 执行器可能在连接关闭后仍处理队列中残留命令：检查 session 状态。
         if (!command.Session.IsConnected)
-            return ValueTask.CompletedTask;
+            return;
 
         var frame = new PacketFrame(
             command.Command,
             command.AsPayloadSequence());
 
-        // 使用 session.LifetimeToken：连接关闭时取消业务调用。
-        // 与 cancellationToken（执行器 token）取交集避免 worker 停机时泄漏。
-        return ProcessPacketAsync(
-            frame,
-            command.Session,
-            command.RemoteIp,
-            command.Session.LifetimeToken);
+        // 同时响应连接关闭、执行器停机和 Actor operation timeout。
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(
+            command.Session.LifetimeToken,
+            cancellationToken);
+        await ProcessPacketAsync(
+                frame,
+                command.Session,
+                command.RemoteIp,
+                linked.Token)
+            .ConfigureAwait(false);
     }
 
 }
-
-
-
 

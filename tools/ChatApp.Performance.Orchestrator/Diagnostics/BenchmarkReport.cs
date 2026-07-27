@@ -51,6 +51,7 @@ internal sealed class BenchmarkConfiguration
     public int PipelineOperationsPerSecond { get; init; }
     public int PipelinePayloadBytes { get; init; }
     public long PipelineBaseUserId { get; init; }
+    public required string InboundTransportMode { get; init; }
     public required string OutboundSendMode { get; init; }
     public int OnDemandSendWorkerCount { get; init; }
     public int OnDemandSendBurstLimit { get; init; }
@@ -84,6 +85,7 @@ internal sealed class BenchmarkConfiguration
         PipelineOperationsPerSecond = options.PipelineOperationsPerSecond,
         PipelinePayloadBytes = options.PipelinePayloadBytes,
         PipelineBaseUserId = options.PipelineBaseUserId,
+        InboundTransportMode = options.InboundTransportMode,
         OutboundSendMode = options.OutboundSendMode,
         OnDemandSendWorkerCount = options.OnDemandSendWorkerCount,
         OnDemandSendBurstLimit = options.OnDemandSendBurstLimit,
