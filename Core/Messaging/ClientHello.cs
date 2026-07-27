@@ -13,7 +13,10 @@ public sealed class ClientHello
     public ushort ProtocolVersion { get; set; } = 1;
 
     /// <summary>
-    /// 客户端能力位掩码（保留，当前未使用）。服务端通过 ServerHello.featureBits 回显协商结果。
+    /// 客户端能力位掩码（<see cref="GatewayFeature"/> flags 的 uint 表示）。
+    /// 服务端通过 ServerHello.featureBits 回显协商结果（按位与）。
+    /// 当前未强制任何能力位；未来引入命令级能力协商时，
+    /// 解析器将根据协商结果决定是否接受特定命令。
     /// </summary>
     public uint FeatureBits { get; set; }
 

@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text.Json;
 using ChatApp.TcpGateway.Core.Messaging.Push;
 using ChatApp.TcpGateway.Core.Push;
@@ -10,14 +11,23 @@ using StackExchange.Redis;
 namespace ChatApp.TcpGateway.Infrastructure.Push;
 
 /// <summary>
-/// Redis 推送令牌存储。
+/// Redis 推送令牌存储（原子 Lua 实现）。
 /// <para>
-/// Key = push:tokens:{userId}（Hash）；field = deviceIdHash（十进制字符串）；
-/// value = PushTokenRecord JSON。每次写入刷新 90 天 TTL。
+/// 双 key 模型，使用 hash tag <c>{userId}</c> 保证同用户 Hash 与 ZSET 落在 Redis Cluster
+/// 同一 slot，从而可在 Lua 中原子操作：
+/// <list type="bullet">
+/// <item><c>push:tokens:{userId}:h</c> — Hash，field = deviceIdHash（20 位十进制字符串），value = PushTokenRecord JSON。</item>
+/// <item><c>push:tokens:{userId}:z</c> — ZSET，member = deviceIdHash，score = UpdatedAtMs，用于按时间淘汰。</item>
+/// </list>
+/// </para>
+/// <para>
+/// 旧版 key <c>push:tokens:userId</c>（无 ZSET）已废弃，不主动迁移：旧 key 仍持 90 天 TTL，
+/// 自然过期；新注册一律走新 key。这避免一次性 SCAN 全库的迁移成本，且旧 key 与新 key 互不干扰。
 /// </para>
 /// <para>
 /// 多设备场景：同一用户可有多个 deviceIdHash 各持一个令牌。
-/// 超过 <see cref="PushTokenLimits.MaxTokensPerUser"/> 时按 UpdatedAtMs 最旧淘汰。
+/// 超过 <see cref="PushTokenLimits.MaxTokensPerUser"/> 时按 UpdatedAtMs 最旧淘汰，淘汰操作在
+/// Lua 内完成（HDEL + ZREM 同步），保证 Hash 与 ZSET 不会出现 membership 漂移。
 /// </para>
 /// </summary>
 internal sealed class RedisPushTokenStore(
@@ -27,7 +37,91 @@ internal sealed class RedisPushTokenStore(
     : IPushTokenStore
 {
     private const string KeyPrefix = "push:tokens:";
+    private const string HashKeySuffix = ":h";
+    private const string ZsetKeySuffix = ":z";
     private const long DefaultTtlMs = 90L * 24 * 60 * 60 * 1000; // 90 天
+
+    /// <summary>
+    /// 原子注册脚本：HSET upsert + ZADD upsert + 超额淘汰 + PEXPIRE 双 key。
+    /// <para>
+    /// ARGV 顺序：field, value, now, ttl, max。
+    /// 返回淘汰后的剩余令牌数（HLEN）。
+    /// </para>
+    /// </summary>
+    private const string RegisterScript = @"
+local hashKey = KEYS[1]
+local zsetKey = KEYS[2]
+local field = ARGV[1]
+local value = ARGV[2]
+local now = tonumber(ARGV[3])
+local ttl = tonumber(ARGV[4])
+local max = tonumber(ARGV[5])
+
+redis.call('HSET', hashKey, field, value)
+redis.call('ZADD', zsetKey, now, field)
+
+local count = redis.call('ZCARD', zsetKey)
+while count > max do
+    local oldest = redis.call('ZRANGE', zsetKey, 0, 0)
+    if #oldest == 0 then break end
+    local oldestField = oldest[1]
+    redis.call('HDEL', hashKey, oldestField)
+    redis.call('ZREM', zsetKey, oldestField)
+    count = count - 1
+end
+
+redis.call('PEXPIRE', hashKey, ttl)
+redis.call('PEXPIRE', zsetKey, ttl)
+
+return redis.call('HLEN', hashKey)
+";
+
+    /// <summary>
+    /// 原子按设备注销脚本：HDEL + ZREM + 空则 DEL 双 key。
+    /// <para>
+    /// ARGV 顺序：field。
+    /// 返回剩余令牌数（HLEN）。
+    /// </para>
+    /// </summary>
+    private const string UnregisterByDeviceScript = @"
+local hashKey = KEYS[1]
+local zsetKey = KEYS[2]
+local field = ARGV[1]
+
+redis.call('HDEL', hashKey, field)
+redis.call('ZREM', zsetKey, field)
+
+local remaining = redis.call('HLEN', hashKey)
+if remaining == 0 then
+    redis.call('DEL', hashKey)
+    redis.call('DEL', zsetKey)
+end
+return remaining
+";
+
+    /// <summary>
+    /// 原子按 token 注销脚本：批量 HDEL + ZREM + 空则 DEL 双 key。
+    /// <para>
+    /// ARGV 顺序：field1, field2, ...（待删除字段）。
+    /// 返回剩余令牌数（HLEN）。
+    /// </para>
+    /// </summary>
+    private const string UnregisterByTokenScript = @"
+local hashKey = KEYS[1]
+local zsetKey = KEYS[2]
+
+for i = 1, #ARGV do
+    redis.call('HDEL', hashKey, ARGV[i])
+    redis.call('ZREM', zsetKey, ARGV[i])
+end
+
+local remaining = redis.call('HLEN', hashKey)
+if remaining == 0 then
+    redis.call('DEL', hashKey)
+    redis.call('DEL', zsetKey)
+end
+return remaining
+";
 
     public async ValueTask<int> RegisterAsync(
         long userId,
@@ -41,8 +135,8 @@ internal sealed class RedisPushTokenStore(
         ArgumentException.ThrowIfNullOrWhiteSpace(token);
         ArgumentOutOfRangeException.ThrowIfZero(deviceIdHash);
 
-        var key = CreateKey(userId);
-        var field = deviceIdHash.ToString("D20", System.Globalization.CultureInfo.InvariantCulture);
+        var (hashKey, zsetKey) = CreateKeys(userId);
+        var field = FormatField(deviceIdHash);
         var nowMs = timeProvider.GetUtcNow().ToUnixTimeMilliseconds();
 
         var record = new PushTokenRecord
@@ -59,18 +153,22 @@ internal sealed class RedisPushTokenStore(
 
         try
         {
-            var db = connectionProvider.Database;
-            await db.HashSetAsync(key, field, valueJson)
-                .WaitAsync(cancellationToken)
-                .ConfigureAwait(false);
-            await db.KeyExpireAsync(key, TimeSpan.FromMilliseconds(DefaultTtlMs))
+            var result = await connectionProvider.Database
+                .ScriptEvaluateAsync(
+                    RegisterScript,
+                    new RedisKey[] { hashKey, zsetKey },
+                    new RedisValue[]
+                    {
+                        field,
+                        valueJson,
+                        nowMs,
+                        DefaultTtlMs,
+                        PushTokenLimits.MaxTokensPerUser
+                    })
                 .WaitAsync(cancellationToken)
                 .ConfigureAwait(false);
 
-            // 超额淘汰：拉取全部字段，按 UpdatedAtMs 排序，删除最旧的直到 ≤ MaxTokensPerUser。
-            var count = await EvictExcessAsync(db, key, cancellationToken)
-                .ConfigureAwait(false);
-            return count;
+            return (int)(long)result;
         }
         catch (RedisException exception)
         {
@@ -90,17 +188,20 @@ internal sealed class RedisPushTokenStore(
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(userId);
         ArgumentOutOfRangeException.ThrowIfZero(deviceIdHash);
 
-        var key = CreateKey(userId);
-        var field = deviceIdHash.ToString("D20", System.Globalization.CultureInfo.InvariantCulture);
+        var (hashKey, zsetKey) = CreateKeys(userId);
+        var field = FormatField(deviceIdHash);
 
         try
         {
-            var db = connectionProvider.Database;
-            await db.HashDeleteAsync(key, field)
+            var result = await connectionProvider.Database
+                .ScriptEvaluateAsync(
+                    UnregisterByDeviceScript,
+                    new RedisKey[] { hashKey, zsetKey },
+                    new RedisValue[] { field })
                 .WaitAsync(cancellationToken)
                 .ConfigureAwait(false);
-            return await EnsureKeyRemovedIfEmptyAsync(db, key, cancellationToken)
-                .ConfigureAwait(false);
+
+            return (int)(long)result;
         }
         catch (RedisException exception)
         {
@@ -120,19 +221,19 @@ internal sealed class RedisPushTokenStore(
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(userId);
         ArgumentException.ThrowIfNullOrWhiteSpace(token);
 
-        var key = CreateKey(userId);
+        var (hashKey, zsetKey) = CreateKeys(userId);
 
         try
         {
             var db = connectionProvider.Database;
-            var entries = await db.HashGetAllAsync(key)
+            var entries = await db.HashGetAllAsync(hashKey)
                 .WaitAsync(cancellationToken)
                 .ConfigureAwait(false);
 
             if (entries.Length == 0)
                 return 0;
 
-            // 扫描所有字段，删除匹配 token 的（同一 token 在多设备注册时全部删除）。
+            // 客户端解析 JSON 收集匹配 field，再通过 Lua 原子删除 Hash + ZSET。
             var fieldsToDelete = new List<RedisValue>();
             foreach (var entry in entries)
             {
@@ -159,11 +260,19 @@ internal sealed class RedisPushTokenStore(
             if (fieldsToDelete.Count == 0)
                 return entries.Length;
 
-            await db.HashDeleteAsync(key, fieldsToDelete.ToArray())
+            var args = new RedisValue[fieldsToDelete.Count];
+            for (var i = 0; i < fieldsToDelete.Count; i++)
+                args[i] = fieldsToDelete[i];
+
+            var result = await db
+                .ScriptEvaluateAsync(
+                    UnregisterByTokenScript,
+                    new RedisKey[] { hashKey, zsetKey },
+                    args)
                 .WaitAsync(cancellationToken)
                 .ConfigureAwait(false);
-            return await EnsureKeyRemovedIfEmptyAsync(db, key, cancellationToken)
-                .ConfigureAwait(false);
+
+            return (int)(long)result;
         }
         catch (RedisException exception)
         {
@@ -181,12 +290,12 @@ internal sealed class RedisPushTokenStore(
     {
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(userId);
 
-        var key = CreateKey(userId);
+        var (hashKey, _) = CreateKeys(userId);
 
         try
         {
             var db = connectionProvider.Database;
-            var entries = await db.HashGetAllAsync(key)
+            var entries = await db.HashGetAllAsync(hashKey)
                 .WaitAsync(cancellationToken)
                 .ConfigureAwait(false);
 
@@ -225,69 +334,15 @@ internal sealed class RedisPushTokenStore(
         }
     }
 
-    private static async ValueTask<int> EvictExcessAsync(
-        IDatabase db,
-        RedisKey key,
-        CancellationToken cancellationToken)
+    private static string FormatField(ulong deviceIdHash) =>
+        deviceIdHash.ToString("D20", CultureInfo.InvariantCulture);
+
+    private static (RedisKey HashKey, RedisKey ZsetKey) CreateKeys(long userId)
     {
-        var entries = await db.HashGetAllAsync(key)
-            .WaitAsync(cancellationToken)
-            .ConfigureAwait(false);
-        if (entries.Length <= PushTokenLimits.MaxTokensPerUser)
-            return entries.Length;
-
-        // 解析所有记录并按 UpdatedAtMs 升序排序，删除最旧的。
-        var parsed = new List<(RedisValue Field, long UpdatedAtMs)>(entries.Length);
-        foreach (var entry in entries)
-        {
-            try
-            {
-                var record = JsonSerializer.Deserialize(
-                    (byte[]?)entry.Value,
-                    GatewayJsonSerializerContext.Default.PushTokenRecord);
-                if (record is not null)
-                    parsed.Add((entry.Name, record.UpdatedAtMs));
-            }
-            catch (JsonException)
-            {
-                // 损坏数据优先淘汰。
-                parsed.Add((entry.Name, 0));
-            }
-        }
-
-        parsed.Sort(static (a, b) => a.UpdatedAtMs.CompareTo(b.UpdatedAtMs));
-        var toEvict = parsed.Count - PushTokenLimits.MaxTokensPerUser;
-        if (toEvict <= 0)
-            return parsed.Count;
-
-        var fieldsToDelete = new RedisValue[toEvict];
-        for (var i = 0; i < toEvict; i++)
-            fieldsToDelete[i] = parsed[i].Field;
-
-        await db.HashDeleteAsync(key, fieldsToDelete)
-            .WaitAsync(cancellationToken)
-            .ConfigureAwait(false);
-        return parsed.Count - toEvict;
+        // hash tag {userId} 保证 Hash 与 ZSET 落在 Redis Cluster 同一 slot。
+        var userSegment = userId.ToString("D", CultureInfo.InvariantCulture);
+        var hashKey = new RedisKey(KeyPrefix + "{" + userSegment + "}" + HashKeySuffix);
+        var zsetKey = new RedisKey(KeyPrefix + "{" + userSegment + "}" + ZsetKeySuffix);
+        return (hashKey, zsetKey);
     }
-
-    private static async ValueTask<int> EnsureKeyRemovedIfEmptyAsync(
-        IDatabase db,
-        RedisKey key,
-        CancellationToken cancellationToken)
-    {
-        var len = await db.HashLengthAsync(key)
-            .WaitAsync(cancellationToken)
-            .ConfigureAwait(false);
-        if (len == 0)
-        {
-            await db.KeyDeleteAsync(key)
-                .WaitAsync(cancellationToken)
-                .ConfigureAwait(false);
-            return 0;
-        }
-        return (int)len;
-    }
-
-    private static RedisKey CreateKey(long userId) =>
-        KeyPrefix + userId.ToString("D", System.Globalization.CultureInfo.InvariantCulture);
 }

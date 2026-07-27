@@ -46,6 +46,7 @@ public sealed class GatewayDirectoryTests
 
         var gateways = await directory.GetOnlineGatewaysAsync(9999, CancellationToken.None);
 
+        // 内存实现永不失败，离线用户返回空集合。
         Assert.Empty(gateways);
     }
 
@@ -150,7 +151,9 @@ public sealed class GatewayDirectoryTests
     [Fact]
     public async Task NullDirectory_GetOnlineGateways_ReturnsEmpty()
     {
+        // NullGatewayDirectory 始终返回空集合，触发调用方回退广播。
         var gateways = await NullGatewayDirectory.Instance.GetOnlineGatewaysAsync(1001, CancellationToken.None);
+
         Assert.Empty(gateways);
     }
 
@@ -273,12 +276,31 @@ public sealed class GatewayDirectoryTests
     {
         var directory = new InMemoryWatcherGatewayDirectory();
 
-        // 同一 (watcher, instance, watched) 重复注册不应产生重复条目。
+        // 同一 (watcher, instance, watched) 重复注册累加计数，但查询结果仍只出现一个 instance。
         await directory.RegisterWatchersAsync(1001, [5001], "gateway-A", CancellationToken.None);
         await directory.RegisterWatchersAsync(1001, [5001], "gateway-A", CancellationToken.None);
 
         var gateways = await directory.GetWatcherGatewaysAsync(5001, CancellationToken.None);
 
+        Assert.Single(gateways);
+        Assert.Contains("gateway-A", gateways);
+    }
+
+    [Fact]
+    public async Task Watcher_Register_DistinctSessions_AreTrackedViaRefCount()
+    {
+        // 新接口通过引用计数维持多会话隔离：同一 watcher 在同一 Gateway 上的多次 Register 累加计数，
+        // 单次 Unregister 只减少计数（计数 > 0 时 instance 仍出现在查询结果中）。
+        var directory = new InMemoryWatcherGatewayDirectory();
+
+        // 模拟两个并发会话各自 Register（计数 = 2）。
+        await directory.RegisterWatchersAsync(1001, [5001], "gateway-A", CancellationToken.None);
+        await directory.RegisterWatchersAsync(1001, [5001], "gateway-A", CancellationToken.None);
+
+        // 注销其中一个会话（计数 = 1，仍 > 0）。
+        await directory.UnregisterWatchersAsync(1001, [5001], "gateway-A", CancellationToken.None);
+
+        var gateways = await directory.GetWatcherGatewaysAsync(5001, CancellationToken.None);
         Assert.Single(gateways);
         Assert.Contains("gateway-A", gateways);
     }
@@ -329,6 +351,7 @@ public sealed class GatewayDirectoryTests
 
         var gateways = await directory.GetWatcherGatewaysAsync(9999, CancellationToken.None);
 
+        // 内存实现永不失败，无人观察返回空集合。
         Assert.Empty(gateways);
     }
 
@@ -412,8 +435,10 @@ public sealed class GatewayDirectoryTests
     [Fact]
     public async Task NullWatcher_GetWatcherGateways_ReturnsEmpty()
     {
+        // NullWatcherGatewayDirectory 始终返回空集合，触发调用方回退广播。
         var gateways = await NullWatcherGatewayDirectory.Instance
             .GetWatcherGatewaysAsync(1001, CancellationToken.None);
+
         Assert.Empty(gateways);
     }
 

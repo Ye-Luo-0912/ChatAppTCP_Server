@@ -22,6 +22,39 @@ public sealed class TcpGatewayOptions
     public int MaxPacketsPerSecond { get; set; } = 200;
 
     /// <summary>
+    /// 出站发送模式：是否为每连接保留永久 SendLoop Task。
+    /// <para>
+    /// 默认 <see cref="OutboundSendMode.PersistentSendLoop"/>：作为 A/B 对照基线，
+    /// 行为与历史版本一致。切换为 <see cref="OutboundSendMode.OnDemandSendPump"/> 后，
+    /// 空闲连接不再保留 SendLoop Task，改由全局共享 worker 池按需 pump。
+    /// </para>
+    /// <para>
+    /// 切换不影响 wire 协议与出站 FIFO/ephemeral mailbox 语义，仅改变驱动 Task 模型。
+    /// 上线前应通过负载测试（10k 空闲 + 活跃聊天混合）验证工作集、alloc/sec、p95/p99。
+    /// </para>
+    /// </summary>
+    public OutboundSendMode OutboundSendMode { get; set; } = OutboundSendMode.PersistentSendLoop;
+
+    /// <summary>
+    /// OnDemandSendPump 模式下，共享出站 worker 池的 worker 数量。
+    /// <para>
+    /// 默认 0：运行时按 <c>Math.Max(2, Environment.ProcessorCount)</c> 推导。
+    /// 显式设为正数时覆盖推导值。worker 数过少会导致慢 socket 拖累跨连接公平性；
+    /// 过多会增加调度开销。建议与 OrderedWrite/Query 执行器 worker 数对齐。
+    /// </para>
+    /// </summary>
+    public int OnDemandSendWorkerCount { get; set; }
+
+    /// <summary>
+    /// OnDemandSendPump 模式下，单个 worker 一次 pump 处理的最大帧数（burst 上限）。
+    /// <para>
+    /// 默认 16：足够批量化以摊薄调度成本，又不至于让单连接独占 worker 饿死后续会话。
+    /// 达到 burst 上限后 worker 将当前会话重新入队 ready queue（公平轮转），再处理下一个会话。
+    /// </para>
+    /// </summary>
+    public int OnDemandSendBurstLimit { get; set; } = 16;
+
+    /// <summary>
     /// 心跳分桶数量。每个 tick 只扫描一个桶，将原本每
     /// <see cref="HeartbeatScanInterval"/> 全量扫描的脉冲打散为 N 次小扫描。
     /// <para>
@@ -74,6 +107,29 @@ public sealed class TcpGatewayOptions
     /// 默认关闭；开启前需 Server 侧 PresenceAuthorizeWorker（好友鉴权）与 Redis 全局在线键。
     /// </summary>
     public bool EnableEphemeralPresenceAndTyping { get; set; }
+
+    /// <summary>
+    /// Presence ZSET 过期成员清理周期。
+    /// <para>
+    /// 热路径（SetOnline/SetOffline/Refresh/IsOnline/GetOnlineMany）不做 ZREMRANGEBYSCORE，
+    /// 由后台服务按此周期调用 <c>IGlobalPresenceStore.RunMaintenanceAsync</c> 回收崩溃实例残留成员。
+    /// 默认 5 分钟；设为 <see cref="TimeSpan.Zero"/> 时禁用维护（仅用于测试）。
+    /// </para>
+    /// </summary>
+    public TimeSpan PresenceMaintenanceInterval { get; set; } = TimeSpan.FromMinutes(5);
+
+    /// <summary>
+    /// Realtime 事件消费分区数。
+    /// <para>
+    /// 按 <c>TargetUserId % PartitionCount</c> 将事件路由到固定分区，每分区单消费者保证
+    /// 同一用户的局部顺序；跨分区并行消费提升吞吐。默认 1（串行，向后兼容）；
+    /// 建议生产环境设为 4～8，根据 CPU 核数与群聊 fanout 负载调整。
+    /// </para>
+    /// <para>
+    /// 分区数为 1 时保持原有串行消费语义；&gt;1 时启用分区并行消费。
+    /// </para>
+    /// </summary>
+    public int RealtimeEventPartitionCount { get; set; } = 1;
 
     // 全局内存预算与过载保护配置。
 
@@ -226,6 +282,9 @@ public sealed class TcpGatewayOptions
         CommandSchedulerOrderedWriteCapacity > 0 &&
         CommandSchedulerQueryCapacity > 0 &&
         CommandSchedulerEphemeralCapacity > 0 &&
+        OnDemandSendWorkerCount >= 0 &&
+        OnDemandSendBurstLimit > 0 &&
         ResumeTokenTtl > TimeSpan.Zero &&
-        GoAwayDrainTimeout > TimeSpan.Zero;
+        GoAwayDrainTimeout > TimeSpan.Zero &&
+        RealtimeEventPartitionCount > 0;
 }

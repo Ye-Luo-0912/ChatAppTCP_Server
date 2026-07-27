@@ -31,7 +31,8 @@ internal enum ConnectionPhase : byte
 /// 命令调度 lane 分类。
 /// <para>
 /// Control 命令（Auth/Heartbeat/PresenceUnwatch）由读循环内联处理；
-/// OrderedWrite/Query/Ephemeral 通过 SessionCommandScheduler 异步处理。
+/// Ephemeral 命令（Typing）由读循环内联处理（V2：消除每连接 Ephemeral Channel）；
+/// OrderedWrite/Query 通过全局 <c>SessionCommandExecutor</c>（共享 worker 池）异步处理。
 /// </para>
 /// </summary>
 internal enum CommandLane : byte
@@ -58,7 +59,19 @@ internal readonly record struct CommandDescriptor(
     ConnectionPhase RequiredPhase,
     CommandLane Lane,
     int MaxPayloadBytes,
-    int RateCost);
+    int RateCost)
+{
+    /// <summary>
+    /// 该命令是否已被弃用。弃用命令仍可在 catalog 中登记以保持客户端向后兼容，
+    /// 但解析器应拒绝执行并返回 <see cref="ProtocolErrorCode.UnsupportedCommand"/> 错误帧，
+    /// 引导客户端迁移到替代命令。默认 false。
+    /// <para>
+    /// 弃用策略：标记 Deprecated=true 的命令在下一个协议大版本中移除；
+    /// 期间服务端只返回错误，不执行任何业务逻辑。
+    /// </para>
+    /// </summary>
+    public bool Deprecated { get; init; }
+}
 
 /// <summary>
 /// 命令元数据目录。集中维护所有 <see cref="PacketCommand"/> 的 Direction / Phase / Lane / Payload 上限 / 速率成本。
@@ -92,8 +105,11 @@ internal static class CommandCatalog
         PacketCommand.GoAway => new(
             PacketCommand.GoAway, CommandDirection.ServerToClient,
             ConnectionPhase.Authenticated, CommandLane.Inline, -1, 1),
-        // ResumeRequest 当前 GetMaxPayloadSize 返回 -1（客户端不可发送），
-        // 协议层视为 ServerToClient 以保持行为等价。后续 Resume 重构时再修正方向。
+        // ResumeRequest 不是独立的 wire 命令——Resume 流程通过 ClientHello.ResumeToken 字段触发
+        // （见 SessionControlHandler.TryResumeAsync）。枚举值仅为 catalog 完整性保留。
+        // Direction 标记为 ServerToClient：客户端不可将其作为独立帧发送，GetMaxPayload 返回 -1，
+        // 解析器立即拒绝。这与"客户端发起 Resume"的语义不矛盾——发起方通过 ClientHello 字段表达意图，
+        // 而非发送 ResumeRequest 帧。
         PacketCommand.ResumeRequest => new(
             PacketCommand.ResumeRequest, CommandDirection.ServerToClient,
             ConnectionPhase.PreAuthentication, CommandLane.Inline, -1, 1),
@@ -330,4 +346,11 @@ internal static class CommandCatalog
     public static bool IsPreAuthentication(PacketCommand command) =>
         TryGetDescriptor(command)?.RequiredPhase is ConnectionPhase.PreHandshake
             or ConnectionPhase.PreAuthentication;
+
+    /// <summary>
+    /// 判断命令是否已被弃用。弃用命令仍登记在 catalog 中以保持客户端向后兼容，
+    /// 但解析器应拒绝执行并返回 <see cref="ProtocolErrorCode.UnsupportedCommand"/> 错误帧。
+    /// </summary>
+    public static bool IsDeprecated(PacketCommand command) =>
+        TryGetDescriptor(command)?.Deprecated ?? false;
 }

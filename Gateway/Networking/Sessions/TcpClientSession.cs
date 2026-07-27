@@ -1,14 +1,23 @@
 using System.Net.Sockets;
 using System.Threading.Channels;
-using ChatApp.TcpGateway.Gateway.Diagnostics;
 using ChatApp.TcpGateway.Gateway.Networking.Buffers;
-using ChatApp.TcpGateway.Observability.Logging;
+using ChatApp.TcpGateway.Gateway.Networking.Executor;
 using ChatApp.TcpGateway.Observability.Metrics;
 using Microsoft.Extensions.Logging;
 
 namespace ChatApp.TcpGateway.Gateway.Networking.Sessions;
 
-internal sealed class TcpClientSession : IAsyncDisposable
+/// <summary>
+/// TCP 客户端会话：封装单连接的状态机、限流、出站队列与生命周期。
+/// <para>
+/// 出站驱动、传输超时与关闭逻辑拆分至 partial 文件：
+/// <list type="bullet">
+/// <item><see cref="TcpClientSession.Outbound"/> — Durable FIFO + Ephemeral mailbox + SendLoop/Pump 驱动</item>
+/// <item><see cref="TcpClientSession.Transport"/> — Close/Dispose、空闲/发送 deadline、SendFrameAsync</item>
+/// </list>
+/// </para>
+/// </summary>
+internal sealed partial class TcpClientSession : IAsyncDisposable
 {
     private readonly Socket _socket;
     private readonly Channel<OutboundWrite> _outbound;
@@ -19,18 +28,44 @@ internal sealed class TcpClientSession : IAsyncDisposable
     private readonly TimeSpan _sendTimeout;
     private readonly GatewayMetrics _metrics;
     private readonly ILogger<TcpClientSession> _logger;
-    private readonly Task _sendLoop;
+    // PersistentSendLoop 模式下的永久发送 Task；OnDemandSendPump 模式下为 null。
+    private readonly Task? _sendLoop;
     private readonly long _connectedTimestamp;
 
-    // 每 Session 一个可复用发送超时 Timer，避免每次发送创建 LinkedCts + CancelAfter。
-    private readonly ITimer _sendTimeoutTimer;
-    private int _sendInProgress; // 0 = idle, 1 = sending
-    // 当前发送的 deadline（UtcTicks）。仅在 _sendInProgress=1 时有效。
-    // 跨发送代次的旧 Timer 回调通过比较此值识别自己已过期，避免误关后续发送。
-    private long _sendDeadlineTicks;
+    // OnDemandSendPump 模式专用：共享出站 pump 协调器。
+    // PersistentSendLoop 模式下为 null，TryQueue/TryQueueEphemeral 不调用 TryScheduleSend。
+    private readonly OutboundPumpCoordinator? _outboundPump;
+    // OnDemandSendPump 调度标志：0 = 未调度，1 = 已入 ready queue 待 pump。
+    // 入队时 CAS 0→1 成功才 TrySchedule；pump 结束时 CAS 1→0 + re-check 防止丢失唤醒。
+    private int _sendScheduled;
 
-    // 鉴权超时精确 Deadline，不依赖定时扫描。
-    private readonly ITimer _authDeadlineTimer;
+    // Ephemeral latest-state mailbox：按 EphemeralKey 分槽，同 key 覆盖旧帧保留最新状态。
+    // Typing key = (KindTyping, hash(conversationId))，Presence key = (KindPresence, userId)。
+    // 与 _outbound FIFO 独立：flush sentinel 写入 FIFO 唤醒发送循环排空 mailbox。
+    private readonly EphemeralMailbox _ephemeralMailbox = new();
+    // 标记是否已有 flush sentinel 在 _outbound 队列中，避免重复入队。
+    private volatile bool _ephemeralFlushPending;
+
+    // 发送超时：通过全局 DeadlineWheel 注册 deadline，到期检查 _sendInProgress 后关闭会话。
+    // 单调时钟 + generation（_sendInProgress CompareExchange）防止墙钟回拨与跨发送代次误关。
+    private readonly DeadlineWheel? _deadlineWheel;
+    private int _sendInProgress; // 0 = idle, 1 = sending
+    // 当前发送开始时的单调时间戳（GetTimestamp()）。仅在 _sendInProgress=1 时有效，0 表示空闲。
+    // Timer 回调用 GetElapsedTime(startedAt) >= _sendTimeout 判断超时，
+    // 避免墙钟回拨导致 deadline 永不到达、Socket Send 永不被关闭。
+    // 跨发送代次的旧 Timer 回调通过 _sendInProgress 的 CompareExchange 防止误关后续发送。
+    private long _sendStartedAt;
+    private DeadlineRegistration _sendDeadlineRegistration;
+
+    // 鉴权超时：通过全局 DeadlineWheel 注册 deadline，认证成功后取消。
+    private DeadlineRegistration _authDeadlineRegistration;
+
+    // 空闲超时：通过全局 DeadlineWheel 注册 deadline。
+    // 采用"check-on-fire"模式：deadline 到期时检查 LastInboundAge，
+    // 若仍活跃则重新注册 (idleTimeout - lastInboundAge)，否则关闭连接。
+    // 避免每包 re-register 的开销（仅 Volatile.Write 时间戳），deadline 至多每 idleTimeout 周期触发一次。
+    private readonly TimeSpan _idleTimeout;
+    private DeadlineRegistration _idleDeadlineRegistration;
 
     private long _lastInboundTimestamp;
     // Token Bucket 替代固定一秒窗口。单线程读取循环访问，无需 Interlocked。
@@ -53,7 +88,10 @@ internal sealed class TcpClientSession : IAsyncDisposable
         GatewayMetrics metrics,
         ILogger<TcpClientSession> logger,
         GlobalOutboundBudget? globalOutboundBudget = null,
-        TimeSpan authenticationTimeout = default)
+        TimeSpan authenticationTimeout = default,
+        DeadlineWheel? deadlineWheel = null,
+        TimeSpan idleTimeout = default,
+        OutboundPumpCoordinator? outboundPump = null)
     {
         _socket = socket;
         ConnectionId = connectionId;
@@ -62,6 +100,9 @@ internal sealed class TcpClientSession : IAsyncDisposable
         _metrics = metrics;
         _logger = logger;
         _globalOutboundBudget = globalOutboundBudget;
+        _deadlineWheel = deadlineWheel;
+        _idleTimeout = idleTimeout;
+        _outboundPump = outboundPump;
         _outboundBudget = new OutboundQueueBudget(
             maxOutboundQueuedBytes);
 
@@ -79,53 +120,42 @@ internal sealed class TcpClientSession : IAsyncDisposable
                 FullMode = BoundedChannelFullMode.Wait
             });
 
-        // 创建可复用发送超时 Timer。到期时双重校验：
-        //   1) _sendInProgress 仍为 1（发送未完成）
-        //   2) 当前单调时钟已过 _sendDeadlineTicks
-        // deadline 校验防止跨发送代次的旧回调误判：
-        // 旧回调触发时 _sendDeadlineTicks 已被后续发送覆盖为更晚的值，
-        // now < deadline，不会误关连接。
-        _sendTimeoutTimer = timeProvider.CreateTimer(
-            static state =>
-            {
-                var session = (TcpClientSession)state!;
-                if (Volatile.Read(ref session._sendInProgress) == 1
-                    && session._timeProvider.GetUtcNow().UtcTicks
-                       >= Volatile.Read(ref session._sendDeadlineTicks))
-                {
-                    if (Interlocked.CompareExchange(
-                            ref session._sendInProgress, 0, 1) == 1)
-                    {
-                        session.Close(SessionCloseReason.SendTimedOut);
-                    }
-                }
-            },
-            this,
-            Timeout.InfiniteTimeSpan,
-            Timeout.InfiniteTimeSpan);
+        // 发送超时：通过全局 DeadlineWheel 注册。
+        // _sendDeadlineRegistration 初始为 default(Id=0)，在 SendFrameAsync 中按需注册。
+        if (_deadlineWheel is not null && sendTimeout > TimeSpan.Zero)
+        {
+            // 占位：实际注册在每次 SendFrameAsync 开始时。
+            _sendDeadlineRegistration = default;
+        }
 
-        // 鉴权超时精确 Deadline。连接建立时启动，认证成功后取消。
-        // 到期时检查 _authenticated，若仍为 0 则 Close(AuthenticationTimedOut)。
-        _authDeadlineTimer = authenticationTimeout > TimeSpan.Zero
-            ? timeProvider.CreateTimer(
-                static state =>
-                {
-                    var session = (TcpClientSession)state!;
-                    if (Volatile.Read(ref session._authenticated) == 0)
-                    {
-                        session.Close(SessionCloseReason.AuthenticationTimedOut);
-                    }
-                },
-                this,
+        // 鉴权超时：通过全局 DeadlineWheel 注册一次性 deadline，认证成功后取消。
+        // deadlineWheel=null 时（测试场景）退化为不启用 deadline，由 HeartbeatCoordinator 兜底扫描。
+        if (_deadlineWheel is not null && authenticationTimeout > TimeSpan.Zero)
+        {
+            _authDeadlineRegistration = _deadlineWheel.Register(
                 authenticationTimeout,
-                Timeout.InfiniteTimeSpan)
-            : timeProvider.CreateTimer(
-                static _ => { },
-                null,
-                Timeout.InfiniteTimeSpan,
-                Timeout.InfiniteTimeSpan);
+                () =>
+                {
+                    if (Volatile.Read(ref _authenticated) == 0)
+                    {
+                        Close(SessionCloseReason.AuthenticationTimedOut);
+                    }
+                });
+        }
 
-        _sendLoop = SendLoopAsync();
+        // 空闲超时：通过全局 DeadlineWheel 注册 deadline，到期时检查活跃度。
+        // check-on-fire 模式：到期时若仍活跃则按剩余时间 re-register，避免每包 re-register 开销。
+        // deadlineWheel=null 时（测试场景）退化为不启用 deadline，由 HeartbeatCoordinator 兜底扫描。
+        if (_deadlineWheel is not null && idleTimeout > TimeSpan.Zero)
+        {
+            _idleDeadlineRegistration = RegisterIdleDeadline();
+        }
+
+        // 出站驱动模型按模式分支：
+        // - PersistentSendLoop（_outboundPump=null）：启动永久 SendLoop Task 消费 _outbound Channel。
+        // - OnDemandSendPump（_outboundPump≠null）：不启动 Task，由 TryQueue/TryQueueEphemeral
+        //   入队后 CAS 唤醒共享 worker 池（PumpOutboundAsync）。
+        _sendLoop = _outboundPump is null ? SendLoopAsync() : null;
     }
 
     public uint ConnectionId { get; }
@@ -159,6 +189,13 @@ internal sealed class TcpClientSession : IAsyncDisposable
     /// 来自 Token 的服务器签发设备标识（权威身份）。
     /// </summary>
     public string? DeviceId { get; private set; }
+
+    /// <summary>
+    /// 当前会话颁发的 ResumeToken。会话被吊销（同设备替换/SessionRevoked）时
+    /// 据此调用 <see cref="Core.Authentication.IResumeTokenStore.RevokeAsync"/> 撤销，
+    /// 防止被替换的旧会话在 Token TTL 窗口内凭此 Token 复活。
+    /// </summary>
+    public string? CurrentResumeToken { get; internal set; }
 
     public SessionCloseReason CloseReason =>
         (SessionCloseReason)Volatile.Read(ref _closeReason);
@@ -197,10 +234,12 @@ internal sealed class TcpClientSession : IAsyncDisposable
         DeviceIdHash = deviceIdHash;
         DeviceId = deviceId;
         Volatile.Write(ref _authenticated, 1);
-        // 认证成功，取消鉴权 deadline timer。
-        _authDeadlineTimer.Change(
-            Timeout.InfiniteTimeSpan,
-            Timeout.InfiniteTimeSpan);
+        // 认证成功，取消鉴权 deadline。
+        if (_authDeadlineRegistration.Id != 0)
+        {
+            _deadlineWheel?.Cancel(_authDeadlineRegistration);
+            _authDeadlineRegistration = default;
+        }
         MarkInboundActivity();
     }
 
@@ -280,267 +319,8 @@ internal sealed class TcpClientSession : IAsyncDisposable
         return true;
     }
 
-    public bool TryQueue(
-        SharedOutboundFrame frame,
-        SessionCloseReason? closeAfterSend = null)
-    {
-        if (!IsConnected)
-        {
-            return false;
-        }
-
-        var byteCount = frame.Length;
-        if (!_outboundBudget.TryReserve(byteCount))
-        {
-            _metrics.OutboundRejected("byte-budget");
-            Close(SessionCloseReason.OutboundQueueFull);
-            return false;
-        }
-
-        // 全局出站字节预算检查。
-        if (_globalOutboundBudget is not null &&
-            !_globalOutboundBudget.TryReserve(byteCount))
-        {
-            _outboundBudget.Release(byteCount);
-            _metrics.OutboundRejectedGlobalBudget();
-            _metrics.OutboundRejected("global-byte-budget");
-            Close(SessionCloseReason.OutboundQueueFull);
-            return false;
-        }
-
-        _metrics.OutboundEnqueued(byteCount);
-
-        if (!frame.TryRetain())
-        {
-            ReleaseQueuedWrite(byteCount);
-            return false;
-        }
-
-        if (_outbound.Writer.TryWrite(
-                new OutboundWrite(
-                    frame,
-                    byteCount,
-                    closeAfterSend)))
-        {
-            return true;
-        }
-
-        frame.Dispose();
-        ReleaseQueuedWrite(byteCount);
-        _metrics.OutboundRejected("item-capacity-or-closed");
-        Close(SessionCloseReason.OutboundQueueFull);
-        return false;
-    }
-
-    /// <summary>
-    /// Ephemeral 等级帧入队。Typing/Presence 等瞬态状态只保留最新，
-    /// 队列满时直接丢弃，不关闭连接，避免慢消费者因瞬态帧被踢下线。
-    /// <para>
-    /// 与 <see cref="TryQueue"/> 的区别：
-    /// <list type="bullet">
-    /// <item>队列满（item-capacity）时仅丢弃帧，不 Close。</item>
-    /// <item>字节预算超限时仅丢弃帧，不 Close。</item>
-    /// </list>
-    /// Critical（Auth/SessionRevoked/Error）和 Durable（Chat/Receipt/Edit）仍使用 <see cref="TryQueue"/>。
-    /// </para>
-    /// </summary>
-    public bool TryQueueEphemeral(SharedOutboundFrame frame)
-    {
-        if (!IsConnected)
-            return false;
-
-        var byteCount = frame.Length;
-
-        // 字节预算超限：丢弃帧，不断开连接。
-        if (!_outboundBudget.TryReserve(byteCount))
-        {
-            _metrics.OutboundRejected("ephemeral-byte-budget");
-            return false;
-        }
-
-        if (_globalOutboundBudget is not null &&
-            !_globalOutboundBudget.TryReserve(byteCount))
-        {
-            _outboundBudget.Release(byteCount);
-            _metrics.OutboundRejectedGlobalBudget();
-            _metrics.OutboundRejected("ephemeral-global-byte-budget");
-            return false;
-        }
-
-        _metrics.OutboundEnqueued(byteCount);
-
-        if (!frame.TryRetain())
-        {
-            ReleaseQueuedWrite(byteCount);
-            return false;
-        }
-
-        if (_outbound.Writer.TryWrite(
-                new OutboundWrite(frame, byteCount, null)))
-        {
-            return true;
-        }
-
-        // 队列满或已关闭：丢弃帧，不断开连接（与 TryQueue 的关键差异）。
-        frame.Dispose();
-        ReleaseQueuedWrite(byteCount);
-        _metrics.OutboundRejected("ephemeral-item-capacity");
-        return false;
-    }
-
-    public void Close(SessionCloseReason reason)
-    {
-        if (Interlocked.CompareExchange(ref _closeState, 1, 0) != 0)
-        {
-            return;
-        }
-
-        Volatile.Write(ref _closeReason, (int)reason);
-        _outbound.Writer.TryComplete();
-        _lifetime.Cancel();
-
-        try
-        {
-            _socket.Shutdown(SocketShutdown.Both);
-        }
-        catch (SocketException)
-        {
-            // The peer may already have closed the connection.
-        }
-        catch (ObjectDisposedException)
-        {
-            // Another close path already released the socket.
-        }
-
-        _socket.Dispose();
-    }
-
-    public async ValueTask DisposeAsync()
-    {
-        Close(SessionCloseReason.ApplicationStopping);
-
-        try
-        {
-            await _sendLoop.ConfigureAwait(false);
-        }
-        finally
-        {
-            _sendTimeoutTimer.Dispose();
-            _authDeadlineTimer.Dispose();
-            _lifetime.Dispose();
-        }
-    }
-
     private void MarkInboundActivity() =>
         Interlocked.Exchange(
             ref _lastInboundTimestamp,
             _timeProvider.GetTimestamp());
-
-    private async Task SendLoopAsync()
-    {
-        try
-        {
-            await foreach (var write in _outbound.Reader.ReadAllAsync(
-                               _lifetime.Token).ConfigureAwait(false))
-            {
-                ReleaseQueuedWrite(write.ByteCount);
-
-                try
-                {
-                    await SendFrameAsync(
-                            write.Frame.Memory,
-                            _lifetime.Token)
-                        .ConfigureAwait(false);
-                    _metrics.FrameSent();
-
-                    if (write.CloseAfterSend is { } closeReason)
-                    {
-                        Close(closeReason);
-                        return;
-                    }
-                }
-                finally
-                {
-                    write.Frame.Dispose();
-                }
-            }
-        }
-        catch (OperationCanceledException)
-        {
-            // Normal close path.
-        }
-        catch (SocketException)
-        {
-            Close(SessionCloseReason.TransportError);
-        }
-        catch (ObjectDisposedException)
-        {
-            Close(SessionCloseReason.TransportError);
-        }
-        catch (Exception exception)
-        {
-            _logger.TransportFailed(
-                GatewayTransportOperation.SendLoop,
-                ConnectionId,
-                exception);
-            Close(SessionCloseReason.TransportError);
-        }
-        finally
-        {
-            while (_outbound.Reader.TryRead(out var pending))
-            {
-                ReleaseQueuedWrite(pending.ByteCount);
-                pending.Frame.Dispose();
-            }
-        }
-    }
-
-    private void ReleaseQueuedWrite(int byteCount)
-    {
-        _outboundBudget.Release(byteCount);
-        _globalOutboundBudget?.Release(byteCount);
-        _metrics.OutboundDequeued(byteCount);
-    }
-
-    private async ValueTask SendFrameAsync(
-        ReadOnlyMemory<byte> frame,
-        CancellationToken lifetimeToken)
-    {
-        // 使用可复用 Timer 替代每次创建 LinkedCts + CancelAfter。
-        // 顺序：先设 deadline，再标记发送中，最后启动 Timer。
-        // 先设 deadline 确保回调看到 _sendInProgress=1 时 deadline 已更新为本代次的值。
-        Volatile.Write(ref _sendDeadlineTicks,
-            _timeProvider.GetUtcNow().UtcTicks + _sendTimeout.Ticks);
-        Interlocked.Exchange(ref _sendInProgress, 1);
-        _sendTimeoutTimer.Change(_sendTimeout, Timeout.InfiniteTimeSpan);
-
-        var sent = 0;
-        try
-        {
-            while (sent < frame.Length)
-            {
-                var bytesSent = await _socket.SendAsync(
-                        frame[sent..],
-                        SocketFlags.None,
-                        lifetimeToken)
-                    .ConfigureAwait(false);
-
-                if (bytesSent <= 0)
-                {
-                    throw new SocketException(
-                        (int)SocketError.ConnectionReset);
-                }
-
-                sent += bytesSent;
-            }
-        }
-        finally
-        {
-            // 标记发送完成，Timer 回调将忽略。
-            Interlocked.Exchange(ref _sendInProgress, 0);
-            _sendTimeoutTimer.Change(
-                Timeout.InfiniteTimeSpan,
-                Timeout.InfiniteTimeSpan);
-        }
-    }
 }

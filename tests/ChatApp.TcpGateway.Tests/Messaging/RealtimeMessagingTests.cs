@@ -1,4 +1,4 @@
-﻿using System.Net.Sockets;
+using System.Net.Sockets;
 using System.Runtime.CompilerServices;
 using ChatApp.Realtime.Abstractions.Conversations;
 using ChatApp.Realtime.Abstractions.Events;
@@ -7,10 +7,12 @@ using ChatApp.Realtime.Abstractions.Sync;
 using ChatApp.Realtime.Integration;
 using ChatApp.TcpGateway.Core.Messaging;
 using ChatApp.TcpGateway.Core.Messaging.Conversations;
+using ChatApp.TcpGateway.Gateway.Configuration;
 using ChatApp.TcpGateway.Gateway.Diagnostics;
 using ChatApp.TcpGateway.Gateway.Networking.Sessions;
 using ChatApp.TcpGateway.Infrastructure.Serialization.Json;
 using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Options;
 using RealtimeEventConsumerService = ChatApp.TcpGateway.Gateway.Messaging.RealtimeEventConsumerService;
 using RealtimeEventDispatcher = ChatApp.TcpGateway.Gateway.Messaging.RealtimeEventDispatcher;
 
@@ -59,6 +61,7 @@ public sealed class RealtimeMessagingTests
             messageBus,
             dispatcher,
             metrics,
+            Options.Create(new TcpGatewayOptions()),
             NullLogger<RealtimeEventConsumerService>.Instance);
 
         await service.StartAsync(CancellationToken.None);

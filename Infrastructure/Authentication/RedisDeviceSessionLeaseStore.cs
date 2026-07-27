@@ -187,6 +187,40 @@ internal sealed class RedisDeviceSessionLeaseStore(
         }
     }
 
+    public async ValueTask<string?> GetCurrentSessionIdAsync(
+        long userId,
+        ulong deviceIdHash,
+        CancellationToken cancellationToken)
+    {
+        if (userId <= 0)
+            return null;
+
+        var key = CreateKey(userId, deviceIdHash);
+        try
+        {
+            var current = await connectionProvider.Database
+                .StringGetAsync(key)
+                .WaitAsync(cancellationToken)
+                .ConfigureAwait(false);
+            if (current.IsNullOrEmpty)
+                return null;
+
+            var value = (string)current!;
+            var sep = value.IndexOf('\n');
+            // 值格式：connectionLeaseId\nsessionId。仅返回 sessionId 部分。
+            return sep >= 0 ? value[(sep + 1)..] : value;
+        }
+        catch (RedisException exception)
+        {
+            logger.DependencyOperationFailed(
+                GatewayDependency.Redis,
+                GatewayDependencyOperation.DeviceLeaseQuery,
+                exception);
+            // 查询失败时返回 null，退化为不拦截（与无租约等同），避免阻断恢复。
+            return null;
+        }
+    }
+
     private static string CreateKey(long userId, ulong deviceIdHash) =>
         string.Concat(
             KeyPrefix,

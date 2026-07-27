@@ -1,4 +1,4 @@
-﻿using ChatApp.Realtime.Integration.Ephemeral;
+using ChatApp.Realtime.Integration.Ephemeral;
 using ChatApp.TcpGateway.Gateway.Networking.Sessions;
 
 namespace ChatApp.TcpGateway.Tests;
@@ -22,4 +22,7 @@ internal sealed class NoopGlobalPresenceStore : IGlobalPresenceStore
         CancellationToken ct = default) =>
         Task.FromResult<IReadOnlyDictionary<long, bool>>(
             userIds.ToDictionary(static id => id, static _ => false));
+
+    public Task RunMaintenanceAsync(CancellationToken ct = default) =>
+        Task.CompletedTask;
 }

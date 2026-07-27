@@ -1,4 +1,4 @@
-﻿using System.Buffers;
+using System.Buffers;
 using ChatApp.TcpGateway.Core.Authentication;
 using ChatApp.TcpGateway.Core.Messaging;
 using ChatApp.TcpGateway.Core.Protocol;
@@ -42,7 +42,7 @@ internal sealed class TypingCommandHandler : ICommandHandler
 
     public ValueTask ExecuteAsync(
         PacketFrame frame,
-        ICommandContext context,
+        CommandContext context,
         CancellationToken cancellationToken) => frame.Command switch
     {
         PacketCommand.TypingNotify => HandleTypingNotifyAsync(

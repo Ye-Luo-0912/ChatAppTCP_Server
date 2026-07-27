@@ -51,6 +51,9 @@ internal sealed class BenchmarkConfiguration
     public int PipelineOperationsPerSecond { get; init; }
     public int PipelinePayloadBytes { get; init; }
     public long PipelineBaseUserId { get; init; }
+    public required string OutboundSendMode { get; init; }
+    public int OnDemandSendWorkerCount { get; init; }
+    public int OnDemandSendBurstLimit { get; init; }
     public required IReadOnlyList<string> DockerContainers { get; init; }
 
     public static BenchmarkConfiguration Create(BenchmarkOptions options) => new()
@@ -81,6 +84,9 @@ internal sealed class BenchmarkConfiguration
         PipelineOperationsPerSecond = options.PipelineOperationsPerSecond,
         PipelinePayloadBytes = options.PipelinePayloadBytes,
         PipelineBaseUserId = options.PipelineBaseUserId,
+        OutboundSendMode = options.OutboundSendMode,
+        OnDemandSendWorkerCount = options.OnDemandSendWorkerCount,
+        OnDemandSendBurstLimit = options.OnDemandSendBurstLimit,
         DockerContainers = options.DockerContainers
     };
 }

@@ -7,13 +7,18 @@ namespace ChatApp.TcpGateway.Infrastructure.Routing;
 /// <summary>
 /// 内存实现：用于测试和开发环境。线程安全，支持手动注册/注销 watcher。
 /// <para>
-/// 存储 watchedUserId -> {复合键 "instanceId:watcherUserId"}，复合键天然幂等，
-/// 查询时聚合出唯一 instanceId 集合。
+/// 存储 watchedUserId -> {复合键 "instanceId:watcherUserId" -> 引用计数}。
+/// 新接口移除了 <c>gatewaySessionId</c> 参数，改用引用计数维持多会话隔离：
+/// 同一 (watchedUserId, watcherUserId, instanceId) 上的多个并发会话各自 Register +1、Unregister -1，
+/// 计数归零时移除条目。这样任一会话注销只减少自身引用，其它会话条目保留。
+/// </para>
+/// <para>
+/// 新接口语义：内存实现永不失败，查询结果恒为非空集合或空集合。
 /// </para>
 /// </summary>
 public sealed class InMemoryWatcherGatewayDirectory : IWatcherGatewayDirectory
 {
-    private readonly ConcurrentDictionary<long, ConcurrentDictionary<string, bool>> _store = new();
+    private readonly ConcurrentDictionary<long, ConcurrentDictionary<string, int>> _store = new();
 
     public Task<IReadOnlyList<string>> GetWatcherGatewaysAsync(
         long watchedUserId,
@@ -43,13 +48,15 @@ public sealed class InMemoryWatcherGatewayDirectory : IWatcherGatewayDirectory
         if (watcherUserId <= 0 || watchedUserIds.Count == 0)
             return Task.CompletedTask;
 
+        var field = BuildField(instanceId, watcherUserId);
         foreach (var watchedUserId in watchedUserIds)
         {
             if (watchedUserId <= 0)
                 continue;
 
-            var bucket = _store.GetOrAdd(watchedUserId, _ => new ConcurrentDictionary<string, bool>());
-            bucket[BuildField(instanceId, watcherUserId)] = true;
+            var bucket = _store.GetOrAdd(watchedUserId, _ => new ConcurrentDictionary<string, int>());
+            // 引用计数 +1；复合 field 天然幂等（同 watcher+instance 的多次 Register 累加计数）。
+            bucket.AddOrUpdate(field, addValue: 1, updateValueFactory: (_, c) => c + 1);
         }
 
         return Task.CompletedTask;
@@ -65,6 +72,7 @@ public sealed class InMemoryWatcherGatewayDirectory : IWatcherGatewayDirectory
         if (watcherUserId <= 0 || watchedUserIds.Count == 0)
             return Task.CompletedTask;
 
+        var field = BuildField(instanceId, watcherUserId);
         foreach (var watchedUserId in watchedUserIds)
         {
             if (watchedUserId <= 0)
@@ -73,7 +81,20 @@ public sealed class InMemoryWatcherGatewayDirectory : IWatcherGatewayDirectory
             if (!_store.TryGetValue(watchedUserId, out var bucket))
                 continue;
 
-            bucket.TryRemove(BuildField(instanceId, watcherUserId), out _);
+            // 引用计数 -1；归零时移除 field，bucket 为空时移除 watchedUserId 条目。
+            // 注销不存在的 field 为无操作（TryUpdate 失败）。
+            while (bucket.TryGetValue(field, out var current) && current > 0)
+            {
+                var decremented = current - 1;
+                if (bucket.TryUpdate(field, decremented, current))
+                {
+                    if (decremented <= 0)
+                        bucket.TryRemove(field, out _);
+                    break;
+                }
+                // CAS 失败：其它并发写操作改变了值，重试。
+            }
+
             if (bucket.IsEmpty)
                 _store.TryRemove(watchedUserId, out _);
         }
@@ -88,10 +109,14 @@ public sealed class InMemoryWatcherGatewayDirectory : IWatcherGatewayDirectory
 
     private IReadOnlyList<string> GetWatcherGatewaysCore(long watchedUserId)
     {
+        if (watchedUserId <= 0)
+            return Array.Empty<string>();
+
         if (!_store.TryGetValue(watchedUserId, out var bucket) || bucket.IsEmpty)
             return Array.Empty<string>();
 
         // 复合键格式 "instanceId:watcherUserId"，提取唯一 instanceId。
+        // 仅取第一个分隔符之前的部分；后续段中若包含 ':' 也不影响 instanceId 提取。
         var instances = new HashSet<string>(StringComparer.Ordinal);
         foreach (var field in bucket.Keys)
         {
@@ -104,5 +129,8 @@ public sealed class InMemoryWatcherGatewayDirectory : IWatcherGatewayDirectory
     }
 
     private static string BuildField(string instanceId, long watcherUserId) =>
-        string.Concat(instanceId, ":", watcherUserId.ToString(CultureInfo.InvariantCulture));
+        string.Concat(
+            instanceId,
+            ":",
+            watcherUserId.ToString(CultureInfo.InvariantCulture));
 }

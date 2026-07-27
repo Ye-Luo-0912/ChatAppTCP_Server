@@ -97,5 +97,6 @@ builder.Services.AddSingleton<CommandDispatcher>();
 builder.Services.AddHostedService<RealtimeEventConsumerService>();
 builder.Services.AddHostedService<EphemeralPresenceTypingConsumerService>();
 builder.Services.AddHostedService<TcpGatewayService>();
+builder.Services.AddHostedService<PresenceMaintenanceService>();
 
 await builder.Build().RunAsync();

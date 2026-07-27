@@ -42,6 +42,16 @@ public static class PacketProtocol
     public const ushort CurrentProtocolVersion = 1;
 
     /// <summary>
+    /// 服务端最低支持的协议版本。客户端发送低于此值的版本将被拒绝
+    /// （返回 <see cref="ProtocolErrorCode.UnsupportedVersion"/> 错误帧）。
+    /// <para>
+    /// 当前与 <see cref="CurrentProtocolVersion"/> 相等。未来引入不兼容变更时
+    /// 可上调此值，强制客户端升级。
+    /// </para>
+    /// </summary>
+    public const ushort MinProtocolVersion = 1;
+
+    /// <summary>
     /// 判断命令是否为握手前命令（允许在未认证状态发送）。
     /// 包含 ClientHello 和 AuthenticationRequest。委托 <see cref="CommandCatalog"/>。
     /// </summary>
@@ -55,4 +65,12 @@ public static class PacketProtocol
     /// </summary>
     public static int GetCommandCost(PacketCommand command) =>
         CommandCatalog.GetCost(command);
+
+    /// <summary>
+    /// 判断命令是否已被弃用。弃用命令仍登记在 catalog 中以保持客户端向后兼容，
+    /// 但解析器应拒绝执行并返回 <see cref="ProtocolErrorCode.UnsupportedCommand"/> 错误帧。
+    /// 委托 <see cref="CommandCatalog"/>。
+    /// </summary>
+    public static bool IsDeprecated(PacketCommand command) =>
+        CommandCatalog.IsDeprecated(command);
 }

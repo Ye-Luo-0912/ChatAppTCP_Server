@@ -10,6 +10,7 @@ public static class GatewayEventIds
     public const int GatewayStarted = 1000;
     public const int GatewayStopped = 1001;
     public const int GatewayFatal = 1002;
+    public const int LifecycleCleanupFailed = 1003;
 
     // Connection & transport: 1100–1199
     public const int TransportFailed = 1100;

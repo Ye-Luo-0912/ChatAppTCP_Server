@@ -5,6 +5,9 @@ param(
     [ValidateRange(1, 1024)] [int] $PipelineConcurrency = 32,
     [ValidateRange(1, 1048576)] [int] $PipelinePayloadBytes = 512,
     [ValidateRange(1, 100000)] [int] $TcpConnections = 1000,
+    [ValidateSet('PersistentSendLoop','OnDemandSendPump')] [string] $OutboundSendMode = 'PersistentSendLoop',
+    [int] $OnDemandSendWorkerCount = 0,
+    [int] $OnDemandSendBurstLimit = 16,
     [string] $ReportDirectory,
     [switch] $SkipBuild
 )
@@ -27,6 +30,9 @@ $arguments = @{
     PipelineConcurrency = $PipelineConcurrency
     PipelinePayloadBytes = $PipelinePayloadBytes
     TcpConnections = $TcpConnections
+    OutboundSendMode = $OutboundSendMode
+    OnDemandSendWorkerCount = $OnDemandSendWorkerCount
+    OnDemandSendBurstLimit = $OnDemandSendBurstLimit
 }
 if (-not [string]::IsNullOrWhiteSpace($ReportDirectory)) {
     $arguments.ReportDirectory = $ReportDirectory

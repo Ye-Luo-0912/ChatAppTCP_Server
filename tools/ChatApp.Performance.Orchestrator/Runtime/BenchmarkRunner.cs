@@ -465,6 +465,14 @@ Console.WriteLine("Starting RealtimeServices...");
                 assemblyPath,
                 "--TcpGateway:ListenAddress=127.0.0.1",
                 $"--TcpGateway:Port={options.GatewayBasePort + index}",
+                // 出站发送模式 A/B：注入 OutboundSendMode 与 OnDemandSendPump 相关参数。
+                // PersistentSendLoop 模式下 OnDemandSendWorkerCount/BurstLimit 被忽略，不影响行为。
+                $"--TcpGateway:OutboundSendMode={options.OutboundSendMode}",
+                $"--TcpGateway:OnDemandSendWorkerCount={options.OnDemandSendWorkerCount}",
+                $"--TcpGateway:OnDemandSendBurstLimit={options.OnDemandSendBurstLimit}",
+                // 负载生成器直接发 AuthenticationRequest，不做 ClientHello 握手；
+                // 关闭 RequireClientHello 以避免握手前置导致的 ProtocolViolation 关闭连接。
+                "--TcpGateway:RequireClientHello=false",
                 "--Observability:OtlpEnabled=false",
                 "--Logging:LogLevel:Default=Warning"
             ],

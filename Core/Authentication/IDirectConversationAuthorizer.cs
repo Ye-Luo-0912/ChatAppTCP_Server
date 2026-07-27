@@ -17,4 +17,21 @@ public interface IDirectConversationAuthorizer
         long senderUserId,
         long targetUserId,
         CancellationToken cancellationToken);
+
+    /// <summary>
+    /// 失效指定方向的授权缓存。关系变更（拉黑、解除好友）后调用，
+    /// 确保缓存窗口内不会继续允许已禁止的 Typing/Presence 通知。
+    /// </summary>
+    /// <param name="senderUserId">发送方用户 Id。</param>
+    /// <param name="targetUserId">目标用户 Id。</param>
+    /// <param name="cancellationToken">取消令牌。</param>
+    /// <remarks>
+    /// 默认实现为 no-op（无缓存的实现器无需关心）。带缓存的实现器应清除
+    /// (sender, target) 方向的缓存条目；调用方需双向调用以清除两个方向。
+    /// </remarks>
+    ValueTask InvalidateAsync(
+        long senderUserId,
+        long targetUserId,
+        CancellationToken cancellationToken)
+        => ValueTask.CompletedTask;
 }

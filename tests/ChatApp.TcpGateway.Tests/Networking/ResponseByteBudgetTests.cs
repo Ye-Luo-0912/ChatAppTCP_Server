@@ -55,8 +55,10 @@ public sealed class ResponseByteBudgetTests
             ResponseCodec,
             PacketProtocol.WireResponseSoftLimit,
             PacketProtocol.WireResponseHardLimit,
-            RebuildWithPrefix);
+            RebuildWithPrefix,
+            out var outcome);
         Assert.Same(response, result);
+        Assert.Equal(TruncateOutcome.Full, outcome);
         Assert.Equal(3, result.Items.Count);
         Assert.False(result.HasMore);
     }
@@ -74,8 +76,10 @@ public sealed class ResponseByteBudgetTests
             ResponseCodec,
             PacketProtocol.WireResponseSoftLimit,
             PacketProtocol.WireResponseHardLimit,
-            RebuildWithPrefix);
+            RebuildWithPrefix,
+            out var outcome);
 
+        Assert.Equal(TruncateOutcome.Truncated, outcome);
         Assert.True(result.Items.Count < 200);
         Assert.True(result.Items.Count > 0);
         Assert.True(result.HasMore);
@@ -99,7 +103,8 @@ public sealed class ResponseByteBudgetTests
             ResponseCodec,
             PacketProtocol.WireResponseSoftLimit,
             PacketProtocol.WireResponseHardLimit,
-            RebuildWithPrefix);
+            RebuildWithPrefix,
+            out _);
 
         Assert.NotNull(result.NextCursor);
         var lastItem = result.Items[^1];
@@ -129,7 +134,8 @@ public sealed class ResponseByteBudgetTests
             ResponseCodec,
             PacketProtocol.WireResponseSoftLimit,
             PacketProtocol.WireResponseHardLimit,
-            RebuildWithPrefix);
+            RebuildWithPrefix,
+            out _);
 
         Assert.Equal("test-request-id", result.RequestId);
         Assert.True(result.Succeeded);
@@ -148,14 +154,16 @@ public sealed class ResponseByteBudgetTests
             ResponseCodec,
             softByteLimit: 1,
             PacketProtocol.WireResponseHardLimit,
-            RebuildWithPrefix);
+            RebuildWithPrefix,
+            out var outcome);
 
+        Assert.Equal(TruncateOutcome.Truncated, outcome);
         Assert.Single(result.Items);
         Assert.True(result.HasMore);
     }
 
     [Fact]
-    public void Truncate_ReturnsEmptyPage_WhenZeroItems()
+    public void Truncate_ReturnsFullOutcome_WhenZeroItems()
     {
         var response = CreateResponse(itemCount: 0);
         var result = ResponseByteBudget.Truncate(
@@ -164,9 +172,78 @@ public sealed class ResponseByteBudgetTests
             ResponseCodec,
             PacketProtocol.WireResponseSoftLimit,
             PacketProtocol.WireResponseHardLimit,
-            RebuildWithPrefix);
+            RebuildWithPrefix,
+            out var outcome);
         Assert.Same(response, result);
+        Assert.Equal(TruncateOutcome.Full, outcome);
         Assert.Empty(result.Items);
+    }
+
+    [Fact]
+    public void Truncate_ReturnsItemTooLarge_WhenSingleItemExceedsHardLimit()
+    {
+        // 单条消息 ~100KB > 80KB 硬上限 → ItemTooLarge。
+        var hugeItem = new MessageHistoryItem
+        {
+            MessageId = "msg-huge",
+            ClientMessageId = "client-huge",
+            SenderUserId = 1,
+            ReceiverUserId = 2,
+            ConversationId = "dm:1:2",
+            Content = new string('x', 100_000),
+            ReceivedAtMs = 1700000000000L,
+            ChangedAtMs = 1700000000000L
+        };
+        var response = new MessageHistoryResponse
+        {
+            RequestId = "req-huge",
+            Succeeded = true,
+            Items = new[] { hugeItem },
+            HasMore = false
+        };
+
+        var result = ResponseByteBudget.Truncate(
+            response,
+            1,
+            ResponseCodec,
+            PacketProtocol.WireResponseSoftLimit,
+            PacketProtocol.WireResponseHardLimit,
+            RebuildWithPrefix,
+            out var outcome);
+
+        Assert.Equal(TruncateOutcome.ItemTooLarge, outcome);
+        // 返回空信封，调用方应忽略返回值并发送错误响应。
+        Assert.Empty(result.Items);
+    }
+
+    [Fact]
+    public void TruncateArray_ReturnsItemTooLarge_WhenSingleItemExceedsHardLimit()
+    {
+        var hugeItem = new MessageHistoryItem
+        {
+            MessageId = "msg-huge",
+            ClientMessageId = "client-huge",
+            SenderUserId = 1,
+            ReceiverUserId = 2,
+            ConversationId = "dm:1:2",
+            Content = new string('x', 100_000),
+            ReceivedAtMs = 1700000000000L,
+            ChangedAtMs = 1700000000000L
+        };
+        var items = new[] { hugeItem };
+
+        var result = ResponseByteBudget.TruncateArray(
+            items,
+            ItemCodec,
+            PacketProtocol.WireResponseSoftLimit,
+            PacketProtocol.WireResponseHardLimit,
+            static (src, k) => k <= 0
+                ? Array.Empty<MessageHistoryItem>()
+                : src.Take(k).ToArray(),
+            out var outcome);
+
+        Assert.Equal(TruncateOutcome.ItemTooLarge, outcome);
+        Assert.Empty(result);
     }
 
     // --- TruncateArray ---
@@ -184,8 +261,10 @@ public sealed class ResponseByteBudgetTests
             PacketProtocol.WireResponseHardLimit,
             static (src, k) => k <= 0
                 ? Array.Empty<MessageHistoryItem>()
-                : src.Take(k).ToArray());
+                : src.Take(k).ToArray(),
+            out var outcome);
         Assert.Same(items, result);
+        Assert.Equal(TruncateOutcome.Full, outcome);
     }
 
     [Fact]
@@ -201,8 +280,10 @@ public sealed class ResponseByteBudgetTests
             PacketProtocol.WireResponseHardLimit,
             static (src, k) => k <= 0
                 ? Array.Empty<MessageHistoryItem>()
-                : src.Take(k).ToArray());
+                : src.Take(k).ToArray(),
+            out var outcome);
 
+        Assert.Equal(TruncateOutcome.Truncated, outcome);
         Assert.True(result.Length < 200);
         Assert.True(result.Length > 0);
 

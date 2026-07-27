@@ -1,4 +1,4 @@
-﻿using ChatApp.Realtime.Abstractions.Events;
+using ChatApp.Realtime.Abstractions.Events;
 using ChatApp.Realtime.Integration;
 using ChatApp.Realtime.Integration.Configuration;
 using ChatApp.Realtime.Integration.Ephemeral;
@@ -27,8 +27,15 @@ namespace ChatApp.TcpGateway.Gateway.Networking.Sessions;
 /// 由 <see cref="Networking.TcpGatewayService"/> 在构造时内部创建并传入已注入的依赖，
 /// 因此 service 构造函数签名不变，既有测试无需修改。
 /// </para>
+/// <para>
+/// 实现拆分至 partial 文件：
+/// <list type="bullet">
+/// <item><see cref="SessionLifecycleCoordinator.Presence"/> — Presence 广播与发布</item>
+/// <item><see cref="SessionLifecycleCoordinator.DeviceSession"/> — 同设备替换与 ResumeToken 撤销</item>
+/// </list>
+/// </para>
 /// </summary>
-internal sealed class SessionLifecycleCoordinator
+internal sealed partial class SessionLifecycleCoordinator
 {
     private readonly IDeviceSessionLeaseStore _deviceSessionLeaseStore;
     private readonly IGlobalPresenceStore _globalPresence;
@@ -108,7 +115,7 @@ internal sealed class SessionLifecycleCoordinator
 
         try
         {
-            return await _resumeTokenStore.IssueAsync(
+            var token = await _resumeTokenStore.IssueAsync(
                 new ResumeContext
                 {
                     UserId = result.UserId,
@@ -119,6 +126,8 @@ internal sealed class SessionLifecycleCoordinator
                 },
                 _options.ResumeTokenTtl,
                 cancellationToken).ConfigureAwait(false);
+            session.CurrentResumeToken = token;
+            return token;
         }
         catch (Exception ex)
         {
@@ -166,6 +175,49 @@ internal sealed class SessionLifecycleCoordinator
 
         if (context is null)
             return null;
+
+        // 代次校验：若待恢复会话携带 DeviceIdHash，查询当前设备租约持有者。
+        // 若租约已被另一个 SessionId 接管（同设备重新登录/管理员踢下线），
+        // 说明此 ResumeContext 来自已被替换的旧会话，必须拒绝恢复。
+        // 这与同设备替换时调用 RevokeAsync 撤销旧 Token 形成双重防线：
+        //   1) RevokeAsync 删除 Redis 中的旧 Token（阻断 Token 复活）
+        //   2) 此处代次校验拦截在 Token 被 Revoke 前的 TTL 窗口内已消费的恢复请求
+        if (context.DeviceIdHash is { } resumeDeviceHash
+            && !string.IsNullOrWhiteSpace(context.SessionId))
+        {
+            try
+            {
+                var currentLeaseSessionId = await _deviceSessionLeaseStore
+                    .GetCurrentSessionIdAsync(
+                        context.UserId,
+                        resumeDeviceHash,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+
+                if (!string.IsNullOrWhiteSpace(currentLeaseSessionId)
+                    && !string.Equals(
+                        currentLeaseSessionId,
+                        context.SessionId,
+                        StringComparison.Ordinal))
+                {
+                    // 设备租约已归属另一个更新的会话，拒绝恢复旧会话。
+                    _logger.TransportFailed(
+                        GatewayTransportOperation.ClientProcessing,
+                        session.ConnectionId,
+                        new InvalidOperationException(
+                            "Resume rejected: device lease owned by a newer session."));
+                    return null;
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.DependencyOperationFailed(
+                    GatewayDependency.Redis,
+                    GatewayDependencyOperation.DeviceLeaseQuery,
+                    ex);
+                // 查询失败时不阻断恢复（退化为旧行为），由 RevokeAsync 兜底。
+            }
+        }
 
         // 恢复会话：复用原 UserId/SessionId/DeviceId。
         session.Authenticate(
@@ -222,6 +274,7 @@ internal sealed class SessionLifecycleCoordinator
                     },
                     _options.ResumeTokenTtl,
                     cancellationToken).ConfigureAwait(false);
+                session.CurrentResumeToken = newToken;
             }
             catch (Exception ex)
             {
@@ -232,13 +285,87 @@ internal sealed class SessionLifecycleCoordinator
             }
         }
 
+        // 查询服务端同步水位：调用 SyncBootstrap（最小 limit）获取 ServerTimeMs 作为水位。
+        // 短超时 + best-effort：失败或超时返回 null，不影响 Resume 成功路径。
+        var lastConversationSequence = await QueryResumeWatermarkAsync(
+                context.UserId,
+                context.DeviceIdHash,
+                cancellationToken)
+            .ConfigureAwait(false);
+
         return new ResumeLifecycleResult
         {
             ResumeToken = newToken,
             UserId = context.UserId,
             SessionId = context.SessionId,
-            DeviceId = context.DeviceId
+            DeviceId = context.DeviceId,
+            LastConversationSequence = lastConversationSequence
         };
+    }
+
+    /// <summary>
+    /// 查询服务端同步水位（Unix 毫秒），用于填充 ResumeResponse.LastConversationSequence。
+    /// <para>
+    /// 调用 <see cref="IRealtimeMessageBus.QuerySyncBootstrapAsync"/> 携带最小 limit
+    /// （ListLimit=0, HistoryLimitPerConversation=0, MaxConversationsWithHistory=0, Watermarks=null）
+    /// 获取服务端 <see cref="ChatApp.Realtime.Abstractions.Sync.SyncBootstrapPage.ServerTimeMs"/>。
+    /// </para>
+    /// <para>
+    /// 短超时（500ms）+ best-effort：任何异常（NATS 超时、取消、协议错误）均吞掉并返回 null。
+    /// 调用方据此决定是否填充 LastConversationSequence 字段；返回 null 时客户端应回退到
+    /// “始终 SyncBootstrap”策略（与未填充字段等价）。
+    /// </para>
+    /// </summary>
+    private async Task<long?> QueryResumeWatermarkAsync(
+        long userId,
+        ulong? deviceIdHash,
+        CancellationToken cancellationToken)
+    {
+        if (userId <= 0)
+            return null;
+
+        // 短超时：Resume 是热路径，水位查询不应阻塞重连超过 500ms。
+        // 超时取消与外部 cancellationToken 解耦：外部取消仍立即生效，超时只限制查询本身。
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeoutCts.CancelAfter(TimeSpan.FromMilliseconds(500));
+
+        var query = new ChatApp.Realtime.Abstractions.Sync.SyncBootstrapQuery
+        {
+            RequestId = Guid.CreateVersion7().ToString("N"),
+            UserId = userId,
+            DeviceIdHash = deviceIdHash,
+            // 最小 limit：只要 ServerTimeMs，不要会话列表与历史。
+            ListLimit = 0,
+            HistoryLimitPerConversation = 0,
+            MaxConversationsWithHistory = 0,
+            Watermarks = null
+        };
+
+        try
+        {
+            var page = await _messageBus
+                .QuerySyncBootstrapAsync(query, timeoutCts.Token)
+                .ConfigureAwait(false);
+
+            if (!page.Succeeded)
+                return null;
+
+            return page.ServerTimeMs > 0 ? page.ServerTimeMs : null;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // 外部取消：传播（不应在此吞掉）。
+            throw;
+        }
+        catch (Exception ex)
+        {
+            // 超时或 NATS 故障：吞掉，返回 null。Resume 主路径不受影响。
+            _logger.DependencyOperationFailed(
+                GatewayDependency.RealtimeService,
+                GatewayDependencyOperation.ResumeWatermarkQuery,
+                ex);
+            return null;
+        }
     }
 
     /// <summary>
@@ -290,7 +417,8 @@ internal sealed class SessionLifecycleCoordinator
     /// 心跳扫描中刷新设备租约 TTL（仅在仍持有所有权时）。
     /// 限制并发 Redis 往返以避免 10k 连接串行扫描。
     /// </summary>
-    public async Task RefreshLeaseAsync(
+    /// <returns><c>true</c> 刷新成功；<c>false</c> Redis 异常或非所有者（已吞异常并记录日志）。</returns>
+    public async Task<bool> RefreshLeaseAsync(
         SemaphoreSlim gate,
         long userId,
         ulong deviceHash,
@@ -309,6 +437,7 @@ internal sealed class SessionLifecycleCoordinator
                     leaseTtl,
                     cancellationToken)
                 .ConfigureAwait(false);
+            return true;
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -320,6 +449,7 @@ internal sealed class SessionLifecycleCoordinator
                 GatewayDependency.Redis,
                 GatewayDependencyOperation.DeviceLeaseRefresh,
                 exception);
+            return false;
         }
         finally
         {
@@ -331,7 +461,8 @@ internal sealed class SessionLifecycleCoordinator
     /// 心跳扫描中刷新 Redis 全局在线状态 score（防止 TTL 过期误判下线）。
     /// 限制并发 Redis 往返以避免 10k 连接串行扫描。
     /// </summary>
-    public async Task RefreshPresenceAsync(
+    /// <returns><c>true</c> 刷新成功；<c>false</c> Redis 异常（已吞异常并记录日志）。</returns>
+    public async Task<bool> RefreshPresenceAsync(
         SemaphoreSlim gate,
         long userId,
         CancellationToken cancellationToken)
@@ -345,6 +476,7 @@ internal sealed class SessionLifecycleCoordinator
                     _integrationOptions.InstanceId,
                     cancellationToken)
                 .ConfigureAwait(false);
+            return true;
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -356,220 +488,12 @@ internal sealed class SessionLifecycleCoordinator
                 GatewayDependency.Redis,
                 GatewayDependencyOperation.PresenceRefresh,
                 exception);
+            return false;
         }
         finally
         {
             gate.Release();
         }
-    }
-
-    /// <summary>
-    /// 只在全局状态转换（0-&gt;1 或 1-&gt;0）时广播与发布跨网关 Presence 事件。
-    /// 旧实现每实例本地首连/断开都无条件广播，导致多实例登录时互相覆盖、误报下线。
-    /// </summary>
-    private async Task PublishPresenceChangedAsync(
-        long userId,
-        bool isOnline,
-        CancellationToken cancellationToken)
-    {
-        PresenceTransition transition;
-        if (isOnline)
-            transition = await _globalPresence
-                .SetOnlineAsync(userId, _integrationOptions.InstanceId, cancellationToken)
-                .ConfigureAwait(false);
-        else
-            transition = await _globalPresence
-                .SetOfflineAsync(userId, _integrationOptions.InstanceId, cancellationToken)
-                .ConfigureAwait(false);
-
-        if (transition == PresenceTransition.None)
-        {
-            _metrics.PresenceTransition("none");
-            return;
-        }
-
-        var globalIsOnline = transition == PresenceTransition.WentOnline;
-        _metrics.PresenceTransition(globalIsOnline ? "online" : "offline");
-        BroadcastPresenceChangedLocal(userId, globalIsOnline);
-
-        try
-        {
-            await _messageBus
-                .PublishEphemeralPresenceAsync(
-                    new EphemeralPresenceEvent
-                    {
-                        OriginInstanceId = _integrationOptions.InstanceId,
-                        UserId = userId,
-                        IsOnline = globalIsOnline
-                    },
-                    cancellationToken)
-                .ConfigureAwait(false);
-            _metrics.PresenceEphemeralPublished();
-        }
-        catch (Exception ex)
-        {
-            _metrics.DependencyOperationFailed(
-                GatewayDependency.RealtimeService,
-                GatewayDependencyOperation.EphemeralPresencePublish);
-            _logger.DependencyOperationFailed(
-                GatewayDependency.RealtimeService,
-                GatewayDependencyOperation.EphemeralPresencePublish,
-                ex);
-        }
-    }
-
-    private void BroadcastPresenceChangedLocal(long userId, bool isOnline)
-    {
-        var watchers = _presenceWatchers.GetWatchers(userId);
-        if (watchers.Length == 0)
-        {
-            _metrics.PresenceFanoutSkipped();
-            return;
-        }
-
-        var update = new PresenceChanged
-        {
-            UserId = userId,
-            IsOnline = isOnline
-        };
-
-        using var frame = OutboundFrameFactory.Create(
-            PacketCommand.PresenceChanged,
-            _presenceChangedCodec,
-            update);
-        var recipientCount = 0;
-        foreach (var watcherId in watchers)
-        {
-            foreach (var watcherSession in _userSessions.GetSnapshot(watcherId))
-            {
-                watcherSession.TryQueueEphemeral(frame);
-                recipientCount++;
-            }
-        }
-        _metrics.PresenceFanoutDelivered(recipientCount);
-    }
-
-    private async ValueTask ReplaceSameDeviceSessionsAsync(
-        TcpClientSession incoming,
-        CancellationToken cancellationToken)
-    {
-        // 1) 本机旧连接立即踢下线。
-        var localVictims = _userSessions.TakeOverSameDevice(incoming);
-        var occurredAtMs = _timeProvider.GetUtcNow().ToUnixTimeMilliseconds();
-        foreach (var victim in localVictims)
-            await RevokeSessionAsync(victim, occurredAtMs, cancellationToken).ConfigureAwait(false);
-
-        // 2) Redis/Garnet 设备租约：发现跨 Gateway 的旧 SessionId 并广播 SessionRevoked。
-        if (incoming.DeviceIdHash is not { } deviceHash
-            || string.IsNullOrWhiteSpace(incoming.SessionId)
-            || incoming.UserId <= 0)
-        {
-            return;
-        }
-
-        // TTL 略长于空闲超时，避免正常心跳间隙丢租约；断开时 ReleaseIfOwner。
-        var leaseTtl = _options.IdleTimeout + TimeSpan.FromMinutes(5);
-        string? previousSessionId;
-        try
-        {
-            // 传入 ConnectionLeaseId 作为所有权令牌。
-            previousSessionId = await _deviceSessionLeaseStore
-                .TakeOverAsync(
-                    incoming.UserId,
-                    deviceHash,
-                    incoming.SessionId,
-                    incoming.ConnectionLeaseId,
-                    leaseTtl,
-                    cancellationToken)
-                .ConfigureAwait(false);
-        }
-        catch (Exception exception)
-        {
-            _logger.SessionRevocationFailed(
-                incoming.ConnectionId,
-                incoming.SessionId,
-                exception);
-            return;
-        }
-
-        if (string.IsNullOrWhiteSpace(previousSessionId)
-            || string.Equals(previousSessionId, incoming.SessionId, StringComparison.Ordinal))
-        {
-            return;
-        }
-
-        // 本机已踢过的 SessionId 不必再发；跨实例依赖此事件。
-        var alreadyLocal = localVictims.Any(v =>
-            string.Equals(v.SessionId, previousSessionId, StringComparison.Ordinal));
-        if (alreadyLocal)
-            return;
-
-        try
-        {
-            await _messageBus
-                .PublishEventAsync(
-                    new RealtimeEvent
-                    {
-                        EventId = RealtimeEventContracts.CreateSessionRevokedEventId(
-                            incoming.UserId,
-                            previousSessionId,
-                            occurredAtMs),
-                        Type = RealtimeEventType.SessionRevoked,
-                        TargetUserId = incoming.UserId,
-                        SessionId = previousSessionId,
-                        OccurredAtMs = occurredAtMs
-                    },
-                    cancellationToken)
-                .ConfigureAwait(false);
-        }
-        catch (Exception exception)
-        {
-            _logger.SessionRevocationFailed(
-                incoming.ConnectionId,
-                previousSessionId,
-                exception);
-        }
-    }
-
-    private async ValueTask RevokeSessionAsync(
-        TcpClientSession victim,
-        long occurredAtMs,
-        CancellationToken cancellationToken)
-    {
-        if (string.IsNullOrWhiteSpace(victim.SessionId))
-        {
-            victim.Close(SessionCloseReason.SessionRevoked);
-            return;
-        }
-
-        try
-        {
-            await _messageBus
-                .PublishEventAsync(
-                    new RealtimeEvent
-                    {
-                        EventId = RealtimeEventContracts.CreateSessionRevokedEventId(
-                            victim.UserId,
-                            victim.SessionId,
-                            occurredAtMs),
-                        Type = RealtimeEventType.SessionRevoked,
-                        TargetUserId = victim.UserId,
-                        SessionId = victim.SessionId,
-                        OccurredAtMs = occurredAtMs
-                    },
-                    cancellationToken)
-                .ConfigureAwait(false);
-        }
-        catch (Exception exception)
-        {
-            _logger.SessionRevocationFailed(
-                victim.ConnectionId,
-                victim.SessionId,
-                exception);
-        }
-
-        // 本机立即断开；跨 Gateway 实例依赖 SessionRevoked 事件。
-        victim.Close(SessionCloseReason.SessionRevoked);
     }
 }
 
@@ -587,4 +511,14 @@ internal sealed class ResumeLifecycleResult
     public string SessionId { get; init; } = string.Empty;
 
     public string? DeviceId { get; init; }
+
+    /// <summary>
+    /// 服务端最后已知同步水位（Unix 毫秒），由 SyncBootstrap 查询返回的 ServerTimeMs 充当。
+    /// 客户端可据此判断是否需要触发增量 SyncBootstrap：若客户端记录的最后 ServerTimeMs
+    /// 小于本值，则发起 SyncBootstrap 拉取缺失数据；否则可跳过。
+    /// <para>
+    /// 查询失败或超时返回 null，客户端应回退到“始终 SyncBootstrap”策略。
+    /// </para>
+    /// </summary>
+    public long? LastConversationSequence { get; init; }
 }

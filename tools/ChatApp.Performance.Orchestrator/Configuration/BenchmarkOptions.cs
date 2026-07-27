@@ -34,6 +34,9 @@ internal sealed record BenchmarkOptions(
     int PipelinePayloadBytes,
     TimeSpan PipelineOperationTimeout,
     long PipelineBaseUserId,
+    string OutboundSendMode,
+    int OnDemandSendWorkerCount,
+    int OnDemandSendBurstLimit,
     string ReportDirectory,
     IReadOnlyList<string> DockerContainers)
 {
@@ -51,7 +54,10 @@ internal sealed record BenchmarkOptions(
         "[--tcp-bootstrap-user-id 9300000000] [--tcp-target-user-id ID] " +
         "[--no-pipeline] [--pipeline-concurrency 4] [--pipeline-operations-per-second 0] " +
         "[--pipeline-payload-bytes 128] [--pipeline-operation-timeout-seconds 15] " +
-        "[--pipeline-base-user-id 9200000000] [--docker-container NAME] " +
+        "[--pipeline-base-user-id 9200000000] " +
+        "[--outbound-send-mode PersistentSendLoop|OnDemandSendPump] " +
+        "[--on-demand-send-worker-count 0] [--on-demand-send-burst-limit 16] " +
+        "[--docker-container NAME] " +
         "[--report-directory .artifacts/performance]";
 
     public static BenchmarkOptions Parse(string[] args)
@@ -87,6 +93,11 @@ internal sealed record BenchmarkOptions(
         var pipelinePayloadBytes = 128;
         var pipelineOperationTimeoutSeconds = 15;
         long pipelineBaseUserId = 9_200_000_000;
+        // 出站发送模式 A/B：默认 PersistentSendLoop（与历史基线一致），
+        // 切换为 OnDemandSendPump 时编排器会注入额外 TcpGateway 配置覆盖项。
+        var outboundSendMode = "PersistentSendLoop";
+        var onDemandSendWorkerCount = 0;
+        var onDemandSendBurstLimit = 16;
         string? reportDirectory = null;
         var dockerContainers = new List<string>();
 
@@ -195,6 +206,15 @@ internal sealed record BenchmarkOptions(
                 case "--pipeline-base-user-id":
                     pipelineBaseUserId = ParseLong(value, option);
                     break;
+                case "--outbound-send-mode":
+                    outboundSendMode = value;
+                    break;
+                case "--on-demand-send-worker-count":
+                    onDemandSendWorkerCount = ParseInt(value, option);
+                    break;
+                case "--on-demand-send-burst-limit":
+                    onDemandSendBurstLimit = ParseInt(value, option);
+                    break;
                 case "--docker-container":
                     dockerContainers.Add(value);
                     break;
@@ -260,6 +280,12 @@ internal sealed record BenchmarkOptions(
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(pipelinePayloadBytes);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(pipelineOperationTimeoutSeconds);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(pipelineBaseUserId);
+        // 校验出站模式 A/B 参数。
+        if (outboundSendMode is not ("PersistentSendLoop" or "OnDemandSendPump"))
+            throw new ArgumentException(
+                "--outbound-send-mode must be PersistentSendLoop or OnDemandSendPump.");
+        ArgumentOutOfRangeException.ThrowIfNegative(onDemandSendWorkerCount);
+        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(onDemandSendBurstLimit, 0);
 
         return new BenchmarkOptions(
             repositoryRoot,
@@ -293,6 +319,9 @@ internal sealed record BenchmarkOptions(
             pipelinePayloadBytes,
             TimeSpan.FromSeconds(pipelineOperationTimeoutSeconds),
             pipelineBaseUserId,
+            outboundSendMode,
+            onDemandSendWorkerCount,
+            onDemandSendBurstLimit,
             reportDirectory,
             dockerContainers.Distinct(StringComparer.Ordinal).ToArray());
     }

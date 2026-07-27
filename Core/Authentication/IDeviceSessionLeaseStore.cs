@@ -48,4 +48,17 @@ public interface IDeviceSessionLeaseStore
         string connectionLeaseId,
         TimeSpan ttl,
         CancellationToken cancellationToken);
+
+    /// <summary>
+    /// 查询当前持有设备租约的 SessionId（只读，不修改租约）。
+    /// <para>
+    /// 用于 Resume 恢复时校验待恢复会话是否仍为当前有效代次：
+    /// 若返回值非空且与待恢复 SessionId 不同，说明已被更新登录接管，应拒绝恢复。
+    /// </para>
+    /// </summary>
+    /// <returns>当前租约持有者的 SessionId；租约不存在或过期返回 null。</returns>
+    ValueTask<string?> GetCurrentSessionIdAsync(
+        long userId,
+        ulong deviceIdHash,
+        CancellationToken cancellationToken);
 }

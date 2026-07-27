@@ -59,7 +59,7 @@ internal sealed class CommandDispatcher
     /// </returns>
     public ValueTask<bool> TryDispatchAsync(
         PacketFrame frame,
-        ICommandContext context,
+        CommandContext context,
         CancellationToken cancellationToken) => frame.Command switch
     {
         // Push
@@ -114,7 +114,7 @@ internal sealed class CommandDispatcher
     private static async ValueTask<bool> InvokeAsync(
         ICommandHandler handler,
         PacketFrame frame,
-        ICommandContext context,
+        CommandContext context,
         CancellationToken cancellationToken)
     {
         await handler

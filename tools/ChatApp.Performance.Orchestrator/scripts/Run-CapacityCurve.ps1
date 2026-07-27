@@ -14,6 +14,9 @@ param(
     [string] $NatsImage = 'nats:2.10.26-alpine',
     [string] $PostgresImage = 'postgres:16.8',
     [string] $GarnetImage = 'ghcr.io/microsoft/garnet:1.0.84',
+    [ValidateSet('PersistentSendLoop','OnDemandSendPump')] [string] $OutboundSendMode = 'PersistentSendLoop',
+    [int] $OnDemandSendWorkerCount = 0,
+    [int] $OnDemandSendBurstLimit = 16,
     [string] $ReportDirectory,
     [switch] $SkipBuild
 )
@@ -129,6 +132,9 @@ try {
                 '--pipeline-concurrency',"$PipelineConcurrency",
                 '--pipeline-operations-per-second',"$rate",
                 '--pipeline-payload-bytes',"$PipelinePayloadBytes",
+                '--outbound-send-mode',"$OutboundSendMode",
+                '--on-demand-send-worker-count',"$OnDemandSendWorkerCount",
+                '--on-demand-send-burst-limit',"$OnDemandSendBurstLimit",
                 '--realtime-database-environment',$dbEnvName,
                 '--garnet-environment',$garnetEnvName,
                 '--docker-container',$nats,
@@ -225,6 +231,9 @@ $summary = [pscustomobject]@{
         PipelinePayloadBytes = $PipelinePayloadBytes
         TcpConnections = $TcpConnections
         RateModel = 'bounded closed-loop pacing'
+        OutboundSendMode = $OutboundSendMode
+        OnDemandSendWorkerCount = $OnDemandSendWorkerCount
+        OnDemandSendBurstLimit = $OnDemandSendBurstLimit
         NatsImage = $NatsImage
         PostgresImage = $PostgresImage
         GarnetImage = $GarnetImage

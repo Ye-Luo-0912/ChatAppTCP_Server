@@ -23,5 +23,8 @@ public enum GatewayDependencyOperation : byte
     PushTokenUnregister = 15,
     PushTokenList = 16,
     GatewayDirectoryQuery = 17,
-    WatcherDirectoryQuery = 18
+    WatcherDirectoryQuery = 18,
+    DeviceLeaseQuery = 19,
+    ResumeTokenRevoke = 20,
+    ResumeWatermarkQuery = 21
 }

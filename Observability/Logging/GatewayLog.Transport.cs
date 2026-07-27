@@ -51,4 +51,14 @@ public static partial class GatewayLog
         "Ephemeral Presence/Typing is disabled; skipping NATS Core subscription.",
         EventName = "TcpGateway.EphemeralDisabled")]
     public static partial void EphemeralDisabled(this ILogger logger);
+
+    [LoggerMessage(
+        GatewayEventIds.LifecycleCleanupFailed,
+        LogLevel.Warning,
+        "External lifecycle cleanup failed on connection {ConnectionId}; local resource accounting proceeds.",
+        EventName = "TcpGateway.LifecycleCleanupFailed")]
+    public static partial void LifecycleCleanupFailed(
+        this ILogger logger,
+        uint connectionId,
+        Exception exception);
 }

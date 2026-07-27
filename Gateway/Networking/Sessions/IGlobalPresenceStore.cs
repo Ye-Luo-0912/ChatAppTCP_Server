@@ -25,7 +25,7 @@ internal interface IGlobalPresenceStore
     /// <summary>
     /// 标记用户在指定实例上线（ZADD 成员 + 刷新 score）。
     /// <para>
-    /// 原子清理过期成员后 ZADD 当前实例，返回全局状态转换。
+    /// 使用 <c>ZCOUNT key (now +inf)</c> 检测全局状态转换，不清理过期成员（由维护路径负责）。
     /// 仅当返回 <see cref="PresenceTransition.WentOnline"/> 时调用方应发布上线事件。
     /// </para>
     /// </summary>
@@ -34,7 +34,7 @@ internal interface IGlobalPresenceStore
     /// <summary>
     /// 标记用户在指定实例下线（ZREM 成员）。
     /// <para>
-    /// 原子清理过期成员后 ZREM 当前实例，返回全局状态转换。
+    /// 使用 <c>ZCOUNT key (now +inf)</c> 检测全局状态转换，不清理过期成员（由维护路径负责）。
     /// 仅当返回 <see cref="PresenceTransition.WentOffline"/> 时调用方应发布下线事件。
     /// 即使本实例非最后一个，也安全移除自身成员，不影响其他实例。
     /// </para>
@@ -43,11 +43,31 @@ internal interface IGlobalPresenceStore
 
     /// <summary>
     /// 刷新当前实例的到期 score（若仍为成员）。
+    /// <para>
+    /// 不清理过期成员；仅 <c>ZSCORE</c> 检查成员存在性后 <c>ZADD</c> 刷新 score。
+    /// </para>
     /// </summary>
     Task RefreshOnlineAsync(long userId, string instanceId, CancellationToken ct = default);
 
+    /// <summary>
+    /// 查询用户是否在线（<c>ZCOUNT key (now +inf)</c> &gt; 0），不清理过期成员。
+    /// </summary>
     Task<bool> IsOnlineAsync(long userId, CancellationToken ct = default);
+
+    /// <summary>
+    /// 批量查询用户在线状态（每用户 <c>ZCOUNT key (now +inf)</c>），不清理过期成员。
+    /// </summary>
     Task<IReadOnlyDictionary<long, bool>> GetOnlineManyAsync(
         IReadOnlyList<long> userIds,
         CancellationToken ct = default);
+
+    /// <summary>
+    /// 低频维护：清理已过期 ZSET 成员（<c>ZREMRANGEBYSCORE key -inf now</c>）。
+    /// <para>
+    /// 热路径（SetOnline/SetOffline/Refresh/IsOnline/GetOnlineMany）不再做清理，
+    /// 过期成员仅占用内存、不影响查询正确性（<c>ZCOUNT key (now +inf)</c> 已排除）。
+    /// 本方法由后台服务定期调用（默认 5 分钟），回收崩溃实例残留的 ZSET 成员内存。
+    /// </para>
+    /// </summary>
+    Task RunMaintenanceAsync(CancellationToken ct = default);
 }

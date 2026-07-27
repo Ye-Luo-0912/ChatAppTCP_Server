@@ -10,15 +10,22 @@ namespace ChatApp.TcpGateway.Infrastructure.Routing;
 /// <summary>
 /// Redis 实现：使用 HASH 存储被观察用户的 watcher 路由。
 /// <para>
-/// key = <c>pw:{watchedUserId}</c>，field = <c>{instanceId}:{watcherUserId}</c>，value = <c>1</c>。
-/// 复合 field 天然幂等：重复 RegisterWatchers 不会产生重复计数，重复 UnregisterWatchers 为无操作。
+/// key = <c>pw:{watchedUserId}</c>，field = <c>{instanceId}:{watcherUserId}</c>，value = 引用计数。
+/// 新接口移除了 <c>gatewaySessionId</c> 参数，改用引用计数维持多会话隔离：
+/// 同一 (watchedUserId, watcherUserId, instanceId) 上的多个并发会话各自 Register +1、Unregister -1，
+/// 计数归零时移除 field。
 /// </para>
 /// <para>
+/// 复合 field 保证 watcher 维度幂等：相同 (watchedUserId, watcherUserId, instanceId) 重复 Register
+/// 累加计数而非产生重复条目，重复 Unregister 减少计数。
+/// </para>
+/// <para>
+/// 注册时通过 PEXPIRE 续期，Gateway 异常退出后整条 HASH 自然过期。
 /// 查询时 HKEYS 返回全部复合 field，应用层解析出唯一 instanceId 集合。
-/// 写操作通过 Lua 脚本保证 HSET/HDEL 与 PEXPIRE 的原子性，并在 HASH 清空后自动 DEL。
+/// 写操作通过 Lua 脚本保证 HINCRBY 与 PEXPIRE 的原子性，并在 HASH 清空后自动 DEL。
 /// </para>
 /// <para>
-/// 查询失败时返回空集合（不抛异常），调用方据此回退到广播模式。
+/// 新接口语义：查询失败时返回空集合，调用方据此回退到 fallback broadcast subject；不抛异常。
 /// </para>
 /// </summary>
 internal sealed class RedisWatcherGatewayDirectory(
@@ -28,21 +35,26 @@ internal sealed class RedisWatcherGatewayDirectory(
     private const string KeyPrefix = "pw:";
     private const string FieldSeparator = ":";
 
-    // HSET key field 1; PEXPIRE key ttl。返回当前 field 数量。
+    // HINCRBY key field 1; PEXPIRE key ttl。返回当前 field 数量。
+    // 引用计数：同 watcher+instance 的多次 Register 累加计数。
     private static readonly LuaScript RegisterScript = LuaScript.Prepare(
         """
-        redis.call('HSET', @key, @field, '1')
+        redis.call('HINCRBY', @key, @field, 1)
         redis.call('PEXPIRE', @key, tonumber(@ttlMs))
         return redis.call('HLEN', @key)
         """);
 
-    // HDEL key field; 若 HASH 为空则 DEL。返回剩余 field 数量。
+    // HINCRBY key field -1; 若计数 <= 0 则 HDEL；HASH 为空则 DEL，否则 PEXPIRE。
+    // 引用计数：归零时移除 field，保证任一会话注销不影响其它并发会话条目。
     private static readonly LuaScript UnregisterScript = LuaScript.Prepare(
         """
-        local removed = redis.call('HDEL', @key, @field)
-        if removed > 0 and redis.call('HLEN', @key) == 0 then
+        local n = redis.call('HINCRBY', @key, @field, -1)
+        if tonumber(n) <= 0 then
+          redis.call('HDEL', @key, @field)
+        end
+        if redis.call('HLEN', @key) == 0 then
           redis.call('DEL', @key)
-        elseif removed > 0 then
+        else
           redis.call('PEXPIRE', @key, tonumber(@ttlMs))
         end
         return redis.call('HLEN', @key)
@@ -86,6 +98,10 @@ internal sealed class RedisWatcherGatewayDirectory(
         if (watchedUserIds.Count == 0)
             return result;
 
+        // 默认填充空集合（无人观察），仅当批量查询抛异常时整体保持空集合（回退广播）。
+        foreach (var userId in watchedUserIds)
+            result[userId] = Array.Empty<string>();
+
         try
         {
             var batch = connectionProvider.Database.CreateBatch();
@@ -96,7 +112,6 @@ internal sealed class RedisWatcherGatewayDirectory(
                 var userId = watchedUserIds[i];
                 if (userId <= 0)
                 {
-                    result[userId] = Array.Empty<string>();
                     tasks[i] = Task.FromResult(Array.Empty<RedisValue>());
                     continue;
                 }
@@ -113,7 +128,9 @@ internal sealed class RedisWatcherGatewayDirectory(
                 if (userId <= 0)
                     continue;
 
-                result[userId] = ExtractInstances(results[i]);
+                var gateways = ExtractInstances(results[i]);
+                if (gateways.Count > 0)
+                    result[userId] = gateways;
             }
         }
         catch (Exception ex)
@@ -122,9 +139,6 @@ internal sealed class RedisWatcherGatewayDirectory(
                 GatewayDependency.Redis,
                 GatewayDependencyOperation.WatcherDirectoryQuery,
                 ex);
-
-            foreach (var userId in watchedUserIds)
-                result.TryAdd(userId, Array.Empty<string>());
         }
 
         return result;
@@ -143,19 +157,23 @@ internal sealed class RedisWatcherGatewayDirectory(
         var field = BuildField(instanceId, watcherUserId);
         try
         {
+            // 批量执行：N 个 watchedUserId 合并为单次 batch 往返，避免 N 次串行 EVAL。
             var db = connectionProvider.Database;
+            var batch = db.CreateBatch();
+            var tasks = new List<Task<RedisResult>>(watchedUserIds.Count);
+
             foreach (var watchedUserId in watchedUserIds)
             {
                 if (watchedUserId <= 0)
                     continue;
 
-                await RegisterScript
-                    .EvaluateAsync(
-                        db,
-                        new { key = (RedisKey)Key(watchedUserId), field, ttlMs = DefaultTtlMs })
-                    .WaitAsync(cancellationToken)
-                    .ConfigureAwait(false);
+                tasks.Add(RegisterScript.EvaluateAsync(
+                    batch,
+                    new { key = (RedisKey)Key(watchedUserId), field, ttlMs = DefaultTtlMs }));
             }
+
+            batch.Execute();
+            await Task.WhenAll(tasks).WaitAsync(cancellationToken).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -179,19 +197,23 @@ internal sealed class RedisWatcherGatewayDirectory(
         var field = BuildField(instanceId, watcherUserId);
         try
         {
+            // 批量执行：N 个 watchedUserId 合并为单次 batch 往返，避免 N 次串行 EVAL。
             var db = connectionProvider.Database;
+            var batch = db.CreateBatch();
+            var tasks = new List<Task<RedisResult>>(watchedUserIds.Count);
+
             foreach (var watchedUserId in watchedUserIds)
             {
                 if (watchedUserId <= 0)
                     continue;
 
-                await UnregisterScript
-                    .EvaluateAsync(
-                        db,
-                        new { key = (RedisKey)Key(watchedUserId), field, ttlMs = DefaultTtlMs })
-                    .WaitAsync(cancellationToken)
-                    .ConfigureAwait(false);
+                tasks.Add(UnregisterScript.EvaluateAsync(
+                    batch,
+                    new { key = (RedisKey)Key(watchedUserId), field, ttlMs = DefaultTtlMs }));
             }
+
+            batch.Execute();
+            await Task.WhenAll(tasks).WaitAsync(cancellationToken).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -206,9 +228,13 @@ internal sealed class RedisWatcherGatewayDirectory(
         string.Concat(KeyPrefix, watchedUserId.ToString(CultureInfo.InvariantCulture));
 
     private static string BuildField(string instanceId, long watcherUserId) =>
-        string.Concat(instanceId, FieldSeparator, watcherUserId.ToString(CultureInfo.InvariantCulture));
+        string.Concat(
+            instanceId,
+            FieldSeparator,
+            watcherUserId.ToString(CultureInfo.InvariantCulture));
 
     // 从 HASH field（格式 "instanceId:watcherUserId"）中提取唯一 instanceId。
+    // 仅取第一个分隔符之前的部分；watcherUserId 中若包含 ':' 也不影响 instanceId 提取。
     private static IReadOnlyList<string> ExtractInstances(RedisValue[] fields)
     {
         if (fields.Length == 0)

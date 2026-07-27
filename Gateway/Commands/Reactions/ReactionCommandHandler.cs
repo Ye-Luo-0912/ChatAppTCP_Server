@@ -1,4 +1,4 @@
-﻿using ChatApp.TcpGateway.Gateway.Networking.Sessions;
+using ChatApp.TcpGateway.Gateway.Networking.Sessions;
 using System.Buffers;
 using ChatApp.Realtime.Abstractions.Messaging;
 using ChatApp.Realtime.Integration;
@@ -62,7 +62,7 @@ internal sealed class ReactionCommandHandler : ICommandHandler
 
     public ValueTask ExecuteAsync(
         PacketFrame frame,
-        ICommandContext context,
+        CommandContext context,
         CancellationToken cancellationToken) => frame.Command switch
     {
         PacketCommand.AddReactionRequest => HandleAddAsync(

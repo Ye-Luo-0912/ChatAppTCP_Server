@@ -476,6 +476,61 @@ public sealed class GatewayMetrics : IDisposable
             description: "WorkingSet 与 committed 的差值，包含 Pipe 未计入 segment、池化余量、对象开销等隐藏内存。");
     }
 
+    /// <summary>
+    /// 注册 Runtime V2 共享执行器 ObservableGauge：DeadlineWheel 活跃 deadline 数、
+    /// OnDemandSendPump ready queue 深度与累计调度次数。
+    /// <para>
+    /// provider 为 null 时对应指标跳过注册：PersistentSendLoop 模式下 OutboundPumpCoordinator 为 null，
+    /// DeadlineWheel 在测试场景下也可为 null。调用方须持有 provider 委托引用避免 GC。
+    /// </para>
+    /// </summary>
+    /// <param name="activeDeadlinesProvider">DeadlineWheel.ActiveDeadlineCount。</param>
+    /// <param name="outboundPumpReadyQueueProvider">OutboundPumpCoordinator.ReadyQueueCount（OnDemandSendPump 模式）。</param>
+    /// <param name="outboundPumpTotalScheduledProvider">OutboundPumpCoordinator.TotalScheduled 累计调度次数。</param>
+    /// <param name="outboundPumpWorkerCountProvider">OutboundPumpCoordinator.WorkerCount。</param>
+    public void RegisterRuntimeV2Observers(
+        Func<long>? activeDeadlinesProvider,
+        Func<long>? outboundPumpReadyQueueProvider,
+        Func<long>? outboundPumpTotalScheduledProvider,
+        Func<int>? outboundPumpWorkerCountProvider)
+    {
+        if (activeDeadlinesProvider is not null)
+        {
+            _meter.CreateObservableGauge(
+                "gateway.deadline_wheel.active_deadlines",
+                () => activeDeadlinesProvider(),
+                unit: "{deadlines}",
+                description: "全局 DeadlineWheel 当前活跃 deadline 数（认证/空闲/发送超时注册，已注册未触发也未取消）。");
+        }
+
+        if (outboundPumpReadyQueueProvider is not null)
+        {
+            _meter.CreateObservableGauge(
+                "gateway.outbound_pump.ready_queue.depth",
+                () => outboundPumpReadyQueueProvider(),
+                unit: "{sessions}",
+                description: "OnDemandSendPump 模式下 ready queue 中待 pump 的 session 数。PersistentSendLoop 模式下不注册此指标。");
+        }
+
+        if (outboundPumpTotalScheduledProvider is not null)
+        {
+            _meter.CreateObservableGauge(
+                "gateway.outbound_pump.total_scheduled",
+                () => outboundPumpTotalScheduledProvider(),
+                unit: "{schedules}",
+                description: "OnDemandSendPump 模式下累计成功调度的 session 次数（含重新入队的轮转）。用于 A/B 评估唤醒频率。");
+        }
+
+        if (outboundPumpWorkerCountProvider is not null)
+        {
+            _meter.CreateObservableGauge(
+                "gateway.outbound_pump.worker_count",
+                () => outboundPumpWorkerCountProvider(),
+                unit: "{workers}",
+                description: "OnDemandSendPump 模式下共享出站 worker 池大小。");
+        }
+    }
+
     private static string GetFailureKindName(AuthenticationFailureKind kind) =>
         kind switch
         {

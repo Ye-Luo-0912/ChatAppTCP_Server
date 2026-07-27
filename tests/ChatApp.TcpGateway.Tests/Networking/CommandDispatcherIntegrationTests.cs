@@ -1,4 +1,4 @@
-﻿using System.Buffers;
+using System.Buffers;
 using System.Buffers.Binary;
 using System.Net;
 using System.Net.Sockets;
@@ -496,6 +496,12 @@ public sealed class CommandDispatcherIntegrationTests
             TimeSpan ttl,
             CancellationToken cancellationToken) =>
             ValueTask.FromResult(true);
+
+        public ValueTask<string?> GetCurrentSessionIdAsync(
+            long userId,
+            ulong deviceIdHash,
+            CancellationToken cancellationToken) =>
+            ValueTask.FromResult<string?>(null);
     }
 
     private sealed class ReactionCapturingMessageBus : IRealtimeMessageBus

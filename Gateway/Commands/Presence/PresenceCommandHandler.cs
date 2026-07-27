@@ -1,4 +1,4 @@
-﻿using System.Buffers;
+using System.Buffers;
 using ChatApp.Realtime.Abstractions.Routing;
 using ChatApp.Realtime.Integration;
 using ChatApp.Realtime.Integration.Configuration;
@@ -75,7 +75,7 @@ internal sealed class PresenceCommandHandler : ICommandHandler
 
     public ValueTask ExecuteAsync(
         PacketFrame frame,
-        ICommandContext context,
+        CommandContext context,
         CancellationToken cancellationToken) => frame.Command switch
     {
         PacketCommand.PresenceQuery => HandlePresenceQueryAsync(
@@ -192,6 +192,8 @@ internal sealed class PresenceCommandHandler : ICommandHandler
 
         // 分片路由：将被观察用户与本实例的对应关系登记到全局 watcher 目录，
         // 供 Presence 事件发布方定向投递。失败不阻断查询响应。
+        // 新接口通过引用计数维持多会话隔离：同一 watcher 在同一 Gateway 上的多个并发会话
+        // 各自 Register +1、Unregister -1，计数归零时移除条目。
         if (allowedIds.Length > 0)
         {
             try

@@ -8,6 +8,10 @@ namespace ChatApp.TcpGateway.Infrastructure.Routing;
 /// <para>
 /// 存储 userId -> {instanceId -> expiresAtMs}，查询时过滤已过期成员。
 /// </para>
+/// <para>
+/// 新接口语义：查询失败时返回空集合（调用方回退广播）。内存实现永不失败，
+/// 用户离线返回空集合。
+/// </para>
 /// </summary>
 public sealed class InMemoryGatewayDirectory : IGatewayDirectory
 {
@@ -58,8 +62,7 @@ public sealed class InMemoryGatewayDirectory : IGatewayDirectory
         CancellationToken cancellationToken = default)
     {
         var nowMs = _timeProvider.GetUtcNow().ToUnixTimeMilliseconds();
-        var result = GetOnlineGatewaysCore(userId, nowMs);
-        return Task.FromResult<IReadOnlyList<string>>(result);
+        return Task.FromResult(GetOnlineGatewaysCore(userId, nowMs));
     }
 
     public Task<IReadOnlyDictionary<long, IReadOnlyList<string>>> GetOnlineGatewaysManyAsync(
@@ -77,10 +80,10 @@ public sealed class InMemoryGatewayDirectory : IGatewayDirectory
 
     private IReadOnlyList<string> GetOnlineGatewaysCore(long userId, long nowMs)
     {
-        if (!_store.TryGetValue(userId, out var bucket))
+        if (userId <= 0)
             return Array.Empty<string>();
 
-        if (bucket.IsEmpty)
+        if (!_store.TryGetValue(userId, out var bucket) || bucket.IsEmpty)
             return Array.Empty<string>();
 
         // 过滤过期成员。

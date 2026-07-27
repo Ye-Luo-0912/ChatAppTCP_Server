@@ -60,3 +60,23 @@ Do not commit:
 - `scratch/`
 
 Use `scratch/` for temporary scripts (gitignored).
+
+## Linux test environment
+
+长期性能测试（soak / capacity curve）在专用 Linux 机器上执行。
+
+- **SSH**: `ssh chatapp-linux`（已在本机 `~/.ssh/config` 配置别名，密钥认证免密）
+- **IP**: 192.168.5.49（内网）
+- **用户**: yeluo
+- **仓库路径**:
+  - `/home/yeluo/chatapp-perf/ChatAppTCP_Server`（本仓库）
+  - `/home/yeluo/chatapp-perf/ChatApp.RealtimeServices`（同级 RealtimeServices 仓库）
+- **环境**: .NET SDK 11.0 preview + PowerShell 7.4.7 (`/home/yeluo/.local/bin/pwsh`) + Docker 29.6.2
+- **Shell**: 默认 fish，远程脚本须用 `bash -c '...'` 或 `pwsh -c '...'` 执行
+- **注意**: `global.json` 要求 SDK 10.0.301（`allowPrerelease: false`），连接后先确认 10.x SDK 可用；若仅有 11.0 preview 需先安装 10.0.301
+
+执行长时间 soak 测试的标准流程：
+1. SSH 连接后 `cd /home/yeluo/chatapp-perf/ChatAppTCP_Server`
+2. `git pull` 同步最新代码（含 Runtime V2 改动）
+3. `dotnet build ChatApp.TcpGateway.sln -c Release`
+4. 运行 `pwsh tools/ChatApp.Performance.Orchestrator/scripts/Run-Soak.ps1` 并指定 `-OutboundSendMode`（两种模式各跑一次对比）

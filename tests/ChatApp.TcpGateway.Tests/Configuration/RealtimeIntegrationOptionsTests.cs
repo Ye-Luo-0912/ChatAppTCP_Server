@@ -1,3 +1,4 @@
+using ChatApp.Realtime.Abstractions.Routing;
 using ChatApp.Realtime.Integration.Configuration;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Hosting;

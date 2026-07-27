@@ -1,4 +1,4 @@
-﻿using System.Net;
+using System.Net;
 using System.Runtime.CompilerServices;
 using ChatApp.Realtime.Abstractions.Conversations;
 using ChatApp.Realtime.Abstractions.Events;
@@ -106,6 +106,9 @@ public sealed class TcpGatewayServiceCompositionTests
             CancellationToken ct = default) =>
             Task.FromResult<IReadOnlyDictionary<long, bool>>(
                 userIds.ToDictionary(static id => id, static _ => false));
+
+        public Task RunMaintenanceAsync(CancellationToken ct = default) =>
+            Task.CompletedTask;
     }
 
     private sealed class EmptyMessageBus : IRealtimeMessageBus

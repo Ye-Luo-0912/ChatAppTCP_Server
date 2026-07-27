@@ -1,3 +1,5 @@
+using ChatApp.TcpGateway.Core.Protocol;
+
 namespace ChatApp.TcpGateway.Core.Messaging;
 
 /// <summary>
@@ -9,7 +11,10 @@ public sealed class ServerHello
     /// <summary>协商后的协议版本（服务端选择的最大支持版本）。</summary>
     public ushort ProtocolVersion { get; set; } = 1;
 
-    /// <summary>服务端能力位掩码（保留，当前未使用）。</summary>
+    /// <summary>
+    /// 服务端能力位掩码（<see cref="GatewayFeature"/> flags 的 uint 表示）。
+    /// 取客户端声明位与服务端支持位的交集（按位与），即双方共同支持的能力。
+    /// </summary>
     public uint FeatureBits { get; set; }
 
     /// <summary>
@@ -40,8 +45,9 @@ public sealed class ServerHello
     public bool ResumeSupported { get; set; }
 
     /// <summary>
-    /// 协议格式标识。当前固定为 "json"。
-    /// 未来可扩展为 "pb"（Protobuf）等。
+    /// 协议格式标识。当前固定为 <see cref="ProtocolPayloadFormat.Json"/>。
+    /// 未来引入二进制格式时扩展为 <see cref="ProtocolPayloadFormat.Protobuf"/>，
+    /// 客户端根据 <c>ClientHello.featureBits</c> 协商结果选择格式。
     /// </summary>
-    public string PayloadFormat { get; set; } = "json";
+    public string PayloadFormat { get; set; } = ProtocolPayloadFormat.Json;
 }

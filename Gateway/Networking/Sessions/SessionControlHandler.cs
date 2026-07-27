@@ -1,4 +1,4 @@
-﻿using System.Buffers;
+using System.Buffers;
 using System.Net.Sockets;
 using ChatApp.Realtime.Abstractions.Events;
 using ChatApp.Realtime.Integration;
@@ -235,13 +235,26 @@ internal sealed class SessionControlHandler
             return;
         }
 
-        // 协议版本协商：客户端版本须 <= 服务端当前版本。
+        // 协议版本协商：客户端版本须在 [MinProtocolVersion, CurrentProtocolVersion] 区间内。
+        // 高于 CurrentProtocolVersion：服务端不支持，致命错误。
+        // 低于 MinProtocolVersion：客户端过旧，需升级，致命错误。
         if (hello.ProtocolVersion > PacketProtocol.CurrentProtocolVersion)
         {
             SendProtocolError(
                 session,
                 ProtocolErrorCode.UnsupportedVersion,
                 $"unsupported protocol version {hello.ProtocolVersion}",
+                fatal: true);
+            session.Close(SessionCloseReason.ProtocolViolation);
+            return;
+        }
+
+        if (hello.ProtocolVersion < PacketProtocol.MinProtocolVersion)
+        {
+            SendProtocolError(
+                session,
+                ProtocolErrorCode.UnsupportedVersion,
+                $"protocol version {hello.ProtocolVersion} below minimum supported {PacketProtocol.MinProtocolVersion}",
                 fatal: true);
             session.Close(SessionCloseReason.ProtocolViolation);
             return;
@@ -272,7 +285,9 @@ internal sealed class SessionControlHandler
                     UserId = resumeResult.UserId,
                     SessionId = resumeResult.SessionId,
                     DeviceId = resumeResult.DeviceId,
-                    LastConversationSequence = null // 后续可从同步服务查询
+                    // 来自 SyncBootstrap 查询的 ServerTimeMs；查询失败或超时为 null，
+                    // 客户端应回退到“始终 SyncBootstrap”策略。
+                    LastConversationSequence = resumeResult.LastConversationSequence
                 };
                 using var resumeFrame = OutboundFrameFactory.Create(
                     PacketCommand.ResumeResponse,
@@ -292,16 +307,20 @@ internal sealed class SessionControlHandler
         }
 
         // 发送 ServerHello 握手响应。
+        // FeatureBits 协商：取客户端声明位与服务端支持位的交集（按位与）。
+        // 当前服务端无强制能力位，协商结果 = 客户端声明位 ∩ 服务端支持位；
+        // 未来引入命令级能力协商时，解析器将根据协商结果决定是否接受特定命令。
+        var negotiatedFeatureBits = hello.FeatureBits & _serverIdentity.FeatureBits;
         var serverHello = new ServerHello
         {
             ProtocolVersion = PacketProtocol.CurrentProtocolVersion,
-            FeatureBits = _serverIdentity.FeatureBits,
+            FeatureBits = negotiatedFeatureBits,
             ServerDeviceId = _serverIdentity.ServerDeviceId,
             ServerTimeMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
             HeartbeatIntervalMs = (int)_options.IdleTimeout.TotalMilliseconds / 2,
             MaxPayloadBytes = _options.MaxInboundPayloadBytes,
             ResumeSupported = _options.EnableResume,
-            PayloadFormat = "json"
+            PayloadFormat = ProtocolPayloadFormat.Json
         };
 
         using var helloFrame = OutboundFrameFactory.Create(

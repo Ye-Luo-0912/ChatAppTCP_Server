@@ -11,7 +11,7 @@ namespace ChatApp.TcpGateway.Infrastructure.Routing;
 /// （<c>presence:{userId}:instances</c>，member = GatewayInstanceId，score = ExpiresAtUnixMs），
 /// 过滤过期成员后返回有效的 Gateway 实例 ID 集合。
 /// <para>
-/// 查询失败时返回空集合（不抛异常），调用方据此回退到广播模式。
+/// 新接口语义：查询失败时返回空集合，调用方据此回退到 fallback broadcast subject；不抛异常。
 /// 不执行清理操作（ZREMRANGEBYSCORE），清理由 PresenceStore 的写路径负责。
 /// </para>
 /// </summary>
@@ -55,7 +55,7 @@ internal sealed class RedisGatewayDirectory(
         }
         catch (Exception ex)
         {
-            // 路由目录查询失败时返回空集合，调用方回退到广播模式。
+            // 路由目录查询失败时返回空集合，调用方回退到 fallback broadcast subject。
             logger.DependencyOperationFailed(
                 GatewayDependency.Redis,
                 GatewayDependencyOperation.GatewayDirectoryQuery,
@@ -72,6 +72,10 @@ internal sealed class RedisGatewayDirectory(
         if (userIds.Count == 0)
             return result;
 
+        // 默认填充空集合（用户离线），仅当批量查询抛异常时整体保持空集合（回退广播）。
+        foreach (var userId in userIds)
+            result[userId] = Array.Empty<string>();
+
         try
         {
             var nowMs = timeProvider.GetUtcNow().ToUnixTimeMilliseconds();
@@ -84,7 +88,6 @@ internal sealed class RedisGatewayDirectory(
                 var userId = userIds[i];
                 if (userId <= 0)
                 {
-                    result[userId] = Array.Empty<string>();
                     tasks[i] = Task.FromResult(Array.Empty<RedisValue>());
                     continue;
                 }
@@ -107,10 +110,7 @@ internal sealed class RedisGatewayDirectory(
 
                 var members = results[i];
                 if (members.Length == 0)
-                {
-                    result[userId] = Array.Empty<string>();
                     continue;
-                }
 
                 var gateways = new string[members.Length];
                 for (var j = 0; j < members.Length; j++)
@@ -121,14 +121,11 @@ internal sealed class RedisGatewayDirectory(
         }
         catch (Exception ex)
         {
-            // 批量查询失败：所有用户回退到空集合（广播模式）。
+            // 批量查询失败：所有用户保持空集合（回退广播）。
             logger.DependencyOperationFailed(
                 GatewayDependency.Redis,
                 GatewayDependencyOperation.GatewayDirectoryQuery,
                 ex);
-
-            foreach (var userId in userIds)
-                result.TryAdd(userId, Array.Empty<string>());
         }
 
         return result;

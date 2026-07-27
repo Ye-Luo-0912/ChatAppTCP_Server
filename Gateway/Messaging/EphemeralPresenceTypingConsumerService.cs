@@ -153,8 +153,13 @@ internal sealed class EphemeralPresenceTypingConsumerService : BackgroundService
             PacketCommand.TypingUpdate,
             _typingUpdateCodec,
             update);
+        // Key = (SenderUserId, ConversationIdHash)：同一发送者在同一会话的 typing 状态可覆盖，
+        // 不同发送者互不覆盖。
+        var key = EphemeralKey.Typing(
+            evt.SenderUserId,
+            EphemeralKey.HashConversationId(evt.ConversationId));
         foreach (var target in targets)
-            target.TryQueueEphemeral(frame);
+            target.TryQueueEphemeral(frame, key);
     }
 
     private void FanoutPresence(EphemeralPresenceEvent evt)
@@ -176,12 +181,14 @@ internal sealed class EphemeralPresenceTypingConsumerService : BackgroundService
             PacketCommand.PresenceChanged,
             _presenceChangedCodec,
             update);
+        // Key = UserId：同一用户的在线状态可覆盖。
+        var key = EphemeralKey.Presence(evt.UserId);
         var recipientCount = 0;
         foreach (var watcherId in watchers)
         {
             foreach (var session in _userSessions.GetSnapshot(watcherId))
             {
-                session.TryQueueEphemeral(frame);
+                session.TryQueueEphemeral(frame, key);
                 recipientCount++;
             }
         }

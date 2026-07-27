@@ -635,6 +635,12 @@ public sealed class TcpGatewayAttachmentValidationTests
             TimeSpan ttl,
             CancellationToken cancellationToken) =>
             ValueTask.FromResult(true);
+
+        public ValueTask<string?> GetCurrentSessionIdAsync(
+            long userId,
+            ulong deviceIdHash,
+            CancellationToken cancellationToken) =>
+            ValueTask.FromResult<string?>(null);
     }
 
     private sealed class CapturingRealtimeMessageBus : IRealtimeMessageBus

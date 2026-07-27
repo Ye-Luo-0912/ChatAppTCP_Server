@@ -1,11 +1,11 @@
-﻿using System.Buffers;
+using System.Buffers;
 using System.IO.Pipelines;
 using System.Net.Sockets;
 using System.Text.Json;
-using System.Threading.Channels;
 using ChatApp.TcpGateway.Core.Protocol;
 using ChatApp.TcpGateway.Gateway.Configuration;
 using ChatApp.TcpGateway.Gateway.Networking.Buffers;
+using ChatApp.TcpGateway.Gateway.Networking.Executor;
 using ChatApp.TcpGateway.Observability.Logging;
 using ChatApp.TcpGateway.Observability.Metrics;
 using Microsoft.Extensions.Logging;
@@ -14,16 +14,17 @@ namespace ChatApp.TcpGateway.Gateway.Networking.Sessions;
 
 /// <summary>
 /// 每连接数据面运行时：封装 session 生命周期内 Pipe reader/writer +
-/// <see cref="SessionCommandScheduler"/> 三件套（fill、read、scheduled-callback），
+/// 全局 <see cref="SessionCommandExecutor"/>（OrderedWrite/Query）调度，
 /// 从 <see cref="Networking.TcpGatewayService"/> 抽取以消除 God Service 中散落的 per-connection 数据路径。
 /// <para>
 /// 职责边界：
 /// <list type="bullet">
 /// <item>构造每会话 CTS（链接 session lifetime + host stopping）；</item>
-/// <item>构造 <see cref="SessionCommandScheduler"/>（OrderedWrite/Query/Ephemeral 三 lane）；</item>
+/// <item>注册连接到全局 <see cref="SessionCommandExecutor"/>（OrderedWrite/Query 各一份）；</item>
 /// <item>构造 Pipe + <see cref="SessionInboundPipeLease"/>；</item>
 /// <item>驱动 FillPipeAsync + ReadPipeAsync 并等待双方退出；</item>
-/// <item>数据面清理：pipeLease 归还、session.Close、scheduler.DisposeAsync、session.DisposeAsync。</item>
+/// <item>Inline 与 Ephemeral 命令在读循环内同步处理（不创建每连接 Consumer Task）；</item>
+/// <item>数据面清理：pipeLease 归还、session.Close、executor 注销、session.DisposeAsync。</item>
 /// </list>
 /// 协议级内联命令处理与早投拒绝（SendProtocolError / RejectOversizedPayload / ProcessPacketAsync）
 /// 通过构造函数注入的委托回调到 <see cref="Networking.TcpGatewayService"/>，
@@ -33,12 +34,20 @@ namespace ChatApp.TcpGateway.Gateway.Networking.Sessions;
 /// <para>
 /// 单例注册：所有连接共享同一实例，通过 <see cref="RunAsync"/> 的 session 参数区分连接。
 /// </para>
+/// <para>
+/// V2 重构：消除每连接 OrderedWrite/Query/Ephemeral 三个 Channel + 三个 Consumer Task。
+/// OrderedWrite/Query 转发到全局 <see cref="SessionCommandExecutor"/>（共享 worker 池）。
+/// Ephemeral 命令（TypingNotify）在读循环内同步处理，直接走 ProcessPacketAsync →
+/// CommandDispatcher → TypingCommandHandler → TypingFanoutCoordinator.TryAccept（非阻塞）。
+/// </para>
 /// </summary>
 internal sealed class SessionRuntime
 {
     private readonly TcpGatewayOptions _options;
     private readonly PipeOptions _pipeOptions;
     private readonly GlobalInboundBudget _globalInboundBudget;
+    private readonly SessionCommandExecutor _orderedWriteExecutor;
+    private readonly SessionCommandExecutor _queryExecutor;
     private readonly GatewayMetrics _metrics;
     private readonly ILogger _logger;
 
@@ -50,6 +59,8 @@ internal sealed class SessionRuntime
         TcpGatewayOptions options,
         PipeOptions pipeOptions,
         GlobalInboundBudget globalInboundBudget,
+        SessionCommandExecutor orderedWriteExecutor,
+        SessionCommandExecutor queryExecutor,
         GatewayMetrics metrics,
         ILogger logger,
         Func<PacketFrame, TcpClientSession, string, CancellationToken, ValueTask> processPacketAsync,
@@ -59,6 +70,8 @@ internal sealed class SessionRuntime
         _options = options;
         _pipeOptions = pipeOptions;
         _globalInboundBudget = globalInboundBudget;
+        _orderedWriteExecutor = orderedWriteExecutor;
+        _queryExecutor = queryExecutor;
         _metrics = metrics;
         _logger = logger;
         _processPacketAsync = processPacketAsync;
@@ -67,8 +80,8 @@ internal sealed class SessionRuntime
     }
 
     /// <summary>
-    /// 驱动单连接数据面：构建 scheduler + Pipe，启动 fill/read 双任务并等待退出。
-    /// 返回时已完成数据面清理（pipeLease/scheduler/session）；服务级清理（Presence/admission/registry）由调用方处理。
+    /// 驱动单连接数据面：注册到全局 executor + 构建 Pipe，启动 fill/read 双任务并等待退出。
+    /// 返回时已完成数据面清理（pipeLease/executor 注销/session）；服务级清理由调用方处理。
     /// </summary>
     public async Task RunAsync(
         TcpClientSession session,
@@ -81,17 +94,9 @@ internal sealed class SessionRuntime
             session.LifetimeToken, cancellationToken);
         var sessionToken = sessionCts.Token;
 
-        // 每会话命令调度器。将命令分发到 OrderedWrite/Query/Ephemeral 三条 lane，
-        // 避免慢请求阻塞同连接的其他命令（队头阻塞）。
-        // Control 命令（Auth/Heartbeat/PresenceUnwatch）由读循环内联处理。
-        var scheduler = new SessionCommandScheduler(
-            (command, token) => ProcessScheduledCommandAsync(
-                command, session, remoteIp, token),
-            _options.CommandSchedulerOrderedWriteCapacity,
-            _options.CommandSchedulerQueryCapacity,
-            _options.CommandSchedulerEphemeralCapacity,
-            sessionToken,
-            ex => _logger.TransportFailed(GatewayTransportOperation.ClientProcessing, session.ConnectionId, ex));
+        // 连接注册到全局执行器由 TcpGatewayService.OnConnectionAccepted 完成
+        // （在 session 暴露到 _sessions 字典前注册，避免命令到达时未注册）。
+        // 注销由 HandleClientAsync finally 块在 SessionRuntime 返回后统一处理。
 
         var pipe = new Pipe(_pipeOptions);
         var pipeLease = new SessionInboundPipeLease(_globalInboundBudget);
@@ -104,7 +109,6 @@ internal sealed class SessionRuntime
             pipe.Reader,
             session,
             remoteIp,
-            scheduler,
             pipeLease,
             sessionToken);
 
@@ -142,9 +146,8 @@ internal sealed class SessionRuntime
                     ? SessionCloseReason.ApplicationStopping
                     : SessionCloseReason.RemoteClosed);
 
-            // 先停止命令调度器（等待 lane 消费者退出并归还租用缓冲区），
-            // 再释放 Session。避免 Session 释放后调度器仍访问其字段。
-            await scheduler.DisposeAsync().ConfigureAwait(false);
+            // 执行器注销由 TcpGatewayService.HandleClientAsync finally 统一处理，
+            // 避免此处与 service 级清理的顺序耦合。
 
             await session.DisposeAsync().ConfigureAwait(false);
         }
@@ -207,7 +210,6 @@ internal sealed class SessionRuntime
         PipeReader reader,
         TcpClientSession session,
         string remoteIp,
-        SessionCommandScheduler scheduler,
         SessionInboundPipeLease pipeLease,
         CancellationToken cancellationToken)
     {
@@ -328,13 +330,32 @@ internal sealed class SessionRuntime
 
                     _metrics.PacketReceived();
 
+                    // 弃用命令检查：标记为 Deprecated 的命令仍登记在 catalog 中以保持向后兼容，
+                    // 但服务端不执行任何业务逻辑，直接返回 UnsupportedCommand 错误帧引导客户端迁移。
+                    // 非致命：连接保持，客户端可继续发送其他命令。
+                    if (PacketProtocol.IsDeprecated(frame.Command))
+                    {
+                        _metrics.ProtocolError();
+                        _sendProtocolError(
+                            session,
+                            ProtocolErrorCode.UnsupportedCommand,
+                            $"command {frame.Command} is deprecated",
+                            false,
+                            null,
+                            (ushort)frame.Command);
+                        consumed = buffer.Start;
+                        continue;
+                    }
+
                     // 按 lane 分类调度。委托 CommandCatalog（单一事实源）。
                     var lane = CommandCatalog.GetLane(frame.Command);
 
-                    if (lane == CommandLane.Inline)
+                    if (lane == CommandLane.Inline || lane == CommandLane.Ephemeral)
                     {
-                        // Control 命令内联处理：ClientHello/Auth/Heartbeat/PresenceUnwatch。
-                        // 握手、认证、恢复必须在同一读循环内严格串行，禁止入 OrderedWrite。
+                        // Control 命令（ClientHello/Auth/Heartbeat/PresenceUnwatch）内联处理。
+                        // Ephemeral 命令（TypingNotify）也内联处理：走 ProcessPacketAsync →
+                        // CommandDispatcher → TypingCommandHandler → TypingFanoutCoordinator.TryAccept（非阻塞）。
+                        // V2：消除每连接 Ephemeral Channel + Consumer Task。
                         try
                         {
                             await _processPacketAsync(
@@ -349,40 +370,6 @@ internal sealed class SessionRuntime
                             _metrics.ProtocolError();
                             session.Close(
                                 SessionCloseReason.ProtocolViolation);
-                            return;
-                        }
-                    }
-                    else if (lane == CommandLane.Ephemeral)
-                    {
-                        // 复制出 Pipe 前预留全局入站预算（所有权从 Pipe 转到 lane 缓冲）。
-                        if (!_globalInboundBudget.TryReserve(payloadLength))
-                        {
-                            session.Close(SessionCloseReason.InboundBudgetExceeded);
-                            return;
-                        }
-
-                        // Ephemeral 命令（Typing）使用普通分配 + DropOldest。
-                        var buffer2 = payloadLength > 0
-                            ? new byte[payloadLength]
-                            : Array.Empty<byte>();
-
-                        if (payloadLength > 0)
-                            frame.Payload.CopyTo(buffer2);
-
-                        var command = new SessionCommand
-                        {
-                            Command = frame.Command,
-                            RentedBuffer = buffer2,
-                            PayloadLength = payloadLength,
-                            IsPooled = false,
-                            ReservedInboundBytes = payloadLength,
-                            InboundBudget = _globalInboundBudget
-                        };
-
-                        // TryEnqueueEphemeral 非阻塞：返回 false 仅在调度器已关闭时。
-                        if (!scheduler.TryEnqueueEphemeral(command))
-                        {
-                            _globalInboundBudget.Release(payloadLength);
                             return;
                         }
                     }
@@ -409,38 +396,25 @@ internal sealed class SessionRuntime
                             PayloadLength = payloadLength,
                             IsPooled = true,
                             ReservedInboundBytes = payloadLength,
-                            InboundBudget = _globalInboundBudget
+                            InboundBudget = _globalInboundBudget,
+                            // V2：全局执行器回调通过 Session/RemoteIp 恢复 per-connection 上下文。
+                            Session = session,
+                            RemoteIp = remoteIp
                         };
 
-                        try
+                        var executor = lane == CommandLane.Query
+                            ? _queryExecutor
+                            : _orderedWriteExecutor;
+
+                        if (!executor.TryEnqueue(session.ConnectionId, command))
                         {
-                            if (lane == CommandLane.Query)
-                            {
-                                await scheduler.EnqueueQueryAsync(
-                                        command, cancellationToken)
-                                    .ConfigureAwait(false);
-                            }
-                            else
-                            {
-                                await scheduler.EnqueueOrderedAsync(
-                                        command, cancellationToken)
-                                    .ConfigureAwait(false);
-                            }
-                        }
-                        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-                        {
-                            // 会话关闭中，归还缓冲区与入站预算并退出。
+                            // 执行器未注册连接或队列满：归还缓冲区与入站预算。
                             if (rented.Length > 0)
                                 ArrayPool<byte>.Shared.Return(rented);
                             _globalInboundBudget.Release(payloadLength);
-                            throw;
-                        }
-                        catch (ChannelClosedException)
-                        {
-                            // 调度器已关闭，归还缓冲区与入站预算并退出。
-                            if (rented.Length > 0)
-                                ArrayPool<byte>.Shared.Return(rented);
-                            _globalInboundBudget.Release(payloadLength);
+                            // 队列满视为背压：关闭连接（与旧 Channel FullMode=Wait 行为不同，
+                            // 但旧行为的 Wait 也会因 lifetime 取消最终抛出 ChannelClosedException）。
+                            session.Close(SessionCloseReason.OutboundQueueFull);
                             return;
                         }
                     }
@@ -480,51 +454,6 @@ internal sealed class SessionRuntime
         {
             await reader.CompleteAsync(completionError)
                 .ConfigureAwait(false);
-        }
-    }
-
-    /// <summary>
-    /// 调度器消费者回调。从租用缓冲区构造 PacketFrame，
-    /// 调用 <see cref="_processPacketAsync"/> 回调，并捕获异常关闭会话。
-    /// </summary>
-    private async ValueTask ProcessScheduledCommandAsync(
-        SessionCommand command,
-        TcpClientSession session,
-        string remoteIp,
-        CancellationToken cancellationToken)
-    {
-        try
-        {
-            var frame = new PacketFrame(
-                command.Command,
-                command.AsPayloadSequence());
-            await _processPacketAsync(
-                    frame,
-                    session,
-                    remoteIp,
-                    cancellationToken)
-                .ConfigureAwait(false);
-        }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch (JsonException)
-        {
-            _metrics.ProtocolError();
-            session.Close(SessionCloseReason.ProtocolViolation);
-        }
-        catch (SocketException)
-        {
-            session.Close(SessionCloseReason.TransportError);
-        }
-        catch (Exception ex)
-        {
-            _logger.TransportFailed(
-                GatewayTransportOperation.ClientProcessing,
-                session.ConnectionId,
-                ex);
-            session.Close(SessionCloseReason.TransportError);
         }
     }
 }

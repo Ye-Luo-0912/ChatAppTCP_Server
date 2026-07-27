@@ -1,4 +1,4 @@
-﻿using ChatApp.TcpGateway.Gateway.Networking.Sessions;
+using ChatApp.TcpGateway.Gateway.Networking.Sessions;
 using System.Buffers;
 using ChatApp.TcpGateway.Core.Messaging.Push;
 using ChatApp.TcpGateway.Core.Protocol;
@@ -53,7 +53,7 @@ internal sealed class PushTokenCommandHandler : ICommandHandler
 
     public ValueTask ExecuteAsync(
         PacketFrame frame,
-        ICommandContext context,
+        CommandContext context,
         CancellationToken cancellationToken) => frame.Command switch
     {
         PacketCommand.RegisterPushTokenRequest => HandleRegisterAsync(

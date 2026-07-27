@@ -1,4 +1,4 @@
-﻿using System.Buffers;
+using System.Buffers;
 using System.Buffers.Binary;
 using System.Net;
 using System.Net.Sockets;
@@ -42,8 +42,11 @@ namespace ChatApp.TcpGateway.Tests.Networking;
 
 public sealed class TcpGatewayServiceTests
 {
-    [Fact(Timeout = 10_000)]
-    public async Task PublishesIncomingMessageAndDispatchesPersistedEventOverTcp()
+    [Theory(Timeout = 10_000)]
+    [InlineData(OutboundSendMode.PersistentSendLoop)]
+    [InlineData(OutboundSendMode.OnDemandSendPump)]
+    public async Task PublishesIncomingMessageAndDispatchesPersistedEventOverTcp(
+        OutboundSendMode outboundSendMode)
     {
         var port = ReserveLoopbackPort();
         var options = new TcpGatewayOptions
@@ -65,7 +68,10 @@ public sealed class TcpGatewayServiceTests
             MaxInboundBytesPerSecond = 256 * 1024,
             MaxInboundPayloadBytes = PacketProtocol.MaxPayloadSize,
             MaxChatAttachments = 32,
-            RequireClientHello = false
+            RequireClientHello = false,
+            // A/B：同一场景同时验证 PersistentSendLoop（永久 SendLoop Task）
+            // 与 OnDemandSendPump（共享 worker 池按需 pump）两条出站路径。
+            OutboundSendMode = outboundSendMode
         };
 
         using var metrics = new GatewayMetrics();
