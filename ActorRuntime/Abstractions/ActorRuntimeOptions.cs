@@ -69,8 +69,22 @@ public sealed class ActorRuntimeOptions
     /// <summary>
     /// Actor 空闲回收阈值：自 LastActiveTimestamp 起经过此时间未收到消息则 Deactivate。
     /// 默认 5 分钟。设为 <see cref="TimeSpan.Zero"/> 禁用空闲回收。
+    /// <para>持有未触发 Deadline 或 Outstanding Operation 的 Actor 不会被空闲回收。</para>
     /// </summary>
     public TimeSpan ActorIdleTimeout { get; set; } = TimeSpan.FromMinutes(5);
+
+    /// <summary>
+    /// 全局活跃 Actor 数上限。达到上限后新 Key 的消息在 Shard 消费侧被丢弃
+    /// （计入 <see cref="ActorRuntimeSnapshot.TotalActiveActorAdmissionRejected"/>）。
+    /// 防止连接风暴中累计创建的 Actor 数远超并发连接数。默认 100,000。
+    /// </summary>
+    public int MaxActiveActors { get; set; } = 100_000;
+
+    /// <summary>
+    /// 每 Shard 活跃 Actor 数上限。0（默认）表示按
+    /// <c>ceil(MaxActiveActors / ShardCount)</c> 派生。
+    /// </summary>
+    public int MaxActiveActorsPerShard { get; set; }
 
     private static int NextPow2(int v)
     {
@@ -113,5 +127,7 @@ internal static class ActorRuntimeOptionsValidation
                 message: $"options.{nameof(options.ShardTickInterval)} must be positive");
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(options.AsyncOperationConcurrency, 0);
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(options.AsyncOperationQueueCapacity, 0);
+        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(options.MaxActiveActors, 0);
+        ArgumentOutOfRangeException.ThrowIfNegative(options.MaxActiveActorsPerShard);
     }
 }

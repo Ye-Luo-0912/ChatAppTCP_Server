@@ -257,9 +257,10 @@ public sealed class ActorRuntimeTests
     {
         var ct = TestContext.Current.CancellationToken;
         var observed = new System.Collections.Concurrent.ConcurrentQueue<int>();
+        var activationHolder = new ActivationHolder();
         await using var runtime =
             new ActorRuntime<int, SuspendState, SuspendMessage>(
-                new SuspendBehavior(observed),
+                new SuspendBehavior(observed, activationHolder),
                 ActorMailboxMode.Fifo,
                 new ActorRuntimeOptions
                 {
@@ -284,10 +285,14 @@ public sealed class ActorRuntimeTests
             TimeSpan.FromSeconds(2),
             ct);
 
+        // P0-1：Completion 必须携带提交 Operation 时捕获的激活纪元。
+        var activation = activationHolder.Activation;
+        Assert.True(activation.IsValid);
+
         var completion = new SuspendMessage(-1, true);
         Assert.Equal(
             ActorPostStatus.Accepted,
-            runtime.TryTellCompletion(7, 1, in completion));
+            runtime.TryTellCompletion(7, activation, in completion));
 
         await WaitUntilAsync(
             () => observed.Count == 3,
@@ -295,6 +300,62 @@ public sealed class ActorRuntimeTests
             ct);
         Assert.Equal(new[] { 1, -1, 2 }, observed.ToArray());
         Assert.Equal(0, runtime.GetSnapshot().BusyActors);
+    }
+
+    [Fact]
+    public async Task CompletionWithStaleActivationIsDropped()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var observed = new System.Collections.Concurrent.ConcurrentQueue<int>();
+        var activationHolder = new ActivationHolder();
+        var staleDrops = 0;
+        var handler = new CountingSuspendDropHandler(reason =>
+        {
+            if (reason == ActorMessageDropReason.StaleGeneration)
+                Interlocked.Increment(ref staleDrops);
+        });
+        await using var runtime =
+            new ActorRuntime<int, SuspendState, SuspendMessage>(
+                new SuspendBehavior(observed, activationHolder),
+                ActorMailboxMode.Fifo,
+                new ActorRuntimeOptions
+                {
+                    ShardCount = 1,
+                    DefaultMailboxCapacity = 8,
+                    ShardIngressCapacity = 32,
+                    ShardBurstLimit = 8,
+                    MaxMessagesPerActorTurn = 8,
+                    ActorIdleTimeout = TimeSpan.FromMinutes(1)
+                },
+                dropHandler: handler);
+
+        await runtime.StartAsync(ct);
+        Assert.Equal(
+            ActorPostStatus.Accepted,
+            runtime.TryTell(7, new SuspendMessage(1, false)));
+
+        await WaitUntilAsync(
+            () => runtime.GetSnapshot().BusyActors == 1,
+            TimeSpan.FromSeconds(2),
+            ct);
+        var activation = activationHolder.Activation;
+        Assert.True(activation.IsValid);
+
+        // 错误激活纪元（P0-1 ABA 防护）：回投被识别为过期并丢弃。
+        var stale = new SuspendMessage(-1, true);
+        Assert.Equal(
+            ActorPostStatus.Accepted,
+            runtime.TryTellCompletion(
+                7,
+                new ActivationId(activation.Value + 100),
+                in stale));
+
+        await WaitUntilAsync(
+            () => Volatile.Read(ref staleDrops) == 1,
+            TimeSpan.FromSeconds(2),
+            ct);
+        Assert.Equal(1, Volatile.Read(ref staleDrops));
+        Assert.Equal(1, runtime.GetSnapshot().BusyActors);
     }
 
     [Fact]
@@ -398,7 +459,7 @@ public sealed class ActorRuntimeTests
     }
 
     [Fact]
-    public async Task CompletionOverflowFallbackDoesNotLoseMessagesOnStop()
+    public async Task CompletionsInRingAreDroppedWithRuntimeStoppingOnStop()
     {
         var stopped = 0;
         var handler = new CountingDropHandler(reason =>
@@ -418,13 +479,17 @@ public sealed class ActorRuntimeTests
                 },
                 dropHandler: handler);
 
-        // Completion Ring 容量为 64；其余消息必须进入惰性 overflow fallback。
+        // Completion Ring 容量派生自 MaxActiveActorsPerShard（≥100 槽）；
+        // 停止前未消费的 Completion 必须在 StopAsync 中以 RuntimeStopping 释放。
         for (var i = 0; i < 100; i++)
         {
             var message = new AtomicCountMessage();
             Assert.Equal(
                 ActorPostStatus.Accepted,
-                runtime.TryTellCompletion(i, 1, in message));
+                runtime.TryTellCompletion(
+                    i,
+                    new ActivationId((ulong)i + 1),
+                    in message));
         }
 
         Assert.Equal(100, runtime.GetSnapshot().PendingIngress);
@@ -518,15 +583,48 @@ public sealed class ActorRuntimeTests
 
     private readonly record struct SuspendMessage(int Value, bool IsCompletion);
 
+    /// <summary>
+    /// 跨线程传递捕获的 ActivationId（Shard Consumer 写、测试线程读）。
+    /// </summary>
+    private sealed class ActivationHolder
+    {
+        private long _value;
+
+        public ActivationId Activation =>
+            new((ulong)Interlocked.Read(ref _value));
+
+        public void Set(ActivationId activation) =>
+            Interlocked.Exchange(ref _value, (long)activation.Value);
+    }
+
+    /// <summary>
+    /// 无操作异步操作：仅用于让 TrySubmitOperation 成功（占位 Outstanding Operation），
+    /// Completion 由测试手动回投。
+    /// </summary>
+    private readonly struct NoopAsyncOperation : IAsyncOperation
+    {
+        public ValueTask ExecuteAsync(CancellationToken cancellationToken)
+            => ValueTask.CompletedTask;
+
+        public void OnFailure(
+            Exception? exception,
+            AsyncOperationFailureKind kind)
+        {
+        }
+    }
+
     private sealed class SuspendBehavior :
         IActorBehavior<int, SuspendState, SuspendMessage>
     {
         private readonly System.Collections.Concurrent.ConcurrentQueue<int> _observed;
+        private readonly ActivationHolder _activationHolder;
 
         public SuspendBehavior(
-            System.Collections.Concurrent.ConcurrentQueue<int> observed)
+            System.Collections.Concurrent.ConcurrentQueue<int> observed,
+            ActivationHolder activationHolder)
         {
             _observed = observed;
+            _activationHolder = activationHolder;
         }
 
         public void Activate(
@@ -545,9 +643,17 @@ public sealed class ActorRuntimeTests
             _observed.Enqueue(message.Value);
             if (message.IsCompletion)
                 return ActorTurnResult.ResumeMailbox;
-            return message.Value == 1
-                ? ActorTurnResult.Suspend
-                : ActorTurnResult.Continue;
+
+            if (message.Value == 1)
+            {
+                // P0-4 契约：Suspend 前必须成功提交 Operation（或持有未触发 Deadline）。
+                _activationHolder.Set(context.Activation);
+                Assert.True(
+                    context.TrySubmitOperation(new NoopAsyncOperation()));
+                return ActorTurnResult.Suspend;
+            }
+
+            return ActorTurnResult.Continue;
         }
 
         public void Deactivate(
@@ -556,6 +662,25 @@ public sealed class ActorRuntimeTests
             ActorDeactivateReason reason,
             ref ActorContext<int, SuspendState, SuspendMessage> context)
         {
+        }
+    }
+
+    private sealed class CountingSuspendDropHandler :
+        IActorMessageDropHandler<SuspendMessage>
+    {
+        private readonly Action<ActorMessageDropReason> _onDrop;
+
+        public CountingSuspendDropHandler(
+            Action<ActorMessageDropReason> onDrop)
+        {
+            _onDrop = onDrop;
+        }
+
+        public void OnDropped(
+            in SuspendMessage message,
+            ActorMessageDropReason reason)
+        {
+            _onDrop(reason);
         }
     }
 
@@ -597,7 +722,6 @@ public sealed class ActorRuntimeTests
                 var deadline = new DeadlineMessage(true);
                 Assert.True(context.TrySchedule(
                     TimeSpan.FromMilliseconds(40),
-                    context.Generation,
                     in deadline));
             }
 

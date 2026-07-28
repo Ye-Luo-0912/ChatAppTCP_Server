@@ -30,6 +30,12 @@ public readonly struct ActorRuntimeSnapshot
     /// <summary>累计 Actor Deactivate 总数（按 reason 分类聚合）。</summary>
     public long TotalDeactivations { get; init; }
 
+    /// <summary>累计 Actor Activate 总数。与 <see cref="TotalDeactivations"/> 共同反映 Actor Churn。</summary>
+    public long TotalActivations { get; init; }
+
+    /// <summary>累计因 MaxActiveActors / MaxActiveActorsPerShard 上限被拒绝的激活总数。</summary>
+    public long TotalActiveActorAdmissionRejected { get; init; }
+
     /// <summary>当前已注册但尚未触发的 deadline 数。</summary>
     public long PendingDeadlines { get; init; }
 

@@ -21,17 +21,47 @@ public interface IActorRuntime<TKey, TState, TMessage> : IAsyncDisposable
     /// <item><see cref="ActorPostStatus.RuntimeStopping"/>：Runtime 已停止。</item>
     /// </list>
     /// </para>
+    /// <para>
+    /// 注意：Accepted 仅表示通过生产侧准入；若 Shard 消费时 Actor 数已达上限
+    /// （MaxActiveActors / MaxActiveActorsPerShard），消息仍会被丢弃并计入
+    /// <see cref="ActorRuntimeSnapshot.TotalActiveActorAdmissionRejected"/>。
+    /// </para>
     /// </summary>
     ActorPostStatus TryTell(in TKey key, in TMessage message);
 
     /// <summary>
-    /// 投递异步操作完成消息。Completion 使用独立高优先级槽，即使 Actor 处于
-    /// Suspend 且普通 Mailbox 非空也会被优先调度。
+    /// 投递异步操作完成消息。Completion 走控制通道（独立于普通 Mailbox 的高优先级槽），
+    /// 即使 Actor 处于 Suspend 且普通 Mailbox 非空也会被优先调度。
+    /// <para>
+    /// 仅允许由经 <see cref="ActorContext{TKey,TState,TMessage}.TrySubmitOperation{TWork}"/>
+    /// 提交的操作回投：<paramref name="activation"/> 必须是提交时 Actor 的
+    /// <see cref="ActorContext{TKey,TState,TMessage}.Activation"/>。
+    /// 提交成功时已预留 Completion 槽位（Credit），回投不会失败于容量。
+    /// </para>
     /// </summary>
     ActorPostStatus TryTellCompletion(
         in TKey key,
-        uint generation,
+        ActivationId activation,
         in TMessage message);
+
+    /// <summary>
+    /// 请求显式 Deactivate 指定 Actor（如连接断开时立即回收对应 Ephemeral Actor，
+    /// 不等待 Idle Sweep）。按 Key 当前任意激活匹配；Key 会被复用的场景应使用
+    /// <see cref="TryDeactivate(in TKey, ActivationId, ActorDeactivateReason)"/> 精确指定。
+    /// </summary>
+    /// <returns>false 表示 Runtime 正在停止或 Shard Ingress 已满（调用方可稍后重试）。</returns>
+    bool TryDeactivate(in TKey key, ActorDeactivateReason reason)
+        => TryDeactivate(in key, ActivationId.None, reason);
+
+    /// <summary>
+    /// 请求显式 Deactivate 指定 Actor，仅当当前激活纪元等于 <paramref name="activation"/> 时生效；
+    /// 否则视为过期请求直接忽略（防 ABA）。
+    /// </summary>
+    /// <returns>false 表示 Runtime 正在停止或 Shard Ingress 已满（调用方可稍后重试）。</returns>
+    bool TryDeactivate(
+        in TKey key,
+        ActivationId activation,
+        ActorDeactivateReason reason);
 
     /// <summary>启动所有 Shard Consumer Loop 与 AsyncOperationExecutor。重复调用幂等。</summary>
     ValueTask StartAsync(CancellationToken cancellationToken);

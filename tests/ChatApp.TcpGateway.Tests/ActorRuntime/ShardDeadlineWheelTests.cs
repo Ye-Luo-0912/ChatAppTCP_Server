@@ -1,3 +1,4 @@
+using ChatApp.ActorRuntime.Abstractions;
 using ChatApp.ActorRuntime.Scheduling;
 
 namespace ChatApp.TcpGateway.Tests.ActorRuntime;
@@ -18,7 +19,8 @@ public sealed class ShardDeadlineWheelTests
 
         wheel.Schedule(
             TimeSpan.FromMilliseconds(2560),
-            generation: 1,
+            new ActivationId(1),
+            deadlineEpoch: 0,
             in key,
             in message);
         time.Advance(TimeSpan.FromMilliseconds(2550));
@@ -45,7 +47,8 @@ public sealed class ShardDeadlineWheelTests
             var message = new TimerMessage(i);
             wheel.Schedule(
                 TimeSpan.FromSeconds(1 + i),
-                generation: 1,
+                new ActivationId(1),
+                deadlineEpoch: 0,
                 in key,
                 in message);
         }
@@ -67,13 +70,13 @@ public sealed class ShardDeadlineWheelTests
         public List<int> Messages { get; } = new();
         public int Dropped { get; private set; }
 
-        public bool TryPostExpired(
+        public void OnExpired(
             in int key,
-            uint generation,
+            ActivationId activation,
+            uint deadlineEpoch,
             in TimerMessage message)
         {
             Messages.Add(message.Value);
-            return true;
         }
 
         public void DropScheduled(in TimerMessage message)

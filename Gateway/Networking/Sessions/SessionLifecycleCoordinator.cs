@@ -8,6 +8,7 @@ using ChatApp.TcpGateway.Core.Protocol;
 using ChatApp.TcpGateway.Core.Serialization;
 using ChatApp.TcpGateway.Gateway.Configuration;
 using ChatApp.TcpGateway.Gateway.Networking.Buffers;
+using ChatApp.TcpGateway.Infrastructure.Caching;
 using ChatApp.TcpGateway.Observability.Logging;
 using ChatApp.TcpGateway.Observability.Metrics;
 using Microsoft.Extensions.Logging;
@@ -49,6 +50,9 @@ internal sealed partial class SessionLifecycleCoordinator
     private readonly TimeProvider _timeProvider;
     private readonly ILogger _logger;
     private readonly IPayloadCodec<PresenceChanged> _presenceChangedCodec;
+    // 可选 Redis 熔断器：仅用于 TryResumeAsync 入口快速失败判定与 CircuitOpen 失败归因。
+    // 实际 Redis 调用由 IResumeTokenStore / IDeviceSessionLeaseStore 内部再次检查。
+    private readonly IRedisCircuitBreaker? _circuitBreaker;
 
     public SessionLifecycleCoordinator(
         IDeviceSessionLeaseStore deviceSessionLeaseStore,
@@ -62,7 +66,8 @@ internal sealed partial class SessionLifecycleCoordinator
         GatewayMetrics metrics,
         TimeProvider timeProvider,
         ILogger logger,
-        IPayloadCodec<PresenceChanged> presenceChangedCodec)
+        IPayloadCodec<PresenceChanged> presenceChangedCodec,
+        IRedisCircuitBreaker? circuitBreaker = null)
     {
         _deviceSessionLeaseStore = deviceSessionLeaseStore;
         _globalPresence = globalPresence;
@@ -76,6 +81,7 @@ internal sealed partial class SessionLifecycleCoordinator
         _timeProvider = timeProvider;
         _logger = logger;
         _presenceChangedCodec = presenceChangedCodec;
+        _circuitBreaker = circuitBreaker;
     }
 
     /// <summary>
@@ -157,6 +163,18 @@ internal sealed partial class SessionLifecycleCoordinator
         if (_resumeTokenStore is null)
             return null;
 
+        // Resume 路径可观测性：每次尝试 +1，用于计算 Resume 命中率与失败分布。
+        _metrics.ResumeAttempted();
+
+        // 熔断器开路：直接快速失败，不发起 Redis 调用，避免重连风暴串行排队。
+        // 此处单独计数 CircuitOpen 失败原因，与 store 内部静默返回 null 区分。
+        if (_circuitBreaker is { IsAvailable: false })
+        {
+            _metrics.RedisCircuitBreakerOpen();
+            _metrics.ResumeFailed(ResumeFailureReason.CircuitOpen);
+            return null;
+        }
+
         ResumeContext? context;
         try
         {
@@ -170,11 +188,15 @@ internal sealed partial class SessionLifecycleCoordinator
                 GatewayDependency.Redis,
                 GatewayDependencyOperation.ResumeTokenLookup,
                 ex);
+            _metrics.ResumeFailed(ResumeFailureReason.RedisFailure);
             return null;
         }
 
         if (context is null)
+        {
+            _metrics.ResumeFailed(ResumeFailureReason.InvalidToken);
             return null;
+        }
 
         // 代次校验：若待恢复会话携带 DeviceIdHash，查询当前设备租约持有者。
         // 若租约已被另一个 SessionId 接管（同设备重新登录/管理员踢下线），
@@ -206,6 +228,7 @@ internal sealed partial class SessionLifecycleCoordinator
                         session.ConnectionId,
                         new InvalidOperationException(
                             "Resume rejected: device lease owned by a newer session."));
+                    _metrics.ResumeFailed(ResumeFailureReason.LeaseMismatch);
                     return null;
                 }
             }
@@ -237,9 +260,10 @@ internal sealed partial class SessionLifecycleCoordinator
         // 不应使用伪设备 0 接管——否则所有无 DeviceIdHash 的会话会落入同一零值设备键，相互覆盖租约。
         if (context.DeviceIdHash is { } deviceHash)
         {
+            string? previousSessionId = null;
             try
             {
-                await _deviceSessionLeaseStore.TakeOverAsync(
+                previousSessionId = await _deviceSessionLeaseStore.TakeOverAsync(
                     context.UserId,
                     deviceHash,
                     context.SessionId,
@@ -253,6 +277,26 @@ internal sealed partial class SessionLifecycleCoordinator
                     GatewayTransportOperation.ClientProcessing,
                     session.ConnectionId,
                     ex);
+            }
+
+            // 接管发现跨 Gateway 旧 SessionId：广播 SessionRevoked 让目标 Gateway 关闭旧连接。
+            // 与 ReplaceSameDeviceSessionsAsync 行为一致；Resume 之前未广播会导致旧 Gateway
+            // 在 SessionRevoked 事件到达前继续向已恢复 session 发送出站帧（虽本机会话已被新连接接管）。
+            if (!string.IsNullOrWhiteSpace(previousSessionId)
+                && !string.Equals(
+                    previousSessionId,
+                    context.SessionId,
+                    StringComparison.Ordinal))
+            {
+                var occurredAtMs = _timeProvider
+                    .GetUtcNow()
+                    .ToUnixTimeMilliseconds();
+                await PublishSessionRevokedEventAsync(
+                    context.UserId,
+                    previousSessionId,
+                    occurredAtMs,
+                    session.ConnectionId,
+                    cancellationToken).ConfigureAwait(false);
             }
         }
 
@@ -291,6 +335,8 @@ internal sealed partial class SessionLifecycleCoordinator
                 context.DeviceIdHash,
                 cancellationToken)
             .ConfigureAwait(false);
+
+        _metrics.ResumeSucceeded();
 
         return new ResumeLifecycleResult
         {

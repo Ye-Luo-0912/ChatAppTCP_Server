@@ -20,6 +20,7 @@ using ChatApp.TcpGateway.Gateway.Networking.Ephemeral;
 using ChatApp.TcpGateway.Gateway.Networking.Executor;
 using ChatApp.TcpGateway.Gateway.Networking.Sessions;
 using ChatApp.TcpGateway.Gateway.Networking.Transport;
+using ChatApp.TcpGateway.Infrastructure.Caching;
 using ChatApp.TcpGateway.Observability.Logging;
 using ChatApp.TcpGateway.Observability.Metrics;
 using ChatApp.TcpGateway.Observability.Tracing;
@@ -105,6 +106,7 @@ internal sealed class TcpGatewayService : BackgroundService
     private readonly SessionCommandExecutor _orderedWriteExecutor;
     private readonly SessionCommandExecutor _queryExecutor;
     private readonly EphemeralCommandPipeline _ephemeralPipeline;
+    private readonly TypingActorPipeline? _typingActorPipeline;
 
     // OnDemandSendPump 模式专用：共享出站 pump 协调器（ready queue + worker 池）。
     // PersistentSendLoop 模式下为 null，每连接保留永久 SendLoop Task。
@@ -142,7 +144,10 @@ internal sealed class TcpGatewayService : BackgroundService
         IPayloadCodec<ResumeResponse>? resumeResponseCodec = null,
         IPayloadCodec<ProtocolErrorFrame>? protocolErrorFrameCodec = null,
         IWatcherGatewayDirectory? watcherDirectory = null,
-        CommandDispatcher? commandDispatcher = null)
+        CommandDispatcher? commandDispatcher = null,
+        IPayloadCodec<TypingNotify>? typingNotifyCodec = null,
+        IDirectConversationAuthorizer? directConversationAuthorizer = null,
+        IRedisCircuitBreaker? circuitBreaker = null)
     {
         _options = options.Value;
         _authenticator = authenticator;
@@ -226,7 +231,8 @@ internal sealed class TcpGatewayService : BackgroundService
             _metrics,
             _timeProvider,
             _logger,
-            _presenceChangedCodec);
+            _presenceChangedCodec,
+            circuitBreaker);
 
         // Typing 扇出宿主：内部创建并复用已注入依赖。
         _typingFanoutHost = new TypingFanoutHost(
@@ -282,6 +288,23 @@ internal sealed class TcpGatewayService : BackgroundService
             _timeProvider,
             _logger);
 
+        // Typing 领域 Actor：TCP Read 直接解析并路由到 LatestOnly Actor，
+        // 不创建通用 SessionCommand。仅在 UseTypingActorPipeline=true 且注入 codec 时启用。
+        // 复用 EphemeralActor 配置（Shard/Ingress/Async/IdleTimeout/OperationTimeout）。
+        if (_options.UseTypingActorPipeline &&
+            _options.UseActorRuntimeForEphemeralCommands &&
+            typingNotifyCodec is not null)
+        {
+            _typingActorPipeline = new TypingActorPipeline(
+                _options,
+                typingNotifyCodec,
+                directConversationAuthorizer,
+                _typingFanout,
+                _metrics,
+                _timeProvider,
+                _logger);
+        }
+
         // OnDemandSendPump 模式：创建共享出站 pump 协调器。
         // PersistentSendLoop 模式（默认）保持 null，每连接保留永久 SendLoop Task。
         // ready queue 容量 ≥ MaxConnections，保证每连接至多一份引用时不会阻塞 TrySchedule。
@@ -323,6 +346,7 @@ internal sealed class TcpGatewayService : BackgroundService
             _orderedWriteExecutor,
             _queryExecutor,
             _ephemeralPipeline,
+            _typingActorPipeline,
             _metrics,
             _logger,
             ProcessPacketAsync,
@@ -450,6 +474,12 @@ internal sealed class TcpGatewayService : BackgroundService
                 .ConfigureAwait(false);
             await _ephemeralPipeline.StopAsync(CancellationToken.None)
                 .ConfigureAwait(false);
+            // Typing 领域 Actor：在 EphemeralCommandPipeline 之后停止，确保 fanout 依赖已就绪。
+            if (_typingActorPipeline is not null)
+            {
+                await _typingActorPipeline.StopAsync(CancellationToken.None)
+                    .ConfigureAwait(false);
+            }
 
             // OnDemandSendPump：停止共享出站 worker 池。
             // 须在所有 session.Close 后调用，确保 in-flight pump 已退出。
@@ -481,6 +511,7 @@ internal sealed class TcpGatewayService : BackgroundService
         _orderedWriteExecutor.DisposeAsync().AsTask().GetAwaiter().GetResult();
         _queryExecutor.DisposeAsync().AsTask().GetAwaiter().GetResult();
         _ephemeralPipeline.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        _typingActorPipeline?.DisposeAsync().AsTask().GetAwaiter().GetResult();
         _deadlineWheel.DisposeAsync().AsTask().GetAwaiter().GetResult();
         _outboundPump?.Dispose();
         base.Dispose();

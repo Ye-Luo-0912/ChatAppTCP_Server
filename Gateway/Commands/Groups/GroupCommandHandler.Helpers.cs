@@ -39,10 +39,31 @@ internal sealed partial class GroupCommandHandler
         IPayloadCodec<TResponse> responseCodec,
         CancellationToken cancellationToken)
     {
+        // 幂等快速路径：缓存命中时直接返回缓存的 Realtime 结果，跳过 Redis/NATS 往返。
+        // 仅对 mutate 命令生效（CreateGroup 走独立路径，见 HandleCreateGroupRequestAsync）。
+        // ListMembers（查询）同样受益：重复翻页请求可直接返回缓存。
+        if (_idempotencyCache is { } cache)
+        {
+            var cached = cache.TryGet(command.ActorUserId, command.RequestId);
+            if (cached is not null)
+            {
+                SendGroupMutateResponse(session, responseCommand, responseCodec, map(cached));
+                return;
+            }
+        }
+
         try
         {
             var result = await _messageBus.MutateGroupConversationAsync(command, cancellationToken)
                 .ConfigureAwait(false);
+
+            // 缓存 Realtime 正常返回的结果（含业务失败）。
+            // 异常路径的 group_unavailable 不经过此处，不会被缓存，确保瞬态故障可重试。
+            if (_idempotencyCache is { } cacheForAdd)
+            {
+                cacheForAdd.TryAdd(command.ActorUserId, command.RequestId, result);
+            }
+
             SendGroupMutateResponse(session, responseCommand, responseCodec, map(result));
         }
         // 会话取消（断线/超时/停机）时让取消正常传播，不返回错误响应——

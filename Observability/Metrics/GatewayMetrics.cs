@@ -52,6 +52,16 @@ public sealed class GatewayMetrics : IDisposable
     private readonly Counter<long> _ephemeralEventsDropped;
     private readonly Counter<long> _presenceQueriesFailed;
 
+    // Resume 路径可观测性：区分 Resume 成功与完整认证成功率，识别 Redis 故障期间的快速失败比例。
+    // attempts：每次 TryResumeAsync 调用 +1，用于计算 Resume 命中率。
+    // succeeded：Resume 成功 +1。
+    // failed：Resume 失败 +1，tag: reason（invalid_token/redis_failure/circuit_open/lease_mismatch）。
+    // circuit_breaker_open：Redis 熔断器开路快速失败 +1（含 Resume 之外的其他 Redis 路径）。
+    private readonly Counter<long> _resumeAttempts;
+    private readonly Counter<long> _resumeSucceeded;
+    private readonly Counter<long> _resumeFailed;
+    private readonly Counter<long> _redisCircuitBreakerOpen;
+
     // Presence 路由/分片监控指标。
     // transitions：全局状态转换计数（tag: transition=online/offline/none），用于观测冗余 SetOnline/SetOffline 比例。
     // fanout.delivered / fanout.recipients：本机 fanout 事件数与接收者数直方图，用于监控放大系数。
@@ -64,6 +74,13 @@ public sealed class GatewayMetrics : IDisposable
     private readonly Counter<long> _presenceFanoutSkipped;
     private readonly Counter<long> _presenceEphemeralPublished;
     private readonly Counter<long> _watcherDirectoryOps;
+
+    // 群组命令 RequestId 幂等缓存监控。
+    // hit：缓存命中（重复请求从缓存返回，未调用 Realtime）。
+    // miss：缓存未命中（新请求，将调用 Realtime 并缓存结果）。
+    // 用于观测客户端重试率与缓存命中率。
+    private readonly Counter<long> _groupIdempotentHits;
+    private readonly Counter<long> _groupIdempotentMisses;
 
     // 心跳分桶扫描监控指标。
     // scan.duration：单次 tick（桶扫描+刷新）总耗时直方图，用于观测周期性脉冲与分桶后的平滑度。
@@ -137,6 +154,14 @@ public sealed class GatewayMetrics : IDisposable
             "gateway.outbound.rejected.global_budget");
         _connectionsUnauthenticated = _meter.CreateUpDownCounter<long>(
             "gateway.connections.unauthenticated");
+        _resumeAttempts = _meter.CreateCounter<long>(
+            "gateway.resume.attempts");
+        _resumeSucceeded = _meter.CreateCounter<long>(
+            "gateway.resume.succeeded");
+        _resumeFailed = _meter.CreateCounter<long>(
+            "gateway.resume.failed");
+        _redisCircuitBreakerOpen = _meter.CreateCounter<long>(
+            "gateway.redis.circuit_breaker.open");
 
         _commandFailures = _meter.CreateCounter<long>(
             "gateway.commands.failures");
@@ -173,6 +198,10 @@ public sealed class GatewayMetrics : IDisposable
             unit: "ms");
         _heartbeatBucketSkew = _meter.CreateCounter<long>(
             "gateway.heartbeat.bucket.skew");
+        _groupIdempotentHits = _meter.CreateCounter<long>(
+            "gateway.group.idempotent.hit");
+        _groupIdempotentMisses = _meter.CreateCounter<long>(
+            "gateway.group.idempotent.miss");
     }
 
     public void ConnectionAccepted()
@@ -234,6 +263,34 @@ public sealed class GatewayMetrics : IDisposable
                 "failure.kind",
                 GetFailureKindName(kind)));
 
+    // Resume 路径可观测性：每次 TryResumeAsync 调用 +1；
+    // 成功/失败分别计数；失败按 reason 分组（invalid_token/redis_failure/circuit_open/lease_mismatch）。
+    public void ResumeAttempted() => _resumeAttempts.Add(1);
+
+    public void ResumeSucceeded() => _resumeSucceeded.Add(1);
+
+    public void ResumeFailed(ResumeFailureReason reason) =>
+        _resumeFailed.Add(
+            1,
+            new KeyValuePair<string, object?>(
+                "reason",
+                GetResumeFailureReasonName(reason)));
+
+    /// <summary>
+    /// Redis 熔断器开路快速失败计数。包含 Resume/Token 颁发/设备租约所有受熔断器保护的 Redis 路径。
+    /// </summary>
+    public void RedisCircuitBreakerOpen() => _redisCircuitBreakerOpen.Add(1);
+
+    private static string GetResumeFailureReasonName(ResumeFailureReason reason) =>
+        reason switch
+        {
+            ResumeFailureReason.InvalidToken => "invalid_token",
+            ResumeFailureReason.RedisFailure => "redis_failure",
+            ResumeFailureReason.CircuitOpen => "circuit_open",
+            ResumeFailureReason.LeaseMismatch => "lease_mismatch",
+            _ => "unknown"
+        };
+
     public void MessagePublished() => _messagesPublished.Add(1);
 
     public void MessagePublishFailed() => _messagePublishFailures.Add(1);
@@ -281,6 +338,16 @@ public sealed class GatewayMetrics : IDisposable
             new KeyValuePair<string, object?>(
                 "command",
                 PacketCommandNames.Get(command)));
+
+    /// <summary>
+    /// 群组命令 RequestId 幂等缓存命中：重复请求从缓存返回，未调用 Realtime。
+    /// </summary>
+    public void GroupIdempotentHit() => _groupIdempotentHits.Add(1);
+
+    /// <summary>
+    /// 群组命令 RequestId 幂等缓存未命中：新请求，将调用 Realtime 并缓存结果。
+    /// </summary>
+    public void GroupIdempotentMiss() => _groupIdempotentMisses.Add(1);
 
     // 通用依赖操作失败计数：dependency 与 operation 均为低基数标签。
     public void DependencyOperationFailed(
@@ -591,4 +658,22 @@ public sealed class GatewayMetrics : IDisposable
         };
 
     public void Dispose() => _meter.Dispose();
+}
+
+/// <summary>
+/// Resume 失败原因分类，用于 metrics tag。
+/// </summary>
+public enum ResumeFailureReason
+{
+    /// <summary>Token 无效、过期或已被消费（GETDEL 返回 null）。</summary>
+    InvalidToken,
+
+    /// <summary>Redis 操作异常（非熔断器开路）。</summary>
+    RedisFailure,
+
+    /// <summary>Redis 熔断器开路快速失败。</summary>
+    CircuitOpen,
+
+    /// <summary>设备租约已被新会话接管，代次不匹配。</summary>
+    LeaseMismatch
 }

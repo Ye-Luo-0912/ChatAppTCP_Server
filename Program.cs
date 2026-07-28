@@ -90,6 +90,7 @@ builder.Services.AddSingleton<ReactionCommandHandler>();
 builder.Services.AddSingleton<MessagingCommandHandler>();
 builder.Services.AddSingleton<HistoryQueryCommandHandler>();
 builder.Services.AddSingleton<ConversationPrefsCommandHandler>();
+builder.Services.AddSingleton<GroupRequestIdempotencyCache>();
 builder.Services.AddSingleton<GroupCommandHandler>();
 builder.Services.AddSingleton<TypingCommandHandler>();
 builder.Services.AddSingleton<PresenceCommandHandler>();

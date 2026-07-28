@@ -70,18 +70,47 @@ internal sealed partial class GroupCommandHandler
 
         try
         {
-            var result = await _messageBus.MutateGroupConversationAsync(
-                    new RealtimeGroupConversationCommand
+            var command = new RealtimeGroupConversationCommand
+            {
+                RequestId = request.RequestId,
+                ActorUserId = session.UserId,
+                Operation = RealtimeGroupConversationOperation.Create,
+                Title = request.Title.Trim(),
+                MemberUserIds = normalizedMemberIds,
+                ActorSessionId = session.SessionId
+            };
+
+            // 幂等快速路径：CreateGroup 同样缓存 Realtime 结果。
+            // CreateGroup 的 RequestId 幂等由 Realtime 侧保证（同 RequestId 不会创建两个群），
+            // Gateway 缓存为前置快速路径，避免重试时重复 Redis/NATS 往返。
+            if (_idempotencyCache is { } cache)
+            {
+                var cached = cache.TryGet(command.ActorUserId, command.RequestId);
+                if (cached is not null)
+                {
+                    SendCreateGroupResponse(session, new CreateGroupResponse
                     {
-                        RequestId = request.RequestId,
-                        ActorUserId = session.UserId,
-                        Operation = RealtimeGroupConversationOperation.Create,
-                        Title = request.Title.Trim(),
-                        MemberUserIds = normalizedMemberIds,
-                        ActorSessionId = session.SessionId
-                    },
-                    cancellationToken)
+                        RequestId = cached.RequestId,
+                        Succeeded = cached.Succeeded,
+                        ErrorCode = cached.ErrorCode,
+                        ErrorMessage = cached.ErrorMessage,
+                        ConversationId = cached.ConversationId,
+                        Title = cached.Title,
+                        Members = MapMembers(cached.Members)
+                    });
+                    return;
+                }
+            }
+
+            var result = await _messageBus.MutateGroupConversationAsync(command, cancellationToken)
                 .ConfigureAwait(false);
+
+            // 缓存 Realtime 正常返回的结果（含业务失败）。
+            if (_idempotencyCache is { } cacheForAdd)
+            {
+                cacheForAdd.TryAdd(command.ActorUserId, command.RequestId, result);
+            }
+
             SendCreateGroupResponse(session, new CreateGroupResponse
             {
                 RequestId = result.RequestId,

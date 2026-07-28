@@ -30,6 +30,23 @@ public static class InfrastructureServiceCollectionExtensions
             static provider =>
                 provider.GetRequiredService<RedisConnectionProvider>());
 
+        // 应用层 Redis 熔断器：所有 Resume/设备租约相关 Redis 调用共享同一实例，
+        // 连续失败阈值由 RedisOptions.CircuitBreakerFailureThreshold 控制（0 = 关闭）。
+        services.AddSingleton<IRedisCircuitBreaker>(
+            static provider =>
+            {
+                var options = provider
+                    .GetRequiredService<Microsoft.Extensions.Options.IOptions<RedisOptions>>()
+                    .Value;
+                if (options.CircuitBreakerFailureThreshold <= 0)
+                    return new RedisCircuitBreaker(
+                        failureThreshold: int.MaxValue,
+                        openDuration: TimeSpan.FromSeconds(1));
+                return new RedisCircuitBreaker(
+                    failureThreshold: options.CircuitBreakerFailureThreshold,
+                    openDuration: options.CircuitBreakerOpenDuration);
+            });
+
         services.AddSingleton<IAccessTokenStore, RedisAccessTokenStore>();
         services.AddSingleton<IDeviceSessionLeaseStore, RedisDeviceSessionLeaseStore>();
         services.AddSingleton<IResumeTokenStore, RedisResumeTokenStore>();

@@ -15,5 +15,11 @@ public enum ActorMessageDropReason : byte
     IdleTimeout = 6,
     RuntimeStopping = 7,
     StaleGeneration = 8,
-    DeadlineRejected = 9
+    DeadlineRejected = 9,
+
+    /// <summary>Actor 数达到 MaxActiveActors / MaxActiveActorsPerShard 上限，新 Actor 激活被拒绝。</summary>
+    AdmissionRejected = 10,
+
+    /// <summary>宿主通过 TryDeactivate 显式回收 Actor，其 Mailbox 剩余消息被丢弃。</summary>
+    ExplicitlyDeactivated = 11
 }

@@ -1,9 +1,15 @@
 using System.Runtime.CompilerServices;
+using ChatApp.ActorRuntime.Abstractions;
 
 namespace ChatApp.ActorRuntime.Scheduling;
 
 /// <summary>
 /// Shard 单线程时间轮。桶通过双 List 交换原地排空，触发路径不创建快照集合。
+/// <para>
+/// 条目携带 <see cref="ActivationId"/> 与 Deadline Epoch：触发时由 Shard 校验
+/// Actor 当前激活纪元与 Deadline 代际，不匹配即为惰性取消的过期条目（直接丢弃）。
+/// 时间轮不提供显式 Remove——取消通过 Epoch bump 实现，条目在触发时刻自行离开轮。
+/// </para>
 /// </summary>
 internal sealed class ShardDeadlineWheel<TKey, TState, TMessage>
     where TKey : notnull
@@ -50,7 +56,8 @@ internal sealed class ShardDeadlineWheel<TKey, TState, TMessage>
 
     public void Schedule(
         TimeSpan delay,
-        uint generation,
+        ActivationId activation,
+        uint deadlineEpoch,
         in TKey key,
         in TMessage message)
     {
@@ -72,7 +79,8 @@ internal sealed class ShardDeadlineWheel<TKey, TState, TMessage>
         _buckets[targetIndex].Add(new TimerEntry
         {
             Rounds = rounds,
-            Generation = generation,
+            Activation = activation,
+            DeadlineEpoch = deadlineEpoch,
             Key = key,
             Message = message
         });
@@ -136,9 +144,10 @@ internal sealed class ShardDeadlineWheel<TKey, TState, TMessage>
             }
 
             _pendingCount--;
-            _callback.TryPostExpired(
+            _callback.OnExpired(
                 in entry.Key,
-                entry.Generation,
+                entry.Activation,
+                entry.DeadlineEpoch,
                 in entry.Message);
         }
 
@@ -148,7 +157,8 @@ internal sealed class ShardDeadlineWheel<TKey, TState, TMessage>
     private struct TimerEntry
     {
         public int Rounds;
-        public uint Generation;
+        public ActivationId Activation;
+        public uint DeadlineEpoch;
         public TKey Key;
         public TMessage Message;
     }
@@ -181,9 +191,14 @@ internal interface IDeadlineCallback<TKey, TMessage>
     where TKey : notnull
     where TMessage : struct
 {
-    bool TryPostExpired(
+    /// <summary>
+    /// Deadline 到期（在 Shard Consumer 线程上调用）。实现方校验 Activation/Epoch
+    /// 并直接投递到 Actor 控制通道；过期条目丢弃。
+    /// </summary>
+    void OnExpired(
         in TKey key,
-        uint generation,
+        ActivationId activation,
+        uint deadlineEpoch,
         in TMessage message);
 
     void DropScheduled(in TMessage message);

@@ -347,8 +347,7 @@ CPU、工作集、分配、Gen2/LOH、TCP 排队字节、JetStream pending/重�
 1. **Resume 同步水位恢复**：`ResumeResponse.LastConversationSequence` 通过 SyncBootstrap
    `ServerTimeMs` 填充，不再是 null。配合 P0 的 epoch/fencing、Token 撤销、主动 Logout、
    被踢设备不可 Resume 闭环。Gateway 已适配 Realtime 的 `changed_at_ms` 水位；
-   v1 JSON 字段名暂时保留 `afterReceivedAtMs` 以避免破坏客户端。跨 Gateway 重连风暴测试
-   与 Token 重放并发测试仍待补。
+   v1 JSON 字段名暂时保留 `afterReceivedAtMs` 以避免破坏客户端。
 2. **群聊廉价结构校验**：AddMembers/CreateGroup 成员数量/正 ID/去重、Title 长度、
    ChangeMemberRole 枚举合法性、RequestId/ConversationId 长度、OperationCanceledException 传播。
    权限矩阵/群主转让/最后 Owner 退群/Member 分页/RequestId 幂等/审计事件仍由 RealtimeServices 判定。
@@ -359,22 +358,183 @@ CPU、工作集、分配、Gen2/LOH、TCP 排队字节、JetStream pending/重�
    `CommandCapabilities` 兼容开关和命令级 `RequiredFeature` 门控。未协商扩展命令返回
    非致命 `FeatureNotNegotiated`；DirectSocket/Pipelines × 两种出站模式均通过真实 TCP 测试。
    Resume 成功路径也会保存协商状态；未来二进制位仍不对外回显。
+6. **Resume 可靠性补强**（2026-07-29 完成）：跨 Gateway 重连风暴防护、Redis 故障快速失败、
+   旧设备被踢后立即重连的代次校验、Resume 路径可观测性闭环。
+   - **Redis 应用层熔断器**（`IRedisCircuitBreaker` / `RedisCircuitBreaker`）：三状态机
+     Closed→Open→HalfOpen，连续失败阈值由 `RedisOptions.CircuitBreakerFailureThreshold`
+     控制（默认 5），开路时长由 `CircuitBreakerOpenDuration` 控制（默认 5s）。
+     `RedisResumeTokenStore` / `RedisDeviceSessionLeaseStore` 所有 Redis 调用前检查熔断器，
+     Open 状态快速失败返回 null/默认值，避免重连风暴串行排队 Redis 超时。
+   - **RevokeAsync DemandMaster**：撤销 ResumeToken 的 `KeyDeleteAsync` 强制落在主节点，
+     防止主从切换期间撤销失效导致旧 Token 在 TTL 窗口内被跨 Gateway 恢复。
+   - **Resume 路径广播 SessionRevoked**：`TryResumeAsync` 接管设备租约发现跨 Gateway 旧
+     SessionId 时，与 `ReplaceSameDeviceSessionsAsync` 一致地调用
+     `PublishSessionRevokedEventAsync`，确保旧 Gateway 在事件到达前不会继续向已恢复
+     session 发送出站帧。
+   - **Resume 可观测性指标**：`gateway.resume.attempts` / `gateway.resume.succeeded` /
+     `gateway.resume.failed`（tag: reason=invalid_token/redis_failure/circuit_open/lease_mismatch）/
+     `gateway.redis.circuit_breaker.open`。`SessionLifecycleCoordinator.TryResumeAsync` 在入口、
+     成功、各失败路径分别记录，用于识别 Redis 故障期间的快速失败比例与代次冲突。
+   - **测试覆盖**：`RedisCircuitBreakerTests`（8 项状态机/线程安全）+
+     `SessionLifecycleCoordinatorTests`（9 项 Resume 路径行为与指标验证）。共 287 项测试通过。
+   - **仍待验证**：跨 Gateway 重连风暴的 Linux soak 压力测试（依赖真实 Redis 故障注入）。
+7. **群聊 RequestId 幂等缓存**（2026-07-29 完成）：Gateway 层前置快速路径，
+   避免客户端重试（网络抖动/超时重发）重复命中 Redis/NATS 往返。
+   - **`GroupRequestIdempotencyCache`**：基于 `ConcurrentDictionary` 的有界 TTL+LRU 缓存，
+     键为 `(ActorUserId, RequestId)`，默认容量 4096 条 / TTL 30 秒（约 ~800 KiB）。
+     容量超限时先回收过期条目（CAS 防并发 sweep，10 秒间隔），仍超限则跳过缓存（自然背压）。
+     `EvictUser` 支持用户级清理（登出/被踢）。线程安全：读取无锁，回收用 `Interlocked` CAS。
+   - **缓存范围**：仅缓存 Realtime 正常返回的 `GroupConversationResult`（含业务失败如
+     not_owner / member_limit_exceeded）；异常路径的 `group_unavailable` 不经过缓存，
+     确保瞬态故障可重试。Realtime 侧 `ActorSessionId` 回声跳过仍是幂等主防线。
+   - **集成路径**：`SendGroupCommandAsync`（AddMembers/RemoveMember/Leave/ChangeRole/
+     ListMembers）和 `HandleCreateGroupRequestAsync`（CreateGroup）均在调用 Realtime 前
+     检查缓存，命中时直接映射缓存结果返回；Realtime 返回后写入缓存。
+   - **可观测性指标**：`gateway.group.idempotent.hit` / `gateway.group.idempotent.miss`，
+     通过 `OnLookup` 回调绑定到 `GatewayMetrics`，用于观测客户端重试率与缓存命中率。
+   - **测试覆盖**：`GroupRequestIdempotencyCacheTests`（14 项：TTL 过期、容量回收、
+     用户级清理、幂等回调、跨用户隔离、覆写、业务失败缓存）。共 301 项测试通过。
+   - **架构边界**：权限矩阵（Owner/Admin/Member）、群主转让、最后 Owner 退出、禁止移除群主、
+     审计事件均为 RealtimeServices 侧职责，Gateway 不重复实现（见 `GroupCommandHandler.Validation.cs`
+     注释）。Member 分页需要跨仓库扩展 `GroupConversationCommand`（当前无分页字段），
+     本阶段不扩展协议框架。
+8. **R1：真实 Ephemeral A/B 测试**（2026-07-29 完成）：覆盖三条 Ephemeral 管道在真实业务路径
+   （授权 I/O + fanout + 资源释放）下的行为正确性，不再只测纯 Actor State 递增。
+   - **三条管道并行验证**：
+     - Legacy `SessionCommandExecutor`（全局无界 ready channel + per-connection 队列，共享 worker 阻塞授权 I/O）
+     - Actor Generic Ephemeral Pipeline（per-connectionId Actor + FIFO mailbox + AsyncOperationExecutor，仍用 SessionCommand + ArrayPool）
+     - Specialized TypingActor（per-(sender,target) Key + LatestOnly mailbox + DomainWorkLane 零装箱 + 缓存授权）
+   - **10+1 场景全覆盖**（`tests/ChatApp.TcpGateway.Tests/Networking/TypingActorABTests.cs`，11 项）：
+     1. 授权缓存命中——第二次 Notify 同 Key 跳过 I/O（CallCount 不变）。
+     2. 授权缓存未命中——提交 I/O 并 Suspend，BusyActors 短暂为 1 后归零。
+     3. 授权拒绝——丢弃 Notify，不发射 fanout。
+     4. NATS 延迟——慢 Key（2s）不阻塞快 Key（800ms 内完成 fanout），用 CompletedCallCount
+        区分 in-flight 与已完成，避免 CallCount 入口递增导致的误判。
+     5. NATS 断线——授权抛异常后回投 denied Completion，Actor 恢复；重试 Notify 成功。
+     6. 同 Key 高频覆盖——typing=true→false 在授权进行中到达，LatestOnly 合并；
+        先等 AuthPending=true 再发第二条，避免 DrainIngress 一次性合并导致无发射。
+        最终 fanout coalescing 仅保留最新状态（typing=false），符合"消费者只关心最终状态"设计。
+     7. 连接 churn——空闲 Actor 被 IdleSweep 回收，ActiveActors 归零。
+     8. 10,000 活跃 Actor——16 分片、4096 入站容量，10k 唯一 (sender,target) Key 全部授权完成。
+     9. 单热点 Actor——100 条 Notify 轰炸同 Key + 1 条其他 Key，热点不阻塞其他；LatestOnly 合并到 1 次授权。
+     10. 预算和 ArrayPool 归零——Generic Actor 路径 50 条 SessionCommand 处理后
+         GlobalInboundBudget 归零、ArrayPool 缓冲全部归还、PendingAsyncOperations 归零。
+     11. Legacy vs TypingActor 对比——5000 条同 Key Notify：Legacy 处理 5000 次；
+         TypingActor 因 LatestOnly 合并仅触发 1 次授权 I/O（语义断言，非脆弱时序）。
+   - **关键 Bug 修复**：
+     - `BoundedMpscRing.TryDequeue` 多消费者竞态：CAS 推进 tail，避免 (0,0) 无效 Key 被处理。
+     - `ReceiveAuthorizationCompleted` 主动 TryEmit：授权完成时若无新 Notify 到达，
+       ResumeMailbox 无消息可恢复，必须在此主动发射当前 DesiredIsTyping。
+   - **测试覆盖**：`TypingActorABTests` 11/11 通过，全套件 312/312 通过，0 警告 0 错误。
+   - **下一步（R2）**：见下方"R2：连接级与协议级压力测试"。
+
+### R2：连接级与协议级压力测试（下一轮）
+
+R1 验证了 Ephemeral 三管道的业务正确性。R2 转向连接生命周期、协议组装与长时间稳定性：
+
+1. **Receive Buffer 大小与动态升降级**：
+   - 初始 512 B / 1 KiB Receive Buffer 下的小帧吞吐与分配。
+   - 活跃连接动态升级到 4 KiB（基于帧大小阈值）。
+   - 长时间空闲后降级回小 Buffer（释放 ArrayPool 槽位）。
+2. **Header/Payload 装配 deadline**：
+   - 半截 Header 超过 deadline 后连接被关闭（慢速/恶意客户端）。
+   - 慢速 Payload（分多帧 TCP 段到达）超过 deadline 的处理。
+3. **大小帧混合负载**：
+   - 512 B Chat 与 64 KiB Chat 混合，验证 Outbound 队列预算与软/硬响应上限。
+4. **空闲连接规模与稳定性**：
+   - 10,000 空闲连接下的内存占用、心跳 Redis 流量平滑度、ThreadPool 压力。
+5. **连接风暴**：
+   - 短时大量连接涌入（如 1k/s 持续 10s）下的握手背压、Auth lane 容量、
+     Inline lane 不被业务命令挤占。
+6. **8～24 小时浸泡**：
+   - Linux 长机执行（`scratch/Run-RuntimeV2-Soak-Linux.ps1`），
+     覆盖内存泄漏、ThreadPool 饱和、Redis 连接池、NATS 重连、Actor IdleSweep 长期正确性。
 
 ### 后续按业务优先级再评估
 
-1. **Resume 完整测试**：跨 Gateway 重连风暴、Token 重放与并发使用测试；Resume 后触发
-   增量 SyncBootstrap 的客户端策略验证。
-2. **群聊产品面深度补齐**：Owner/Admin/Member 权限矩阵（Realtime 侧）、群主转让、
-   最后一位 Owner 退出规则、禁止移除自己/群主、Member 列表分页、RequestId 幂等、
-   成员数量与批量变更上限、审计事件。
+1. ~~**Resume 完整测试**：跨 Gateway 重连风暴、Token 重放与并发使用测试；Resume 后触发
+   增量 SyncBootstrap 的客户端策略验证。~~ **已基本完成**（见上"Resume 可靠性补强"），
+   剩余 Linux soak 压力验证待安排。
+2. **群聊产品面深度补齐**：~~RequestId 幂等~~（已完成，见上"群聊 RequestId 幂等缓存"）。
+   Owner/Admin/Member 权限矩阵（Realtime 侧）、群主转让、最后一位 Owner 退出规则、
+   禁止移除自己/群主、Member 列表分页（需跨仓库扩展 `GroupConversationCommand`）、
+   成员数量与批量变更上限、审计事件（Realtime 侧持久层职责）。
 3. **Push 端到端**：FCM/APNs/WebPush Provider abstraction、仅离线/无活跃设备时推送、
    会话静音/@mention/消息类型策略、Collapse key/idempotency、重试/DLQ/速率限制、
    Provider 返回无效 Token 时自动删除、Token 加密或最小权限保护。
+   - **已完成（Gateway 侧基础设施）**：
+     - `IPushTokenStore` / `RedisPushTokenStore`：原子化 Lua 注册/注销，Hash tag `{userId}`
+       确保 Cluster 同 slot，90 天 TTL，超限淘汰最旧，多设备上限 8。
+     - `PushTokenCommandHandler`：`deviceIdHash` 取自认证会话（不可伪造），Register 幂等覆写，
+       Unregister 支持按设备/按 Token 两种模式，返回 `ActiveTokenCount`。
+     - `PushPlatform` 枚举已包含 `Fcm=1` / `Apns=2` / `WebPush=3`。
+     - Presence 基础设施：`IGlobalPresenceStore`（Redis ZSET 0↔1 转换）+
+       `IGatewayDirectory.GetOnlineGatewaysWithStatusAsync`（区分 `UserOffline` vs `LookupFailure`），
+       Publisher 可据此判断"用户全局离线 → 需要 Push"。
+   - **仍需跨仓库实现（RealtimeServices / 独立 Push Service）**：
+     - FCM/APNs/WebPush Provider client 与 payload builder。
+     - Publisher 侧 Push 触发：`GetOnlineGatewaysWithStatusAsync` 返回 `UserOffline` 时，
+       不投递 Gateway，而是入队 Push 任务（Pull tokens via `IPushTokenStore.ListAsync`）。
+     - 仅离线/无活跃设备推送策略、静音/@mention/消息类型过滤。
+     - Collapse Key、Retry/DLQ、速率限制。
+     - Provider 返回无效 Token 时回调 `IPushTokenStore.UnregisterByTokenAsync`。
+     - Token 加密或最小权限保护（当前 Token 明文存储于 Redis，需评估加密方案）。
+     - **跨仓库依赖**：`IPushTokenStore` / `PushTokenRecord` 当前位于
+       `ChatApp.TcpGateway.Core.Push`，RealtimeServices 无法直接引用。需提取到
+       `ChatApp.Realtime.Abstractions` 或发布为独立 NuGet 包（见 AGENTS.md
+       "Long-term: publish shared Realtime contracts as a versioned package"）。
 4. **附件完整闭环**：上传凭证与所有权、上传完成 Finalize、扫毒/内容审核状态、
    消息发送时验证附件 Ready、临时附件过期清理、删除/失效通知、下载授权、
    消息撤回后附件保留策略。
+   - **已完成（Gateway 侧）**：
+     - `InboundPayloadEarlyValidator`：ChatMessage 入站前廉价结构校验（附件数 ≤32、
+       ID 长度 1..64），不分配业务对象。
+     - `MessagingCommandHandler.ChatMessage`：语义校验（空内容 + 无附件 = 协议违规），
+       转发 `AttachmentIds` 至 Realtime。
+     - `AttachmentLifecycleHandler`：消费 `AttachmentLifecycleChanged` 事件，
+       向上传者本机会话推送 `AttachmentLifecycleUpdate`（Status/RejectReason/Thumbnail）。
+     - `AttachmentWireMapper`：Realtime → wire `AttachmentRef` 映射（Bound → Available）。
+     - `AttachmentRef` wire DTO：6 状态枚举（Scanning/Available/UploadConfirmed/Rejected/
+       Expired/ThumbnailUpdated）+ DownloadApiHint/DownloadToken 字段。
+   - **仍需跨仓库实现（RealtimeServices / Server HTTP API）**：
+     - 所有权验证：`MessagingCommandHandler` 当前不校验 `AttachmentIds` 归属，由 Realtime
+       `BindToMessageAsync` 拒绝非本人附件。如需 Gateway 前置校验需新增
+       `IRealtimeMessageBus.VerifyAttachmentOwnershipAsync` 查询。
+     - 上传 Finalize / Initiate：当前无 C2S 协议命令（仅有 S2C `AttachmentLifecycleChanged=154`）。
+       需新增 `PacketCommand.AttachmentFinalizeRequest/Response` 等，且 Realtime 侧需
+       `IRealtimeAttachmentStore.FinalizeUploadAsync`（Ticketed→Uploaded 转换）。
+     - 扫毒/内容审核：`Scanning`/`Rejected` 状态的下游推送已就绪，但扫描触发与发布者
+       在两个仓库之外（独立 worker / Server）。
+     - 临时附件过期清理：`ix_attachments_unbound_age` 索引已存在（Migration012），
+       但无 sweep worker。需 RealtimeServices 或独立服务定期扫描并发布 `Expired` 事件。
+     - 下载授权：wire DTO 有 `DownloadApiHint`/`DownloadToken` 字段，但 Token 签发与
+       校验在 Server HTTP API（`GET /api/attachments/{id}/download`），Gateway 不参与。
+     - **Migration012 CHECK 约束过期**：`status IN (0,1,2,3)` 不包含 `Uploaded=4 /
+       Scanning=5 / Rejected=6`，需新增 migration 放宽约束。
+     - **枚举不一致**：Gateway `AttachmentWireStatus` 有 6 状态，
+       Realtime Abstractions `AttachmentWireStatus` 仅 2 状态（Scanning/Available），
+       `AttachmentRefMapper` 无法产出完整状态，需对齐。
 5. **Relationship 产品接口**：好友列表分页、好友请求列表、接受/拒绝、拉黑/取消拉黑、
    Relationship version/watermark。
+   - **已完成（Gateway 侧下游推送 + 授权缓存）**：
+     - `RelationshipListChanged=153`（S2C）+ `RelationshipListHandler`：消费
+       `FriendRequestListChanged` / `FriendListChanged` / `BlockedListChanged` 事件，
+       向客户端推送 `RelationshipListChangedUpdate`（Resource/Action/ResourceId/Message）。
+     - `IDirectConversationAuthorizer` 缓存主动失效：`RelationshipListHandler` 在
+       `friendship` / `blocked-user` 变更时双向失效 `(actor,target)` 与 `(target,actor)`
+       缓存（30s allow / 10s deny），避免 Typing/Presence 在缓存窗口内继续允许已禁止的通知。
+       `friend-request` 不失效（未建立关系）。
+   - **仍需跨仓库实现（RealtimeServices + Gateway 协议面）**：
+     - C2S 协议命令：当前无 `RelationshipListRequest` / `FriendRequestSend` / `BlockUser` 等
+       入站命令。新增 PacketCommand 值（159+ 范围）+ DTO + CommandCatalog 描述符 +
+       `RelationshipCommandHandler` 属于 Gateway 填空（不扩展协议框架），但需要
+       `IRealtimeMessageBus` 新增对应查询/命令方法。
+     - RealtimeServices 侧域：无 `IRelationshipStore` / `IRelationshipQueryProcessor` /
+       `IRelationshipCommandProcessor` / Postgres migration / NATS consumer。三个事件类型
+       （`FriendRequestListChanged=1` / `FriendListChanged=2` / `BlockedListChanged=3`）
+       已在枚举中预留但无发布者。
+     - Relationship watermark：`ConversationSyncWatermark` 存在但仅限会话维度，
+       需扩展为 Relationship 级别版本/水位用于增量同步。
 6. ~~**协议版本与兼容性深化**：最低支持版本、FeatureBits 实际强制检查、命令级能力协商、
    Deprecated command 策略落地。~~ **已完成**。下一次协议升级只在新增 v2/binary 功能时继续，
    现阶段回到 Resume 可靠性、Push、附件和 Relationship 产品功能。

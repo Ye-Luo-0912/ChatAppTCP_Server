@@ -221,6 +221,14 @@ public sealed class TcpGatewayOptions
     /// </summary>
     public bool UseActorRuntimeForEphemeralCommands { get; set; }
 
+    /// <summary>
+    /// 启用 Typing 领域 Actor：TCP Read 路径直接解析 TypingNotify 并路由到
+    /// LatestOnly Mailbox 的领域 Actor，不创建通用 SessionCommand。
+    /// 需要 <see cref="UseActorRuntimeForEphemeralCommands"/> 为 true。
+    /// 关闭时 TypingNotify 回退到 EphemeralCommandPipeline 通用路径。
+    /// </summary>
+    public bool UseTypingActorPipeline { get; set; }
+
     /// <summary>Ephemeral Actor Shard 数；0 表示按 CPU 自动选择 2 的幂。</summary>
     public int EphemeralActorShardCount { get; set; }
 

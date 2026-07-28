@@ -16,6 +16,7 @@ public sealed class ActorRuntime<TKey, TState, TMessage> :
 {
     private readonly ActorShard<TKey, TState, TMessage>[] _shards;
     private readonly AsyncOperationExecutor _asyncExecutor;
+    private readonly GlobalActorAdmissionQuota _globalQuota;
     private readonly int _shardMask;
     private readonly ActorRuntimeOptions _options;
     private readonly TimeProvider _timeProvider;
@@ -44,6 +45,17 @@ public sealed class ActorRuntime<TKey, TState, TMessage> :
             options.AsyncOperationQueueCapacity,
             options.AsyncOperationTimeout,
             _timeProvider);
+        _globalQuota = new GlobalActorAdmissionQuota(options.MaxActiveActors);
+
+        var maxActorsPerShard = options.MaxActiveActorsPerShard > 0
+            ? options.MaxActiveActorsPerShard
+            : (options.MaxActiveActors + options.ShardCount - 1) /
+              options.ShardCount;
+        // Completion Ring 容量 == 每 Shard Completion Credit 上限。
+        // 严格上界：单 Outstanding Operation 约束下每 Actor 至多持有一个 Credit，
+        // 而每 Shard 活跃 Actor 数 ≤ maxActorsPerShard，故 Ring 永远不会溢出。
+        var completionCreditCapacity =
+            NextPowerOfTwo(Math.Max(2, maxActorsPerShard));
 
         _shards =
             new ActorShard<TKey, TState, TMessage>[options.ShardCount];
@@ -60,8 +72,11 @@ public sealed class ActorRuntime<TKey, TState, TMessage> :
                 options.MaxMessagesPerActorTurn,
                 options.ShardTickInterval,
                 options.ActorIdleTimeout,
+                maxActorsPerShard,
+                completionCreditCapacity,
                 _timeProvider,
-                _asyncExecutor);
+                _asyncExecutor,
+                _globalQuota);
         }
     }
 
@@ -80,7 +95,7 @@ public sealed class ActorRuntime<TKey, TState, TMessage> :
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public ActorPostStatus TryTellCompletion(
         in TKey key,
-        uint generation,
+        ActivationId activation,
         in TMessage message)
     {
         // Drain 期间仍允许在途异步操作回投 Completion；真正 stopped 后拒绝。
@@ -90,8 +105,28 @@ public sealed class ActorRuntime<TKey, TState, TMessage> :
         return _shards[GetShardIndex(in key)]
             .TryEnqueueCompletion(
                 in key,
-                generation,
+                activation,
                 in message);
+    }
+
+    public bool TryDeactivate(
+        in TKey key,
+        ActorDeactivateReason reason)
+        => TryDeactivate(in key, ActivationId.None, reason);
+
+    public bool TryDeactivate(
+        in TKey key,
+        ActivationId activation,
+        ActorDeactivateReason reason)
+    {
+        if (Volatile.Read(ref _lifecycle) >= 2)
+            return false;
+
+        return _shards[GetShardIndex(in key)]
+            .TryEnqueueDeactivate(
+                in key,
+                activation,
+                reason);
     }
 
     public async ValueTask StartAsync(
@@ -189,6 +224,8 @@ public sealed class ActorRuntime<TKey, TState, TMessage> :
         long totalMailboxFull = 0;
         long totalShardOverloaded = 0;
         long totalDeactivations = 0;
+        long totalActivations = 0;
+        long totalAdmissionRejected = 0;
 
         foreach (var shard in _shards)
         {
@@ -201,6 +238,8 @@ public sealed class ActorRuntime<TKey, TState, TMessage> :
             totalMailboxFull += shard.MailboxFullCount;
             totalShardOverloaded += shard.ShardOverloadedCount;
             totalDeactivations += shard.DeactivationCount;
+            totalActivations += shard.ActivationCount;
+            totalAdmissionRejected += shard.AdmissionRejectedCount;
         }
 
         var asyncSnapshot = _asyncExecutor.GetSnapshot();
@@ -215,6 +254,8 @@ public sealed class ActorRuntime<TKey, TState, TMessage> :
             TotalMailboxFull = totalMailboxFull,
             TotalShardOverloaded = totalShardOverloaded,
             TotalDeactivations = totalDeactivations,
+            TotalActivations = totalActivations,
+            TotalActiveActorAdmissionRejected = totalAdmissionRejected,
             PendingAsyncOperations = asyncSnapshot.PendingCount,
             TotalAsyncOperationsSubmitted = asyncSnapshot.TotalSubmitted,
             TotalAsyncOperationsCompleted = asyncSnapshot.TotalCompleted,
@@ -275,6 +316,17 @@ public sealed class ActorRuntime<TKey, TState, TMessage> :
         }
 
         return hash & _shardMask;
+    }
+
+    private static int NextPowerOfTwo(int value)
+    {
+        value--;
+        value |= value >> 1;
+        value |= value >> 2;
+        value |= value >> 4;
+        value |= value >> 8;
+        value |= value >> 16;
+        return value + 1;
     }
 
     public async ValueTask DisposeAsync()

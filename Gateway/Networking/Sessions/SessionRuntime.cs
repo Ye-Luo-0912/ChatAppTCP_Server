@@ -49,6 +49,7 @@ internal sealed partial class SessionRuntime
     private readonly SessionCommandExecutor _orderedWriteExecutor;
     private readonly SessionCommandExecutor _queryExecutor;
     private readonly EphemeralCommandPipeline _ephemeralPipeline;
+    private readonly TypingActorPipeline? _typingActorPipeline;
     private readonly GatewayMetrics _metrics;
     private readonly ILogger _logger;
 
@@ -63,6 +64,7 @@ internal sealed partial class SessionRuntime
         SessionCommandExecutor orderedWriteExecutor,
         SessionCommandExecutor queryExecutor,
         EphemeralCommandPipeline ephemeralPipeline,
+        TypingActorPipeline? typingActorPipeline,
         GatewayMetrics metrics,
         ILogger logger,
         Func<PacketFrame, TcpClientSession, string, CancellationToken, ValueTask> processPacketAsync,
@@ -75,6 +77,7 @@ internal sealed partial class SessionRuntime
         _orderedWriteExecutor = orderedWriteExecutor;
         _queryExecutor = queryExecutor;
         _ephemeralPipeline = ephemeralPipeline;
+        _typingActorPipeline = typingActorPipeline;
         _metrics = metrics;
         _logger = logger;
         _processPacketAsync = processPacketAsync;

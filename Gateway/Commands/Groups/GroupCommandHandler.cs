@@ -53,6 +53,7 @@ internal sealed partial class GroupCommandHandler : ICommandHandler
     private readonly IPayloadCodec<ListGroupMembersResponse> _listGroupMembersResponseCodec;
     private readonly GatewayMetrics _metrics;
     private readonly ILogger<GroupCommandHandler> _logger;
+    private readonly GroupRequestIdempotencyCache? _idempotencyCache;
 
     public GroupCommandHandler(
         IRealtimeMessageBus messageBus,
@@ -69,7 +70,8 @@ internal sealed partial class GroupCommandHandler : ICommandHandler
         IPayloadCodec<ListGroupMembersRequest> listGroupMembersRequestCodec,
         IPayloadCodec<ListGroupMembersResponse> listGroupMembersResponseCodec,
         GatewayMetrics metrics,
-        ILogger<GroupCommandHandler> logger)
+        ILogger<GroupCommandHandler> logger,
+        GroupRequestIdempotencyCache? idempotencyCache = null)
     {
         _messageBus = messageBus;
         _createGroupRequestCodec = createGroupRequestCodec;
@@ -86,6 +88,20 @@ internal sealed partial class GroupCommandHandler : ICommandHandler
         _listGroupMembersResponseCodec = listGroupMembersResponseCodec;
         _metrics = metrics;
         _logger = logger;
+        _idempotencyCache = idempotencyCache;
+
+        // 将幂等命中/未命中回调绑定到 metrics。
+        // 缓存实例在 DI 中单例，回调只绑定一次；null 时不记录 metrics。
+        if (idempotencyCache is { } cache)
+        {
+            cache.OnLookup = hit =>
+            {
+                if (hit)
+                    metrics.GroupIdempotentHit();
+                else
+                    metrics.GroupIdempotentMiss();
+            };
+        }
     }
 
     public ValueTask ExecuteAsync(

@@ -89,7 +89,19 @@ internal sealed class EphemeralCommandPipeline : IAsyncDisposable
         => _legacy?.TryRegisterConnection(connectionId, userId) ?? true;
 
     public void UnregisterConnection(uint connectionId)
-        => _legacy?.UnregisterConnection(connectionId);
+    {
+        if (_legacy is not null)
+        {
+            _legacy.UnregisterConnection(connectionId);
+            return;
+        }
+
+        // 连接断开立即回收对应 Ephemeral Actor，不等待 Idle Sweep（P0-6）。
+        // ActivationId.None 匹配当前任意激活；Shard Ingress 满时退回 Idle 回收兜底。
+        _actor!.TryDeactivate(
+            in connectionId,
+            ActorDeactivateReason.Explicit);
+    }
 
     public bool TryEnqueue(
         uint connectionId,
@@ -221,7 +233,7 @@ internal sealed class EphemeralCommandPipeline : IAsyncDisposable
             var operation = new EphemeralCommandOperation(
                 _runtime!,
                 key,
-                context.Generation,
+                context.Activation,
                 in message.Command,
                 _processor,
                 _metrics,
@@ -247,7 +259,7 @@ internal sealed class EphemeralCommandPipeline : IAsyncDisposable
     {
         private readonly IActorRuntime<uint, EphemeralActorState, EphemeralActorMessage> _runtime;
         private readonly uint _key;
-        private readonly uint _generation;
+        private readonly ActivationId _activation;
         private readonly SessionCommand _command;
         private readonly Func<SessionCommand, CancellationToken, ValueTask> _processor;
         private readonly GatewayMetrics _metrics;
@@ -257,7 +269,7 @@ internal sealed class EphemeralCommandPipeline : IAsyncDisposable
         public EphemeralCommandOperation(
             IActorRuntime<uint, EphemeralActorState, EphemeralActorMessage> runtime,
             uint key,
-            uint generation,
+            ActivationId activation,
             in SessionCommand command,
             Func<SessionCommand, CancellationToken, ValueTask> processor,
             GatewayMetrics metrics,
@@ -265,7 +277,7 @@ internal sealed class EphemeralCommandPipeline : IAsyncDisposable
         {
             _runtime = runtime;
             _key = key;
-            _generation = generation;
+            _activation = activation;
             _command = command;
             _processor = processor;
             _metrics = metrics;
@@ -316,7 +328,7 @@ internal sealed class EphemeralCommandPipeline : IAsyncDisposable
             var completion = EphemeralActorMessage.Completion;
             _runtime.TryTellCompletion(
                 in _key,
-                _generation,
+                _activation,
                 in completion);
         }
     }

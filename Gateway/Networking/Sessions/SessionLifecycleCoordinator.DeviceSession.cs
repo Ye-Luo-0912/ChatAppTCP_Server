@@ -80,6 +80,36 @@ internal sealed partial class SessionLifecycleCoordinator
         if (alreadyLocal)
             return;
 
+        await PublishSessionRevokedEventAsync(
+            incoming.UserId,
+            previousSessionId,
+            occurredAtMs,
+            incoming.ConnectionId,
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// 发布 <see cref="RealtimeEventType.SessionRevoked"/> 事件，通知所有 Gateway
+    /// 关闭指定 SessionId 的旧连接。Resume 路径接管设备租约后也调用此方法，
+    /// 以确保跨 Gateway 的旧连接及时关闭（与 <see cref="ReplaceSameDeviceSessionsAsync"/>
+    /// 行为一致）。
+    /// <para>
+    /// Best-effort：发布失败仅记录日志，不阻断调用方流程。NATS/Realtime bus 故障时
+    /// 旧连接依赖设备租约 TTL 自然失效。
+    /// </para>
+    /// </summary>
+    /// <param name="userId">用户 Id。</param>
+    /// <param name="revokedSessionId">被吊销的 SessionId。</param>
+    /// <param name="occurredAtMs">事件发生时间（Unix 毫秒）。</param>
+    /// <param name="reportingConnectionId">用于日志追溯的当前连接 Id。</param>
+    /// <param name="cancellationToken">取消令牌。</param>
+    private async ValueTask PublishSessionRevokedEventAsync(
+        long userId,
+        string revokedSessionId,
+        long occurredAtMs,
+        uint reportingConnectionId,
+        CancellationToken cancellationToken)
+    {
         try
         {
             await _messageBus
@@ -87,12 +117,12 @@ internal sealed partial class SessionLifecycleCoordinator
                     new RealtimeEvent
                     {
                         EventId = SessionEventIdFactory.CreateSessionRevokedEventId(
-                            incoming.UserId,
-                            previousSessionId,
+                            userId,
+                            revokedSessionId,
                             occurredAtMs),
                         Type = RealtimeEventType.SessionRevoked,
-                        TargetUserId = incoming.UserId,
-                        SessionId = previousSessionId,
+                        TargetUserId = userId,
+                        SessionId = revokedSessionId,
                         OccurredAtMs = occurredAtMs
                     },
                     cancellationToken)
@@ -101,8 +131,8 @@ internal sealed partial class SessionLifecycleCoordinator
         catch (Exception exception)
         {
             _logger.SessionRevocationFailed(
-                incoming.ConnectionId,
-                previousSessionId,
+                reportingConnectionId,
+                revokedSessionId,
                 exception);
         }
     }
@@ -123,31 +153,12 @@ internal sealed partial class SessionLifecycleCoordinator
         // 必须在 Close 之前执行：Close 后 session 对象仍可访问 CurrentResumeToken。
         await RevokeResumeTokenSafeAsync(victim, cancellationToken).ConfigureAwait(false);
 
-        try
-        {
-            await _messageBus
-                .PublishEventAsync(
-                    new RealtimeEvent
-                    {
-                        EventId = SessionEventIdFactory.CreateSessionRevokedEventId(
-                            victim.UserId,
-                            victim.SessionId,
-                            occurredAtMs),
-                        Type = RealtimeEventType.SessionRevoked,
-                        TargetUserId = victim.UserId,
-                        SessionId = victim.SessionId,
-                        OccurredAtMs = occurredAtMs
-                    },
-                    cancellationToken)
-                .ConfigureAwait(false);
-        }
-        catch (Exception exception)
-        {
-            _logger.SessionRevocationFailed(
-                victim.ConnectionId,
-                victim.SessionId,
-                exception);
-        }
+        await PublishSessionRevokedEventAsync(
+            victim.UserId,
+            victim.SessionId!,
+            occurredAtMs,
+            victim.ConnectionId,
+            cancellationToken).ConfigureAwait(false);
 
         // 本机立即断开；跨 Gateway 实例依赖 SessionRevoked 事件。
         victim.Close(SessionCloseReason.SessionRevoked);

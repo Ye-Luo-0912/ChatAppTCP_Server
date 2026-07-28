@@ -5,8 +5,14 @@ using ChatApp.ActorRuntime.Abstractions;
 namespace ChatApp.ActorRuntime.Runtime;
 
 /// <summary>
-/// 单 Actor 的状态、Mailbox 与 Ready Queue 链接。所有字段仅由所属 Shard 消费线程修改。
+/// 单 Actor 的状态、Mailbox、控制通道与 Ready Queue 链接。所有字段仅由所属 Shard 消费线程修改。
 /// FIFO 前四项直接内嵌，超过后才租用 ArrayPool 环形数组，避免每 Actor 创建 Queue 对象。
+/// <para>
+/// 控制通道（Completion 槽 + Deadline FIFO）独立于业务 Mailbox：
+/// Busy（Suspend 等待 I/O）的 Actor 暂停业务 Mailbox，但仍处理控制消息。
+/// 一个 Actor 同一时刻最多一个 Outstanding Operation（Completion 槽容量 1 即为该约束的物化），
+/// Deadline 控制消息数受 <see cref="MaxControlDeadlines"/> 上限约束。
+/// </para>
 /// </summary>
 internal sealed class ActorCell<TKey, TState, TMessage>
     where TKey : notnull
@@ -15,11 +21,32 @@ internal sealed class ActorCell<TKey, TState, TMessage>
 {
     private const int InlineCapacity = 4;
 
+    /// <summary>
+    /// 每 Actor Deadline 控制上限：未触发（<see cref="PendingDeadlineCount"/>）
+    /// 与已触发未消费（Deadline FIFO 内）之和不超过该值。
+    /// </summary>
+    public const int MaxControlDeadlines = 4;
+
     public TKey Key;
     public TState State;
-    public uint Generation;
+
+    /// <summary>当前激活纪元。由 Shard 单调计数器在 Activate 时分配（不按 Key 重置）。</summary>
+    public ActivationId Activation;
+
     public ActorCellFlags Flags;
     public long LastActiveTimestamp;
+
+    /// <summary>未触发 Deadline 数（已触发进入控制通道的不计入）。Idle Sweep 依据之一。</summary>
+    public int PendingDeadlineCount;
+
+    /// <summary>
+    /// Deadline 代际：TryScheduleOrReplace / CancelDeadlines 时自增，
+    /// 使时间轮中尚未触发的旧条目在触发时被识别为过期（惰性取消）。
+    /// </summary>
+    public uint DeadlineEpoch;
+
+    /// <summary>是否存在未完成的异步操作。为 true 时 TrySubmitOperation 拒绝新提交。</summary>
+    public bool HasOutstandingOperation;
 
     // 侵入式 Ready Queue 链接；Scheduled 标志确保每个 Cell 至多入队一次。
     public ActorCell<TKey, TState, TMessage>? ReadyNext;
@@ -33,9 +60,14 @@ internal sealed class ActorCell<TKey, TState, TMessage>
     private ActorMailboxItem<TMessage> _latestMessage;
     private bool _hasLatest;
 
-    // Suspend Actor 的 Completion 独立高优先级槽，不受普通 Mailbox 是否为空影响。
+    // 控制通道：Completion 单槽（Outstanding Operation 唯一），不受普通 Mailbox 是否为空影响。
     private ActorMailboxItem<TMessage> _completion;
     private bool _hasCompletion;
+
+    // 控制通道：Deadline FIFO（内联，容量 MaxControlDeadlines）。
+    private InlineDeadlineControl _deadlineControl;
+    private int _deadlineHead;
+    private int _deadlineCount;
 
     private ActorCell()
     {
@@ -44,13 +76,13 @@ internal sealed class ActorCell<TKey, TState, TMessage>
 
     public static ActorCell<TKey, TState, TMessage> Create(
         in TKey key,
-        uint generation,
+        ActivationId activation,
         long timestamp)
     {
         return new ActorCell<TKey, TState, TMessage>
         {
             Key = key,
-            Generation = generation,
+            Activation = activation,
             LastActiveTimestamp = timestamp,
             Flags = ActorCellFlags.Active
         };
@@ -59,6 +91,12 @@ internal sealed class ActorCell<TKey, TState, TMessage>
     public bool IsActive => (Flags & ActorCellFlags.Active) != 0;
     public bool IsBusy => (Flags & ActorCellFlags.Busy) != 0;
     public bool IsScheduled => (Flags & ActorCellFlags.Scheduled) != 0;
+
+    /// <summary>已触发未消费的 Deadline 控制消息数。</summary>
+    public int PendingDeadlineControlCount => _deadlineCount;
+
+    /// <summary>控制通道是否有待处理消息（Completion 槽或 Deadline FIFO）。</summary>
+    public bool HasPendingControl => _hasCompletion || _deadlineCount > 0;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public ActorPostStatus TryEnqueueMessage(
@@ -96,7 +134,7 @@ internal sealed class ActorCell<TKey, TState, TMessage>
         if (_fifoCount >= fifoCapacity)
             return ActorPostStatus.MailboxFull;
 
-        becameReady = _fifoCount == 0 && !_hasLatest && !_hasCompletion;
+        becameReady = _fifoCount == 0 && !_hasLatest && !_hasCompletion && _deadlineCount == 0;
         EnsureFifoStorage(_fifoCount + 1, fifoCapacity);
 
         if (_fifoBuffer is null)
@@ -128,9 +166,29 @@ internal sealed class ActorCell<TKey, TState, TMessage>
         return ActorPostStatus.Accepted;
     }
 
+    /// <summary>
+    /// 向 Deadline 控制 FIFO 投递已触发的 Deadline 消息。
+    /// 容量由调度侧不变量保证（未触发 + 已触发未消费 ≤ <see cref="MaxControlDeadlines"/>），
+    /// 正常路径不会返回 false；false 表示内部不变量被破坏。
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public bool TryEnqueueDeadline(in ActorMailboxItem<TMessage> item)
+    {
+        if (_deadlineCount >= MaxControlDeadlines)
+            return false;
+
+        _deadlineControl[(_deadlineHead + _deadlineCount) & (MaxControlDeadlines - 1)] = item;
+        _deadlineCount++;
+        return true;
+    }
+
+    /// <summary>
+    /// 按优先级出队：Completion → Deadline 控制 →（<paramref name="controlOnly"/> 为 false 时）业务 Mailbox。
+    /// Busy Actor 传 controlOnly: true，仅处理控制消息。
+    /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool TryDequeue(
-        bool completionOnly,
+        bool controlOnly,
         out ActorMailboxItem<TMessage> item,
         out bool wasCompletion)
     {
@@ -139,11 +197,23 @@ internal sealed class ActorCell<TKey, TState, TMessage>
             item = _completion;
             _completion = default;
             _hasCompletion = false;
+            HasOutstandingOperation = false;
             wasCompletion = true;
             return true;
         }
 
-        if (completionOnly)
+        if (_deadlineCount > 0)
+        {
+            var index = _deadlineHead & (MaxControlDeadlines - 1);
+            item = _deadlineControl[index];
+            _deadlineControl[index] = default;
+            _deadlineHead = (_deadlineHead + 1) & (MaxControlDeadlines - 1);
+            _deadlineCount--;
+            wasCompletion = false;
+            return true;
+        }
+
+        if (controlOnly)
         {
             item = default;
             wasCompletion = false;
@@ -187,7 +257,7 @@ internal sealed class ActorCell<TKey, TState, TMessage>
     }
 
     public int PendingCount =>
-        _fifoCount + (_hasLatest ? 1 : 0) + (_hasCompletion ? 1 : 0);
+        _fifoCount + (_hasLatest ? 1 : 0) + (_hasCompletion ? 1 : 0) + _deadlineCount;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void MarkBusy() => Flags |= ActorCellFlags.Busy;
@@ -273,6 +343,12 @@ internal sealed class ActorCell<TKey, TState, TMessage>
 
     [InlineArray(InlineCapacity)]
     private struct InlineMailbox
+    {
+        private ActorMailboxItem<TMessage> _element0;
+    }
+
+    [InlineArray(MaxControlDeadlines)]
+    private struct InlineDeadlineControl
     {
         private ActorMailboxItem<TMessage> _element0;
     }

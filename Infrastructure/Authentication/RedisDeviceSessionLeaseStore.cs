@@ -8,16 +8,30 @@ namespace ChatApp.TcpGateway.Infrastructure.Authentication;
 
 /// <summary>
 /// Redis/Garnet 设备租约：key = tcp:devlease:{userId}:{deviceIdHash} → value = connectionLeaseId\nsessionId。
+/// <para>
+/// 可选注入 <see cref="IRedisCircuitBreaker"/>：Redis 故障期间快速失败，避免心跳刷新与
+/// TakeOver 串行触发超时。未注入时跳过熔断器逻辑（兼容旧测试）。
+/// </para>
 /// </summary>
 /// <remarks>
 /// 租约值拆分为 connectionLeaseId（所有权令牌）与 sessionId（路由标识）。
 /// </remarks>
-internal sealed class RedisDeviceSessionLeaseStore(
-    RedisConnectionProvider connectionProvider,
-    ILogger<RedisDeviceSessionLeaseStore> logger)
-    : IDeviceSessionLeaseStore
+internal sealed class RedisDeviceSessionLeaseStore : IDeviceSessionLeaseStore
 {
     private const string KeyPrefix = "tcp:devlease:";
+    private readonly RedisConnectionProvider _connectionProvider;
+    private readonly ILogger<RedisDeviceSessionLeaseStore> _logger;
+    private readonly IRedisCircuitBreaker? _circuitBreaker;
+
+    public RedisDeviceSessionLeaseStore(
+        RedisConnectionProvider connectionProvider,
+        ILogger<RedisDeviceSessionLeaseStore> logger,
+        IRedisCircuitBreaker? circuitBreaker = null)
+    {
+        _connectionProvider = connectionProvider;
+        _logger = logger;
+        _circuitBreaker = circuitBreaker;
+    }
 
     // 值格式：connectionLeaseId\nsessionId
     // GET old; SET new with TTL; return old sessionId if connectionLeaseId differs (else empty string).
@@ -94,6 +108,12 @@ internal sealed class RedisDeviceSessionLeaseStore(
         if (ttl <= TimeSpan.Zero)
             ttl = TimeSpan.FromHours(24);
 
+        if (_circuitBreaker is { IsAvailable: false })
+        {
+            // 熔断器开路：退化为仅本机替换，避免阻断登录。
+            return null;
+        }
+
         var key = CreateKey(userId, deviceIdHash);
         var ttlMs = (long)Math.Clamp(ttl.TotalMilliseconds, 1_000, 7 * 24 * 60 * 60 * 1000d);
 
@@ -101,10 +121,11 @@ internal sealed class RedisDeviceSessionLeaseStore(
         {
             var result = await TakeOverScript
                 .EvaluateAsync(
-                    connectionProvider.Database,
+                    _connectionProvider.Database,
                     new { key = (RedisKey)key, sessionId, connectionLeaseId, ttlMs })
                 .WaitAsync(cancellationToken)
                 .ConfigureAwait(false);
+            _circuitBreaker?.RecordSuccess();
 
             if (result.IsNull)
                 return null;
@@ -114,7 +135,8 @@ internal sealed class RedisDeviceSessionLeaseStore(
         }
         catch (RedisException exception)
         {
-            logger.DependencyOperationFailed(
+            _circuitBreaker?.RecordFailure();
+            _logger.DependencyOperationFailed(
                 GatewayDependency.Redis,
                 GatewayDependencyOperation.DeviceLeaseTakeOver,
                 exception);
@@ -132,19 +154,27 @@ internal sealed class RedisDeviceSessionLeaseStore(
         if (userId <= 0 || string.IsNullOrWhiteSpace(connectionLeaseId))
             return;
 
+        if (_circuitBreaker is { IsAvailable: false })
+        {
+            // 熔断器开路：跳过 Release，依赖租约 TTL 自然失效。
+            return;
+        }
+
         var key = CreateKey(userId, deviceIdHash);
         try
         {
             await ReleaseIfOwnerScript
                 .EvaluateAsync(
-                    connectionProvider.Database,
+                    _connectionProvider.Database,
                     new { key = (RedisKey)key, connectionLeaseId })
                 .WaitAsync(cancellationToken)
                 .ConfigureAwait(false);
+            _circuitBreaker?.RecordSuccess();
         }
         catch (RedisException exception)
         {
-            logger.DependencyOperationFailed(
+            _circuitBreaker?.RecordFailure();
+            _logger.DependencyOperationFailed(
                 GatewayDependency.Redis,
                 GatewayDependencyOperation.DeviceLeaseRelease,
                 exception);
@@ -163,6 +193,12 @@ internal sealed class RedisDeviceSessionLeaseStore(
         if (ttl <= TimeSpan.Zero)
             return false;
 
+        if (_circuitBreaker is { IsAvailable: false })
+        {
+            // 熔断器开路：刷新失败但不关闭连接（与原 RedisException 路径一致）。
+            return false;
+        }
+
         var key = CreateKey(userId, deviceIdHash);
         var ttlMs = (long)Math.Clamp(ttl.TotalMilliseconds, 1_000, 7 * 24 * 60 * 60 * 1000d);
 
@@ -170,16 +206,18 @@ internal sealed class RedisDeviceSessionLeaseStore(
         {
             var result = await RefreshIfOwnerScript
                 .EvaluateAsync(
-                    connectionProvider.Database,
+                    _connectionProvider.Database,
                     new { key = (RedisKey)key, connectionLeaseId, ttlMs })
                 .WaitAsync(cancellationToken)
                 .ConfigureAwait(false);
+            _circuitBreaker?.RecordSuccess();
 
             return result.IsNull ? false : (long)result == 1;
         }
         catch (RedisException exception)
         {
-            logger.DependencyOperationFailed(
+            _circuitBreaker?.RecordFailure();
+            _logger.DependencyOperationFailed(
                 GatewayDependency.Redis,
                 GatewayDependencyOperation.DeviceLeaseRefresh,
                 exception);
@@ -195,13 +233,22 @@ internal sealed class RedisDeviceSessionLeaseStore(
         if (userId <= 0)
             return null;
 
+        if (_circuitBreaker is { IsAvailable: false })
+        {
+            // 熔断器开路：查询失败返回 null，退化为不拦截（与原 RedisException 路径一致），
+            // 由 RevokeAsync 兜底防止旧 Token 复活。
+            return null;
+        }
+
         var key = CreateKey(userId, deviceIdHash);
         try
         {
-            var current = await connectionProvider.Database
+            var current = await _connectionProvider.Database
                 .StringGetAsync(key)
                 .WaitAsync(cancellationToken)
                 .ConfigureAwait(false);
+            _circuitBreaker?.RecordSuccess();
+
             if (current.IsNullOrEmpty)
                 return null;
 
@@ -212,7 +259,8 @@ internal sealed class RedisDeviceSessionLeaseStore(
         }
         catch (RedisException exception)
         {
-            logger.DependencyOperationFailed(
+            _circuitBreaker?.RecordFailure();
+            _logger.DependencyOperationFailed(
                 GatewayDependency.Redis,
                 GatewayDependencyOperation.DeviceLeaseQuery,
                 exception);

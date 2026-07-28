@@ -107,15 +107,16 @@ internal sealed class BoundedMpscRing<T> where T : struct
     }
 
     /// <summary>
-    /// 单消费者出队。队列为空时返回 false。
+    /// 单消费者或多消费者出队。队列为空或竞争失败时返回 false。
     /// <para>
-    /// 仅由 Shard Consumer Loop 调用：生产者并发入队与消费者出队通过 Cell.Sequence 同步。
+    /// 通过 CAS 推进 <c>_tail</c> 保证多消费者安全：竞争失败的调用方应重试（spin/yield）。
+    /// 单消费者场景（如 Shard Consumer Loop）CAS 必然成功，无额外开销。
     /// </para>
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool TryDequeue(out T item)
     {
-        var tail = _tail.Value;
+        var tail = Volatile.Read(ref _tail.Value);
         // tail 已通过 mask 约束，局部使用 Unsafe.Add 不暴露任意指针。
         ref var first = ref MemoryMarshal.GetArrayDataReference(_buffer);
         ref var cell = ref Unsafe.Add(
@@ -126,8 +127,15 @@ internal sealed class BoundedMpscRing<T> where T : struct
 
         if (diff == 0)
         {
-            // 槽位可读：推进 tail（单消费者，无需 CAS），读值，发布新 sequence。
-            _tail.Value = tail + 1;
+            // 槽位可读：CAS 推进 tail。MPSC 场景下单消费者必然成功；
+            // MPMC 场景下（如 DomainWorkLane）竞争失败者返回 false 由调用方重试。
+            if (Interlocked.CompareExchange(ref _tail.Value, tail + 1, tail) != tail)
+            {
+                item = default!;
+                return false;
+            }
+
+            // CAS 成功：本消费者独占该槽位，安全读值并发布新 sequence。
             item = cell.Value!;
             // 在发布槽位可复用前清除引用，避免消息/Key 被 Ring 保留一整圈。
             cell.Value = default!;
