@@ -49,13 +49,29 @@ internal sealed class SessionRevocationHandler : IRealtimeEventHandler
             return;
         }
 
+        // P0-7：优先按 ConnectionLeaseId 精确匹配（PayloadJson 携带旧连接的 lease id），
+        // 避免在 SessionId 相同时（Resume 复用原 SessionId）误关新连接。
+        // PayloadJson 为空时回退到 SessionId 匹配（兼容未携带 lease id 的旧事件）。
+        var targetLeaseId = realtimeEvent.PayloadJson;
+        var matchByLeaseId = !string.IsNullOrWhiteSpace(targetLeaseId);
+
         var closedSessions = 0;
         foreach (var session in _userSessions.GetSnapshot(realtimeEvent.TargetUserId))
         {
-            if (!string.Equals(
-                    session.SessionId,
-                    realtimeEvent.SessionId,
-                    StringComparison.Ordinal))
+            if (matchByLeaseId)
+            {
+                if (!string.Equals(
+                        session.ConnectionLeaseId,
+                        targetLeaseId,
+                        StringComparison.Ordinal))
+                {
+                    continue;
+                }
+            }
+            else if (!string.Equals(
+                        session.SessionId,
+                        realtimeEvent.SessionId,
+                        StringComparison.Ordinal))
             {
                 continue;
             }
@@ -63,7 +79,7 @@ internal sealed class SessionRevocationHandler : IRealtimeEventHandler
             // 撤销 ResumeToken：尽力而为，Redis 故障不阻断关闭。
             // fire-and-forget：SessionRevoked 是单向事件，不应因 Redis 延迟阻塞 dispatcher。
             // Token 在 TTL 到期后自然失效，此处撤销只是加速失效。
-            // 异步异常通过 RevokeResumeTokenSafeAsync 观测并记录，避免静默吞没 Redis 故障。
+            // 异常通过 RevokeResumeTokenSafeAsync 观测并记录，避免静默吞没 Redis 故障。
             if (_resumeTokenStore is not null
                 && !string.IsNullOrWhiteSpace(session.CurrentResumeToken))
             {

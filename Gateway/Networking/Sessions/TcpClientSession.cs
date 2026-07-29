@@ -60,7 +60,9 @@ internal sealed partial class TcpClientSession : IAsyncDisposable
     // Ephemeral latest-state mailbox：按 EphemeralKey 分槽，同 key 覆盖旧帧保留最新状态。
     // Typing key = (KindTyping, hash(conversationId))，Presence key = (KindPresence, userId)。
     // 与 _outbound FIFO 独立：flush sentinel 写入 FIFO 唤醒发送循环排空 mailbox。
-    private readonly EphemeralMailbox _ephemeralMailbox = new();
+    // 惰性创建：首次 TryQueueEphemeral 时才分配。Specialized Typing 模式下永远不创建，
+    // 节省每连接一个 mailbox 对象（数组 + List）。
+    private EphemeralMailbox? _ephemeralMailbox;
     // 标记是否已有 flush sentinel 在 _outbound 队列中，避免重复入队。
     private volatile bool _ephemeralFlushPending;
 
@@ -182,8 +184,14 @@ internal sealed partial class TcpClientSession : IAsyncDisposable
     /// <summary>
     /// 每次 TCP 连接生成的唯一所有权令牌（GUID），用于设备租约的 compare-and-delete/refresh。
     /// 与 <see cref="SessionId"/> 分离：SessionId 是用户可见会话标识，ConnectionLeaseId 是内部所有权凭证。
+    /// <para>
+    /// 内部存储为 <see cref="Guid"/>（16 字节），仅首次访问时格式化为 "N" 字符串。
+    /// 未认证即断开的连接不产生字符串分配。
+    /// </para>
     /// </summary>
-    public string ConnectionLeaseId { get; } = Guid.NewGuid().ToString("N");
+    private readonly Guid _connectionLeaseId = Guid.NewGuid();
+    private string? _connectionLeaseIdString;
+    public string ConnectionLeaseId => _connectionLeaseIdString ??= _connectionLeaseId.ToString("N");
 
     public bool IsConnected => Volatile.Read(ref _closeState) == 0;
 
@@ -374,4 +382,27 @@ internal sealed partial class TcpClientSession : IAsyncDisposable
         Interlocked.Exchange(
             ref _lastInboundTimestamp,
             _timeProvider.GetTimestamp());
+
+    /// <summary>
+    /// 获取或创建 EphemeralMailbox。首次 TryQueueEphemeral 时惰性创建。
+    /// Specialized Typing 模式下永远不会被调用，节省每连接一个 mailbox 对象。
+    /// 线程安全：CAS 发布，多线程首次调用时仅一个实例胜出。
+    /// </summary>
+    private EphemeralMailbox GetOrCreateEphemeralMailbox()
+    {
+        var mailbox = Volatile.Read(ref _ephemeralMailbox);
+        if (mailbox is not null)
+            return mailbox;
+
+        var created = new EphemeralMailbox();
+        return Interlocked.CompareExchange(ref _ephemeralMailbox, created, null) is null
+            ? created
+            : Volatile.Read(ref _ephemeralMailbox);
+    }
+
+    /// <summary>
+    /// EphemeralMailbox 是否非空（有未排空的 ephemeral 条目）。
+    /// mailbox 未创建（null）时返回 false，避免 null-check 散落。
+    /// </summary>
+    private bool HasEphemeralEntries => _ephemeralMailbox is not null && !_ephemeralMailbox.IsEmpty;
 }

@@ -34,7 +34,8 @@ internal sealed class RedisDeviceSessionLeaseStore : IDeviceSessionLeaseStore
     }
 
     // 值格式：connectionLeaseId\nsessionId
-    // GET old; SET new with TTL; return old sessionId if connectionLeaseId differs (else empty string).
+    // GET old; SET new with TTL; return "prevLease\nprevSession" if connectionLeaseId differs (else empty string).
+    // P0-7：返回旧 lease 和旧 session（用 \n 分隔），使调用方能按 ConnectionLeaseId 精确匹配旧连接。
     private static readonly LuaScript TakeOverScript = LuaScript.Prepare(
         """
         local previous = redis.call('GET', @key)
@@ -46,10 +47,10 @@ internal sealed class RedisDeviceSessionLeaseStore : IDeviceSessionLeaseStore
             local prevLease = string.sub(previous, 1, sep - 1)
             local prevSession = string.sub(previous, sep + 1)
             if prevLease ~= @connectionLeaseId then
-              return prevSession
+              return prevLease .. '\n' .. prevSession
             end
           else
-            return previous
+            return previous .. '\n'
           end
         end
         return ''
@@ -94,7 +95,7 @@ internal sealed class RedisDeviceSessionLeaseStore : IDeviceSessionLeaseStore
         return 0
         """);
 
-    public async ValueTask<string?> TakeOverAsync(
+    public async ValueTask<DeviceLeaseTakeoverResult?> TakeOverAsync(
         long userId,
         ulong deviceIdHash,
         string sessionId,
@@ -108,11 +109,11 @@ internal sealed class RedisDeviceSessionLeaseStore : IDeviceSessionLeaseStore
         if (ttl <= TimeSpan.Zero)
             ttl = TimeSpan.FromHours(24);
 
+        // 熔断器开路时抛异常而非返回 null——返回 null 会让 Coordinator 误判为"无旧租约需吊销"
+        // 并继续 Resume（fail-open）。Same-device fencing 的接管侧属于安全不变量，必须 fail-closed。
+        // 与 GetCurrentSessionIdAsync 的熔断器处理对齐。
         if (_circuitBreaker is { IsAvailable: false })
-        {
-            // 熔断器开路：退化为仅本机替换，避免阻断登录。
-            return null;
-        }
+            throw new RedisException("Redis circuit breaker is open");
 
         var key = CreateKey(userId, deviceIdHash);
         var ttlMs = (long)Math.Clamp(ttl.TotalMilliseconds, 1_000, 7 * 24 * 60 * 60 * 1000d);
@@ -131,7 +132,38 @@ internal sealed class RedisDeviceSessionLeaseStore : IDeviceSessionLeaseStore
                 return null;
 
             var previous = (string?)result;
-            return string.IsNullOrWhiteSpace(previous) ? null : previous;
+            if (string.IsNullOrWhiteSpace(previous))
+                return null;
+
+            // Lua 返回格式：prevLease\nprevSession
+            // P0-7：解析出旧 ConnectionLeaseId 和旧 SessionId，供调用方按 lease 精确匹配。
+            var sepIndex = previous.IndexOf('\n');
+            string? prevLease;
+            string? prevSession;
+            if (sepIndex < 0)
+            {
+                prevLease = previous;
+                prevSession = null;
+            }
+            else
+            {
+                prevLease = sepIndex > 0 ? previous[..sepIndex] : null;
+                prevSession = sepIndex < previous.Length - 1
+                    ? previous[(sepIndex + 1)..]
+                    : null;
+            }
+
+            prevLease = string.IsNullOrWhiteSpace(prevLease) ? null : prevLease;
+            prevSession = string.IsNullOrWhiteSpace(prevSession) ? null : prevSession;
+
+            if (prevLease is null && prevSession is null)
+                return null;
+
+            return new DeviceLeaseTakeoverResult
+            {
+                PreviousConnectionLeaseId = prevLease,
+                PreviousSessionId = prevSession
+            };
         }
         catch (RedisException exception)
         {
@@ -140,8 +172,10 @@ internal sealed class RedisDeviceSessionLeaseStore : IDeviceSessionLeaseStore
                 GatewayDependency.Redis,
                 GatewayDependencyOperation.DeviceLeaseTakeOver,
                 exception);
-            // 租约不可用时退化为仅本机替换，避免阻断登录。
-            return null;
+            // 抛异常让 Coordinator fail-closed（拒绝 Resume，要求完整认证）。
+            // 旧实现返回 null 导致 Redis 故障期间跨 Gateway 旧连接吊销静默丢失（fail-open），
+            // 新登录继续但旧 Transport 不被关闭。与 GetCurrentSessionIdAsync 的 fail-closed 策略对齐。
+            throw;
         }
     }
 

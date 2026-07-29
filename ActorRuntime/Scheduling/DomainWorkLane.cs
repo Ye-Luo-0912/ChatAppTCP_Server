@@ -39,9 +39,12 @@ public sealed class DomainWorkLane<TWork> : IAsyncDisposable
     private readonly TimeSpan _operationTimeout;
     private readonly List<Task> _workers = new();
     private readonly CancellationTokenSource _stopCts = new();
-    // 异步唤醒信号：替代 spin+yield 的忙等。
-    // 入队时 Release()，Worker 队列空时 WaitAsync() 真正休眠。
-    private readonly SemaphoreSlim _signal = new(0, int.MaxValue);
+    // 二值唤醒信号：替代计数信号量，匹配批量 Drain 语义。
+    // _signalState: 0 = Worker 正在 Drain 或已唤醒，1 = 需要唤醒。
+    // 生产者只在 0→1 时 Release()，Worker 唤醒后重置为 0 并 Drain 全部 Work。
+    // 避免计数信号量下"入队 N 条 → N 个 permit → 1 次 Drain 消费 1 permit → N-1 次空唤醒"。
+    private readonly SemaphoreSlim _signal = new(0, 1);
+    private int _signalState;
 
     private int _queuedCount;
     private int _inflightCount;
@@ -91,9 +94,13 @@ public sealed class DomainWorkLane<TWork> : IAsyncDisposable
         }
 
         _submittedCount.Increment();
-        // 唤醒一个等待中的 Worker。SemaphoreSlim 内部线程安全，
-        // 多次 Release 会累积计数，确保所有入队的 work 都有对应的唤醒信号。
-        _signal.Release();
+        // 二值唤醒：只在 0→1 时 Release()，避免计数信号量的 permit 累积。
+        // 若 Worker 正在 Drain（_signalState=0），设为 1 并唤醒；
+        // 若已有待处理唤醒（_signalState=1），不重复 Release。
+        if (Interlocked.Exchange(ref _signalState, 1) == 0)
+        {
+            _signal.Release();
+        }
         return true;
     }
 
@@ -110,66 +117,123 @@ public sealed class DomainWorkLane<TWork> : IAsyncDisposable
 
     private async Task RunWorkerAsync(CancellationToken stopToken)
     {
-        // 每 Worker 持有一个可复用 CTS：消除 per-work CreateLinkedTokenSource 分配。
-        // stopToken 触发时通过注册回调显式 Cancel 当前 CTS，替代 linked CTS。
-        var workerCts = new CancellationTokenSource();
-        using var stopRegistration = stopToken.Register(
-            static state => ((CancellationTokenSource)state!).Cancel(),
-            workerCts);
-
-        while (true)
-        {
-            // 尝试批量 drain：一次唤醒处理尽可能多的 work，减少信号开销。
-            while (_ring.TryDequeue(out var work))
+        // 使用 Holder 包装当前 CTS：stopRegistration 回调通过 Holder 间接访问，
+        // 确保 workerCts 被 TryReset 替换后回调仍能 Cancel 最新的 CTS。
+        var holder = new CtsHolder(new CancellationTokenSource());
+        // stopToken 回调：Cancel holder 内当前的 CTS。捕获 holder 而非 CTS 本身，
+        // 使 CTS 替换后回调仍指向新 CTS。ObjectDisposedException 防御旧 CTS 被回收后的竞态。
+        var stopRegistration = stopToken.Register(
+            static state =>
             {
-                Interlocked.Decrement(ref _queuedCount);
-                Interlocked.Increment(ref _inflightCount);
+                var h = (CtsHolder)state!;
+                var cts = h.Current;
+                try { cts.Cancel(); }
+                catch (ObjectDisposedException) { }
+            },
+            holder);
+
+        try
+        {
+            while (true)
+            {
+                // 重置二值信号为 0（表示"有 Worker 正在 Drain"），然后批量 drain。
+                // 关键：必须在 Drain 之前重置，而非之后。否则 Drain 期间（可能耗时很长，
+                // 如慢速授权 I/O）_signalState 保持 1，生产者 Exchange 返回 1 不 Release，
+                // 其他 Worker 永远不会被唤醒——表现为单慢请求阻塞全部后续请求。
+                Volatile.Write(ref _signalState, 0);
+
+                // 尝试批量 drain：一次唤醒处理尽可能多的 work，减少信号开销。
+                while (_ring.TryDequeue(out var work))
+                {
+                    Interlocked.Decrement(ref _queuedCount);
+                    Interlocked.Increment(ref _inflightCount);
+
+                    // 多 Worker 信号补传：取出一条 work 后若队列非空，立即唤醒其他 Worker。
+                    // 背景：二值信号合并入队——多条 work 快速入队时仅一次 Release()。
+                    // 若当前 Worker 取出慢 I/O work 并 await 阻塞，剩余 fast work 会被搁置
+                    // 在队列中无人处理（其他 Worker 在 WaitAsync 上无 permit 可消费）。
+                    // 此处补传信号后，其他 Worker 可并行取出剩余 work，避免慢请求阻塞快请求。
+                    if (_ring.Count > 0)
+                    {
+                        if (Interlocked.Exchange(ref _signalState, 1) == 0)
+                            _signal.Release();
+                    }
+
+                    var workerCts = holder.Current;
+                    try
+                    {
+                        await ExecuteWorkAsync(work, workerCts, stopToken)
+                            .ConfigureAwait(false);
+                        _completedCount.Increment();
+                    }
+                    catch (OperationCanceledException)
+                        when (!stopToken.IsCancellationRequested && workerCts.IsCancellationRequested)
+                    {
+                        // 超时（非 stop）：workerCts 被 CancelAfter 触发。
+                        _timeoutCount.Increment();
+                        NotifyFailure(work, exception: null, AsyncOperationFailureKind.TimedOut);
+                    }
+                    catch (OperationCanceledException)
+                        when (stopToken.IsCancellationRequested)
+                    {
+                        NotifyFailure(work, exception: null, AsyncOperationFailureKind.RuntimeStopping);
+                    }
+                    catch (Exception ex)
+                    {
+                        _failedCount.Increment();
+                        NotifyFailure(work, ex, AsyncOperationFailureKind.Faulted);
+                    }
+                    finally
+                    {
+                        Interlocked.Decrement(ref _inflightCount);
+                        Interlocked.Decrement(ref _outstandingCount);
+                        // 复用 CTS：TryReset 清除取消状态，供下一个 work 使用。
+                        // TryReset 失败（CTS 已取消）时创建新 CTS 替换。
+                        // 旧 CTS 不立即 Dispose——holder 回调可能仍通过 Volatile.Read 访问它。
+                        // 旧 CTS 由 GC 终结器处理 Timer 释放。
+                        if (!workerCts.TryReset())
+                        {
+                            holder.Replace(new CancellationTokenSource());
+                        }
+                    }
+                }
+
+                // Drain 完成：队列空。重检防止"重置 _signalState=0 → 新入队设 1 并 Release → WaitAsync"竞态。
+                // 若在 Drain 最后一次 TryDequeue 与此处之间有新入队，重检发现非空则继续 Drain。
+                if (_ring.Count > 0)
+                {
+                    // 有新 Work 入队：继续循环（循环顶部会重置 _signalState=0 再 Drain）。
+                    continue;
+                }
+
                 try
                 {
-                    await ExecuteWorkAsync(work, workerCts, stopToken)
-                        .ConfigureAwait(false);
-                    _completedCount.Increment();
+                    await _signal.WaitAsync(stopToken).ConfigureAwait(false);
                 }
                 catch (OperationCanceledException)
-                    when (!stopToken.IsCancellationRequested && workerCts.IsCancellationRequested)
                 {
-                    // 超时（非 stop）：workerCts 被 CancelAfter 触发。
-                    _timeoutCount.Increment();
-                    NotifyFailure(work, exception: null, AsyncOperationFailureKind.TimedOut);
+                    break;
                 }
-                catch (OperationCanceledException)
-                    when (stopToken.IsCancellationRequested)
-                {
-                    NotifyFailure(work, exception: null, AsyncOperationFailureKind.RuntimeStopping);
-                }
-                catch (Exception ex)
-                {
-                    _failedCount.Increment();
-                    NotifyFailure(work, ex, AsyncOperationFailureKind.Faulted);
-                }
-                finally
-                {
-                    Interlocked.Decrement(ref _inflightCount);
-                    Interlocked.Decrement(ref _outstandingCount);
-                    // 复用 CTS：TryReset 清除取消状态，供下一个 work 使用。
-                    workerCts.TryReset();
-                }
-            }
-
-            // 队列空：真正异步休眠，等待信号唤醒。空闲时接近零 CPU。
-            // 注意：入队时已 Release，此处 WaitAsync 消费一个信号计数。
-            // 若在 TryDequeue 与 WaitAsync 之间有新入队，信号已累积，WaitAsync 立即返回。
-            try
-            {
-                await _signal.WaitAsync(stopToken).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException)
-            {
-                break;
             }
         }
+        finally
+        {
+            // 先反注册 stopToken 回调，再 Dispose 当前 CTS。
+            stopRegistration.Dispose();
+            holder.Current.Dispose();
+        }
+    }
 
-        workerCts.Dispose();
+    /// <summary>
+    /// CTS 持有者：允许 stopToken 回调通过 Volatile.Read 访问最新的 CTS，
+    /// 即使 Worker 在 TryReset 失败后替换了 CTS。
+    /// </summary>
+    private sealed class CtsHolder
+    {
+        private CancellationTokenSource _current;
+        public CancellationTokenSource Current => Volatile.Read(ref _current);
+        public CtsHolder(CancellationTokenSource initial) => _current = initial;
+        public void Replace(CancellationTokenSource next) => Volatile.Write(ref _current, next);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]

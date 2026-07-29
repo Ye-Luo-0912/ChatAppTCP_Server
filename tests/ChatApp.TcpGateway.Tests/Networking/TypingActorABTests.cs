@@ -160,9 +160,10 @@ public sealed class TypingActorABTests
         var ct = TestContext.Current.CancellationToken;
         var clock = new ManualTimeProvider(DateTimeOffset.UnixEpoch);
 
-        // Key (4001,4002) 的授权慢 2s（远大于第一段等待窗口）；Key (4003,4004) 的授权快。
+        // Key (4001,4002) 的授权慢 10s（远大于第一段等待窗口）；Key (4003,4004) 的授权快。
+        // 10s 延迟为 CI 环境调度抖动留足余量，确保快 Key 完成断言时慢 Key 仍在 in-flight。
         var authorizer = new FakeDirectConversationAuthorizer(allowAll: true);
-        authorizer.SetLatency(senderUserId: 4001, TimeSpan.FromSeconds(2));
+        authorizer.SetLatency(senderUserId: 4001, TimeSpan.FromSeconds(10));
 
         var fanout = new TypingFanoutCoordinator(
             clock,
@@ -181,20 +182,21 @@ public sealed class TypingActorABTests
         // 立即发快 Key——不应被慢 Key 阻塞。
         SendTypingNotify(pipeline, session2, conversationId: "dm:4003:4004", isTyping: true);
 
-        // 快 Key 应在 800ms 内完成授权 + 发射（无慢 Key 阻塞）。
+        // 快 Key 应在 5s 内完成授权 + 发射（无慢 Key 阻塞）。
+        // 5s 窗口容忍 CI 调度抖动与 ThreadPool 竞争；慢 Key 10s 延迟保证此期间未完成。
         await WaitUntilAsync(
             () => fanout.DrainPending().Count > 0,
-            TimeSpan.FromMilliseconds(800), ct);
+            TimeSpan.FromSeconds(5), ct);
 
-        // 慢 Key 的授权仍在进行中（2s 未到）。
+        // 慢 Key 的授权仍在进行中（10s 未到）。
         // 注意：CallCount 在 AuthorizeAsync 入口即递增（含慢 Key 的 in-flight 调用），
-        // 必须用 CompletedCallCount 判据——只有真正走完 Task.Delay(2s) 的才计入。
+        // 必须用 CompletedCallCount 判据——只有真正走完 Task.Delay(10s) 的才计入。
         Assert.Equal(1, authorizer.CompletedCallCount);
 
-        // 等待慢 Key 完成。
+        // 等待慢 Key 完成（15s 窗口覆盖 10s 延迟 + CI 抖动）。
         await WaitUntilAsync(
             () => authorizer.CompletedCallCount >= 2,
-            TimeSpan.FromSeconds(5), ct);
+            TimeSpan.FromSeconds(15), ct);
 
         await pipeline.StopAsync(ct);
     }
@@ -648,6 +650,217 @@ public sealed class TypingActorABTests
         Assert.Equal(1, typingAuthorizer.CallCount);
         Assert.Equal(0, typingPipeline.Snapshot.BusyActors);
         Assert.Equal(0, typingPipeline.Snapshot.PendingAsyncOperations);
+    }
+
+    #endregion
+
+    #region 场景 12：P0-9 授权失效——stale Completion 被纪元校验拒绝
+
+    /// <summary>
+    /// P0-9：关系变更触发的授权失效必须使在途的 stale Completion 被拒绝，
+    /// 防止"关系变更 → 失效 → 旧 I/O 完成回投 Authorized=true 覆盖失效"的竞态。
+    /// <para>
+    /// 场景：
+    /// 1. 发送 typing=true → Actor 激活并提交授权 I/O（epoch=0），Suspend
+    /// 2. 授权 I/O 进行中时调用 InvalidateAuthorization → 自增 epoch=1，清空缓存
+    /// 3. 授权 I/O 完成（携带 epoch=0）→ Completion 被拒绝（epoch 不匹配）
+    /// 4. 验证：无 typing=true 发射（授权结果被拒绝）
+    /// 5. 验证：Actor 未卡住（BusyActors == 0）
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task P09_Invalidation_RejectsStaleCompletionAndDoesNotEmitTypingTrue()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var clock = new ManualTimeProvider(DateTimeOffset.UnixEpoch);
+
+        // 授权慢 1s，确保 Invalidation 能在 I/O 完成前到达。
+        var authorizer = new FakeDirectConversationAuthorizer(allowAll: true);
+        authorizer.SetLatency(senderUserId: 12001, TimeSpan.FromSeconds(1));
+
+        var fanout = new TypingFanoutCoordinator(
+            clock,
+            minInterval: TimeSpan.FromMilliseconds(1),
+            ttl: TimeSpan.FromSeconds(30),
+            tickInterval: TimeSpan.FromMilliseconds(500));
+
+        await using var pipeline = CreateTypingActorPipeline(authorizer, fanout, clock);
+        await using var session = CreateSession(userId: 12001);
+        await pipeline.StartAsync(ct);
+
+        // 1. 发送 typing=true → 触发授权 I/O（epoch=0）。
+        SendTypingNotify(pipeline, session, conversationId: "dm:12001:12002", isTyping: true);
+
+        // 等待授权 I/O 提交（CallCount 在入口即递增）。
+        await WaitUntilAsync(
+            () => authorizer.CallCount >= 1,
+            TimeSpan.FromSeconds(2), ct);
+
+        // 2. 授权 I/O 进行中时触发失效：自增 epoch=1。
+        //    此时 stale Completion（epoch=0）还未到达。
+        pipeline.InvalidateAuthorization(senderUserId: 12001, targetUserId: 12002);
+
+        // 3. 等待授权 I/O 完成 → stale Completion 回投并被拒绝。
+        await WaitUntilAsync(
+            () => authorizer.CompletedCallCount >= 1,
+            TimeSpan.FromSeconds(3), ct);
+
+        // 4. 等待 Actor 处理完 Invalidation + stale Completion。
+        await WaitUntilAsync(
+            () => pipeline.Snapshot.BusyActors == 0,
+            TimeSpan.FromSeconds(3), ct);
+
+        // 5. 验证：无 typing=true 发射。
+        //    - 授权 I/O 完成（authorized=true）但 epoch 不匹配，被拒绝，不发射。
+        //    - Invalidation 在 LastEmittedIsTyping=false 时不发射 typing=false。
+        //    因此 fanout 应为空。
+        var emissions = fanout.DrainPending();
+        Assert.Empty(emissions);
+
+        await pipeline.StopAsync(ct);
+    }
+
+    #endregion
+
+    #region 场景 13：P0-9 控制通道——Invalidation 不被 LatestOnly Mailbox 覆盖
+
+    /// <summary>
+    /// P0-9：Invalidation 经控制通道投递（TryTellInvalidation），优先级高于
+    /// Completion 与业务 Mailbox，确保不被 LatestOnly Mailbox 中的后续 Notify 覆盖。
+    /// <para>
+    /// 场景：
+    /// 1. 发送 typing=true → Actor 激活并提交授权 I/O（epoch=0），Suspend
+    /// 2. 发送 typing=false → 落入 LatestOnly Mailbox
+    /// 3. 调用 InvalidateAuthorization → 经控制通道投递到 Invalidation 槽
+    /// 4. 授权 I/O 完成（epoch=0）→ Completion 槽
+    /// 5. Actor 恢复时按优先级处理：Invalidation（epoch++）→ stale Completion（拒绝）→ Mailbox（typing=false）
+    /// 6. 验证：无 typing=true 发射（stale Completion 被拒绝）
+    /// 7. 验证：Actor 未卡住
+    /// </para>
+    /// <para>
+    /// 此测试证明 Invalidation 不会因 LatestOnly Mailbox 有 pending 消息而丢失——
+    /// 若 Invalidation 走普通 Mailbox（TryTellEphemeral），它会被 typing=false 覆盖，
+    /// epoch 不会自增，stale Completion 会以 authorized=true 覆盖失效。
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task P09_Invalidation_ControlChannelNotOverwrittenByLatestOnlyMailbox()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var clock = new ManualTimeProvider(DateTimeOffset.UnixEpoch);
+
+        // 授权慢 1s，确保 Invalidation 与 typing=false 能在 I/O 完成前到达。
+        var authorizer = new FakeDirectConversationAuthorizer(allowAll: true);
+        authorizer.SetLatency(senderUserId: 13001, TimeSpan.FromSeconds(1));
+
+        var fanout = new TypingFanoutCoordinator(
+            clock,
+            minInterval: TimeSpan.FromMilliseconds(1),
+            ttl: TimeSpan.FromSeconds(30),
+            tickInterval: TimeSpan.FromMilliseconds(500));
+
+        await using var pipeline = CreateTypingActorPipeline(authorizer, fanout, clock);
+        await using var session = CreateSession(userId: 13001);
+        await pipeline.StartAsync(ct);
+
+        // 1. 发送 typing=true → 触发授权 I/O（epoch=0），Actor Suspend。
+        SendTypingNotify(pipeline, session, conversationId: "dm:13001:13002", isTyping: true);
+
+        // 等待授权 I/O 提交。
+        await WaitUntilAsync(
+            () => authorizer.CallCount >= 1,
+            TimeSpan.FromSeconds(2), ct);
+
+        // 2. 发送 typing=false → 落入 LatestOnly Mailbox（覆盖 typing=true）。
+        SendTypingNotify(pipeline, session, conversationId: "dm:13001:13002", isTyping: false);
+
+        // 3. 触发失效：经控制通道投递到 Invalidation 槽。
+        //    若走普通 Mailbox，此消息会被 step 2 的 typing=false 覆盖（LatestOnly）。
+        pipeline.InvalidateAuthorization(senderUserId: 13001, targetUserId: 13002);
+
+        // 4. 等待所有授权 I/O 完成（stale Completion + 可能的二次 I/O）。
+        await WaitUntilAsync(
+            () => pipeline.Snapshot.BusyActors == 0 && pipeline.Snapshot.PendingAsyncOperations == 0,
+            TimeSpan.FromSeconds(5), ct);
+
+        // 5. 验证：无 typing=true 发射。
+        //    - stale Completion（authorized=true, epoch=0）被拒绝（state.epoch=1）→ 不发射
+        //    - Invalidation 在 LastEmittedIsTyping=false 时不发射 typing=false
+        //    - Mailbox 的 typing=false 触发新 I/O（epoch=1 匹配），但 DesiredIsTyping=false，
+        //      TryEmit 跳过（DesiredIsTyping==LastEmittedIsTyping==false）
+        //    因此 fanout 应为空——证明 stale Completion 未覆盖失效。
+        var emissions = fanout.DrainPending();
+        Assert.Empty(emissions);
+
+        // 6. 验证：Actor 未卡住。
+        Assert.Equal(0, pipeline.Snapshot.BusyActors);
+
+        await pipeline.StopAsync(ct);
+    }
+
+    #endregion
+
+    #region 场景 14：P0-9 失效后新 Notify 触发重新授权
+
+    /// <summary>
+    /// P0-9：授权失效后，新的 Notify 应触发新一轮授权 I/O（使用自增后的 epoch）。
+    /// <para>
+    /// 场景：
+    /// 1. 发送 typing=true → 授权通过（epoch=0），发射 typing=true
+    /// 2. 调用 InvalidateAuthorization → epoch=1，清空缓存
+    /// 3. 发送 typing=true → 因 Authorized=false，触发新授权 I/O（epoch=1）
+    /// 4. 授权完成（epoch=1 匹配）→ 接受结果，发射 typing=true
+    /// 5. 验证：两次授权 I/O 调用，两次 typing=true 发射
+    /// </para>
+    /// 此测试证明失效后 epoch 机制不阻碍合法的新一轮授权。
+    /// </summary>
+    [Fact]
+    public async Task P09_AfterInvalidation_NewNotifyTriggersReauthorizationWithNewEpoch()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var clock = new ManualTimeProvider(DateTimeOffset.UnixEpoch);
+        var authorizer = new FakeDirectConversationAuthorizer(allowAll: true);
+
+        var fanout = new TypingFanoutCoordinator(
+            clock,
+            minInterval: TimeSpan.FromMilliseconds(1),
+            ttl: TimeSpan.FromSeconds(30),
+            tickInterval: TimeSpan.FromMilliseconds(500));
+
+        await using var pipeline = CreateTypingActorPipeline(authorizer, fanout, clock);
+        await using var session = CreateSession(userId: 14001);
+        await pipeline.StartAsync(ct);
+
+        // 1. 发送 typing=true → 授权通过，发射 typing=true。
+        SendTypingNotify(pipeline, session, conversationId: "dm:14001:14002", isTyping: true);
+        await WaitUntilAsync(
+            () => authorizer.CallCount >= 1 && fanout.DrainPending().Count > 0,
+            TimeSpan.FromSeconds(2), ct);
+        Assert.Equal(1, authorizer.CallCount);
+
+        // 2. 触发失效：清空缓存，自增 epoch。
+        pipeline.InvalidateAuthorization(senderUserId: 14001, targetUserId: 14002);
+        // 等待 Invalidation 处理完成。
+        await WaitUntilAsync(
+            () => pipeline.Snapshot.BusyActors == 0,
+            TimeSpan.FromSeconds(2), ct);
+
+        // 3. 发送 typing=true → Authorized=false，触发新授权 I/O（epoch=1）。
+        SendTypingNotify(pipeline, session, conversationId: "dm:14001:14002", isTyping: true);
+        await WaitUntilAsync(
+            () => authorizer.CallCount >= 2,
+            TimeSpan.FromSeconds(2), ct);
+
+        // 4. 等待第二次授权完成 + 发射。
+        await WaitUntilAsync(
+            () => fanout.DrainPending().Count > 0,
+            TimeSpan.FromSeconds(2), ct);
+
+        // 5. 验证：两次授权 I/O。
+        Assert.Equal(2, authorizer.CallCount);
+        Assert.Equal(0, pipeline.Snapshot.BusyActors);
+
+        await pipeline.StopAsync(ct);
     }
 
     #endregion

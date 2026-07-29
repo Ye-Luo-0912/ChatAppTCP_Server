@@ -57,8 +57,11 @@ var context = new ResumeScenarioContext
 {
     GatewayEndpoints = options.GatewayEndpoints,
     RedisConnectionString = options.RedisConnectionString,
+    // P0-B：注入真实 DeviceIdHash（按 userId 确定性派生），使 AccessToken 与
+    // AuthenticationRequest 携带一致的设备指纹，触发 same-device fencing 路径。
+    // 旧实现传 null，网关跳过设备绑定校验，fencing 路径永远不被执行。
     BootstrapFactory = (userId, ct) => ResumeTokenBootstrap.CreateAsync(
-        options.RedisConnectionString, userId, deviceIdHash: null, ct),
+        options.RedisConnectionString, userId, deviceIdHash: DeriveDeviceIdHash(userId), ct),
     MetricsSampler = metricsSampler,
     TimeProvider = TimeProvider.System,
     Options = options
@@ -120,3 +123,9 @@ static List<IResumeScenario> BuildScenarios(IReadOnlyList<string> names)
 
     return scenarios;
 }
+
+// 按 userId 确定性派生 DeviceIdHash：同一用户跨连接/跨网关使用同一设备指纹，
+// 使 same-device fencing（租约接管校验）路径被实际执行。
+// 使用黄金比例乘数 + 1 保证分布且 userId=0 时仍非零（0 在某些路径被当作"未设置"）。
+static ulong DeriveDeviceIdHash(long userId) =>
+    unchecked((ulong)userId * 0x9E3779B97F4A7C15UL + 1);

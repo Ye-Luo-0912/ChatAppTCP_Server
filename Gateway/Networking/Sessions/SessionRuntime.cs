@@ -53,6 +53,8 @@ internal sealed partial class SessionRuntime
     private readonly GatewayMetrics _metrics;
     private readonly TimeProvider _timeProvider;
     private readonly ILogger _logger;
+    // DeadlineWheel：用于注册帧装配超时回调，超时后关闭 Socket 唤醒挂起的 ReceiveAsync。
+    private readonly DeadlineWheel _deadlineWheel;
 
     private readonly Func<PacketFrame, TcpClientSession, string, CancellationToken, ValueTask> _processPacketAsync;
     private readonly Action<TcpClientSession, ProtocolErrorCode, string?, bool, int?, ushort?> _sendProtocolError;
@@ -69,6 +71,7 @@ internal sealed partial class SessionRuntime
         GatewayMetrics metrics,
         TimeProvider timeProvider,
         ILogger logger,
+        DeadlineWheel deadlineWheel,
         Func<PacketFrame, TcpClientSession, string, CancellationToken, ValueTask> processPacketAsync,
         Action<TcpClientSession, ProtocolErrorCode, string?, bool, int?, ushort?> sendProtocolError,
         Action<TcpClientSession, PacketCommand> rejectOversizedPayload)
@@ -83,6 +86,7 @@ internal sealed partial class SessionRuntime
         _metrics = metrics;
         _timeProvider = timeProvider;
         _logger = logger;
+        _deadlineWheel = deadlineWheel;
         _processPacketAsync = processPacketAsync;
         _sendProtocolError = sendProtocolError;
         _rejectOversizedPayload = rejectOversizedPayload;

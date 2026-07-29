@@ -74,12 +74,11 @@ internal sealed class RedisResumeTokenStore : IResumeTokenStore
         if (string.IsNullOrWhiteSpace(resumeToken))
             return null;
 
-        // 熔断器开路时抛异常而非返回 null——返回 null 会被 Coordinator 误记为 InvalidToken，
-        // 污染 Token 重放率与过期 Token 比例指标。抛异常让 Coordinator 归因为 RedisFailure。
-        // Coordinator 在 TryResumeAsync 入口已有 breaker 检查（CircuitOpen 路径），
-        // 此处仅为 race-condition 兜底（breaker 在 Coordinator 检查与 store 调用之间开路）。
-        if (_circuitBreaker is { IsAvailable: false })
-            throw new RedisException("Redis circuit breaker is open");
+        // 不在此处检查熔断器 IsAvailable：Coordinator.TryResumeAsync 入口已检查过，
+        // 此处二次检查会消耗 Half-Open Probe Lease，导致同一 Resume 请求被拦截。
+        // 熔断器的 RecordSuccess/RecordFailure 仍由此处记录（基于实际 Redis 操作结果）。
+        // IssueAsync/RevokeAsync 保留各自独立的 IsAvailable 检查，因为它们的调用方
+        // （OnAuthenticatedAsync）不在 Resume 路径上，不存在二次获取 Probe 的问题。
 
         var key = new RedisKey(KeyPrefix + resumeToken.Trim());
 

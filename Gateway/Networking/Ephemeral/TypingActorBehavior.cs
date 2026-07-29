@@ -84,7 +84,7 @@ internal sealed class TypingActorBehavior
             TypingActorMessageKind.AuthorizationCompleted =>
                 ReceiveAuthorizationCompleted(in key, in message, ref state),
             TypingActorMessageKind.AuthorizationInvalidated =>
-                ReceiveAuthorizationInvalidated(ref state),
+                ReceiveAuthorizationInvalidated(in key, ref state),
             _ => ReceiveNotify(in key, ref state, in message, ref context)
         };
     }
@@ -126,6 +126,9 @@ internal sealed class TypingActorBehavior
                 return ActorTurnResult.Continue;
             }
 
+            // P0-9：捕获当前授权纪元，Work 完成时携带此 epoch 回投 Completion。
+            // 若 Invalidation 在 I/O 期间到达并自增 epoch，Completion 的旧 epoch
+            // 会被 ReceiveAuthorizationCompleted 拒绝，避免 stale 结果覆盖失效。
             var work = new TypingAuthorizationWork(
                 _runtime!,
                 in key,
@@ -134,7 +137,8 @@ internal sealed class TypingActorBehavior
                 key.TargetUserId,
                 _authorizer,
                 _metrics,
-                _logger);
+                _logger,
+                state.AuthorizationEpoch);
             if (_authLane.TrySubmit(in work))
             {
                 state.AuthPending = true;
@@ -157,6 +161,19 @@ internal sealed class TypingActorBehavior
         ref TypingActorState state)
     {
         state.AuthPending = false;
+
+        // P0-9：授权纪元校验——若 Invalidation 在 I/O 期间到达并自增了 epoch，
+        // 此 Completion 携带的旧 epoch 不匹配，拒绝结果（Authorized 保持 false）。
+        // 这防止了"关系变更 → 失效 → 旧 I/O 完成回投 Authorized=true 覆盖失效"的竞态。
+        if (message.AuthorizationEpoch != state.AuthorizationEpoch)
+        {
+            _metrics.EphemeralEventDropped("typing_auth_stale_completion");
+            // 不发射、不缓存授权。DesiredIsTyping 已被 Invalidation 重置为 false，
+            // 此处无需再次 TryEmit。若 Invalidation 之后有新 Notify 到达，
+            // LatestOnly Mailbox 会保留它，ResumeMailbox 后重新触发授权 I/O。
+            return ActorTurnResult.ResumeMailbox;
+        }
+
         state.Authorized = message.Authorized;
 
         if (!message.Authorized)
@@ -182,16 +199,50 @@ internal sealed class TypingActorBehavior
     }
 
     /// <summary>
-    /// 关系变更触发的授权失效：清空 Actor 内缓存的 Authorized=true 与 TTL，
-    /// 下一次 Notify 必须重新走授权 I/O。不主动 Deactivate——
-    /// 若有 in-flight Notify 等待授权完成，Completion 仍会到达并按新状态发射。
+    /// 关系变更触发的授权失效：自增授权纪元（使在途的 stale Completion 被拒绝）、
+    /// 清空缓存的 Authorized=true 与 TTL、发射 typing=false 清理对端状态、
+    /// 重置 DesiredIsTyping=false（避免 stale Completion 后 ResumeMailbox 误发射）。
+    /// <para>
+    /// P0-9：经控制通道投递（TryTellInvalidation），不被 LatestOnly Mailbox 中的
+    /// 后续 Notify 覆盖。Invalidation 优先级高于 Completion，确保在处理 stale Completion
+    /// 前完成 epoch 自增。
+    /// </para>
+    /// <para>
+    /// 不主动 Deactivate——若有在途 I/O，Completion 仍会到达并被 epoch 校验拒绝。
+    /// 不提交新 I/O——Outstanding 可能仍被在途 I/O 占用。
+    /// </para>
     /// </summary>
-    private static ActorTurnResult ReceiveAuthorizationInvalidated(ref TypingActorState state)
+    private ActorTurnResult ReceiveAuthorizationInvalidated(
+        in TypingActorKey key,
+        ref TypingActorState state)
     {
+        // 自增 epoch：使在途 Completion 的旧 epoch 不匹配，被 ReceiveAuthorizationCompleted 拒绝。
+        state.AuthorizationEpoch++;
+
+        // 清空缓存授权与 TTL。
         state.Authorized = false;
         state.AuthorizedUntilTimestamp = 0;
-        // AuthPending 保持原值：若授权 I/O 正在进行，Completion 回来后会覆盖 Authorized。
-        // 这里不强行清零 AuthPending，避免 Completion 回来后误以为已缓存而跳过 I/O。
+
+        // 发射 typing=false 清理对端状态（若当前正在 typing）。
+        // 重置 DesiredIsTyping 与 LastEmittedIsTyping 以保持一致。
+        if (state.LastEmittedIsTyping)
+        {
+            _typingFanout.TryAccept(
+                key.SenderUserId,
+                key.TargetUserId,
+                state.ConversationId,
+                isTyping: false);
+            state.LastEmittedIsTyping = false;
+        }
+
+        // 重置期望状态：失效后不应继续尝试发射旧 typing=true。
+        // 若用户在失效后仍想 typing，需发送新 Notify 触发新一轮授权 I/O。
+        state.DesiredIsTyping = false;
+
+        // AuthPending 保持原值：
+        // - 若 I/O 在途（AuthPending=true），Completion 仍会到达并被 epoch 拒绝。
+        //   拒绝后 AuthPending 被置 false，Outstanding 被释放。
+        // - 若无 I/O 在途（AuthPending=false），无需额外处理。
         return ActorTurnResult.Continue;
     }
 
@@ -251,6 +302,7 @@ internal readonly struct TypingAuthorizationWork : IAsyncOperation
     private readonly IDirectConversationAuthorizer? _authorizer;
     private readonly GatewayMetrics _metrics;
     private readonly ILogger _logger;
+    private readonly uint _authorizationEpoch;
 
     public TypingAuthorizationWork(
         IActorRuntime<TypingActorKey, TypingActorState, TypingActorMessage> runtime,
@@ -260,7 +312,8 @@ internal readonly struct TypingAuthorizationWork : IAsyncOperation
         long targetUserId,
         IDirectConversationAuthorizer? authorizer,
         GatewayMetrics metrics,
-        ILogger logger)
+        ILogger logger,
+        uint authorizationEpoch)
     {
         _runtime = runtime;
         _key = key;
@@ -270,6 +323,7 @@ internal readonly struct TypingAuthorizationWork : IAsyncOperation
         _authorizer = authorizer;
         _metrics = metrics;
         _logger = logger;
+        _authorizationEpoch = authorizationEpoch;
     }
 
     public async ValueTask ExecuteAsync(CancellationToken cancellationToken)
@@ -312,7 +366,9 @@ internal readonly struct TypingAuthorizationWork : IAsyncOperation
             / Stopwatch.Frequency * 1000.0;
         _metrics.TypingAuthCompleted(elapsedMs, authorized);
 
-        var completion = TypingActorMessage.AuthorizationCompleted(authorized);
+        // P0-9：Completion 携带提交时捕获的授权纪元。
+        // Behavior 比较此 epoch 与 state.AuthorizationEpoch 以拒绝 stale Completion。
+        var completion = TypingActorMessage.AuthorizationCompleted(authorized, _authorizationEpoch);
         _runtime.TryTellCompletion(in _key, _activation, in completion);
     }
 
@@ -322,7 +378,11 @@ internal readonly struct TypingAuthorizationWork : IAsyncOperation
             return;
 
         // 超时或异常：回投 denied Completion 以唤醒 Suspend 的 Actor。
-        var completion = TypingActorMessage.AuthorizationCompleted(authorized: false);
+        // 携带原始 epoch——若 Invalidation 在此期间到达，epoch 不匹配会被拒绝，
+        // Actor 保持 Authorized=false（安全语义：失效优先）。
+        var completion = TypingActorMessage.AuthorizationCompleted(
+            authorized: false,
+            _authorizationEpoch);
         _runtime.TryTellCompletion(in _key, _activation, in completion);
     }
 }

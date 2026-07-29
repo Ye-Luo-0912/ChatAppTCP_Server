@@ -44,7 +44,13 @@ public sealed class SessionLifecycleCoordinatorTests
         var leaseStore = new FakeDeviceSessionLeaseStore
         {
             // TakeOver 发现旧 SessionId（跨 Gateway），应触发 SessionRevoked 广播。
-            OnTakeOver = _ => ValueTask.FromResult<string?>("old-remote-session")
+            // P0-7：返回 DeviceLeaseTakeoverResult 携带旧 SessionId 和旧 ConnectionLeaseId。
+            OnTakeOver = _ => ValueTask.FromResult<DeviceLeaseTakeoverResult?>(
+                new DeviceLeaseTakeoverResult
+                {
+                    PreviousSessionId = "old-remote-session",
+                    PreviousConnectionLeaseId = "old-remote-lease"
+                })
         };
         var tokenStore = new FakeResumeTokenStore
         {
@@ -255,7 +261,7 @@ public sealed class SessionLifecycleCoordinatorTests
         {
             // 当前租约归属待恢复 SessionId（无冲突）
             OnGetCurrentSessionId = _ => ValueTask.FromResult<string?>("resuming-session"),
-            OnTakeOver = _ => ValueTask.FromResult<string?>(null) // 无旧 Session
+            OnTakeOver = _ => ValueTask.FromResult<DeviceLeaseTakeoverResult?>(null) // 无旧 Session
         };
         var tokenStore = new FakeResumeTokenStore
         {
@@ -292,7 +298,7 @@ public sealed class SessionLifecycleCoordinatorTests
         var bus = new CapturingMessageBus();
         var leaseStore = new FakeDeviceSessionLeaseStore
         {
-            OnTakeOver = _ => ValueTask.FromResult<string?>(null)
+            OnTakeOver = _ => ValueTask.FromResult<DeviceLeaseTakeoverResult?>(null)
         };
         var tokenStore = new FakeResumeTokenStore
         {
@@ -355,6 +361,73 @@ public sealed class SessionLifecycleCoordinatorTests
 
         Assert.True(cbListener.WaitForIncrement(TimeSpan.FromSeconds(2)),
             "gateway.redis.circuit_breaker.open was not incremented");
+    }
+
+    [Fact]
+    public async Task TryResumeAsync_FailsWithTakeOverUnavailable_WhenTakeOverThrows()
+    {
+        // P0-A: TakeOverAsync 依赖不可用时必须 fail-closed（拒绝恢复 + 关闭连接），
+        // 而非旧行为的 fail-open（吞异常继续恢复，旧 Transport 不被吊销）。
+        var ct = TestContext.Current.CancellationToken;
+        using var metrics = new GatewayMetrics();
+        var bus = new CapturingMessageBus();
+        var leaseStore = new FakeDeviceSessionLeaseStore
+        {
+            OnGetCurrentSessionId = _ => ValueTask.FromResult<string?>(null), // 租约查询通过
+            OnTakeOver = _ => throw new InvalidOperationException("simulated takeover failure")
+        };
+        var tokenStore = new FakeResumeTokenStore
+        {
+            OnTryValidate = _ => Task.FromResult<ResumeContext?>(
+                new ResumeContext
+                {
+                    UserId = 1001,
+                    SessionId = "resuming-session",
+                    ConnectionLeaseId = "old-lease",
+                    DeviceIdHash = 0xAA
+                })
+        };
+        var coordinator = CreateCoordinator(metrics, bus, leaseStore, tokenStore);
+        await using var session = CreateSession(metrics);
+
+        var result = await coordinator.TryResumeAsync("valid-token", session, ct);
+
+        // 拒绝恢复（fail-closed）
+        Assert.Null(result);
+        // 不应广播任何事件（未恢复成功）
+        Assert.Empty(bus.PublishedEvents);
+    }
+
+    [Fact]
+    public async Task TryResumeAsync_RecordsTakeOverUnavailableMetric_WhenTakeOverThrows()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        using var metrics = new GatewayMetrics();
+        using var failedListener = new SingleCounterListener("gateway.resume.failed");
+        var bus = new CapturingMessageBus();
+        var leaseStore = new FakeDeviceSessionLeaseStore
+        {
+            OnGetCurrentSessionId = _ => ValueTask.FromResult<string?>(null),
+            OnTakeOver = _ => throw new InvalidOperationException("simulated takeover failure")
+        };
+        var tokenStore = new FakeResumeTokenStore
+        {
+            OnTryValidate = _ => Task.FromResult<ResumeContext?>(
+                new ResumeContext
+                {
+                    UserId = 1001,
+                    SessionId = "resuming-session",
+                    ConnectionLeaseId = "old-lease",
+                    DeviceIdHash = 0xAA
+                })
+        };
+        var coordinator = CreateCoordinator(metrics, bus, leaseStore, tokenStore);
+        await using var session = CreateSession(metrics);
+
+        await coordinator.TryResumeAsync("valid-token", session, ct);
+
+        Assert.True(failedListener.WaitForIncrement(TimeSpan.FromSeconds(2)),
+            "gateway.resume.failed was not incremented");
     }
 
     private static SessionLifecycleCoordinator CreateCoordinator(
@@ -557,17 +630,17 @@ public sealed class SessionLifecycleCoordinatorTests
 
     private sealed class FakeDeviceSessionLeaseStore : IDeviceSessionLeaseStore
     {
-        public Func<long, ValueTask<string?>>? OnTakeOver { get; set; }
+        public Func<long, ValueTask<DeviceLeaseTakeoverResult?>>? OnTakeOver { get; set; }
         public Func<long, ValueTask<string?>>? OnGetCurrentSessionId { get; set; }
 
-        public ValueTask<string?> TakeOverAsync(
+        public ValueTask<DeviceLeaseTakeoverResult?> TakeOverAsync(
             long userId,
             ulong deviceIdHash,
             string sessionId,
             string connectionLeaseId,
             TimeSpan ttl,
             CancellationToken cancellationToken) =>
-            OnTakeOver?.Invoke(userId) ?? ValueTask.FromResult<string?>(null);
+            OnTakeOver?.Invoke(userId) ?? ValueTask.FromResult<DeviceLeaseTakeoverResult?>(null);
 
         public ValueTask ReleaseIfOwnerAsync(
             long userId,

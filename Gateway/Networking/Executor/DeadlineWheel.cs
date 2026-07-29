@@ -29,11 +29,10 @@ internal sealed partial class DeadlineWheel : IAsyncDisposable
 
     private readonly Lock _gate = new();
     private readonly List<DeadlineEntry>[] _buckets;
-    // 已取消但尚未被 sweep 清理的 id。sweep 时遇到匹配条目即移除。
-    private readonly HashSet<long> _cancelled = new();
-    // 已触发的 id。用于让 Cancel 在已触发注册上幂等忽略，避免重复递减计数。
-    // 注意：此集合会随生命周期增长，长期运行需在 FullSweepLocked 中按最低活跃 id 压缩。
-    private readonly HashSet<long> _fired = new();
+    // 当前有效注册的有界表：仅包含已注册未触发也未取消的 deadline。
+    // 替代原先的 _fired + _cancelled 双 HashSet，避免长期运行的内存泄漏。
+    // Key = deadline id，Value = entry（用于 sweep 时校验条目仍活跃）。
+    private readonly Dictionary<long, DeadlineEntry> _activeRegistrations = new();
     private long _nextId;
     private long _lastSweptTick;
     private Task? _runTask;
@@ -120,7 +119,9 @@ internal sealed partial class DeadlineWheel : IAsyncDisposable
             var id = ++_nextId;
             var tick = deadlineTimestamp / _tickIntervalTimestamp;
             var bucketIndex = (int)(tick % _bucketCount);
-            _buckets[bucketIndex].Add(new DeadlineEntry(id, deadlineTimestamp, callback));
+            var entry = new DeadlineEntry(id, deadlineTimestamp, callback);
+            _buckets[bucketIndex].Add(entry);
+            _activeRegistrations.Add(id, entry);
             Interlocked.Increment(ref _activeDeadlines);
             return new DeadlineRegistration(id);
         }
@@ -140,14 +141,13 @@ internal sealed partial class DeadlineWheel : IAsyncDisposable
 
         lock (_gate)
         {
-            // 已触发：幂等忽略，不重复递减（sweep 已在触发时递减过）。
-            if (_fired.Contains(registration.Id))
-                return;
-            // 已取消：幂等忽略。
-            if (!_cancelled.Add(registration.Id))
-                return;
-            // 首次取消：递减活跃计数。
-            Interlocked.Decrement(ref _activeDeadlines);
+            // 从 activeRegistrations 原子移除：如果存在则首次取消，递减计数。
+            // 如果不存在（已触发或已取消），幂等忽略。
+            // 条目仍留在桶中，sweep 时通过 activeRegistrations 缺失跳过。
+            if (_activeRegistrations.Remove(registration.Id))
+            {
+                Interlocked.Decrement(ref _activeDeadlines);
+            }
         }
     }
 
@@ -233,8 +233,8 @@ internal sealed partial class DeadlineWheel : IAsyncDisposable
         {
             var entry = bucket[i];
 
-            // 已取消：跳过并从 _cancelled 中移除（id 单调递增不重复，安全清理）。
-            if (_cancelled.Remove(entry.Id))
+            // 已取消或已触发：activeRegistrations 中不存在，直接跳过。
+            if (!_activeRegistrations.ContainsKey(entry.Id))
                 continue;
 
             if (entry.DeadlineTimestamp > nowTimestamp)
@@ -244,10 +244,9 @@ internal sealed partial class DeadlineWheel : IAsyncDisposable
                 continue;
             }
 
+            // 到期且仍活跃：从 activeRegistrations 移除并加入触发列表。
+            _activeRegistrations.Remove(entry.Id);
             toFire.Add(entry);
-            // 已触发：标记到 _fired，使后续 Cancel 幂等忽略；
-            // 并递减活跃计数。已 Cancel 的条目已在 Cancel() 中递减，不重复。
-            _fired.Add(entry.Id);
             Interlocked.Decrement(ref _activeDeadlines);
         }
 
@@ -290,8 +289,7 @@ internal sealed partial class DeadlineWheel : IAsyncDisposable
         {
             for (var i = 0; i < _bucketCount; i++)
                 _buckets[i].Clear();
-            _cancelled.Clear();
-            _fired.Clear();
+            _activeRegistrations.Clear();
             Interlocked.Exchange(ref _activeDeadlines, 0);
         }
 

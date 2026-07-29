@@ -296,8 +296,9 @@ internal sealed class TcpGatewayService : BackgroundService
         // Ephemeral lane 可切换到轻量 ActorRuntime；旧 SessionCommandExecutor 保留为 A/B 回退。
         // 当 Specialized TypingActor 启用时，TypingNotify 是唯一 Ephemeral C2S 命令，
         // 会被快路径截获而不进入 _ephemeralPipeline。为避免两套 Ephemeral Runtime 并存
-        // （浪费 worker 池、重复注册指标），关闭 Generic Pipeline 的 ActorRuntime 内核，
-        // 仅保留对象以维持 SessionRuntime 签名不变；StartAsync 也会跳过启动。
+        // （浪费 worker 池、重复注册指标），将 Generic EphemeralPipeline 设为 Disabled：
+        // 不创建 Legacy Worker、不创建 Generic Actor、不为连接创建 Ephemeral ConnectionQueue。
+        // Register/Unregister 为真正 no-op，Start/Stop 为 no-op。
         // 同时要求 EnableEphemeralPresenceAndTyping=true：功能关闭时 Typing 命令应走
         // FeatureNotNegotiated 路径，而非被 Specialized Pipeline 截获。
         var specializedTypingEnabled =
@@ -306,16 +307,14 @@ internal sealed class TcpGatewayService : BackgroundService
             _options.EnableEphemeralPresenceAndTyping &&
             typingNotifyCodec is not null;
 
-        var ephemeralOptions = _options;
-        if (specializedTypingEnabled && _options.UseActorRuntimeForEphemeralCommands)
-        {
-            // 复制选项并关闭 Generic ActorRuntime，强制走 Legacy SessionCommandExecutor 路径。
-            // 这样 _ephemeralPipeline 不会创建 Shard/Ingress/Completion Ring/Async Executor。
-            ephemeralOptions = CloneWithActorRuntimeDisabled(_options);
-        }
+        // Specialized Typing 启用时强制 Disabled；否则按 options 推导（Legacy/GenericActor）。
+        var ephemeralMode = specializedTypingEnabled
+            ? EphemeralPipelineMode.Disabled
+            : _options.ResolveEphemeralPipelineMode();
 
         _ephemeralPipeline = new EphemeralCommandPipeline(
-            ephemeralOptions,
+            _options,
+            ephemeralMode,
             ProcessScheduledCommandAsync,
             _metrics,
             _timeProvider,
@@ -430,6 +429,7 @@ internal sealed class TcpGatewayService : BackgroundService
             _metrics,
             _timeProvider,
             _logger,
+            _deadlineWheel,
             ProcessPacketAsync,
             SendProtocolError,
             RejectOversizedPayload);
@@ -509,6 +509,11 @@ internal sealed class TcpGatewayService : BackgroundService
 
         var deadlineWheelTask = _deadlineWheel.StartAsync(executionToken);
 
+        // SendTimeoutTracker：启动定时扫描线程，检测卡死的 Socket Send。
+        // 必须在 Listener 启动前启动，确保所有 Session 注册的发送超时能被检测。
+        await _sendTimeoutTracker.StartAsync(executionToken)
+            .ConfigureAwait(false);
+
         // OnDemandSendPump 模式：启动共享出站 worker 池。
         // PersistentSendLoop 模式下 _outboundPump=null，跳过。
         if (_outboundPump is not null)
@@ -557,6 +562,11 @@ internal sealed class TcpGatewayService : BackgroundService
 
             await heartbeatTask.ConfigureAwait(false);
             await typingFanoutTask.ConfigureAwait(false);
+
+            // SendTimeoutTracker：所有 Session 已关闭后停止扫描。
+            // 须在执行器停止前停止，避免扫描已释放的执行器资源。
+            await _sendTimeoutTracker.StopAsync()
+                .ConfigureAwait(false);
 
             // 停止执行器：取消 worker 循环并排空残留命令（释放缓冲区与入站预算）。
             await _orderedWriteExecutor.StopAsync(CancellationToken.None)
@@ -872,74 +882,6 @@ internal sealed class TcpGatewayService : BackgroundService
         session.Close(SessionCloseReason.ProtocolViolation);
     }
 
-    /// <summary>
-    /// 复制选项并关闭 ActorRuntime，用于 Specialized TypingActor 启用时
-    /// 让 Generic EphemeralCommandPipeline 退化为 Legacy SessionCommandExecutor 路径。
-    /// 避免两套 Ephemeral Runtime（Generic Actor + Specialized Typing）并存。
-    /// </summary>
-    private static TcpGatewayOptions CloneWithActorRuntimeDisabled(TcpGatewayOptions source)
-    {
-        // 浅拷贝所有字段；只需修改 UseActorRuntimeForEphemeralCommands 标志。
-        return new TcpGatewayOptions
-        {
-            ListenAddress = source.ListenAddress,
-            Port = source.Port,
-            ListenBacklog = source.ListenBacklog,
-            MaxConnections = source.MaxConnections,
-            ReceiveBufferSize = source.ReceiveBufferSize,
-            InboundTransportMode = source.InboundTransportMode,
-            PipePauseWriterThreshold = source.PipePauseWriterThreshold,
-            PipeResumeWriterThreshold = source.PipeResumeWriterThreshold,
-            OutboundQueueCapacity = source.OutboundQueueCapacity,
-            MaxOutboundQueuedBytes = source.MaxOutboundQueuedBytes,
-            AuthenticationTimeout = source.AuthenticationTimeout,
-            IdleTimeout = source.IdleTimeout,
-            HeartbeatScanInterval = source.HeartbeatScanInterval,
-            SendTimeout = source.SendTimeout,
-            MaxPacketsPerSecond = source.MaxPacketsPerSecond,
-            OutboundSendMode = source.OutboundSendMode,
-            OnDemandSendWorkerCount = source.OnDemandSendWorkerCount,
-            OnDemandSendBurstLimit = source.OnDemandSendBurstLimit,
-            HeartbeatBucketCount = source.HeartbeatBucketCount,
-            HeartbeatRefreshConcurrency = source.HeartbeatRefreshConcurrency,
-            HeartbeatRefreshJitterRatio = source.HeartbeatRefreshJitterRatio,
-            MaxInboundBytesPerSecond = source.MaxInboundBytesPerSecond,
-            MaxInboundPayloadBytes = source.MaxInboundPayloadBytes,
-            MaxChatAttachments = source.MaxChatAttachments,
-            ReplaceSameDeviceSession = source.ReplaceSameDeviceSession,
-            EnableEphemeralPresenceAndTyping = source.EnableEphemeralPresenceAndTyping,
-            PresenceMaintenanceInterval = source.PresenceMaintenanceInterval,
-            RealtimeEventPartitionCount = source.RealtimeEventPartitionCount,
-            GlobalMaxOutboundQueuedBytes = source.GlobalMaxOutboundQueuedBytes,
-            GlobalMaxInboundBufferedBytes = source.GlobalMaxInboundBufferedBytes,
-            MaxUnauthenticatedConnections = source.MaxUnauthenticatedConnections,
-            MaxConnectionsPerIp = source.MaxConnectionsPerIp,
-            MaxAuthenticationAttemptsPerIp = source.MaxAuthenticationAttemptsPerIp,
-            AuthenticationRateWindow = source.AuthenticationRateWindow,
-            CommandSchedulerOrderedWriteCapacity = source.CommandSchedulerOrderedWriteCapacity,
-            CommandSchedulerQueryCapacity = source.CommandSchedulerQueryCapacity,
-            CommandSchedulerEphemeralCapacity = source.CommandSchedulerEphemeralCapacity,
-            // 关键：关闭 Generic ActorRuntime，强制走 Legacy SessionCommandExecutor。
-            UseActorRuntimeForEphemeralCommands = false,
-            UseTypingActorPipeline = false,
-            EphemeralActorShardCount = source.EphemeralActorShardCount,
-            EphemeralActorIngressCapacity = source.EphemeralActorIngressCapacity,
-            EphemeralActorAsyncConcurrency = source.EphemeralActorAsyncConcurrency,
-            EphemeralActorIdleTimeout = source.EphemeralActorIdleTimeout,
-            EphemeralActorOperationTimeout = source.EphemeralActorOperationTimeout,
-            MinimumClientProtocolVersion = source.MinimumClientProtocolVersion,
-            RequireClientHello = source.RequireClientHello,
-            EnableResume = source.EnableResume,
-            ResumeTokenTtl = source.ResumeTokenTtl,
-            ServerDeviceId = source.ServerDeviceId,
-            GoAwayDrainTimeout = source.GoAwayDrainTimeout,
-            ReceiveBufferInitialSize = source.ReceiveBufferInitialSize,
-            ReceiveBufferMaxSize = source.ReceiveBufferMaxSize,
-            ReceiveBufferDowngradeIdleTimeout = source.ReceiveBufferDowngradeIdleTimeout,
-            HeaderAssemblyTimeout = source.HeaderAssemblyTimeout,
-            PayloadAssemblyTimeout = source.PayloadAssemblyTimeout
-        };
-    }
 
     /// <summary>
     /// 全局 <see cref="SessionCommandExecutor"/> 的命令处理回调。
@@ -951,6 +893,12 @@ internal sealed class TcpGatewayService : BackgroundService
     /// <para>
     /// 使用 session.LifetimeToken 而非执行器 token：连接关闭时取消业务调用，
     /// 避免后端资源继续被占用。执行器 token 仅用于 worker 池停机。
+    /// </para>
+    /// <para>
+    /// Opt-2：不再为每条命令创建 LinkedCTS(session.LifetimeToken, executorToken)。
+    /// 停机流程保证先关闭所有 Session（取消 LifetimeToken），再停止 Executor，
+    /// 因此 executorToken 对命令处理是冗余的——LifetimeToken 已覆盖连接关闭与宿主停机两个场景。
+    /// 这消除了每条 Chat/Receipt/Edit/History 命令的 CTS 分配与 Token Registration 开销。
     /// </para>
     /// </summary>
     private async ValueTask ProcessScheduledCommandAsync(
@@ -965,15 +913,14 @@ internal sealed class TcpGatewayService : BackgroundService
             command.Command,
             command.AsPayloadSequence());
 
-        // 同时响应连接关闭、执行器停机和 Actor operation timeout。
-        using var linked = CancellationTokenSource.CreateLinkedTokenSource(
-            command.Session.LifetimeToken,
-            cancellationToken);
+        // 直接使用 session.LifetimeToken：覆盖连接关闭与宿主停机（停机先 Close Session）。
+        // cancellationToken（executor token）不再链接——它只在 executor 停止时取消，
+        // 而那时 Session 已被 Close，LifetimeToken 已取消。
         await ProcessPacketAsync(
                 frame,
                 command.Session,
                 command.RemoteIp,
-                linked.Token)
+                command.Session.LifetimeToken)
             .ConfigureAwait(false);
     }
 

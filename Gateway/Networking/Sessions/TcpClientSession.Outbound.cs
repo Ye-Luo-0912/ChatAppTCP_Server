@@ -124,9 +124,9 @@ internal sealed partial class TcpClientSession
         _metrics.OutboundEnqueued(byteCount);
 
         // 写入 mailbox：同 key 原子覆盖旧帧（dispose + 释放预算），不同 key 独立共存。
-        // CAS 循环在 EphemeralMailbox.TryStore 内完成，避免与 drain 的 TryRemove 竞争。
+        // lock + 开放寻址在 EphemeralMailbox.TryStore 内完成，避免与 drain 的竞争。
         var newEntry = new EphemeralEntry(frame, byteCount);
-        if (_ephemeralMailbox.TryStore(key, newEntry) is { } oldEntry)
+        if (GetOrCreateEphemeralMailbox().TryStore(key, newEntry) is { } oldEntry)
         {
             // CAS 成功：drain 不会拿到 oldEntry，可安全 dispose 与释放预算。
             oldEntry.Frame.Dispose();
@@ -158,6 +158,9 @@ internal sealed partial class TcpClientSession
 
     private async Task SendLoopAsync()
     {
+        // 发送所有权注册：PersistentSendLoop 模式下 Session 在整个连接生命周期内驻留活跃集合。
+        // 帧内仅更新 _sendStartedAt/_sendInProgress，无每帧字典操作。
+        _sendTimeoutTracker?.OnSendOwnershipAcquired(this);
         try
         {
             await foreach (var write in _outbound.Reader.ReadAllAsync(
@@ -197,7 +200,7 @@ internal sealed partial class TcpClientSession
                 // 机会式排空：处理 sentinel TryWrite 失败（队列满）导致的丢失唤醒。
                 // 队列满时 sentinel 无法入队，但 mailbox 中有未发送帧；
                 // 每个 durable write 后检查并排空，确保 ephemeral 不会因队列满而无限滞留。
-                if (!_ephemeralMailbox.IsEmpty)
+                if (HasEphemeralEntries)
                 {
                     _ephemeralFlushPending = false;
                     await DrainEphemeralMailboxAsync().ConfigureAwait(false);
@@ -227,6 +230,8 @@ internal sealed partial class TcpClientSession
         finally
         {
             DrainOutboundOnClose();
+            // 发送所有权释放：从活跃集合移除。Close 路径的 OnSessionClosed 为兜底。
+            _sendTimeoutTracker?.OnSendOwnershipReleased(this);
         }
     }
 
@@ -288,6 +293,8 @@ internal sealed partial class TcpClientSession
     /// </summary>
     private async Task RunPerSessionDrainAsync()
     {
+        // 发送所有权注册：drain 活跃期间驻留活跃集合，drain 退出时释放。
+        _sendTimeoutTracker?.OnSendOwnershipAcquired(this);
         try
         {
             while (IsConnected)
@@ -295,7 +302,7 @@ internal sealed partial class TcpClientSession
                 if (!_outbound.Reader.TryRead(out var write))
                 {
                     // FIFO 空：检查 ephemeral mailbox（机会式排空，处理 sentinel TryWrite 失败的丢失唤醒）。
-                    if (!_ephemeralMailbox.IsEmpty)
+                    if (HasEphemeralEntries)
                     {
                         _ephemeralFlushPending = false;
                         await DrainEphemeralMailboxAsync().ConfigureAwait(false);
@@ -347,7 +354,7 @@ internal sealed partial class TcpClientSession
                 }
 
                 // 机会式排空：处理 sentinel TryWrite 失败（队列满）导致的丢失唤醒。
-                if (!_ephemeralMailbox.IsEmpty)
+                if (HasEphemeralEntries)
                 {
                     _ephemeralFlushPending = false;
                     await DrainEphemeralMailboxAsync().ConfigureAwait(false);
@@ -384,8 +391,18 @@ internal sealed partial class TcpClientSession
         }
         finally
         {
+            // 异常路径（SocketException/ObjectDisposedException/其他异常）也必须排空剩余帧，
+            // 释放 Session Outbound Budget、Global Outbound Budget 和 Ephemeral Mailbox Entry。
+            // 正常路径与 OperationCanceledException 路径已在上方调用过 DrainOutboundOnClose，
+            // 此处幂等再调用一次安全（TryRead/TryRemove 返回 false 后即退出）。
+            if (!IsConnected)
+            {
+                DrainOutboundOnClose();
+            }
             // 确保 drain 退出时状态归位（异常路径可能未 CAS Running→Idle）。
             Interlocked.CompareExchange(ref _sendState, SendStateIdle, SendStateRunning);
+            // 发送所有权释放：从活跃集合移除。Close 路径的 OnSessionClosed 为兜底。
+            _sendTimeoutTracker?.OnSendOwnershipReleased(this);
         }
     }
 
@@ -409,6 +426,8 @@ internal sealed partial class TcpClientSession
         if (Interlocked.CompareExchange(ref _sendState, SendStateRunning, SendStateQueued) != SendStateQueued)
             return;
 
+        // 发送所有权注册：pump 活跃期间驻留活跃集合，pump 退出时释放。
+        _sendTimeoutTracker?.OnSendOwnershipAcquired(this);
         try
         {
             var processed = 0;
@@ -449,7 +468,7 @@ internal sealed partial class TcpClientSession
                 processed++;
 
                 // 机会式排空：处理 sentinel TryWrite 失败（队列满）导致的丢失唤醒。
-                if (!_ephemeralMailbox.IsEmpty)
+                if (HasEphemeralEntries)
                 {
                     _ephemeralFlushPending = false;
                     await DrainEphemeralMailboxAsync().ConfigureAwait(false);
@@ -521,6 +540,9 @@ internal sealed partial class TcpClientSession
             {
                 DrainOutboundOnClose();
             }
+
+            // 发送所有权释放：从活跃集合移除。Close 路径的 OnSessionClosed 为兜底。
+            _sendTimeoutTracker?.OnSendOwnershipReleased(this);
         }
     }
 
@@ -529,7 +551,7 @@ internal sealed partial class TcpClientSession
     /// 用于 pump 结束时的 re-check，判断是否需要重新调度。
     /// </summary>
     private bool HasPendingWork() =>
-        _outbound.Reader.TryPeek(out _) || !_ephemeralMailbox.IsEmpty;
+        _outbound.Reader.TryPeek(out _) || HasEphemeralEntries;
 
     /// <summary>
     /// 排空出站 FIFO 与 ephemeral mailbox 中残留的帧，释放预算与帧引用。
@@ -555,7 +577,8 @@ internal sealed partial class TcpClientSession
     /// </summary>
     private async ValueTask DrainEphemeralMailboxAsync()
     {
-        var toSend = _ephemeralMailbox.Drain();
+        // mailbox 可能为 null（Specialized 模式或连接从未收到 ephemeral 帧）。
+        var toSend = _ephemeralMailbox?.Drain();
         if (toSend is null)
             return;
 
@@ -593,7 +616,8 @@ internal sealed partial class TcpClientSession
     /// </summary>
     private void DrainEphemeralMailboxOnClose()
     {
-        var toDispose = _ephemeralMailbox.Drain();
+        // mailbox 可能为 null（Specialized 模式或连接从未收到 ephemeral 帧）。
+        var toDispose = _ephemeralMailbox?.Drain();
         if (toDispose is null)
             return;
 

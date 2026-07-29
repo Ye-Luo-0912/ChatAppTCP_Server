@@ -298,6 +298,7 @@ public sealed class GatewayMetrics : IDisposable
             ResumeFailureReason.CircuitOpen => "circuit_open",
             ResumeFailureReason.LeaseMismatch => "lease_mismatch",
             ResumeFailureReason.LeaseQueryFailed => "lease_query_failed",
+            ResumeFailureReason.TakeOverUnavailable => "takeover_unavailable",
             _ => "unknown"
         };
 
@@ -844,5 +845,8 @@ public enum ResumeFailureReason
     LeaseMismatch,
 
     /// <summary>设备租约查询依赖不可用（Redis 异常或熔断器开路），fail-closed 拒绝恢复。</summary>
-    LeaseQueryFailed
+    LeaseQueryFailed,
+
+    /// <summary>设备租约接管依赖不可用（Redis 异常或熔断器开路），fail-closed 拒绝恢复。</summary>
+    TakeOverUnavailable
 }

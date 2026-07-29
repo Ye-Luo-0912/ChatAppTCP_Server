@@ -271,6 +271,59 @@ internal sealed class RedisWatcherGatewayDirectory(
         }
     }
 
+    // 四-4：Gateway 实例注册自身活跃状态（ZADD ActiveShardsKey，score = 租约到期 Unix 毫秒）。
+    public async Task RegisterGatewayInstanceAsync(
+        string instanceId,
+        TimeSpan leaseDuration,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(instanceId);
+        try
+        {
+            var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            var expiryMs = nowMs + (long)leaseDuration.TotalMilliseconds;
+            await connectionProvider.Database
+                .SortedSetAddAsync(ActiveShardsKey, instanceId, expiryMs)
+                .WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            logger.DependencyOperationFailed(
+                GatewayDependency.Redis,
+                GatewayDependencyOperation.WatcherDirectoryQuery,
+                ex);
+        }
+    }
+
+    // 四-4：Gateway 实例注销自身活跃状态（ZREM ActiveShardsKey）。
+    public async Task UnregisterGatewayInstanceAsync(
+        string instanceId,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(instanceId);
+        try
+        {
+            await connectionProvider.Database
+                .SortedSetRemoveAsync(ActiveShardsKey, instanceId)
+                .WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            logger.DependencyOperationFailed(
+                GatewayDependency.Redis,
+                GatewayDependencyOperation.WatcherDirectoryQuery,
+                ex);
+        }
+    }
+
     private static RedisKey Key(long watchedUserId) =>
         string.Concat(KeyPrefix, watchedUserId.ToString(CultureInfo.InvariantCulture));
 

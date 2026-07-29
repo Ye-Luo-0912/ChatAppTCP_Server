@@ -23,15 +23,24 @@ internal sealed class ResumeTokenBootstrap : IAsyncDisposable
     private ResumeTokenBootstrap(
         ConnectionMultiplexer connection,
         RedisKey cacheKey,
-        string token)
+        string token,
+        ulong? deviceIdHash)
     {
         _connection = connection;
         _cacheKey = cacheKey;
         Token = token;
+        DeviceIdHash = deviceIdHash;
     }
 
     /// <summary>引导写入的 AccessToken 明文（客户端发送给网关）。</summary>
     public string Token { get; }
+
+    /// <summary>
+    /// 写入 Redis 的 <see cref="AccessTokenRecord.DeviceIdHash"/>。
+    /// 调用方应将同一值通过 <c>AuthenticationRequest.DeviceIdHash</c> 发送给网关，
+    /// 使 same-device fencing 路径被执行（AccessToken 与认证请求的设备指纹一致）。
+    /// </summary>
+    public ulong? DeviceIdHash { get; }
 
     /// <summary>
     /// 创建引导实例：连接 Redis，生成随机 Token，写入 AccessToken 记录。
@@ -72,7 +81,7 @@ internal sealed class ResumeTokenBootstrap : IAsyncDisposable
                 .WaitAsync(cancellationToken)
                 .ConfigureAwait(false);
 
-            return new ResumeTokenBootstrap(connection, cacheKey, token);
+            return new ResumeTokenBootstrap(connection, cacheKey, token, deviceIdHash);
         }
         catch
         {

@@ -72,6 +72,24 @@ checks.Add(new(
     outboxOldestAge <= options.MaximumOutboxOldestAgeSeconds,
     outboxOldestAge.ToString("F3", CultureInfo.InvariantCulture) + " s"));
 
+// GC / 内存 / 每连接字节 硬门禁：可选阈值，null 时跳过。
+// 指标来源：MetricsAfter（Prometheus 快照）+ ProcessResources（进程级采样）。
+// GC 指标为 cumulative counter，用 MetricDeltas（After-Before）计算增量。
+if (report.TryGetProperty("MetricDeltas", out var deltas))
+{
+    AddGcGateChecks(checks, deltas, options);
+}
+
+if (report.TryGetProperty("ProcessResources", out var processResources))
+{
+    AddProcessResourceChecks(checks, processResources, options);
+}
+
+if (expectedTcpConnections > 0 && options.MaximumBytesPerConnection is not null)
+{
+    AddBytesPerConnectionCheck(checks, metrics, options, expectedTcpConnections);
+}
+
 AddStageLatencyChecks(checks, pipeline, options);
 
 var result = new GateResult(
@@ -84,6 +102,125 @@ if (options.OutputPath is not null)
     File.WriteAllText(options.OutputPath, output);
 Console.WriteLine(output);
 return result.Passed ? 0 : 1;
+
+static void AddGcGateChecks(List<GateCheck> checks, JsonElement deltas, GateOptions options)
+{
+    // Gen2 GC 次数增量（cumulative counter delta）。
+    if (options.MaximumGen2Collections is not null)
+    {
+        var gen2Delta = SumOptionalMetrics(deltas, "dotnet_gc_collections_total{", "gc_heap_generation=\"gen2\"");
+        if (gen2Delta.HasValue)
+        {
+            checks.Add(new(
+                $"Gen2 GC collections delta <= {options.MaximumGen2Collections}",
+                gen2Delta.Value <= options.MaximumGen2Collections.Value,
+                gen2Delta.Value.ToString("F0", CultureInfo.InvariantCulture)));
+        }
+    }
+
+    // GC 暂停时间增量（秒，cumulative counter delta）。
+    if (options.MaximumGcPauseSeconds is not null)
+    {
+        var pauseDelta = SumOptionalMetrics(deltas, "dotnet_gc_pause_time_seconds_total{");
+        if (pauseDelta.HasValue)
+        {
+            checks.Add(new(
+                $"GC pause time delta <= {options.MaximumGcPauseSeconds.Value.ToString(CultureInfo.InvariantCulture)} s",
+                pauseDelta.Value <= options.MaximumGcPauseSeconds.Value,
+                pauseDelta.Value.ToString("F3", CultureInfo.InvariantCulture) + " s"));
+        }
+    }
+
+    // 总分配字节增量（cumulative counter delta），转 MB 便于阈值配置。
+    if (options.MaximumAllocatedMegabytes is not null)
+    {
+        var allocDelta = SumOptionalMetrics(deltas, "dotnet_gc_heap_total_allocated_bytes_total{");
+        if (allocDelta.HasValue)
+        {
+            var allocMb = allocDelta.Value / (1024.0 * 1024.0);
+            checks.Add(new(
+                $"Allocated bytes delta <= {options.MaximumAllocatedMegabytes.Value.ToString(CultureInfo.InvariantCulture)} MB",
+                allocMb <= options.MaximumAllocatedMegabytes.Value,
+                allocMb.ToString("F2", CultureInfo.InvariantCulture) + " MB"));
+        }
+    }
+
+    // LOH 最后堆大小（gauge，非 counter，直接读 MetricsAfter 但此处用 deltas 也合理）。
+    if (options.MaximumLohHeapBytes is not null)
+    {
+        var lohSize = MaxOptionalMetric(deltas, "dotnet_gc_last_collection_heap_size_bytes{", "gc_heap_generation=\"loh\"");
+        if (lohSize.HasValue)
+        {
+            checks.Add(new(
+                $"LOH heap size <= {options.MaximumLohHeapBytes.Value.ToString(CultureInfo.InvariantCulture)} bytes",
+                lohSize.Value <= options.MaximumLohHeapBytes.Value,
+                lohSize.Value.ToString("F0", CultureInfo.InvariantCulture) + " bytes"));
+        }
+    }
+
+    // POH 最后堆大小。
+    if (options.MaximumPohHeapBytes is not null)
+    {
+        var pohSize = MaxOptionalMetric(deltas, "dotnet_gc_last_collection_heap_size_bytes{", "gc_heap_generation=\"poh\"");
+        if (pohSize.HasValue)
+        {
+            checks.Add(new(
+                $"POH heap size <= {options.MaximumPohHeapBytes.Value.ToString(CultureInfo.InvariantCulture)} bytes",
+                pohSize.Value <= options.MaximumPohHeapBytes.Value,
+                pohSize.Value.ToString("F0", CultureInfo.InvariantCulture) + " bytes"));
+        }
+    }
+}
+
+static void AddProcessResourceChecks(
+    List<GateCheck> checks,
+    JsonElement processResources,
+    GateOptions options)
+{
+    if (options.MaximumWorkingSetMegabytes is null)
+        return;
+
+    // 取所有进程的最大 WorkingSet 峰值（含 gateway + realtime）。
+    double maxWorkingSetBytes = 0;
+    foreach (var proc in processResources.EnumerateArray())
+    {
+        if (proc.TryGetProperty("MaximumWorkingSetBytes", out var wsEl) &&
+            wsEl.ValueKind == JsonValueKind.Number)
+        {
+            var ws = wsEl.GetDouble();
+            if (ws > maxWorkingSetBytes)
+                maxWorkingSetBytes = ws;
+        }
+    }
+
+    if (maxWorkingSetBytes > 0)
+    {
+        var wsMb = maxWorkingSetBytes / (1024.0 * 1024.0);
+        checks.Add(new(
+            $"Max working set <= {options.MaximumWorkingSetMegabytes.Value.ToString(CultureInfo.InvariantCulture)} MB",
+            wsMb <= options.MaximumWorkingSetMegabytes.Value,
+            wsMb.ToString("F2", CultureInfo.InvariantCulture) + " MB"));
+    }
+}
+
+static void AddBytesPerConnectionCheck(
+    List<GateCheck> checks,
+    JsonElement metrics,
+    GateOptions options,
+    int expectedTcpConnections)
+{
+    // gateway.inbound.avg_per_session.bytes 是 gauge，直接读 MetricsAfter。
+    // 取所有 gateway 副本的最大值。
+    var avgPerSession = MaxOptionalMetric(metrics, "gateway.inbound.avg_per_session.bytes{");
+    var threshold = options.MaximumBytesPerConnection;
+    if (avgPerSession.HasValue && threshold.HasValue)
+    {
+        checks.Add(new(
+            $"Inbound avg bytes/session <= {threshold.Value.ToString(CultureInfo.InvariantCulture)}",
+            avgPerSession.Value <= threshold.Value,
+            avgPerSession.Value.ToString("F0", CultureInfo.InvariantCulture) + " bytes"));
+    }
+}
 
 static void AddStageLatencyChecks(
     List<GateCheck> checks,
@@ -189,6 +326,27 @@ static double SumRequiredMetrics(JsonElement metrics, string prefix)
     return sum;
 }
 
+/// <summary>
+/// 可选指标求和：按 prefix + 可选 labelFilter 匹配，未找到返回 null（不抛异常）。
+/// labelFilter 用于区分同前缀不同 label 的 series（如 gen0/gen1/gen2）。
+/// </summary>
+static double? SumOptionalMetrics(JsonElement metrics, string prefix, string? labelFilter = null)
+{
+    var sum = 0d;
+    var matches = 0;
+    foreach (var metric in metrics.EnumerateObject())
+    {
+        if (!metric.Name.StartsWith(prefix, StringComparison.Ordinal))
+            continue;
+        if (labelFilter is not null && !metric.Name.Contains(labelFilter, StringComparison.Ordinal))
+            continue;
+        sum += metric.Value.GetDouble();
+        matches++;
+    }
+
+    return matches > 0 ? sum : null;
+}
+
 static double MaxRequiredMetric(JsonElement metrics, string prefix)
 {
     double? maximum = null;
@@ -202,6 +360,24 @@ static double MaxRequiredMetric(JsonElement metrics, string prefix)
 
     return maximum ?? throw new InvalidOperationException(
         $"Required metric '{prefix}' was not found in MetricsAfter.");
+}
+
+/// <summary>
+/// 可选指标取最大值：按 prefix + 可选 labelFilter 匹配，未找到返回 null（不抛异常）。
+/// </summary>
+static double? MaxOptionalMetric(JsonElement metrics, string prefix, string? labelFilter = null)
+{
+    double? maximum = null;
+    foreach (var metric in metrics.EnumerateObject())
+    {
+        if (!metric.Name.StartsWith(prefix, StringComparison.Ordinal))
+            continue;
+        if (labelFilter is not null && !metric.Name.Contains(labelFilter, StringComparison.Ordinal))
+            continue;
+        maximum = Math.Max(maximum ?? double.NegativeInfinity, metric.Value.GetDouble());
+    }
+
+    return maximum;
 }
 
 internal sealed record GateCheck(string Name, bool Passed, string Actual);
@@ -222,6 +398,13 @@ internal sealed record GateOptions(
     double? MaximumConversationListP95Milliseconds,
     double? MaximumSyncBootstrapP95Milliseconds,
     bool RequireConversationStages,
+    double? MaximumGen2Collections,
+    double? MaximumGcPauseSeconds,
+    double? MaximumAllocatedMegabytes,
+    double? MaximumLohHeapBytes,
+    double? MaximumPohHeapBytes,
+    double? MaximumWorkingSetMegabytes,
+    double? MaximumBytesPerConnection,
     string? OutputPath)
 {
     public static GateOptions Parse(string[] args)
@@ -237,6 +420,14 @@ internal sealed record GateOptions(
         double? maxConversationListP95 = null;
         double? maxSyncBootstrapP95 = null;
         var requireConversationStages = false;
+        // GC / 内存 / 每连接字节 可选阈值：null 时跳过对应检查。
+        double? maxGen2Collections = null;
+        double? maxGcPauseSeconds = null;
+        double? maxAllocatedMb = null;
+        double? maxLohHeapBytes = null;
+        double? maxPohHeapBytes = null;
+        double? maxWorkingSetMb = null;
+        double? maxBytesPerConnection = null;
 
         for (var index = 0; index < args.Length; index++)
         {
@@ -264,6 +455,13 @@ internal sealed record GateOptions(
                 case "--max-history-p95-ms": maxHistoryP95 = ParseDouble(value, option); break;
                 case "--max-conversation-list-p95-ms": maxConversationListP95 = ParseDouble(value, option); break;
                 case "--max-sync-bootstrap-p95-ms": maxSyncBootstrapP95 = ParseDouble(value, option); break;
+                case "--max-gen2-collections": maxGen2Collections = ParseDouble(value, option); break;
+                case "--max-gc-pause-seconds": maxGcPauseSeconds = ParseDouble(value, option); break;
+                case "--max-allocated-mb": maxAllocatedMb = ParseDouble(value, option); break;
+                case "--max-loh-heap-bytes": maxLohHeapBytes = ParseDouble(value, option); break;
+                case "--max-poh-heap-bytes": maxPohHeapBytes = ParseDouble(value, option); break;
+                case "--max-working-set-mb": maxWorkingSetMb = ParseDouble(value, option); break;
+                case "--max-bytes-per-connection": maxBytesPerConnection = ParseDouble(value, option); break;
                 default: throw new ArgumentException("Unknown option: " + option + Environment.NewLine + Usage);
             }
         }
@@ -286,6 +484,13 @@ internal sealed record GateOptions(
             maxConversationListP95,
             maxSyncBootstrapP95,
             requireConversationStages,
+            maxGen2Collections,
+            maxGcPauseSeconds,
+            maxAllocatedMb,
+            maxLohHeapBytes,
+            maxPohHeapBytes,
+            maxWorkingSetMb,
+            maxBytesPerConnection,
             outputPath);
     }
 
@@ -303,5 +508,8 @@ internal sealed record GateOptions(
         "Usage: --report PATH [--output PATH] [--max-error-rate-percent 0] [--max-p95-ms 300] " +
         "[--max-jetstream-pending 0] [--max-outbox-pending 16] [--max-outbox-oldest-age-seconds 5] " +
         "[--max-history-p95-ms N] [--max-conversation-list-p95-ms N] [--max-sync-bootstrap-p95-ms N] " +
-        "[--require-conversation-stages]";
+        "[--require-conversation-stages] " +
+        "[--max-gen2-collections N] [--max-gc-pause-seconds N] [--max-allocated-mb N] " +
+        "[--max-loh-heap-bytes N] [--max-poh-heap-bytes N] [--max-working-set-mb N] " +
+        "[--max-bytes-per-connection N]";
 }

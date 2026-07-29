@@ -149,6 +149,20 @@ public sealed class ActorRuntime<TKey, TState, TMessage> :
                 in message);
     }
 
+    /// <summary>
+    /// 投递 Invalidation 控制消息：经普通 Ingress Ring 路由，由 Shard Consumer
+    /// 投递到 ActorCell 的 Invalidation 控制槽（优先级高于 Completion）。
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public ActorPostStatus TryTellInvalidation(in TKey key, in TMessage message)
+    {
+        if (Volatile.Read(ref _lifecycle) >= 2)
+            return ActorPostStatus.RuntimeStopping;
+
+        return _shards[GetShardIndex(in key)]
+            .TryEnqueueInvalidation(in key, in message);
+    }
+
     public bool TryDeactivate(
         in TKey key,
         ActorDeactivateReason reason)

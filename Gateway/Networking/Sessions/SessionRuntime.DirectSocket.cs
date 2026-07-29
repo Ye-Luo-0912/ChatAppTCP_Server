@@ -1,5 +1,6 @@
 using System.Buffers;
 using ChatApp.TcpGateway.Core.Protocol;
+using ChatApp.TcpGateway.Gateway.Networking.Executor;
 
 namespace ChatApp.TcpGateway.Gateway.Networking.Sessions;
 
@@ -40,6 +41,9 @@ internal sealed partial class SessionRuntime
         // 帧装配 deadline 跟踪：记录第一个不完整字节到达的时间戳。
         // 0 = 当前无不完整帧（buffer 为空或刚完成一帧）。
         var partialFrameStartTimestamp = 0L;
+        // DeadlineWheel 注册句柄：有部分帧时注册超时回调，ReceiveAsync 返回后取消。
+        // 超时回调关闭 Socket，使挂起的 ReceiveAsync 被唤醒，避免永久阻塞。
+        var assemblyDeadlineReg = default(DeadlineRegistration);
 
         // 上次 Receive 的时间戳，用于空闲降级判断。
         var lastReceiveTimestamp = _timeProvider.GetTimestamp();
@@ -129,12 +133,16 @@ internal sealed partial class SessionRuntime
                         receiveBuffer.Length < maxBufferSize)
                     {
                         // 升级缓冲区：租更大 buffer，复制残留数据，归还旧 buffer。
+                        // 升级后数据在新 buffer 的 0..remaining 位置，必须重置 start/end。
+                        var remaining = end - start;
                         receiveBuffer = UpgradeReceiveBuffer(
                             receiveBuffer,
                             start,
                             end,
                             maxBufferSize);
                         currentBufferSize = maxBufferSize;
+                        start = 0;
+                        end = remaining;
                         // 不 break：重新进入 while 循环，frameLength <= receiveBuffer.Length 时走上面路径。
                         continue;
                     }
@@ -263,22 +271,43 @@ internal sealed partial class SessionRuntime
                     }
                 }
 
-                // 空闲降级检查：若超过降级空闲时间且缓冲区大于初始大小，降级。
-                if (_options.ReceiveBufferDowngradeIdleTimeout > TimeSpan.Zero &&
-                    receiveBuffer.Length > currentBufferSize &&
-                    end - start == 0)
+                // 空闲降级：完成一帧后（无残留数据且无进行中的帧装配），
+                // 如果缓冲区大于初始大小，立即归还大缓冲区并租初始大小缓冲区。
+                // 这比"等待空闲 60 秒后降级"更可靠：不依赖额外 Timer，且
+                // 保证空闲 Receive 始终使用基础 buffer，大 buffer 仅在 burst 期间临时持有。
+                if (end - start == 0 &&
+                    partialFrameStartTimestamp == 0 &&
+                    receiveBuffer.Length > Math.Max(
+                        _options.ReceiveBufferInitialSize,
+                        PacketProtocol.HeaderSize))
                 {
-                    var idleElapsed = _timeProvider.GetElapsedTime(
-                        lastReceiveTimestamp);
-                    if (idleElapsed >= _options.ReceiveBufferDowngradeIdleTimeout)
+                    ArrayPool<byte>.Shared.Return(receiveBuffer);
+                    currentBufferSize = Math.Max(
+                        _options.ReceiveBufferInitialSize,
+                        PacketProtocol.HeaderSize);
+                    receiveBuffer = ArrayPool<byte>.Shared.Rent(currentBufferSize);
+                    start = 0;
+                    end = 0;
+                }
+
+                // 帧装配 deadline 注册：若有不完整帧，注册超时回调。
+                // 回调在 DeadlineWheel sweep 线程触发，关闭 Socket 使挂起的 ReceiveAsync 唤醒。
+                // 不给每次 Receive 创建 CTS/Timer，复用全局 DeadlineWheel。
+                if (partialFrameStartTimestamp != 0 && assemblyDeadlineReg.Id == 0)
+                {
+                    var isHeaderAssembly = end - start < PacketProtocol.HeaderSize;
+                    var deadline = isHeaderAssembly
+                        ? _options.HeaderAssemblyTimeout
+                        : _options.PayloadAssemblyTimeout;
+                    if (deadline > TimeSpan.Zero)
                     {
-                        // 降级：归还大缓冲区，租初始大小缓冲区。
-                        // end - start == 0 保证无数据丢失。
-                        ArrayPool<byte>.Shared.Return(receiveBuffer);
-                        currentBufferSize = Math.Max(
-                            _options.ReceiveBufferInitialSize,
-                            PacketProtocol.HeaderSize);
-                        receiveBuffer = ArrayPool<byte>.Shared.Rent(currentBufferSize);
+                        assemblyDeadlineReg = _deadlineWheel.Register(deadline, () =>
+                        {
+                            // 超时回调：关闭 Socket，使挂起的 ReceiveAsync 抛出异常被唤醒。
+                            // session.Close 是幂等的，重复调用安全。
+                            _metrics.ProtocolError();
+                            session.Close(SessionCloseReason.SlowFrameAssembly);
+                        });
                     }
                 }
 
@@ -289,6 +318,13 @@ internal sealed partial class SessionRuntime
                             receiveBuffer.Length - end),
                         cancellationToken)
                     .ConfigureAwait(false);
+
+                // ReceiveAsync 返回后取消装配超时注册（无论成功或异常）。
+                if (assemblyDeadlineReg.Id != 0)
+                {
+                    _deadlineWheel.Cancel(assemblyDeadlineReg);
+                    assemblyDeadlineReg = default;
+                }
                 if (bytesRead == 0)
                 {
                     if (end != 0)
@@ -315,6 +351,13 @@ internal sealed partial class SessionRuntime
         }
         finally
         {
+            // 确保取消残留的帧装配超时注册，避免回调在 buffer 已归还后触发。
+            if (assemblyDeadlineReg.Id != 0)
+            {
+                _deadlineWheel.Cancel(assemblyDeadlineReg);
+                assemblyDeadlineReg = default;
+            }
+
             if (bufferedReservedBytes > 0)
             {
                 _globalInboundBudget.Release(
@@ -374,13 +417,40 @@ internal sealed partial class SessionRuntime
                 }
             }
 
-            var bytesRead = await session
-                .ReceiveAsync(
-                    payloadBuffer.AsMemory(
-                        received,
-                        payloadLength - received),
-                    cancellationToken)
-                .ConfigureAwait(false);
+            // 注册剩余装配时间的超时回调，防止 ReceiveAsync 永久挂起。
+            // 超时后关闭 Socket，使 ReceiveAsync 被唤醒。
+            DeadlineRegistration payloadReg = default;
+            if (payloadDeadline > TimeSpan.Zero)
+            {
+                var elapsed = _timeProvider.GetElapsedTime(assemblyStartTimestamp);
+                var remaining = payloadDeadline - elapsed;
+                if (remaining > TimeSpan.Zero)
+                {
+                    payloadReg = _deadlineWheel.Register(remaining, () =>
+                    {
+                        _metrics.ProtocolError();
+                        session.Close(SessionCloseReason.SlowFrameAssembly);
+                    });
+                }
+            }
+
+            int bytesRead;
+            try
+            {
+                bytesRead = await session
+                    .ReceiveAsync(
+                        payloadBuffer.AsMemory(
+                            received,
+                            payloadLength - received),
+                        cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            finally
+            {
+                if (payloadReg.Id != 0)
+                    _deadlineWheel.Cancel(payloadReg);
+            }
+
             if (bytesRead == 0)
                 return false;
 

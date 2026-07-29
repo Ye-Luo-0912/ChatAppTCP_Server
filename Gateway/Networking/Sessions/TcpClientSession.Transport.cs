@@ -81,6 +81,9 @@ internal sealed partial class TcpClientSession
             else if (_perSessionDrainTask is not null)
             {
                 await _perSessionDrainTask.ConfigureAwait(false);
+                // 防御性排空：覆盖 CAS 竞争（drain Task 已启动但 _perSessionDrainTask 字段尚未发布）
+                // 与 drain 异常路径 finally 排空失败的理论边缘情况。幂等，多次调用安全。
+                DrainOutboundOnClose();
             }
             else
             {
@@ -164,14 +167,12 @@ internal sealed partial class TcpClientSession
         ReadOnlyMemory<byte> frame,
         CancellationToken lifetimeToken)
     {
-        // 发送超时改由 SendTimeoutTracker 扫描管理（替代每帧 DeadlineWheel.Register）。
-        // 顺序：先记 startedAt，再标记发送中，最后通知 tracker 开始监控。
-        // 先记 startedAt 确保扫描看到 _sendInProgress=1 时 startedAt 已更新为本代次的值。
-        // 单调时钟避免墙钟回拨导致的死锁。
+        // 发送超时注册粒度为发送所有权周期（drain/pump/loop 入口/出口），
+        // 帧内仅更新 _sendStartedAt / _sendInProgress，无 ConcurrentDictionary 操作。
+        // 顺序：先记 startedAt，再标记发送中。先记 startedAt 确保扫描看到 _sendInProgress=1
+        // 时 startedAt 已更新为本代次的值。单调时钟避免墙钟回拨导致的死锁。
         Volatile.Write(ref _sendStartedAt, _timeProvider.GetTimestamp());
         Interlocked.Exchange(ref _sendInProgress, 1);
-        // TryAdd 幂等：burst 内连续帧为廉价 no-op（仅 hash 查找，无分配、无全局锁）。
-        _sendTimeoutTracker?.OnSendStart(this);
 
         var sent = 0;
         try
@@ -195,10 +196,9 @@ internal sealed partial class TcpClientSession
         }
         finally
         {
-            // 标记发送完成并清除 startedAt；从 tracker 活跃集合移除。
+            // 标记发送完成并清除 startedAt。所有权注销由 drain/pump/loop finally 负责。
             Volatile.Write(ref _sendStartedAt, 0);
             Interlocked.Exchange(ref _sendInProgress, 0);
-            _sendTimeoutTracker?.OnSendComplete(this);
         }
     }
 }

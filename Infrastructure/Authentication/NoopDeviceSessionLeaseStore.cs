@@ -5,14 +5,14 @@ namespace ChatApp.TcpGateway.Infrastructure.Authentication;
 /// <summary>无 Redis 时的空实现（仅本机 TakeOverSameDevice）。</summary>
 internal sealed class NoopDeviceSessionLeaseStore : IDeviceSessionLeaseStore
 {
-    public ValueTask<string?> TakeOverAsync(
+    public ValueTask<DeviceLeaseTakeoverResult?> TakeOverAsync(
         long userId,
         ulong deviceIdHash,
         string sessionId,
         string connectionLeaseId,
         TimeSpan ttl,
         CancellationToken cancellationToken) =>
-        ValueTask.FromResult<string?>(null);
+        ValueTask.FromResult<DeviceLeaseTakeoverResult?>(null);
 
     public ValueTask ReleaseIfOwnerAsync(
         long userId,

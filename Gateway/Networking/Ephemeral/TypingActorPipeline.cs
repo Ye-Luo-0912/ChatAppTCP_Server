@@ -110,8 +110,14 @@ internal sealed class TypingActorPipeline : IAsyncDisposable, ITypingAuthorizati
     /// 关系变更触发的授权失效：向对应 (sender, target) 双向 Actor 投递 AuthorizationInvalidated。
     /// 清空 Actor 内缓存的 Authorized=true，下一次 Notify 必须重新走授权 I/O。
     /// <para>
+    /// P0-9：经控制通道（TryTellInvalidation）投递，而非普通 Mailbox（TryTellEphemeral）。
+    /// 这确保 Invalidation 不会被 LatestOnly Mailbox 中的后续 Notify 覆盖——
+    /// 失效是安全不变量，不能因消息合并而丢失。
+    /// </para>
+    /// <para>
     /// 调用方（如 RelationshipListHandler）在拉黑/解除好友时对两个方向各调用一次。
-    /// Ephemeral 语义：若 Actor 已被 IdleSweep 回收，TryTell 返回 ActorClosed，调用方无需处理。
+    /// Ephemeral 语义：若 Actor 已被 IdleSweep 回收，TryTellInvalidation 返回 ActorClosed，
+    /// 调用方无需处理。
     /// </para>
     /// </summary>
     public void InvalidateAuthorization(long senderUserId, long targetUserId)
@@ -122,9 +128,10 @@ internal sealed class TypingActorPipeline : IAsyncDisposable, ITypingAuthorizati
         var forward = new TypingActorKey(senderUserId, targetUserId);
         var reverse = new TypingActorKey(targetUserId, senderUserId);
         var message = TypingActorMessage.AuthorizationInvalidated();
+        // P0-9：走控制通道而非普通 Mailbox，确保不被 LatestOnly 合并丢弃。
         // 丢弃语义：Actor 不存在或 Shard 满载时静默失败，关系变更后 TTL 兜底。
-        _actor.TryTellEphemeral(in forward, in message);
-        _actor.TryTellEphemeral(in reverse, in message);
+        _actor.TryTellInvalidation(in forward, in message);
+        _actor.TryTellInvalidation(in reverse, in message);
     }
 
     /// <summary>

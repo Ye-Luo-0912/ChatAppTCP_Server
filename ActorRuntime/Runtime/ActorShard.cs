@@ -262,6 +262,31 @@ internal sealed class ActorShard<TKey, TState, TMessage>
         return true;
     }
 
+    /// <summary>
+    /// Invalidation 控制消息入队。经普通 Ingress Ring 路由（与 Deactivate 相同通道），
+    /// 由 Consumer 投递到 ActorCell 的 Invalidation 控制槽。不占 Mailbox 准入容量。
+    /// </summary>
+    public ActorPostStatus TryEnqueueInvalidation(in TKey key, in TMessage message)
+    {
+        if (_stopping)
+            return ActorPostStatus.RuntimeStopping;
+
+        var envelope = new ActorEnvelope<TKey, TMessage>(
+            in key,
+            in message,
+            admission: null,
+            ActivationId.None,
+            ActorEnvelopeKind.Invalidation);
+        if (!_ingress.TryEnqueue(in envelope))
+        {
+            Interlocked.Increment(ref _shardOverloadedCount);
+            return ActorPostStatus.ShardOverloaded;
+        }
+
+        _signal.Signal();
+        return ActorPostStatus.Accepted;
+    }
+
     public Task StartAsync(CancellationToken cancellationToken)
     {
         if (_loopTask is not null)
@@ -303,9 +328,12 @@ internal sealed class ActorShard<TKey, TState, TMessage>
 
         while (_ingress.TryDequeue(out var envelope))
         {
-            // Deactivate 信封不携带业务消息，直接跳过（无资源可释放）。
-            if (envelope.Kind != ActorEnvelopeKind.Deactivate)
+            // Deactivate / Invalidation 信封不携带业务消息，直接跳过（无资源可释放）。
+            if (envelope.Kind is not (ActorEnvelopeKind.Deactivate
+                or ActorEnvelopeKind.Invalidation))
+            {
                 DropEnvelope(in envelope, ActorMessageDropReason.RuntimeStopping);
+            }
         }
 
         while (_completionIngress.TryDequeue(out var completion))
@@ -406,10 +434,18 @@ internal sealed class ActorShard<TKey, TState, TMessage>
 
         while (drained < max && _ingress.TryDequeue(out var envelope))
         {
-            if (envelope.Kind == ActorEnvelopeKind.Deactivate)
-                RouteDeactivate(in envelope);
-            else
-                RouteEnvelope(in envelope);
+            switch (envelope.Kind)
+            {
+                case ActorEnvelopeKind.Deactivate:
+                    RouteDeactivate(in envelope);
+                    break;
+                case ActorEnvelopeKind.Invalidation:
+                    RouteInvalidation(in envelope);
+                    break;
+                default:
+                    RouteEnvelope(in envelope);
+                    break;
+            }
             drained++;
         }
     }
@@ -547,6 +583,31 @@ internal sealed class ActorShard<TKey, TState, TMessage>
             return;
         }
 
+        _pendingMailboxCount++;
+        ScheduleReady(actor);
+        actor.LastActiveTimestamp = _timeProvider.GetTimestamp();
+    }
+
+    /// <summary>
+    /// 路由 Invalidation 控制消息到 ActorCell 的 Invalidation 控制槽。
+    /// Actor 不存在时静默丢弃（Ephemeral 语义：TTL 兜底）。
+    /// 不校验 Activation：Invalidation 是 Key 级别的（非 Activation 级别），
+    /// 即使 Actor 已重建也应应用失效（清空新 Actor 的授权缓存）。
+    /// </summary>
+    private void RouteInvalidation(in ActorEnvelope<TKey, TMessage> envelope)
+    {
+        if (!_cells.TryGetValue(in envelope.Key, out var actor) ||
+            actor is null ||
+            !actor.IsActive)
+        {
+            // Actor 不存在：静默丢弃。关系变更后新 Notify 会重新触发授权 I/O。
+            return;
+        }
+
+        var item = new ActorMailboxItem<TMessage>(
+            in envelope.Message,
+            admission: null);
+        actor.TryEnqueueInvalidation(in item);
         _pendingMailboxCount++;
         ScheduleReady(actor);
         actor.LastActiveTimestamp = _timeProvider.GetTimestamp();

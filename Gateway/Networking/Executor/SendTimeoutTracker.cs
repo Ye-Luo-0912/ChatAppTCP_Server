@@ -4,30 +4,45 @@ using ChatApp.TcpGateway.Gateway.Networking.Sessions;
 namespace ChatApp.TcpGateway.Gateway.Networking.Executor;
 
 /// <summary>
-/// 发送超时扫描器：替代 <see cref="DeadlineWheel"/> 处理每帧发送超时。
+/// 发送超时扫描器：替代 <see cref="DeadlineWheel"/> 处理发送超时。
+/// <para>
+/// 注册粒度为<b>发送所有权周期</b>（drain/pump/loop 一次持续占用），
+/// 而非每帧。这样活跃聊天场景下每条出站帧不再产生
+/// <see cref="ConcurrentDictionary{TKey,TValue}"/> 的 TryAdd/TryRemove 操作，
+/// 消除共享字典上的每帧热点。
+/// </para>
 /// <para>
 /// 与 DeadlineWheel 的区别：
 /// <list type="bullet">
 /// <item><b>无每帧闭包分配</b>：超时检查逻辑在 <see cref="TcpClientSession.CheckSendTimeout"/> 中，
 /// 不为每帧创建捕获 Session 的 <c>Action</c> 委托；</item>
+/// <item><b>无每帧字典操作</b>：注册在 drain/pump/loop 获得 Session 发送所有权时一次完成，
+/// 注销在所有权释放时一次完成。帧内仅更新 <c>_sendStartedAt</c>/<c>_sendInProgress</c>；</item>
 /// <item><b>无全局锁</b>：活跃发送方集合用 <see cref="ConcurrentDictionary{TKey,TValue}"/>，
-/// <see cref="OnSendStart"/>/<see cref="OnSendComplete"/> 为无锁 CAS，不竞争 DeadlineWheel 的全局 <c>Lock</c>；</item>
-/// <item><b>聚焦扫描</b>：只扫描当前正在发送的少量 Session（活跃发送方集合），
-/// 而非全部连接。空闲时集合为空，扫描近乎零开销；</item>
+/// <see cref="OnSendOwnershipAcquired"/>/<see cref="OnSendOwnershipReleased"/> 为无锁 CAS，
+/// 不竞争 DeadlineWheel 的全局 <c>Lock</c>；</item>
 /// <item><b>无 <c>_fired</c> 增长</b>：不维护按 id 追踪的已触发集合，
 /// 避免发送超时 id 在 <see cref="DeadlineWheel"/> 中无限增长。</item>
 /// </list>
 /// </para>
 /// <para>
-/// 生命周期：
+/// 生命周期（所有权周期模型）：
 /// <list type="bullet">
-/// <item><see cref="OnSendStart"/>：SendFrameAsync 开始时 TryAdd（幂等，burst 内连续帧为廉价 no-op）；</item>
-/// <item><see cref="OnSendComplete"/>：SendFrameAsync 完成时 TryRemove；</item>
-/// <item><see cref="OnSessionClosed"/>：连接 Close 时 TryRemove，防止残留引用。</item>
+/// <item><see cref="OnSendOwnershipAcquired"/>：drain/pump/loop 获得发送所有权时调用一次
+/// （<c>SendLoopAsync</c>/<c>RunPerSessionDrainAsync</c>/<c>PumpOutboundAsync</c> 入口）；</item>
+/// <item>每帧：仅更新 <c>_sendStartedAt</c>/<c>_sendInProgress</c>，无字典操作；</item>
+/// <item><see cref="OnSendOwnershipReleased"/>：drain/pump/loop 退出时调用一次（finally 块）；</item>
+/// <item><see cref="OnSessionClosed"/>：连接 Close 时 TryRemove 兜底，防止残留引用。</item>
 /// </list>
 /// 扫描线程周期性遍历活跃集合，对每个 Session 调用
 /// <see cref="TcpClientSession.CheckSendTimeout"/>。后者复用既有的 generation CAS +
-/// 单调时钟校验，超时则 CAS 关闭连接。
+/// 单调时钟校验，超时则 CAS 关闭连接。非发送中的 Session（<c>_sendInProgress=0</c>）
+/// 仅做一次 volatile 读即返回，开销极低。
+/// </para>
+/// <para>
+/// 注意：PersistentSendLoop 模式下 Session 在整个连接生命周期内驻留活跃集合，
+/// 空闲时由 <see cref="TcpClientSession.CheckSendTimeout"/> 的 volatile 读快速跳过。
+/// PerSessionDrain/OnDemandSendPump 模式下仅 drain/pump 活跃期间驻留，空闲时集合为空。
 /// </para>
 /// <para>
 /// Auth/Idle 超时仍由 <see cref="DeadlineWheel"/> 管理（低频，符合其设计假设）。
@@ -35,8 +50,8 @@ namespace ChatApp.TcpGateway.Gateway.Networking.Executor;
 /// </summary>
 internal sealed class SendTimeoutTracker : IAsyncDisposable
 {
-    // 活跃发送方集合：仅包含当前正在执行 Socket.SendAsync 的 Session。
-    // 大多数时刻为空或很小（只有慢客户端会长期停留在此集合中）。
+    // 活跃发送方集合：包含当前持有发送所有权的 Session（drain/pump/loop 处于活跃期）。
+    // PersistentSendLoop：连接生命周期内常驻；PerSessionDrain/OnDemandSendPump：drain/pump 活跃期驻留。
     private readonly ConcurrentDictionary<TcpClientSession, byte> _activeSenders = new();
     private readonly TimeProvider _timeProvider;
     private readonly TimeSpan _scanInterval;
@@ -54,19 +69,23 @@ internal sealed class SendTimeoutTracker : IAsyncDisposable
         _scanInterval = scanInterval ?? DefaultScanInterval;
     }
 
-    /// <summary>当前正在发送的 Session 数（近似值，用于观测）。</summary>
+    /// <summary>当前持有发送所有权的 Session 数（近似值，用于观测）。</summary>
     public int ActiveSenderCount => _activeSenders.Count;
 
     /// <summary>
-    /// 标记 Session 开始发送。幂等：burst 内连续帧调用为廉价 TryAdd no-op。
+    /// drain/pump/loop 获得发送所有权时注册。幂等：重复调用为廉价 TryAdd no-op。
+    /// <para>
+    /// 注册后扫描线程会周期检查此 Session 的 <c>CheckSendTimeout</c>，
+    /// 非发送中（<c>_sendInProgress=0</c>）仅 volatile 读即返回。
+    /// </para>
     /// </summary>
-    public void OnSendStart(TcpClientSession session)
+    public void OnSendOwnershipAcquired(TcpClientSession session)
         => _activeSenders.TryAdd(session, 0);
 
     /// <summary>
-    /// 标记 Session 发送完成。从活跃集合移除，后续扫描不再检查此 Session。
+    /// drain/pump/loop 释放发送所有权时注销。从活跃集合移除，后续扫描不再检查此 Session。
     /// </summary>
-    public void OnSendComplete(TcpClientSession session)
+    public void OnSendOwnershipReleased(TcpClientSession session)
         => _activeSenders.TryRemove(session, out _);
 
     /// <summary>

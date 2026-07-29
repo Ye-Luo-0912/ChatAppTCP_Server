@@ -204,7 +204,37 @@ internal sealed class RealtimeEventConsumerService : BackgroundService
                 }
             }, cts.Token);
 
-            await mainLoop.ConfigureAwait(false);
+            // 使用 Task.WhenAny 竞争 mainLoop 与 workers：
+            // 若 worker 先 Fault → 取消 mainLoop（避免 channel 满后永久阻塞 WriteAsync）；
+            // 若 mainLoop 先结束（正常停机或异常）→ 完成 channel 并等待 workers 排空。
+            var workersTask = Task.WhenAll(workers);
+            var completed = await Task.WhenAny(mainLoop, workersTask)
+                .ConfigureAwait(false);
+
+            // 无论谁先完成，都取消 cts 以加速终止另一侧。
+            cts.Cancel();
+
+            // 等待两侧都完成，传播最先的异常。
+            // mainLoop 异常优先（通常是宿主停机或 JetStream 错误）；
+            // workers 异常次之（dispatch 错误）。
+            Exception? mainLoopException = null;
+            try { await mainLoop.ConfigureAwait(false); }
+            catch (Exception ex) { mainLoopException = ex; }
+
+            try { await workersTask.ConfigureAwait(false); }
+            catch
+            {
+                // worker 异常已通过 Task 状态传播；若 mainLoop 也有异常，优先抛出 mainLoop 的。
+            }
+
+            if (mainLoopException is not null)
+                throw mainLoopException;
+
+            // 若 workers 先 fault 且 mainLoop 被取消（无异常），抛出 workers 的异常。
+            if (completed == workersTask)
+            {
+                await workersTask.ConfigureAwait(false);
+            }
         }
         finally
         {
@@ -214,21 +244,14 @@ internal sealed class RealtimeEventConsumerService : BackgroundService
                 ch.Writer.TryComplete();
             }
 
+            // 确保所有 worker 已退出（上方已 await，此处为防御性等待）。
             try
             {
                 await Task.WhenAll(workers).ConfigureAwait(false);
             }
             catch
             {
-                // worker 异常已通过 Task 状态传播；主循环异常优先抛出。
-            }
-
-            // 如果 worker 先于主循环失败，取消主循环以加速终止。
-            if (mainLoop is { IsFaulted: false, IsCanceled: false, IsCompletedSuccessfully: false })
-            {
-                cts.Cancel();
-                try { await mainLoop.ConfigureAwait(false); }
-                catch { /* 取消导致的异常已预期 */ }
+                // 异常已在上文传播。
             }
         }
     }

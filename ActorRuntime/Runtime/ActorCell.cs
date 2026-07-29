@@ -59,6 +59,12 @@ internal abstract class ActorCell<TKey, TState, TMessage>
     /// </summary>
     public int LastDeadlineBucketIndex = -1;
 
+    // 控制通道：Invalidation 单槽（幂等：多次投递等效于一次）。
+    // 优先级高于 Completion，确保失效在处理过期 Completion 前生效
+    // （epoch 自增后，Completion 的旧 epoch 会被 Behavior 拒绝）。
+    private ActorMailboxItem<TMessage> _invalidation;
+    private bool _hasInvalidation;
+
     // 控制通道：Completion 单槽（Outstanding Operation 唯一），不受普通 Mailbox 是否为空影响。
     private ActorMailboxItem<TMessage> _completion;
     private bool _hasCompletion;
@@ -97,15 +103,19 @@ internal abstract class ActorCell<TKey, TState, TMessage>
     /// <summary>已触发未消费的 Deadline 控制消息数。</summary>
     public int PendingDeadlineControlCount => _deadlineCount;
 
-    /// <summary>控制通道是否有待处理消息（Completion 槽或 Deadline FIFO）。</summary>
-    public bool HasPendingControl => _hasCompletion || _deadlineCount > 0;
+    /// <summary>控制通道是否有待处理消息（Invalidation + Completion + Deadline FIFO）。</summary>
+    public bool HasPendingControl =>
+        _hasInvalidation || _hasCompletion || _deadlineCount > 0;
 
     /// <summary>业务 Mailbox 中的待处理消息数（不含控制通道）。</summary>
     public abstract int MailboxPendingCount { get; }
 
     /// <summary>总待处理数（业务 Mailbox + 控制通道）。</summary>
     public int PendingCount =>
-        MailboxPendingCount + (_hasCompletion ? 1 : 0) + _deadlineCount;
+        MailboxPendingCount +
+        (_hasInvalidation ? 1 : 0) +
+        (_hasCompletion ? 1 : 0) +
+        _deadlineCount;
 
     /// <summary>
     /// 向业务 Mailbox 投递消息。模式特定逻辑由派生类实现。
@@ -142,6 +152,18 @@ internal abstract class ActorCell<TKey, TState, TMessage>
     }
 
     /// <summary>
+    /// 向 Invalidation 控制槽投递失效消息。幂等：已有 Invalidation 时直接覆盖
+    /// （多次失效等效于一次，Behavior 自增 epoch 决定拒绝边界）。
+    /// 不返回 Replaced——旧 Invalidation 不需要 DropHandler 通知。
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void TryEnqueueInvalidation(in ActorMailboxItem<TMessage> item)
+    {
+        _invalidation = item;
+        _hasInvalidation = true;
+    }
+
+    /// <summary>
     /// 向 Deadline 控制 FIFO 投递已触发的 Deadline 消息。
     /// 容量由调度侧不变量保证（未触发 + 已触发未消费 ≤ <see cref="MaxControlDeadlines"/>），
     /// 正常路径不会返回 false；false 表示内部不变量被破坏。
@@ -158,8 +180,12 @@ internal abstract class ActorCell<TKey, TState, TMessage>
     }
 
     /// <summary>
-    /// 按优先级出队：Completion → Deadline 控制 →（<paramref name="controlOnly"/> 为 false 时）业务 Mailbox。
+    /// 按优先级出队：Invalidation → Completion → Deadline 控制 →（<paramref name="controlOnly"/> 为 false 时）业务 Mailbox。
     /// Busy Actor 传 controlOnly: true，仅处理控制消息。
+    /// <para>
+    /// Invalidation 优先于 Completion：确保 epoch 自增在处理过期 Completion 前生效，
+    /// 使 Behavior 能据 epoch 拒绝 stale Completion（避免已失效授权被旧 I/O 结果覆盖）。
+    /// </para>
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool TryDequeue(
@@ -167,6 +193,17 @@ internal abstract class ActorCell<TKey, TState, TMessage>
         out ActorMailboxItem<TMessage> item,
         out bool wasCompletion)
     {
+        // Invalidation 优先级最高：即使 Outstanding Operation 仍在 flight，
+        // 也要先处理失效（Behavior 仅自增 epoch + 清缓存，不提交新 I/O）。
+        if (_hasInvalidation)
+        {
+            item = _invalidation;
+            _invalidation = default;
+            _hasInvalidation = false;
+            wasCompletion = false;
+            return true;
+        }
+
         if (_hasCompletion)
         {
             item = _completion;

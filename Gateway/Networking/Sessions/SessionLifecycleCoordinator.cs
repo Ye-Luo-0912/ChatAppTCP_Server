@@ -268,10 +268,10 @@ internal sealed partial class SessionLifecycleCoordinator
         // 不应使用伪设备 0 接管——否则所有无 DeviceIdHash 的会话会落入同一零值设备键，相互覆盖租约。
         if (context.DeviceIdHash is { } deviceHash)
         {
-            string? previousSessionId = null;
+            DeviceLeaseTakeoverResult? takeover = null;
             try
             {
-                previousSessionId = await _deviceSessionLeaseStore.TakeOverAsync(
+                takeover = await _deviceSessionLeaseStore.TakeOverAsync(
                     context.UserId,
                     deviceHash,
                     context.SessionId,
@@ -281,29 +281,42 @@ internal sealed partial class SessionLifecycleCoordinator
             }
             catch (Exception ex)
             {
+                // Fail-closed：TakeOver 依赖不可用时拒绝恢复，要求完整认证。
+                // 旧行为是 fail-open（吞异常继续恢复），会导致跨 Gateway 旧连接不被吊销，
+                // 新登录与旧 Transport 共存。Same-device fencing 的接管侧属于安全不变量。
                 _logger.TransportFailed(
                     GatewayTransportOperation.ClientProcessing,
                     session.ConnectionId,
                     ex);
+                _metrics.ResumeFailed(ResumeFailureReason.TakeOverUnavailable);
+                // 回滚已完成的认证状态（上面的 Authenticate 调用）。
+                session.Close(SessionCloseReason.AuthenticationRejected);
+                return null;
             }
 
-            // 接管发现跨 Gateway 旧 SessionId：广播 SessionRevoked 让目标 Gateway 关闭旧连接。
-            // 与 ReplaceSameDeviceSessionsAsync 行为一致；Resume 之前未广播会导致旧 Gateway
-            // 在 SessionRevoked 事件到达前继续向已恢复 session 发送出站帧（虽本机会话已被新连接接管）。
-            if (!string.IsNullOrWhiteSpace(previousSessionId)
+            // P0-7：按 ConnectionLeaseId 判断是否需要广播 SessionRevoked（而非仅按 SessionId）。
+            // Resume 复用原 SessionId，若仅比较 SessionId 会漏发吊销事件，
+            // 导致旧 TCP 连接与新连接共存。只要旧连接的 ConnectionLeaseId 与当前不同，
+            // 即说明存在需要被吊销的旧连接，无论 SessionId 是否相同。
+            if (takeover is { } t
+                && !string.IsNullOrWhiteSpace(t.PreviousConnectionLeaseId)
                 && !string.Equals(
-                    previousSessionId,
-                    context.SessionId,
+                    t.PreviousConnectionLeaseId,
+                    session.ConnectionLeaseId,
                     StringComparison.Ordinal))
             {
                 var occurredAtMs = _timeProvider
                     .GetUtcNow()
                     .ToUnixTimeMilliseconds();
+                // 事件 SessionId 用旧 SessionId（若为空则回退到当前 SessionId）；
+                // PayloadJson 携带旧 ConnectionLeaseId 供目标 Gateway 精确匹配旧连接，
+                // 避免误关同 SessionId 的新连接。
                 await PublishSessionRevokedEventAsync(
                     context.UserId,
-                    previousSessionId,
+                    !string.IsNullOrWhiteSpace(t.PreviousSessionId) ? t.PreviousSessionId! : context.SessionId!,
                     occurredAtMs,
                     session.ConnectionId,
+                    t.PreviousConnectionLeaseId,
                     cancellationToken).ConfigureAwait(false);
             }
         }
@@ -468,18 +481,19 @@ internal sealed partial class SessionLifecycleCoordinator
 
     /// <summary>
     /// 心跳扫描中刷新设备租约 TTL（仅在仍持有所有权时）。
-    /// 限制并发 Redis 往返以避免 10k 连接串行扫描。
     /// </summary>
+    /// <param name="gate">并发限制信号量；为 null 时由调用方（如固定 Worker 池）保证并发上限。</param>
     /// <returns><c>true</c> 刷新成功；<c>false</c> Redis 异常或非所有者（已吞异常并记录日志）。</returns>
     public async Task<bool> RefreshLeaseAsync(
-        SemaphoreSlim gate,
+        SemaphoreSlim? gate,
         long userId,
         ulong deviceHash,
         string leaseId,
         TimeSpan leaseTtl,
         CancellationToken cancellationToken)
     {
-        await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        if (gate is not null)
+            await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             await _deviceSessionLeaseStore
@@ -506,21 +520,23 @@ internal sealed partial class SessionLifecycleCoordinator
         }
         finally
         {
-            gate.Release();
+            if (gate is not null)
+                gate.Release();
         }
     }
 
     /// <summary>
     /// 心跳扫描中刷新 Redis 全局在线状态 score（防止 TTL 过期误判下线）。
-    /// 限制并发 Redis 往返以避免 10k 连接串行扫描。
     /// </summary>
+    /// <param name="gate">并发限制信号量；为 null 时由调用方（如固定 Worker 池）保证并发上限。</param>
     /// <returns><c>true</c> 刷新成功；<c>false</c> Redis 异常（已吞异常并记录日志）。</returns>
     public async Task<bool> RefreshPresenceAsync(
-        SemaphoreSlim gate,
+        SemaphoreSlim? gate,
         long userId,
         CancellationToken cancellationToken)
     {
-        await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        if (gate is not null)
+            await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             await _globalPresence
@@ -545,7 +561,8 @@ internal sealed partial class SessionLifecycleCoordinator
         }
         finally
         {
-            gate.Release();
+            if (gate is not null)
+                gate.Release();
         }
     }
 }

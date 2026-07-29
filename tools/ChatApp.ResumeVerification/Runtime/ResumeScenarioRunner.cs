@@ -81,9 +81,12 @@ internal static class ResumeScenarioRunner
                 .ConfigureAwait(false);
             await client.HandshakeAsync(DefaultFeatureBits, cancellationToken)
                 .ConfigureAwait(false);
+            // P0-B：复用 bootstrap 写入 Redis 的 DeviceIdHash，保证 AccessToken 与
+            // AuthenticationRequest 设备指纹一致，触发 same-device fencing 校验路径。
+            // 旧实现传 null，网关将认证请求视为无设备绑定，fencing 路径不被执行。
             var session = await client.AuthenticateAsync(
                     bootstrap.Token,
-                    deviceIdHash: null,
+                    deviceIdHash: bootstrap.DeviceIdHash,
                     cancellationToken)
                 .ConfigureAwait(false);
 

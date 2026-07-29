@@ -1,3 +1,4 @@
+using System.Threading.Channels;
 using ChatApp.TcpGateway.Gateway.Configuration;
 using ChatApp.TcpGateway.Gateway.Networking.Transport;
 using ChatApp.TcpGateway.Observability.Metrics;
@@ -6,32 +7,70 @@ using Microsoft.Extensions.Logging;
 namespace ChatApp.TcpGateway.Gateway.Networking.Sessions;
 
 /// <summary>
+/// 心跳刷新种类：设备租 lease 或全局 presence。
+/// </summary>
+internal enum HeartbeatRefreshKind : byte
+{
+    Lease = 1,
+    Presence = 2,
+}
+
+/// <summary>
+/// 心跳刷新工作项：值类型，避免每刷新分配 lambda/Task/Timer。
+/// <para>
+/// 由 HeartbeatCoordinator 的 tick 循环产生，写入有界 Channel，
+/// 由固定 Worker 池消费执行。jitter 编码为 <see cref="DueTimestampTicks"/>，
+/// 不为每个刷新创建独立 Timer——Worker 池数量本身就是并发上限与负载分散机制。
+/// </para>
+/// </summary>
+internal readonly record struct HeartbeatRefreshWork(
+    HeartbeatRefreshKind Kind,
+    long UserId,
+    ulong DeviceHash,
+    string? LeaseId,
+    TimeSpan LeaseTtl,
+    long DueTimestampTicks);
+
+/// <summary>
 /// 心跳扫描协调器：周期性执行设备租约 TTL 刷新与 Redis 全局在线状态刷新。
 /// <para>
-/// 从 <see cref="Networking.TcpGatewayService"/> 抽取以消除 God Service 中散落的后台扫描循环。
-/// 单例，由宿主在 ExecuteAsync 中驱动 <see cref="RunAsync"/>，停机时取消 token 退出。
+/// V3 重构：采用<b>固定 Work Queue + 固定 Redis Worker</b>模型，替代每 tick 的
+/// per-refresh Lambda/Task/Task.Delay/Task.WhenAll 分配。
+/// <para>
+/// 架构：
+/// <code>
+/// HeartbeatBucket (每 tick 枚举一个桶)
+///     ↓  产生 HeartbeatRefreshWork 值类型
+/// Bounded Channel (有界工作队列)
+///     ↓
+/// 固定 Redis Workers (N = HeartbeatRefreshConcurrency)
+///     ↓  调用 SessionLifecycleCoordinator.Refresh*
+/// Redis
+/// </code>
 /// </para>
 /// <para>
-/// V2 重构：认证超时与空闲超时已迁移到全局 <see cref="Executor.DeadlineWheel"/>（per-connection
-/// check-on-fire deadline），本协调器不再执行全量超时扫描。仅保留 Redis 分桶刷新：
+/// 消除的每刷新分配：
 /// <list type="bullet">
-/// <item>tick 间隔 = <see cref="TcpGatewayOptions.HeartbeatScanInterval"/> /
-///   <see cref="TcpGatewayOptions.HeartbeatBucketCount"/>（默认 30s/30 = 1s）；</item>
-/// <item>每 tick 仅枚举 <see cref="HeartbeatBucketRegistry"/> 的一个连接桶 + 一个用户桶，
-///   不再 <c>_sessions.ToArray()</c> 全量复制。10k 连接下每 tick 仅遍历 ~333 连接 + ~333 用户；</item>
-/// <item>连接桶按 connectionId 分桶用于设备租约刷新（每连接独立租约）；</item>
-/// <item>用户桶按 userId 分桶用于 presence 刷新（同用户多连接只在本 user 桶 tick 内刷新一次，
-///   不再因 connectionId 桶不同导致一周期内重复刷新同一用户）；</item>
-/// <item>刷新前追加确定性 jitter（tick 间隔 × jitterRatio），避免同桶任务同步触发 Redis；</item>
-/// <item>刷新并发上限 = <see cref="TcpGatewayOptions.HeartbeatRefreshConcurrency"/>（取代原硬编码 32）；</item>
-/// <item>刷新结果（成功/失败）由 <see cref="SessionLifecycleCoordinator.RefreshLeaseAsync"/> /
-///   <see cref="SessionLifecycleCoordinator.RefreshPresenceAsync"/> 显式返回 bool，失败不再被记为成功。</item>
+/// <item><b>Lambda 闭包</b>：work 是值类型，无闭包捕获；</item>
+/// <item><b>Task 状态机</b>：Worker 在 RunAsync 启动时一次性创建，不随刷新数增长；</item>
+/// <item><b>Task.Delay Timer</b>：jitter 编码为 DueTimestampTicks，Worker 池数量即并发上限，
+/// 不为每个刷新创建独立 Timer；</item>
+/// <item><b>Task.WhenAll</b>：Worker 持续消费 Channel，无需每 tick 同步等待。</item>
 /// </list>
-/// 实际 Redis 往返与异常吞噬委托 <see cref="SessionLifecycleCoordinator"/> 完成。
 /// </para>
 /// <para>
-/// 当 <see cref="TcpGatewayOptions.HeartbeatBucketCount"/> = 1 时退化为全量刷新（兼容旧行为）。
+/// 负载分散：bounded Worker 数量（HeartbeatRefreshConcurrency）天然限制 Redis 并发，
+/// Worker 按 Redis 往返速度逐条消费，无需 jitter Timer 即可将 333 项/tick 的刷新
+/// 分散到多个 Redis 往返周期中。
 /// </para>
+/// <para>
+/// 背压：Channel 容量 = WorkerCount × 4。队列满时 tick 循环 await WriteAsync 阻塞，
+/// 防止 Redis 持续慢速时工作项无限积压。Redis 恢复后自动恢复写入。
+/// </para>
+/// </para>
+/// <para>
+/// V2：认证超时与空闲超时已迁移到全局 <see cref="Executor.DeadlineWheel"/>（per-connection
+/// check-on-fire deadline），本协调器不再执行全量超时扫描。仅保留 Redis 分桶刷新。
 /// </para>
 /// </summary>
 internal sealed class HeartbeatCoordinator
@@ -64,9 +103,11 @@ internal sealed class HeartbeatCoordinator
     }
 
     /// <summary>
-    /// 驱动心跳扫描循环，直到 cancellationToken 取消。
-    /// 单次 tick 内并发刷新 Redis（SemaphoreSlim 限 <see cref="TcpGatewayOptions.HeartbeatRefreshConcurrency"/>），
-    /// 单点失败不中断循环。
+    /// 驱动心跳扫描循环 + 固定 Redis Worker 池，直到 cancellationToken 取消。
+    /// <para>
+    /// tick 循环：每 tick 枚举一个桶，产生 HeartbeatRefreshWork 值写入有界 Channel。
+    /// Worker 池：N 个固定 Task 并行消费 Channel，执行 Redis 刷新。
+    /// </para>
     /// </summary>
     public async Task RunAsync(CancellationToken cancellationToken)
     {
@@ -76,16 +117,32 @@ internal sealed class HeartbeatCoordinator
             ? _options.HeartbeatScanInterval / bucketCount
             : _options.HeartbeatScanInterval;
 
-        // jitter 窗口：tick 间隔 × jitterRatio。每个刷新任务在 [0, jitterWindow) 内随机延迟。
+        // jitter 窗口：编码为 DueTimestampTicks，不创建 Timer。
         var jitterWindowMs = tickInterval.TotalMilliseconds * _options.HeartbeatRefreshJitterRatio;
 
-        using var timer = new PeriodicTimer(tickInterval, _timeProvider);
-        using var refreshGate = new SemaphoreSlim(
-            _options.HeartbeatRefreshConcurrency,
-            _options.HeartbeatRefreshConcurrency);
+        var workerCount = Math.Max(1, _options.HeartbeatRefreshConcurrency);
+        // Channel 容量 = Worker × 4：队列满时 tick 循环阻塞提供背压，
+        // 防止 Redis 持续慢速时工作项无限积压。
+        var channelCapacity = workerCount * 4;
+        var channel = Channel.CreateBounded<HeartbeatRefreshWork>(
+            new BoundedChannelOptions(channelCapacity)
+            {
+                SingleReader = false,
+                SingleWriter = false,
+                AllowSynchronousContinuations = false,
+                FullMode = BoundedChannelFullMode.Wait
+            });
 
-        // 复用刷新任务列表，避免每 tick 分配新 List<Task>。
-        var refreshTasks = new List<Task>(capacity: 256);
+        // 启动固定 Worker 池：每个 Worker 持续消费 Channel 执行 Redis 刷新。
+        // Worker 数量 = HeartbeatRefreshConcurrency，即 Redis 并发上限。
+        // gate=null：并发由 Worker 数量保证，无需 SemaphoreSlim。
+        var workers = new Task[workerCount];
+        for (var i = 0; i < workerCount; i++)
+        {
+            workers[i] = WorkerLoopAsync(channel.Reader, cancellationToken);
+        }
+
+        using var timer = new PeriodicTimer(tickInterval, _timeProvider);
         var tickCounter = 0;
 
         try
@@ -108,9 +165,12 @@ internal sealed class HeartbeatCoordinator
 
                 // 指标：当前 tick 扫描的连接数（仅当前桶，非全局总数）。
                 _metrics.HeartbeatSessionsScanned(sessionsInBucket.Count);
-                refreshTasks.Clear();
+
+                var nowTicks = _timeProvider.GetTimestamp();
+                var leaseTtl = _options.IdleTimeout + TimeSpan.FromMinutes(5);
 
                 // 设备租约刷新：每连接独立租约，按 connectionId 桶遍历。
+                // 产生 HeartbeatRefreshWork 值写入 Channel，无 lambda/Task 分配。
                 if (_options.ReplaceSameDeviceSession)
                 {
                     foreach (var session in sessionsInBucket)
@@ -119,49 +179,39 @@ internal sealed class HeartbeatCoordinator
                         if (session is not { IsAuthenticated: true, UserId: > 0, DeviceIdHash: { } deviceHash })
                             continue;
 
-                        var leaseTtl = _options.IdleTimeout + TimeSpan.FromMinutes(5);
-                        var leaseId = session.ConnectionLeaseId;
-                        refreshTasks.Add(RefreshLeaseWithJitterAsync(
-                            () => _lifecycleCoordinator.RefreshLeaseAsync(
-                                refreshGate,
-                                session.UserId,
-                                deviceHash,
-                                leaseId,
-                                leaseTtl,
-                                cancellationToken),
-                            jitterWindowMs,
-                            cancellationToken));
+                        _metrics.HeartbeatRefreshAttempted("lease");
+                        var dueTicks = ApplyJitter(nowTicks, jitterWindowMs);
+                        var work = new HeartbeatRefreshWork(
+                            HeartbeatRefreshKind.Lease,
+                            session.UserId,
+                            deviceHash,
+                            session.ConnectionLeaseId,
+                            leaseTtl,
+                            dueTicks);
+
+                        // 队列满时 await 阻塞提供背压（Redis 慢速时 tick 自然降速）。
+                        await channel.Writer.WriteAsync(work, cancellationToken)
+                            .ConfigureAwait(false);
                     }
                 }
 
-                // Presence 刷新：按 userId 桶遍历，同用户多连接只刷新一次（引用计数已在注册表去重）。
+                // Presence 刷新：按 userId 桶遍历，同用户多连接只刷新一次。
                 if (_options.EnableEphemeralPresenceAndTyping)
                 {
                     foreach (var userId in usersInBucket)
                     {
-                        refreshTasks.Add(RefreshPresenceWithJitterAsync(
-                            () => _lifecycleCoordinator.RefreshPresenceAsync(
-                                refreshGate,
-                                userId,
-                                cancellationToken),
-                            jitterWindowMs,
-                            cancellationToken));
-                    }
-                }
+                        _metrics.HeartbeatRefreshAttempted("presence");
+                        var dueTicks = ApplyJitter(nowTicks, jitterWindowMs);
+                        var work = new HeartbeatRefreshWork(
+                            HeartbeatRefreshKind.Presence,
+                            userId,
+                            0,
+                            null,
+                            TimeSpan.Zero,
+                            dueTicks);
 
-                if (refreshTasks.Count > 0)
-                {
-                    try
-                    {
-                        await Task.WhenAll(refreshTasks).ConfigureAwait(false);
-                    }
-                    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-                    {
-                        throw;
-                    }
-                    catch
-                    {
-                        // 单个刷新失败已在 Refresh*WithJitterAsync 内部记录；不中断心跳循环。
+                        await channel.Writer.WriteAsync(work, cancellationToken)
+                            .ConfigureAwait(false);
                     }
                 }
 
@@ -174,105 +224,99 @@ internal sealed class HeartbeatCoordinator
         {
             // Normal host shutdown.
         }
-    }
-
-    /// <summary>
-    /// 在执行设备租约刷新前追加随机 jitter 延迟。
-    /// 刷新成功/失败由 <see cref="SessionLifecycleCoordinator.RefreshLeaseAsync"/> 显式返回 bool，
-    /// 失败时记录 <see cref="GatewayMetrics.HeartbeatRefreshFailed"/> 不再被误记为成功。
-    /// </summary>
-    private async Task RefreshLeaseWithJitterAsync(
-        Func<Task<bool>> refreshOperation,
-        double jitterWindowMs,
-        CancellationToken cancellationToken)
-    {
-        _metrics.HeartbeatRefreshAttempted("lease");
-
-        if (jitterWindowMs > 0)
+        finally
         {
-            var jitterMs = _jitterRandom.NextDouble() * jitterWindowMs;
+            // 通知 Worker 池停止：完成写入端，Worker 的 ReadAllAsync 自然结束。
+            channel.Writer.TryComplete();
             try
             {
-                await Task.Delay(TimeSpan.FromMilliseconds(jitterMs), cancellationToken)
-                    .ConfigureAwait(false);
+                await Task.WhenAll(workers).ConfigureAwait(false);
             }
-            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            catch
             {
-                throw;
+                // Worker 异常已在 WorkerLoopAsync 内吞噬，此处忽略。
             }
-        }
-
-        var opStart = _timeProvider.GetTimestamp();
-        try
-        {
-            var success = await refreshOperation().ConfigureAwait(false);
-            var opDuration = _timeProvider.GetElapsedTime(opStart);
-            if (success)
-            {
-                _metrics.HeartbeatRefreshCompleted(opDuration, "lease");
-            }
-            else
-            {
-                _metrics.HeartbeatRefreshFailed("lease");
-            }
-        }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch
-        {
-            _metrics.HeartbeatRefreshFailed("lease");
-            // 吞噬异常：Task.WhenAll 不应因单个刷新失败短路。
         }
     }
 
     /// <summary>
-    /// 在执行 presence 刷新前追加随机 jitter 延迟。
-    /// 刷新成功/失败由 <see cref="SessionLifecycleCoordinator.RefreshPresenceAsync"/> 显式返回 bool。
+    /// 固定 Redis Worker 循环：持续消费 Channel 中的刷新工作项并执行。
+    /// <para>
+    /// gate=null：并发由 Worker 数量保证。单点失败仅记录指标，不中断 Worker。
+    /// </para>
     /// </summary>
-    private async Task RefreshPresenceWithJitterAsync(
-        Func<Task<bool>> refreshOperation,
-        double jitterWindowMs,
+    private async Task WorkerLoopAsync(
+        ChannelReader<HeartbeatRefreshWork> reader,
         CancellationToken cancellationToken)
     {
-        _metrics.HeartbeatRefreshAttempted("presence");
+        const string leaseLabel = "lease";
+        const string presenceLabel = "presence";
 
-        if (jitterWindowMs > 0)
-        {
-            var jitterMs = _jitterRandom.NextDouble() * jitterWindowMs;
-            try
-            {
-                await Task.Delay(TimeSpan.FromMilliseconds(jitterMs), cancellationToken)
-                    .ConfigureAwait(false);
-            }
-            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-            {
-                throw;
-            }
-        }
-
-        var opStart = _timeProvider.GetTimestamp();
         try
         {
-            var success = await refreshOperation().ConfigureAwait(false);
-            var opDuration = _timeProvider.GetElapsedTime(opStart);
-            if (success)
+            await foreach (var work in reader.ReadAllAsync(cancellationToken)
+                               .ConfigureAwait(false))
             {
-                _metrics.HeartbeatRefreshCompleted(opDuration, "presence");
-            }
-            else
-            {
-                _metrics.HeartbeatRefreshFailed("presence");
+                var kindLabel = work.Kind == HeartbeatRefreshKind.Lease
+                    ? leaseLabel
+                    : presenceLabel;
+
+                var opStart = _timeProvider.GetTimestamp();
+                try
+                {
+                    bool success;
+                    if (work.Kind == HeartbeatRefreshKind.Lease)
+                    {
+                        success = await _lifecycleCoordinator.RefreshLeaseAsync(
+                            gate: null,
+                            work.UserId,
+                            work.DeviceHash,
+                            work.LeaseId!,
+                            work.LeaseTtl,
+                            cancellationToken).ConfigureAwait(false);
+                    }
+                    else
+                    {
+                        success = await _lifecycleCoordinator.RefreshPresenceAsync(
+                            gate: null,
+                            work.UserId,
+                            cancellationToken).ConfigureAwait(false);
+                    }
+
+                    var opDuration = _timeProvider.GetElapsedTime(opStart);
+                    if (success)
+                        _metrics.HeartbeatRefreshCompleted(opDuration, kindLabel);
+                    else
+                        _metrics.HeartbeatRefreshFailed(kindLabel);
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch
+                {
+                    _metrics.HeartbeatRefreshFailed(kindLabel);
+                    // 吞噬异常：Worker 不应因单个刷新失败退出。
+                }
             }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            throw;
+            // Normal shutdown.
         }
-        catch
-        {
-            _metrics.HeartbeatRefreshFailed("presence");
-        }
+    }
+
+    /// <summary>
+    /// 生成带 jitter 的 DueTimestamp（单调时钟 ticks）。
+    /// jitter 仅修改 DueTimestamp 值，不创建 Timer；Worker 池数量即并发上限与负载分散。
+    /// </summary>
+    private long ApplyJitter(long nowTicks, double jitterWindowMs)
+    {
+        if (jitterWindowMs <= 0)
+            return nowTicks;
+
+        var jitterMs = _jitterRandom.NextDouble() * jitterWindowMs;
+        var jitterTicks = (long)(jitterMs * _timeProvider.TimestampFrequency / 1000.0);
+        return nowTicks + jitterTicks;
     }
 }

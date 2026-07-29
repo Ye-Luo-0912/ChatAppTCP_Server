@@ -122,6 +122,21 @@ public sealed class InMemoryWatcherGatewayDirectory : IWatcherGatewayDirectory
                 : new List<string>(instances));
     }
 
+    /// <summary>四-4：内存实现为无操作（测试环境不依赖独立 Gateway 实例注册）。</summary>
+#pragma warning disable CA1822 // 接口实现，无法标记为 static
+    public Task RegisterGatewayInstanceAsync(
+        string instanceId,
+        TimeSpan leaseDuration,
+        CancellationToken cancellationToken = default)
+        => Task.CompletedTask;
+
+    /// <summary>四-4：内存实现为无操作。</summary>
+    public Task UnregisterGatewayInstanceAsync(
+        string instanceId,
+        CancellationToken cancellationToken = default)
+        => Task.CompletedTask;
+#pragma warning restore CA1822
+
     /// <summary>
     /// 清空所有 watcher 路由记录。
     /// </summary>

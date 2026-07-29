@@ -44,7 +44,8 @@ internal enum TypingActorMessageKind : byte
 /// <summary>
 /// Typing Actor 消息：值类型联合，避免装箱。
 /// <para>
-/// Notify 消息携带目标用户、typing 状态与时间戳；AuthorizationCompleted 仅携带授权结果。
+/// Notify 消息携带目标用户、typing 状态与时间戳；AuthorizationCompleted 携带授权结果与
+/// 授权纪元（用于拒绝 stale Completion——失效后自增的 epoch 使旧 Completion 被拒绝）。
 /// 不携带 byte[]/Session/RemoteIp 等通用 SessionCommand 字段，热路径零分配。
 /// </para>
 /// </summary>
@@ -60,18 +61,27 @@ internal readonly struct TypingActorMessage
     // --- AuthorizationCompleted 字段 ---
     public readonly bool Authorized;
 
+    /// <summary>
+    /// 授权纪元：AuthorizationCompleted 携带提交 I/O 时捕获的 epoch。
+    /// Behavior 仅在 CompletionEpoch == state.AuthorizationEpoch 时接受结果，
+    /// 否则视为 stale Completion（失效后旧 I/O 的回投）并拒绝。
+    /// </summary>
+    public readonly uint AuthorizationEpoch;
+
     private TypingActorMessage(
         TypingActorMessageKind kind,
         bool isTyping,
         long timestamp,
         long sessionGeneration,
-        bool authorized)
+        bool authorized,
+        uint authorizationEpoch)
     {
         Kind = kind;
         IsTyping = isTyping;
         Timestamp = timestamp;
         SessionGeneration = sessionGeneration;
         Authorized = authorized;
+        AuthorizationEpoch = authorizationEpoch;
     }
 
     /// <summary>构造 typing 状态变更通知。</summary>
@@ -79,15 +89,18 @@ internal readonly struct TypingActorMessage
         bool isTyping,
         long timestamp,
         long sessionGeneration)
-        => new(TypingActorMessageKind.Notify, isTyping, timestamp, sessionGeneration, authorized: false);
+        => new(TypingActorMessageKind.Notify, isTyping, timestamp, sessionGeneration, authorized: false, authorizationEpoch: 0);
 
-    /// <summary>构造授权完成回调。</summary>
-    public static TypingActorMessage AuthorizationCompleted(bool authorized)
-        => new(TypingActorMessageKind.AuthorizationCompleted, isTyping: false, timestamp: 0, sessionGeneration: 0, authorized);
+    /// <summary>
+    /// 构造授权完成回调，携带提交时捕获的授权纪元。
+    /// Behavior 比较此 epoch 与 state.AuthorizationEpoch 以拒绝 stale Completion。
+    /// </summary>
+    public static TypingActorMessage AuthorizationCompleted(bool authorized, uint authorizationEpoch)
+        => new(TypingActorMessageKind.AuthorizationCompleted, isTyping: false, timestamp: 0, sessionGeneration: 0, authorized, authorizationEpoch);
 
     /// <summary>构造授权失效通知（关系变更触发）。</summary>
     public static TypingActorMessage AuthorizationInvalidated()
-        => new(TypingActorMessageKind.AuthorizationInvalidated, isTyping: false, timestamp: 0, sessionGeneration: 0, authorized: false);
+        => new(TypingActorMessageKind.AuthorizationInvalidated, isTyping: false, timestamp: 0, sessionGeneration: 0, authorized: false, authorizationEpoch: 0);
 }
 
 /// <summary>

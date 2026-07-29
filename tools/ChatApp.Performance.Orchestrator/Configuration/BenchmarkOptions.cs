@@ -57,7 +57,7 @@ internal sealed record BenchmarkOptions(
         "[--pipeline-payload-bytes 128] [--pipeline-operation-timeout-seconds 15] " +
         "[--pipeline-base-user-id 9200000000] " +
         "[--inbound-transport-mode Pipelines|DirectSocket] " +
-        "[--outbound-send-mode PersistentSendLoop|OnDemandSendPump] " +
+        "[--outbound-send-mode PersistentSendLoop|OnDemandSendPump|PerSessionDrain] " +
         "[--on-demand-send-worker-count 0] [--on-demand-send-burst-limit 16] " +
         "[--docker-container NAME] " +
         "[--report-directory .artifacts/performance]";
@@ -289,10 +289,11 @@ internal sealed record BenchmarkOptions(
         if (inboundTransportMode is not ("Pipelines" or "DirectSocket"))
             throw new ArgumentException(
                 "--inbound-transport-mode must be Pipelines or DirectSocket.");
-        // 校验出站模式 A/B 参数。
-        if (outboundSendMode is not ("PersistentSendLoop" or "OnDemandSendPump"))
+        // 校验出站模式 A/B 参数。三种模式均由 Gateway 配置支持，
+        // 编排器统一透传给 Gateway 进程，无需模式特定逻辑。
+        if (outboundSendMode is not ("PersistentSendLoop" or "OnDemandSendPump" or "PerSessionDrain"))
             throw new ArgumentException(
-                "--outbound-send-mode must be PersistentSendLoop or OnDemandSendPump.");
+                "--outbound-send-mode must be PersistentSendLoop, OnDemandSendPump, or PerSessionDrain.");
         ArgumentOutOfRangeException.ThrowIfNegative(onDemandSendWorkerCount);
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(onDemandSendBurstLimit, 0);
 

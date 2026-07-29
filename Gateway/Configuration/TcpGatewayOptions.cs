@@ -270,6 +270,18 @@ public sealed class TcpGatewayOptions
     public bool UseActorRuntimeForEphemeralCommands { get; set; }
 
     /// <summary>
+    /// 解析当前 Ephemeral 调度模式。优先使用 <see cref="EphemeralPipelineMode"/>，
+    /// 布尔标志保留作为配置入口与 A/B 切换开关。
+    /// <para>
+    /// 调用方应使用此属性而非直接读取布尔标志，确保 Disabled 模式被正确识别。
+    /// </para>
+    /// </summary>
+    public EphemeralPipelineMode ResolveEphemeralPipelineMode() =>
+        UseActorRuntimeForEphemeralCommands
+            ? EphemeralPipelineMode.GenericActor
+            : EphemeralPipelineMode.Legacy;
+
+    /// <summary>
     /// 启用 Typing 领域 Actor：TCP Read 路径直接解析 TypingNotify 并路由到
     /// LatestOnly Mailbox 的领域 Actor，不创建通用 SessionCommand。
     /// 需要 <see cref="UseActorRuntimeForEphemeralCommands"/> 为 true。

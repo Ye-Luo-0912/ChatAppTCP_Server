@@ -12,9 +12,20 @@ namespace ChatApp.TcpGateway.Gateway.Networking.Ephemeral;
 /// <summary>
 /// Ephemeral 入站命令调度边界。可在轻量 ActorRuntime 与旧
 /// SessionCommandExecutor 间切换，不改变 SessionRuntime 或 wire 协议。
+/// <para>
+/// 三种模式：
+/// <list type="bullet">
+/// <item><see cref="EphemeralPipelineMode.Disabled"/>：不创建任何调度资源。
+///   用于 Specialized Typing 模式：TypingNotify 被快路径截获，通用调度完全冗余。
+///   Register/Unregister 为 no-op；TryEnqueue 返回 false；Start/Stop 为 no-op。</item>
+/// <item><see cref="EphemeralPipelineMode.Legacy"/>：使用 SessionCommandExecutor（Worker 池 + 每连接 ConcurrentQueue）。</item>
+/// <item><see cref="EphemeralPipelineMode.GenericActor"/>：使用 ActorRuntime（FIFO Mailbox + 异步操作执行器）。</item>
+/// </list>
+/// </para>
 /// </summary>
 internal sealed class EphemeralCommandPipeline : IAsyncDisposable
 {
+    private readonly EphemeralPipelineMode _mode;
     private readonly SessionCommandExecutor? _legacy;
     private readonly ActorRuntime<uint, EphemeralActorState, EphemeralActorMessage>? _actor;
     private readonly TimeSpan _operationTimeout;
@@ -26,12 +37,38 @@ internal sealed class EphemeralCommandPipeline : IAsyncDisposable
         GatewayMetrics metrics,
         TimeProvider timeProvider,
         ILogger logger)
+        : this(options, ephemeralMode: null, processor, metrics, timeProvider, logger)
+    {
+    }
+
+    /// <summary>
+    /// 构造指定模式的 Ephemeral 调度管道。
+    /// <paramref name="ephemeralMode"/> 为 null 时从 <paramref name="options"/> 推导。
+    /// </summary>
+    public EphemeralCommandPipeline(
+        TcpGatewayOptions options,
+        EphemeralPipelineMode? ephemeralMode,
+        Func<SessionCommand, CancellationToken, ValueTask> processor,
+        GatewayMetrics metrics,
+        TimeProvider timeProvider,
+        ILogger logger)
     {
         ArgumentNullException.ThrowIfNull(options);
         ArgumentNullException.ThrowIfNull(processor);
         _operationTimeout = options.EphemeralActorOperationTimeout;
 
-        if (!options.UseActorRuntimeForEphemeralCommands)
+        // 显式模式优先：调用方可通过 ephemeralMode 覆盖布尔标志推导结果。
+        // 未指定时由 options.ResolveEphemeralPipelineMode() 推导。
+        _mode = ephemeralMode ?? options.ResolveEphemeralPipelineMode();
+
+        if (_mode == EphemeralPipelineMode.Disabled)
+        {
+            // Disabled：不创建任何 Worker / Actor / ConnectionQueue 资源。
+            // 用于 Specialized Typing 模式——TypingNotify 已被快路径截获。
+            return;
+        }
+
+        if (_mode == EphemeralPipelineMode.Legacy)
         {
             _legacy = new SessionCommandExecutor(
                 processor,
@@ -80,16 +117,37 @@ internal sealed class EphemeralCommandPipeline : IAsyncDisposable
         behavior.Attach(_actor);
     }
 
+    /// <summary>
+    /// 当前调度模式。Disabled 下所有资源相关方法为 no-op。
+    /// </summary>
+    public EphemeralPipelineMode Mode => _mode;
+
     public bool UsesActorRuntime => _actor is not null;
 
     public ActorRuntimeSnapshot Snapshot =>
         _actor?.GetSnapshot() ?? default;
 
+    /// <summary>
+    /// 注册连接。Disabled 模式下为 no-op（返回 true 维持调用方契约）。
+    /// Legacy 模式下委托 SessionCommandExecutor；GenericActor 模式下为 no-op
+    /// （Actor Key 即 connectionId，无需预注册）。
+    /// </summary>
     public bool TryRegisterConnection(uint connectionId, long userId)
-        => _legacy?.TryRegisterConnection(connectionId, userId) ?? true;
+    {
+        if (_mode == EphemeralPipelineMode.Disabled)
+            return true;
+        return _legacy?.TryRegisterConnection(connectionId, userId) ?? true;
+    }
 
+    /// <summary>
+    /// 注销连接。Disabled 模式下为 no-op。
+    /// Legacy 模式下排空队列；GenericActor 模式下立即 Deactivate 对应 Actor。
+    /// </summary>
     public void UnregisterConnection(uint connectionId)
     {
+        if (_mode == EphemeralPipelineMode.Disabled)
+            return;
+
         if (_legacy is not null)
         {
             _legacy.UnregisterConnection(connectionId);
@@ -103,10 +161,17 @@ internal sealed class EphemeralCommandPipeline : IAsyncDisposable
             ActorDeactivateReason.Explicit);
     }
 
+    /// <summary>
+    /// 入队命令。Disabled 模式下返回 false——调用方不应到达此路径
+    /// （Specialized Typing 模式下 TypingNotify 已被快路径截获）。
+    /// </summary>
     public bool TryEnqueue(
         uint connectionId,
         in SessionCommand command)
     {
+        if (_mode == EphemeralPipelineMode.Disabled)
+            return false;
+
         if (_legacy is not null)
             return _legacy.TryEnqueue(connectionId, in command);
 
@@ -116,12 +181,19 @@ internal sealed class EphemeralCommandPipeline : IAsyncDisposable
     }
 
     public Task StartAsync(CancellationToken cancellationToken)
-        => _legacy is not null
+    {
+        if (_mode == EphemeralPipelineMode.Disabled)
+            return Task.CompletedTask;
+        return _legacy is not null
             ? _legacy.StartAsync(cancellationToken)
             : _actor!.StartAsync(cancellationToken).AsTask();
+    }
 
     public async Task StopAsync(CancellationToken cancellationToken)
     {
+        if (_mode == EphemeralPipelineMode.Disabled)
+            return;
+
         if (_legacy is not null)
         {
             await _legacy.StopAsync(cancellationToken).ConfigureAwait(false);

@@ -45,11 +45,11 @@ internal sealed partial class SessionLifecycleCoordinator
 
         // TTL 略长于空闲超时，避免正常心跳间隙丢租约；断开时 ReleaseIfOwner。
         var leaseTtl = _options.IdleTimeout + TimeSpan.FromMinutes(5);
-        string? previousSessionId;
+        DeviceLeaseTakeoverResult? takeover;
         try
         {
             // 传入 ConnectionLeaseId 作为所有权令牌。
-            previousSessionId = await _deviceSessionLeaseStore
+            takeover = await _deviceSessionLeaseStore
                 .TakeOverAsync(
                     incoming.UserId,
                     deviceHash,
@@ -68,23 +68,30 @@ internal sealed partial class SessionLifecycleCoordinator
             return;
         }
 
-        if (string.IsNullOrWhiteSpace(previousSessionId)
-            || string.Equals(previousSessionId, incoming.SessionId, StringComparison.Ordinal))
+        // P0-7：按 ConnectionLeaseId 判断是否存在跨 Gateway 旧连接需要吊销。
+        // 仅比较 SessionId 会在 Resume 复用 SessionId 时漏发吊销事件。
+        if (takeover is not { } t
+            || string.IsNullOrWhiteSpace(t.PreviousConnectionLeaseId)
+            || string.Equals(
+                t.PreviousConnectionLeaseId,
+                incoming.ConnectionLeaseId,
+                StringComparison.Ordinal))
         {
             return;
         }
 
-        // 本机已踢过的 SessionId 不必再发；跨实例依赖此事件。
+        // 本机已踢过的连接不必再发；按 ConnectionLeaseId 判断（比 SessionId 更精确）。
         var alreadyLocal = localVictims.Any(v =>
-            string.Equals(v.SessionId, previousSessionId, StringComparison.Ordinal));
+            string.Equals(v.ConnectionLeaseId, t.PreviousConnectionLeaseId, StringComparison.Ordinal));
         if (alreadyLocal)
             return;
 
         await PublishSessionRevokedEventAsync(
             incoming.UserId,
-            previousSessionId,
+            !string.IsNullOrWhiteSpace(t.PreviousSessionId) ? t.PreviousSessionId! : incoming.SessionId!,
             occurredAtMs,
             incoming.ConnectionId,
+            t.PreviousConnectionLeaseId,
             cancellationToken).ConfigureAwait(false);
     }
 
@@ -94,6 +101,11 @@ internal sealed partial class SessionLifecycleCoordinator
     /// 以确保跨 Gateway 的旧连接及时关闭（与 <see cref="ReplaceSameDeviceSessionsAsync"/>
     /// 行为一致）。
     /// <para>
+    /// P0-7：<paramref name="connectionLeaseId"/> 携带旧连接的租约 ID，写入 PayloadJson，
+    /// 供目标 Gateway 的 <c>SessionRevocationHandler</c> 按 ConnectionLeaseId 精确匹配旧连接，
+    /// 避免在 SessionId 相同时（Resume 复用）误关新连接。
+    /// </para>
+    /// <para>
     /// Best-effort：发布失败仅记录日志，不阻断调用方流程。NATS/Realtime bus 故障时
     /// 旧连接依赖设备租约 TTL 自然失效。
     /// </para>
@@ -102,12 +114,14 @@ internal sealed partial class SessionLifecycleCoordinator
     /// <param name="revokedSessionId">被吊销的 SessionId。</param>
     /// <param name="occurredAtMs">事件发生时间（Unix 毫秒）。</param>
     /// <param name="reportingConnectionId">用于日志追溯的当前连接 Id。</param>
+    /// <param name="connectionLeaseId">旧连接的 ConnectionLeaseId，写入 PayloadJson 供精确匹配。</param>
     /// <param name="cancellationToken">取消令牌。</param>
     private async ValueTask PublishSessionRevokedEventAsync(
         long userId,
         string revokedSessionId,
         long occurredAtMs,
         uint reportingConnectionId,
+        string? connectionLeaseId,
         CancellationToken cancellationToken)
     {
         try
@@ -123,6 +137,9 @@ internal sealed partial class SessionLifecycleCoordinator
                         Type = RealtimeEventType.SessionRevoked,
                         TargetUserId = userId,
                         SessionId = revokedSessionId,
+                        // P0-7：携带旧连接的 ConnectionLeaseId 供目标 Gateway 精确匹配，
+                        // 避免在 SessionId 相同时（Resume 复用原 SessionId）误关新连接。
+                        PayloadJson = connectionLeaseId,
                         OccurredAtMs = occurredAtMs
                     },
                     cancellationToken)
@@ -158,6 +175,7 @@ internal sealed partial class SessionLifecycleCoordinator
             victim.SessionId!,
             occurredAtMs,
             victim.ConnectionId,
+            victim.ConnectionLeaseId,
             cancellationToken).ConfigureAwait(false);
 
         // 本机立即断开；跨 Gateway 实例依赖 SessionRevoked 事件。

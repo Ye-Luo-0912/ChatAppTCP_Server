@@ -16,9 +16,13 @@ namespace ChatApp.TcpGateway.Core.Authentication;
 public interface IDeviceSessionLeaseStore
 {
     /// <summary>
-    /// 夺取设备租约。若已有不同 ConnectionLeaseId，返回旧 SessionId；否则返回 null。
+    /// 夺取设备租约。若已有不同 ConnectionLeaseId，返回旧会话的 SessionId 和 ConnectionLeaseId；否则返回 null。
+    /// <para>
+    /// P0-7：返回 <see cref="DeviceLeaseTakeoverResult"/> 而非仅 SessionId，
+    /// 使调用方能按 ConnectionLeaseId 精确判断旧连接是否需要吊销（Resume 复用 SessionId 时尤其关键）。
+    /// </para>
     /// </summary>
-    ValueTask<string?> TakeOverAsync(
+    ValueTask<DeviceLeaseTakeoverResult?> TakeOverAsync(
         long userId,
         ulong deviceIdHash,
         string sessionId,

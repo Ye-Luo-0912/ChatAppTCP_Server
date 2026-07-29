@@ -66,6 +66,25 @@ public interface IActorRuntime<TKey, TState, TMessage> : IAsyncDisposable
         in TMessage message);
 
     /// <summary>
+    /// 投递控制通道 Invalidation 消息（如 Typing 授权失效）。走独立的 Invalidation 控制槽，
+    /// 优先级高于 Completion 与普通 Mailbox——确保失效在处理过期 Completion 前生效。
+    /// <para>
+    /// 与 <see cref="TryTellEphemeral"/> 的关键区别：Invalidation 不会被 LatestOnly Mailbox
+    /// 中的后续 Notify 覆盖。这使得"授权失效"不会被"新 typing 状态"静默丢弃。
+    /// </para>
+    /// <para>
+    /// 幂等：多次 Invalidation 投递等效于一次（控制槽覆盖语义）。
+    /// Actor 不存在时静默丢弃（Ephemeral 语义，关系变更后 TTL 兜底）。
+    /// </para>
+    /// </summary>
+    /// <returns>
+    /// <see cref="ActorPostStatus.Accepted"/> 表示已进入 Ingress；
+    /// <see cref="ActorPostStatus.RuntimeStopping"/> 表示 Runtime 正在停止；
+    /// <see cref="ActorPostStatus.ShardOverloaded"/> 表示 Ingress Ring 满（丢弃）。
+    /// </returns>
+    ActorPostStatus TryTellInvalidation(in TKey key, in TMessage message);
+
+    /// <summary>
     /// 请求显式 Deactivate 指定 Actor（如连接断开时立即回收对应 Ephemeral Actor，
     /// 不等待 Idle Sweep）。按 Key 当前任意激活匹配；Key 会被复用的场景应使用
     /// <see cref="TryDeactivate(in TKey, ActivationId, ActorDeactivateReason)"/> 精确指定。

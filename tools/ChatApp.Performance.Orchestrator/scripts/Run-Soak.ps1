@@ -6,7 +6,7 @@ param(
     [ValidateRange(1, 1048576)] [int] $PipelinePayloadBytes = 512,
     [ValidateRange(1, 100000)] [int] $TcpConnections = 1000,
     [ValidateSet('Pipelines','DirectSocket')] [string] $InboundTransportMode = 'DirectSocket',
-    [ValidateSet('PersistentSendLoop','OnDemandSendPump')] [string] $OutboundSendMode = 'PersistentSendLoop',
+    [ValidateSet('PersistentSendLoop','OnDemandSendPump','PerSessionDrain')] [string] $OutboundSendMode = 'PersistentSendLoop',
     [int] $OnDemandSendWorkerCount = 0,
     [int] $OnDemandSendBurstLimit = 16,
     [string] $ReportDirectory,

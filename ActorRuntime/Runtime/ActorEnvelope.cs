@@ -48,7 +48,15 @@ internal enum ActorEnvelopeKind : byte
     /// 显式 Deactivate 请求（TryDeactivate）。携带 ActivationId：
     /// <see cref="ActivationId.None"/> 匹配当前任意激活；否则仅当精确匹配时生效。
     /// </summary>
-    Deactivate = 2
+    Deactivate = 2,
+
+    /// <summary>
+    /// 控制通道 Invalidations（如 Typing 授权失效）。不占用 Mailbox 准入容量，
+    /// 也不需要 Completion Credit。路由到 ActorCell 的 Invalidation 控制槽，
+    /// 优先级高于 Completion（确保失效在处理过期 Completion 前生效）。
+    /// 幂等：多次 Invalidation 等效于一次。
+    /// </summary>
+    Invalidation = 3
 }
 
 internal readonly struct ActorMailboxItem<TMessage>
