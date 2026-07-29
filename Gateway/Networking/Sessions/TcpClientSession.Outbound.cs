@@ -231,10 +231,11 @@ internal sealed partial class TcpClientSession
     }
 
     /// <summary>
-    /// OnDemandSendPump 模式：入队后唤醒共享 worker 池。
+    /// OnDemandSendPump/PerSessionDrain 模式：入队后唤醒发送驱动。
     /// <para>
-    /// 三态状态机：CAS Idle→Queued 成功后 TrySchedule 入 ready queue。
-    /// PersistentSendLoop 模式下 <see cref="_outboundPump"/> 为 null，本方法是 no-op。
+    /// OnDemandSendPump（三态）：CAS Idle→Queued 成功后 TrySchedule 入 ready queue。
+    /// PerSessionDrain（二态）：CAS Idle→Running 成功后启动自有 drain Task。
+    /// PersistentSendLoop 模式下两者均为 null，本方法是 no-op。
     /// </para>
     /// <para>
     /// 若 <see cref="OutboundPumpCoordinator.TrySchedule"/> 失败（coordinator 停机），
@@ -243,6 +244,18 @@ internal sealed partial class TcpClientSession
     /// </summary>
     private void TryScheduleSend()
     {
+        // PerSessionDrain 模式：CAS Idle→Running 直接启动自有 drain（跳过 Queued）。
+        if (_usePerSessionDrain)
+        {
+            if (Interlocked.CompareExchange(ref _sendState, SendStateRunning, SendStateIdle) != SendStateIdle)
+                return;
+
+            // 启动 Session 自有按需 drain Task。Socket.SendAsync 的 continuation 天然恢复同一 drain。
+            // _perSessionDrainTask 仅用于 DisposeAsync 等待 drain 退出，无需取消（drain 通过 _lifetime 退出）。
+            _perSessionDrainTask = RunPerSessionDrainAsync();
+            return;
+        }
+
         if (_outboundPump is null)
             return;
 
@@ -254,6 +267,125 @@ internal sealed partial class TcpClientSession
         {
             // ready channel 已关闭（停机）：回退 Queued→Idle，避免后续 TryScheduleSend 永远 CAS 失败。
             Interlocked.Exchange(ref _sendState, SendStateIdle);
+        }
+    }
+
+    /// <summary>
+    /// PerSessionDrain 模式的自有按需 drain：持续消费出站 Channel 直到队列空。
+    /// <para>
+    /// 与 <see cref="PumpOutboundAsync"/> 的区别：
+    /// <list type="bullet">
+    /// <item>无 burst 上限——drain 持续消费直到队列空（每连接独立，无需公平轮转）；</item>
+    /// <item>无 ready queue 调度——CAS Idle→Running 直接启动，Socket continuation 恢复同一 drain；</item>
+    /// <item>慢 Socket 不占用全局 Worker 名额——每连接独立 drain。</item>
+    /// </list>
+    /// </para>
+    /// <para>
+    /// 状态机：drain 退出时 CAS Running→Idle，然后重检防丢失唤醒
+    /// （enqueuer 可能在 Running→Idle 转换前入队，其 CAS Idle→Running 会失败，
+    /// 依赖此处 Idle 后的 re-check 来补发 drain）。
+    /// </para>
+    /// </summary>
+    private async Task RunPerSessionDrainAsync()
+    {
+        try
+        {
+            while (IsConnected)
+            {
+                if (!_outbound.Reader.TryRead(out var write))
+                {
+                    // FIFO 空：检查 ephemeral mailbox（机会式排空，处理 sentinel TryWrite 失败的丢失唤醒）。
+                    if (!_ephemeralMailbox.IsEmpty)
+                    {
+                        _ephemeralFlushPending = false;
+                        await DrainEphemeralMailboxAsync().ConfigureAwait(false);
+                        continue;
+                    }
+
+                    // 队列空：CAS Running→Idle 退出 drain。
+                    if (Interlocked.CompareExchange(ref _sendState, SendStateIdle, SendStateRunning) != SendStateRunning)
+                        return; // 状态已变（停机回退等），让出 drain。
+
+                    // 清除后重检：enqueuer 可能在 Running→Idle 转换前入队，
+                    // 其 CAS Idle→Running 会失败（因为状态是 Running），
+                    // 它依赖此处 Idle 后的 re-check 来补发 drain。
+                    if (IsConnected && HasPendingWork())
+                    {
+                        if (Interlocked.CompareExchange(ref _sendState, SendStateRunning, SendStateIdle) == SendStateIdle)
+                            continue; // 重新获得 drain 所有权，继续消费。
+                    }
+                    return; // 真正空闲，drain 退出。
+                }
+
+                if (write.Frame is null)
+                {
+                    // Ephemeral flush sentinel：先重置 flag 再排空 mailbox。
+                    _ephemeralFlushPending = false;
+                    await DrainEphemeralMailboxAsync().ConfigureAwait(false);
+                    continue; // sentinel 不计入 burst（PerSessionDrain 无 burst 限制）。
+                }
+
+                ReleaseQueuedWrite(write.ByteCount);
+
+                try
+                {
+                    await SendFrameAsync(
+                            write.Frame.Memory,
+                            _lifetime.Token)
+                        .ConfigureAwait(false);
+                    _metrics.FrameSent();
+
+                    if (write.CloseAfterSend is { } closeReason)
+                    {
+                        Close(closeReason);
+                        return;
+                    }
+                }
+                finally
+                {
+                    write.Frame.Dispose();
+                }
+
+                // 机会式排空：处理 sentinel TryWrite 失败（队列满）导致的丢失唤醒。
+                if (!_ephemeralMailbox.IsEmpty)
+                {
+                    _ephemeralFlushPending = false;
+                    await DrainEphemeralMailboxAsync().ConfigureAwait(false);
+                }
+            }
+
+            // 连接关闭期间 drain 退出：排空残留帧释放预算（与 DisposeAsync 幂等）。
+            if (!IsConnected)
+            {
+                DrainOutboundOnClose();
+            }
+        }
+        catch (OperationCanceledException)
+            when (_lifetime.Token.IsCancellationRequested)
+        {
+            // 关闭或停机：Close 由 DisposeAsync/HandleClientAsync 调用。
+            DrainOutboundOnClose();
+        }
+        catch (SocketException)
+        {
+            Close(SessionCloseReason.TransportError);
+        }
+        catch (ObjectDisposedException)
+        {
+            Close(SessionCloseReason.TransportError);
+        }
+        catch (Exception exception)
+        {
+            _logger.TransportFailed(
+                GatewayTransportOperation.SendLoop,
+                ConnectionId,
+                exception);
+            Close(SessionCloseReason.TransportError);
+        }
+        finally
+        {
+            // 确保 drain 退出时状态归位（异常路径可能未 CAS Running→Idle）。
+            Interlocked.CompareExchange(ref _sendState, SendStateIdle, SendStateRunning);
         }
     }
 

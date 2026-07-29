@@ -12,22 +12,43 @@ public interface IActorRuntime<TKey, TState, TMessage> : IAsyncDisposable
     /// <summary>
     /// 同步入队消息。高频默认 API：不创建 Task/CTS/CompletionSource/回执消息对象。
     /// <para>
-    /// 返回值决定调用方后续动作：
-    /// <list type="bullet">
-    /// <item><see cref="ActorPostStatus.Accepted"/>：消息已入 Shard Ingress Ring；</item>
-    /// <item><see cref="ActorPostStatus.MailboxFull"/>：FIFO Mailbox 满，调用方应拒绝或关闭连接；</item>
-    /// <item><see cref="ActorPostStatus.ShardOverloaded"/>：Shard Ingress Ring 满，背压；</item>
-    /// <item><see cref="ActorPostStatus.ActorClosed"/>：Actor 已 Deactivate 或从未 Activate；</item>
-    /// <item><see cref="ActorPostStatus.RuntimeStopping"/>：Runtime 已停止。</item>
-    /// </list>
-    /// </para>
-    /// <para>
     /// 注意：Accepted 仅表示通过生产侧准入；若 Shard 消费时 Actor 数已达上限
     /// （MaxActiveActors / MaxActiveActorsPerShard），消息仍会被丢弃并计入
     /// <see cref="ActorRuntimeSnapshot.TotalActiveActorAdmissionRejected"/>。
     /// </para>
+    /// <para>
+    /// 临时消息（可丢）应使用 <see cref="TryTellEphemeral"/>；
+    /// 持久消息（不可丢）应使用 <see cref="TryTellDurable"/> 以获得生产侧配额检查。
+    /// </para>
     /// </summary>
     ActorPostStatus TryTell(in TKey key, in TMessage message);
+
+    /// <summary>
+    /// 同步入队临时消息（Typing/Presence 等）。等同于 <see cref="TryTell"/>，
+    /// 不检查 Actor 数量配额——若 Shard 消费时 Actor 数已达上限，
+    /// 消息会被丢弃并计入 <see cref="ActorRuntimeSnapshot.TotalActiveActorAdmissionRejected"/>。
+    /// <para>
+    /// 适用于可丢消息场景。<see cref="ActorPostStatus.Accepted"/> 仅表示进入 Ingress Ring。
+    /// </para>
+    /// </summary>
+    ActorPostStatus TryTellEphemeral(in TKey key, in TMessage message)
+        => TryTell(in key, in message);
+
+    /// <summary>
+    /// 同步入队持久消息（Chat/Receipt/Edit/Recall 等）。
+    /// 在生产侧同步检查 Actor 数量配额（全局 + 每 Shard）：
+    /// <list type="bullet">
+    /// <item><see cref="ActorPostStatus.AdmissionRejected"/>：配额已满，消息未入队，调用方应拒绝或关闭连接；</item>
+    /// </list>
+    /// 其余返回值与 <see cref="TryTell"/> 一致。
+    /// <para>
+    /// 注意：由于生产侧检查与消费侧创建存在竞态窗口（极小），
+    /// 消费侧仍保留配额安全网。若竞态导致消费侧拒绝（极罕见），
+    /// 消息会被丢弃并计入 <see cref="ActorRuntimeSnapshot.TotalActiveActorAdmissionRejected"/>。
+    /// 调用方应在收到 AdmissionRejected 时拒绝客户端请求而非接受重试。
+    /// </para>
+    /// </summary>
+    ActorPostStatus TryTellDurable(in TKey key, in TMessage message);
 
     /// <summary>
     /// 投递异步操作完成消息。Completion 走控制通道（独立于普通 Mailbox 的高优先级槽），

@@ -51,11 +51,15 @@ public sealed class ActorRuntime<TKey, TState, TMessage> :
             ? options.MaxActiveActorsPerShard
             : (options.MaxActiveActors + options.ShardCount - 1) /
               options.ShardCount;
-        // Completion Ring 容量 == 每 Shard Completion Credit 上限。
-        // 严格上界：单 Outstanding Operation 约束下每 Actor 至多持有一个 Credit，
-        // 而每 Shard 活跃 Actor 数 ≤ maxActorsPerShard，故 Ring 永远不会溢出。
+        // Completion Ring 容量基于每 Shard 可能的 Outstanding Operation 上限，
+        // 而非 MaxActors。每 Shard 的 Outstanding Operation ≤
+        // (AsyncOperationQueueCapacity + AsyncOperationConcurrency) / ShardCount + 余量。
+        // 这比 maxActorsPerShard 小得多（默认 100k Actor vs 4k+并发的工作队列）。
+        var perShardMaxOutstanding =
+            (options.AsyncOperationQueueCapacity + options.AsyncOperationConcurrency +
+             options.ShardCount - 1) / options.ShardCount;
         var completionCreditCapacity =
-            NextPowerOfTwo(Math.Max(2, maxActorsPerShard));
+            NextPowerOfTwo(Math.Max(2, perShardMaxOutstanding));
 
         _shards =
             new ActorShard<TKey, TState, TMessage>[options.ShardCount];
@@ -90,6 +94,42 @@ public sealed class ActorRuntime<TKey, TState, TMessage> :
 
         return _shards[GetShardIndex(in key)]
             .TryEnqueue(in key, in message);
+    }
+
+    /// <summary>
+    /// 临时消息入队：等同于 <see cref="TryTell"/>，不检查 Actor 数量配额。
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public ActorPostStatus TryTellEphemeral(
+        in TKey key,
+        in TMessage message)
+        => TryTell(in key, in message);
+
+    /// <summary>
+    /// 持久消息入队：在生产侧同步检查 Actor 数量配额。
+    /// 若配额已满，返回 AdmissionRejected 且不入队，避免持久消息被静默丢弃。
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public ActorPostStatus TryTellDurable(
+        in TKey key,
+        in TMessage message)
+    {
+        if (Volatile.Read(ref _lifecycle) >= 2)
+            return ActorPostStatus.RuntimeStopping;
+
+        var shardIndex = GetShardIndex(in key);
+        var shard = _shards[shardIndex];
+
+        // 生产侧同步检查：若 Actor 数已达上限，拒绝入队而非静默丢弃。
+        // 注意：这是保守检查——竞态窗口内其他 Shard 可能先创建 Actor 导致全局配额超限，
+        // 消费侧仍保留安全网检查。
+        if (shard.ActiveActorCount >= shard.MaxActorsPerShard ||
+            !_globalQuota.CanAcquire())
+        {
+            return ActorPostStatus.AdmissionRejected;
+        }
+
+        return shard.TryEnqueue(in key, in message);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -226,6 +266,7 @@ public sealed class ActorRuntime<TKey, TState, TMessage> :
         long totalDeactivations = 0;
         long totalActivations = 0;
         long totalAdmissionRejected = 0;
+        long totalReplaced = 0;
 
         foreach (var shard in _shards)
         {
@@ -240,6 +281,7 @@ public sealed class ActorRuntime<TKey, TState, TMessage> :
             totalDeactivations += shard.DeactivationCount;
             totalActivations += shard.ActivationCount;
             totalAdmissionRejected += shard.AdmissionRejectedCount;
+            totalReplaced += shard.ReplacedCount;
         }
 
         var asyncSnapshot = _asyncExecutor.GetSnapshot();
@@ -256,6 +298,7 @@ public sealed class ActorRuntime<TKey, TState, TMessage> :
             TotalDeactivations = totalDeactivations,
             TotalActivations = totalActivations,
             TotalActiveActorAdmissionRejected = totalAdmissionRejected,
+            TotalReplaced = totalReplaced,
             PendingAsyncOperations = asyncSnapshot.PendingCount,
             TotalAsyncOperationsSubmitted = asyncSnapshot.TotalSubmitted,
             TotalAsyncOperationsCompleted = asyncSnapshot.TotalCompleted,

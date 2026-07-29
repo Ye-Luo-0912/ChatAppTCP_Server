@@ -81,6 +81,7 @@ internal sealed class ActorShard<TKey, TState, TMessage>
     private long _mailboxFullCount;
     private long _shardOverloadedCount;
     private long _admissionRejectedCount;
+    private long _replacedCount;
     private int _pendingCompletionIngress;
 
     private CancellationTokenSource? _cts;
@@ -150,12 +151,14 @@ internal sealed class ActorShard<TKey, TState, TMessage>
     public long DeactivationCount => Volatile.Read(ref _deactivationCount);
     public long ActivationCount => Volatile.Read(ref _activationCount);
     public long AdmissionRejectedCount => Volatile.Read(ref _admissionRejectedCount);
+    public long ReplacedCount => Volatile.Read(ref _replacedCount);
     public long PendingIngress =>
         _ingress.Count + Volatile.Read(ref _pendingCompletionIngress);
     public long PendingMailbox => Volatile.Read(ref _pendingMailboxCount);
     public long ActiveActorCount => Volatile.Read(ref _activeActorCount);
     public long BusyActorCount => Volatile.Read(ref _busyActorCount);
     public int PendingDeadlines => _deadlines.PendingCount;
+    public int MaxActorsPerShard => _maxActorsPerShard;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public ActorPostStatus TryEnqueue(in TKey key, in TMessage message)
@@ -431,7 +434,8 @@ internal sealed class ActorShard<TKey, TState, TMessage>
             var cell = ActorCell<TKey, TState, TMessage>.Create(
                 in envelope.Key,
                 new ActivationId(_nextActivationId++),
-                timestamp);
+                timestamp,
+                _mailboxMode);
             cellRef = cell;
 
             SetCurrentCell(cell);
@@ -481,7 +485,6 @@ internal sealed class ActorShard<TKey, TState, TMessage>
             envelope.Admission);
         var status = actor.TryEnqueueMessage(
             in item,
-            _mailboxMode,
             _mailboxCapacity,
             out var becameReady,
             out var replaced,
@@ -502,7 +505,10 @@ internal sealed class ActorShard<TKey, TState, TMessage>
         }
 
         if (hasReplaced)
+        {
+            Interlocked.Increment(ref _replacedCount);
             DropMailboxItem(in replaced, ActorMessageDropReason.Replaced);
+        }
         else
             _pendingMailboxCount++;
 
@@ -1008,7 +1014,18 @@ internal sealed class ActorShard<TKey, TState, TMessage>
 
         if (replaceExisting)
         {
-            // 惰性取消：bump 代际使时间轮中未触发条目在触发时被视为过期。
+            // 显式取消旧条目：在桶中标记为 Cancelled，避免高频 ScheduleOrReplace
+            // 导致物理桶积累过期条目（仅靠 Epoch bump 会让旧条目留到触发时才丢弃）。
+            if (cell.LastDeadlineBucketIndex >= 0)
+            {
+                _deadlines.TryCancelScheduled(
+                    cell.LastDeadlineBucketIndex,
+                    cell.Activation,
+                    cell.DeadlineEpoch);
+            }
+
+            // bump 代际作为双重防线：即使显式取消遗漏（如桶已开始排空），
+            // 触发时仍会因 Epoch 不匹配被丢弃。
             cell.DeadlineEpoch++;
             cell.PendingDeadlineCount = 0;
         }
@@ -1021,12 +1038,13 @@ internal sealed class ActorShard<TKey, TState, TMessage>
             return false;
         }
 
-        _deadlines.Schedule(
+        var bucketIndex = _deadlines.Schedule(
             delay,
             cell.Activation,
             cell.DeadlineEpoch,
             in cell.Key,
             in message);
+        cell.LastDeadlineBucketIndex = bucketIndex;
         cell.PendingDeadlineCount++;
         return true;
     }
@@ -1037,8 +1055,19 @@ internal sealed class ActorShard<TKey, TState, TMessage>
         if (cell is null)
             return;
 
+        // 显式取消最近的 Deadline 条目（如果有多个未触发条目，
+        // 其余仍由 Epoch bump 在触发时惰性丢弃）。
+        if (cell.LastDeadlineBucketIndex >= 0)
+        {
+            _deadlines.TryCancelScheduled(
+                cell.LastDeadlineBucketIndex,
+                cell.Activation,
+                cell.DeadlineEpoch);
+        }
+
         cell.DeadlineEpoch++;
         cell.PendingDeadlineCount = 0;
+        cell.LastDeadlineBucketIndex = -1;
     }
 
     void IDeadlineCallback<TKey, TMessage>.OnExpired(
@@ -1060,6 +1089,8 @@ internal sealed class ActorShard<TKey, TState, TMessage>
         }
 
         actor.PendingDeadlineCount--;
+        if (actor.PendingDeadlineCount == 0)
+            actor.LastDeadlineBucketIndex = -1;
         var item = new ActorMailboxItem<TMessage>(
             in message,
             admission: null);

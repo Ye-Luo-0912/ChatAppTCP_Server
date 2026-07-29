@@ -98,8 +98,12 @@ internal sealed class TcpGatewayService : BackgroundService
     // 替代每 tick _sessions.Values.ToArray() 全量复制，10k 连接下每 tick 仅遍历 ~333 条目。
     private readonly HeartbeatBucketRegistry _heartbeatBuckets;
 
-    // 全局 DeadlineWheel：替代每连接 Auth/Send Timer。所有连接共享一个时间轮 + 单 PeriodicTimer。
+    // 全局 DeadlineWheel：替代每连接 Auth/Idle Timer。所有连接共享一个时间轮 + 单 PeriodicTimer。
+    // 仅管理 Auth/Idle 超时（低频，符合其全局锁设计假设）。发送超时已迁移到 SendTimeoutTracker。
     private readonly DeadlineWheel _deadlineWheel;
+    // 全局发送超时扫描器：替代每帧 DeadlineWheel.Register。周期扫描活跃发送方集合，
+    // 不为每帧创建闭包、不竞争 DeadlineWheel 全局锁、不增长 _fired 集合。
+    private readonly SendTimeoutTracker _sendTimeoutTracker;
 
     // 全局命令执行器：替代每连接 OrderedWrite/Query/Ephemeral Channel + Consumer Task。
     // 共享 worker 池，按 connectionId 串行保序，跨连接并行。
@@ -107,10 +111,15 @@ internal sealed class TcpGatewayService : BackgroundService
     private readonly SessionCommandExecutor _queryExecutor;
     private readonly EphemeralCommandPipeline _ephemeralPipeline;
     private readonly TypingActorPipeline? _typingActorPipeline;
+    // Typing 授权失效桥接器：解耦 RelationshipListHandler（DI 创建）与 TypingActorPipeline
+    // （本 service 内部创建）。Specialized 未启用时持有 null，调用为 no-op。
+    private readonly TypingAuthorizationInvalidatorAccessor _typingInvalidatorAccessor;
 
     // OnDemandSendPump 模式专用：共享出站 pump 协调器（ready queue + worker 池）。
-    // PersistentSendLoop 模式下为 null，每连接保留永久 SendLoop Task。
+    // PersistentSendLoop/PerSessionDrain 模式下为 null。
     private readonly OutboundPumpCoordinator? _outboundPump;
+    // PerSessionDrain 模式标志：构造时确定，传递给每个 TcpClientSession。
+    private readonly bool _usePerSessionDrain;
 
     // 会话控制命令处理器：AuthenticationRequest + ClientHello 握手/鉴权流程。
     // 从本 service 抽取以消除 God Service 中散落的连接状态机逻辑。
@@ -147,7 +156,8 @@ internal sealed class TcpGatewayService : BackgroundService
         CommandDispatcher? commandDispatcher = null,
         IPayloadCodec<TypingNotify>? typingNotifyCodec = null,
         IDirectConversationAuthorizer? directConversationAuthorizer = null,
-        IRedisCircuitBreaker? circuitBreaker = null)
+        IRedisCircuitBreaker? circuitBreaker = null,
+        TypingAuthorizationInvalidatorAccessor? typingInvalidatorAccessor = null)
     {
         _options = options.Value;
         _authenticator = authenticator;
@@ -246,9 +256,12 @@ internal sealed class TcpGatewayService : BackgroundService
             _logger,
             _typingUpdateCodec);
 
-        // 全局 DeadlineWheel：替代每连接 Auth/Send Timer。
+        // 全局 DeadlineWheel：替代每连接 Auth/Idle Timer。
         // 单 PeriodicTimer + 分桶时间轮，所有连接共享。单调时钟避免墙钟回拨死锁。
+        // 仅管理 Auth/Idle 超时（低频）。发送超时由 SendTimeoutTracker 独立扫描管理。
         _deadlineWheel = new DeadlineWheel(_timeProvider);
+        // 全局发送超时扫描器：替代每帧 DeadlineWheel.Register（消除闭包分配 + 全局锁竞争）。
+        _sendTimeoutTracker = new SendTimeoutTracker(_timeProvider);
 
         // 全局命令执行器：OrderedWrite lane。
         // 共享 worker 池，按 connectionId 串行保序，跨连接并行。Burst 限制防止单连接独占 worker。
@@ -281,8 +294,28 @@ internal sealed class TcpGatewayService : BackgroundService
             logger: _logger);
 
         // Ephemeral lane 可切换到轻量 ActorRuntime；旧 SessionCommandExecutor 保留为 A/B 回退。
+        // 当 Specialized TypingActor 启用时，TypingNotify 是唯一 Ephemeral C2S 命令，
+        // 会被快路径截获而不进入 _ephemeralPipeline。为避免两套 Ephemeral Runtime 并存
+        // （浪费 worker 池、重复注册指标），关闭 Generic Pipeline 的 ActorRuntime 内核，
+        // 仅保留对象以维持 SessionRuntime 签名不变；StartAsync 也会跳过启动。
+        // 同时要求 EnableEphemeralPresenceAndTyping=true：功能关闭时 Typing 命令应走
+        // FeatureNotNegotiated 路径，而非被 Specialized Pipeline 截获。
+        var specializedTypingEnabled =
+            _options.UseTypingActorPipeline &&
+            _options.UseActorRuntimeForEphemeralCommands &&
+            _options.EnableEphemeralPresenceAndTyping &&
+            typingNotifyCodec is not null;
+
+        var ephemeralOptions = _options;
+        if (specializedTypingEnabled && _options.UseActorRuntimeForEphemeralCommands)
+        {
+            // 复制选项并关闭 Generic ActorRuntime，强制走 Legacy SessionCommandExecutor 路径。
+            // 这样 _ephemeralPipeline 不会创建 Shard/Ingress/Completion Ring/Async Executor。
+            ephemeralOptions = CloneWithActorRuntimeDisabled(_options);
+        }
+
         _ephemeralPipeline = new EphemeralCommandPipeline(
-            _options,
+            ephemeralOptions,
             ProcessScheduledCommandAsync,
             _metrics,
             _timeProvider,
@@ -291,22 +324,25 @@ internal sealed class TcpGatewayService : BackgroundService
         // Typing 领域 Actor：TCP Read 直接解析并路由到 LatestOnly Actor，
         // 不创建通用 SessionCommand。仅在 UseTypingActorPipeline=true 且注入 codec 时启用。
         // 复用 EphemeralActor 配置（Shard/Ingress/Async/IdleTimeout/OperationTimeout）。
-        if (_options.UseTypingActorPipeline &&
-            _options.UseActorRuntimeForEphemeralCommands &&
-            typingNotifyCodec is not null)
+        _typingInvalidatorAccessor = typingInvalidatorAccessor
+            ?? new TypingAuthorizationInvalidatorAccessor();
+        if (specializedTypingEnabled)
         {
             _typingActorPipeline = new TypingActorPipeline(
                 _options,
-                typingNotifyCodec,
+                typingNotifyCodec!,
                 directConversationAuthorizer,
                 _typingFanout,
                 _metrics,
                 _timeProvider,
                 _logger);
+            // 注册到桥接器，使 RelationshipListHandler 能在关系变更时失效 Actor 内授权缓存。
+            _typingInvalidatorAccessor.SetInstance(_typingActorPipeline);
         }
 
         // OnDemandSendPump 模式：创建共享出站 pump 协调器。
         // PersistentSendLoop 模式（默认）保持 null，每连接保留永久 SendLoop Task。
+        // PerSessionDrain 模式也保持 null，每连接按需启动自有 drain Task（无共享 worker 池）。
         // ready queue 容量 ≥ MaxConnections，保证每连接至多一份引用时不会阻塞 TrySchedule。
         // worker 数在 ExecuteAsync 中按 OnDemandSendWorkerCount 推导并传入 StartAsync。
         if (_options.OutboundSendMode == Configuration.OutboundSendMode.OnDemandSendPump)
@@ -316,16 +352,60 @@ internal sealed class TcpGatewayService : BackgroundService
                 readyQueueCapacity: Math.Max(_options.MaxConnections, 1024),
                 logger: _logger);
         }
+        var usePerSessionDrain =
+            _options.OutboundSendMode == Configuration.OutboundSendMode.PerSessionDrain;
+        _usePerSessionDrain = usePerSessionDrain;
 
         // 注册 Runtime V2 共享执行器 ObservableGauge。
         // DeadlineWheel 始终存在；OutboundPumpCoordinator 仅 OnDemandSendPump 模式下非 null，
         // PersistentSendLoop 模式下出站相关 provider 传 null，对应指标不注册。
         _metrics.RegisterRuntimeV2Observers(
             activeDeadlinesProvider: () => _deadlineWheel.ActiveDeadlineCount,
+            sendTimeoutActiveSendersProvider: () => _sendTimeoutTracker.ActiveSenderCount,
             outboundPumpReadyQueueProvider: _outboundPump is null ? null : () => _outboundPump.ReadyQueueCount,
             outboundPumpTotalScheduledProvider: _outboundPump is null ? null : () => _outboundPump.TotalScheduled,
             outboundPumpWorkerCountProvider: _outboundPump is null ? null : () => _outboundPump.WorkerCount);
-        if (_ephemeralPipeline.UsesActorRuntime)
+
+        // Actor Runtime 指标注册：优先 Specialized TypingActor，其次 Generic Ephemeral Pipeline。
+        // 二者不会同时启用（Specialized 启用时 Generic 的 ActorRuntime 已被关闭）。
+        if (_typingActorPipeline is not null)
+        {
+            var typingSnapshot = () => _typingActorPipeline.Snapshot;
+            // 通用 gateway.actor.* 指标仍注册（基线观测），但 Specialized 启用时数据来自 Typing Actor。
+            _metrics.RegisterActorRuntimeObservers(
+                activeActorsProvider: () => typingSnapshot().ActiveActors,
+                busyActorsProvider: () => typingSnapshot().BusyActors,
+                pendingIngressProvider: () => typingSnapshot().PendingIngress,
+                pendingMailboxProvider: () => typingSnapshot().PendingMailbox,
+                pendingAsyncProvider: () => typingSnapshot().PendingAsyncOperations,
+                totalProcessedProvider: () => typingSnapshot().TotalProcessed);
+
+            // Specialized 专属指标：typing_actor.* 覆盖 replaced/admission/async 等领域维度，
+            // typing_auth.* 覆盖授权 I/O DomainWorkLane 状态与耗时。避免开启 Specialized 后
+            // 仪表盘仍只显示 Generic Actor 空闲数据。
+            _metrics.RegisterTypingActorRuntimeObservers(
+                activeActorsProvider: () => typingSnapshot().ActiveActors,
+                busyActorsProvider: () => typingSnapshot().BusyActors,
+                ingressPendingProvider: () => typingSnapshot().PendingIngress,
+                replacedProvider: () => typingSnapshot().TotalReplaced,
+                admissionRejectedProvider: () => typingSnapshot().TotalActiveActorAdmissionRejected,
+                pendingDeadlinesProvider: () => typingSnapshot().PendingDeadlines,
+                activationsProvider: () => typingSnapshot().TotalActivations,
+                deactivationsProvider: () => typingSnapshot().TotalDeactivations,
+                mailboxFullProvider: () => typingSnapshot().TotalMailboxFull,
+                shardOverloadedProvider: () => typingSnapshot().TotalShardOverloaded,
+                asyncSubmittedProvider: () => typingSnapshot().TotalAsyncOperationsSubmitted,
+                asyncCompletedProvider: () => typingSnapshot().TotalAsyncOperationsCompleted,
+                asyncRejectedProvider: () => typingSnapshot().TotalAsyncOperationsRejected);
+
+            var authSnapshot = () => _typingActorPipeline.AuthLaneSnapshot;
+            _metrics.RegisterTypingAuthLaneObservers(
+                queuedProvider: () => authSnapshot().QueuedCount,
+                inflightProvider: () => authSnapshot().InflightCount,
+                rejectedProvider: () => authSnapshot().TotalRejected,
+                timeoutProvider: () => authSnapshot().TotalTimeout);
+        }
+        else if (_ephemeralPipeline.UsesActorRuntime)
         {
             _metrics.RegisterActorRuntimeObservers(
                 activeActorsProvider: () => _ephemeralPipeline.Snapshot.ActiveActors,
@@ -348,6 +428,7 @@ internal sealed class TcpGatewayService : BackgroundService
             _ephemeralPipeline,
             _typingActorPipeline,
             _metrics,
+            _timeProvider,
             _logger,
             ProcessPacketAsync,
             SendProtocolError,
@@ -416,6 +497,16 @@ internal sealed class TcpGatewayService : BackgroundService
             .ConfigureAwait(false);
         await _ephemeralPipeline.StartAsync(executionToken)
             .ConfigureAwait(false);
+
+        // Specialized Typing Actor Runtime：在 EphemeralCommandPipeline 之后启动，
+        // 确保授权 DomainWorkLane 与 Actor Consumer 就绪后再开始接受 TypingNotify。
+        // 启动顺序：Typing Authorization Lane → Typing Actor Runtime → Session Listener。
+        if (_typingActorPipeline is not null)
+        {
+            await _typingActorPipeline.StartAsync(executionToken)
+                .ConfigureAwait(false);
+        }
+
         var deadlineWheelTask = _deadlineWheel.StartAsync(executionToken);
 
         // OnDemandSendPump 模式：启动共享出站 worker 池。
@@ -513,6 +604,7 @@ internal sealed class TcpGatewayService : BackgroundService
         _ephemeralPipeline.DisposeAsync().AsTask().GetAwaiter().GetResult();
         _typingActorPipeline?.DisposeAsync().AsTask().GetAwaiter().GetResult();
         _deadlineWheel.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        _sendTimeoutTracker.DisposeAsync().AsTask().GetAwaiter().GetResult();
         _outboundPump?.Dispose();
         base.Dispose();
     }
@@ -549,7 +641,9 @@ internal sealed class TcpGatewayService : BackgroundService
                 _options.AuthenticationTimeout,
                 deadlineWheel: _deadlineWheel,
                 idleTimeout: _options.IdleTimeout,
-                outboundPump: _outboundPump);
+                outboundPump: _outboundPump,
+                sendTimeoutTracker: _sendTimeoutTracker,
+                usePerSessionDrain: _usePerSessionDrain);
 
             // 注册连接到全局执行器（OrderedWrite/Query/Ephemeral 共享 worker 池）。
             // 未认证会话 UserId=0，认证成功后执行器不依赖此字段重新路由（按 connectionId 串行）。
@@ -776,6 +870,75 @@ internal sealed class TcpGatewayService : BackgroundService
         }
 
         session.Close(SessionCloseReason.ProtocolViolation);
+    }
+
+    /// <summary>
+    /// 复制选项并关闭 ActorRuntime，用于 Specialized TypingActor 启用时
+    /// 让 Generic EphemeralCommandPipeline 退化为 Legacy SessionCommandExecutor 路径。
+    /// 避免两套 Ephemeral Runtime（Generic Actor + Specialized Typing）并存。
+    /// </summary>
+    private static TcpGatewayOptions CloneWithActorRuntimeDisabled(TcpGatewayOptions source)
+    {
+        // 浅拷贝所有字段；只需修改 UseActorRuntimeForEphemeralCommands 标志。
+        return new TcpGatewayOptions
+        {
+            ListenAddress = source.ListenAddress,
+            Port = source.Port,
+            ListenBacklog = source.ListenBacklog,
+            MaxConnections = source.MaxConnections,
+            ReceiveBufferSize = source.ReceiveBufferSize,
+            InboundTransportMode = source.InboundTransportMode,
+            PipePauseWriterThreshold = source.PipePauseWriterThreshold,
+            PipeResumeWriterThreshold = source.PipeResumeWriterThreshold,
+            OutboundQueueCapacity = source.OutboundQueueCapacity,
+            MaxOutboundQueuedBytes = source.MaxOutboundQueuedBytes,
+            AuthenticationTimeout = source.AuthenticationTimeout,
+            IdleTimeout = source.IdleTimeout,
+            HeartbeatScanInterval = source.HeartbeatScanInterval,
+            SendTimeout = source.SendTimeout,
+            MaxPacketsPerSecond = source.MaxPacketsPerSecond,
+            OutboundSendMode = source.OutboundSendMode,
+            OnDemandSendWorkerCount = source.OnDemandSendWorkerCount,
+            OnDemandSendBurstLimit = source.OnDemandSendBurstLimit,
+            HeartbeatBucketCount = source.HeartbeatBucketCount,
+            HeartbeatRefreshConcurrency = source.HeartbeatRefreshConcurrency,
+            HeartbeatRefreshJitterRatio = source.HeartbeatRefreshJitterRatio,
+            MaxInboundBytesPerSecond = source.MaxInboundBytesPerSecond,
+            MaxInboundPayloadBytes = source.MaxInboundPayloadBytes,
+            MaxChatAttachments = source.MaxChatAttachments,
+            ReplaceSameDeviceSession = source.ReplaceSameDeviceSession,
+            EnableEphemeralPresenceAndTyping = source.EnableEphemeralPresenceAndTyping,
+            PresenceMaintenanceInterval = source.PresenceMaintenanceInterval,
+            RealtimeEventPartitionCount = source.RealtimeEventPartitionCount,
+            GlobalMaxOutboundQueuedBytes = source.GlobalMaxOutboundQueuedBytes,
+            GlobalMaxInboundBufferedBytes = source.GlobalMaxInboundBufferedBytes,
+            MaxUnauthenticatedConnections = source.MaxUnauthenticatedConnections,
+            MaxConnectionsPerIp = source.MaxConnectionsPerIp,
+            MaxAuthenticationAttemptsPerIp = source.MaxAuthenticationAttemptsPerIp,
+            AuthenticationRateWindow = source.AuthenticationRateWindow,
+            CommandSchedulerOrderedWriteCapacity = source.CommandSchedulerOrderedWriteCapacity,
+            CommandSchedulerQueryCapacity = source.CommandSchedulerQueryCapacity,
+            CommandSchedulerEphemeralCapacity = source.CommandSchedulerEphemeralCapacity,
+            // 关键：关闭 Generic ActorRuntime，强制走 Legacy SessionCommandExecutor。
+            UseActorRuntimeForEphemeralCommands = false,
+            UseTypingActorPipeline = false,
+            EphemeralActorShardCount = source.EphemeralActorShardCount,
+            EphemeralActorIngressCapacity = source.EphemeralActorIngressCapacity,
+            EphemeralActorAsyncConcurrency = source.EphemeralActorAsyncConcurrency,
+            EphemeralActorIdleTimeout = source.EphemeralActorIdleTimeout,
+            EphemeralActorOperationTimeout = source.EphemeralActorOperationTimeout,
+            MinimumClientProtocolVersion = source.MinimumClientProtocolVersion,
+            RequireClientHello = source.RequireClientHello,
+            EnableResume = source.EnableResume,
+            ResumeTokenTtl = source.ResumeTokenTtl,
+            ServerDeviceId = source.ServerDeviceId,
+            GoAwayDrainTimeout = source.GoAwayDrainTimeout,
+            ReceiveBufferInitialSize = source.ReceiveBufferInitialSize,
+            ReceiveBufferMaxSize = source.ReceiveBufferMaxSize,
+            ReceiveBufferDowngradeIdleTimeout = source.ReceiveBufferDowngradeIdleTimeout,
+            HeaderAssemblyTimeout = source.HeaderAssemblyTimeout,
+            PayloadAssemblyTimeout = source.PayloadAssemblyTimeout
+        };
     }
 
     /// <summary>

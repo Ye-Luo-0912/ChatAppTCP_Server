@@ -8,8 +8,11 @@ namespace ChatApp.TcpGateway.Gateway.Commands.Groups;
 /// <see cref="GroupConversationResult"/>，避免客户端重试（网络抖动/超时重发）
 /// 重复命中 Redis/NATS 往返。
 /// <para>
-/// 缓存键为 <c>(ActorUserId, RequestId)</c>，TTL 默认 30 秒（覆盖典型客户端重试窗口），
-/// 容量上限默认 4096 条（约 ~800 KiB）。容量超限时先回收过期条目，仍超限则跳过缓存。
+/// 缓存键为 <c>(ActorUserId, Operation, RequestId)</c>，并存储 <c>PayloadHash</c>
+/// 用于检测同一 RequestId 对应不同操作指纹的冲突。加入 Operation 防止客户端错误复用
+/// 同一 RequestId 跨不同操作（如先 AddMembers 再 RemoveMember）时误命中前者结果。
+/// TTL 默认 30 秒（覆盖典型客户端重试窗口），容量上限默认 4096 条（约 ~800 KiB）。
+/// 容量超限时先回收过期条目，仍超限则跳过缓存。
 /// </para>
 /// <para>
 /// 仅缓存 Realtime 正常返回的结果（含业务失败如 not_owner / member_limit_exceeded）；
@@ -34,6 +37,7 @@ public sealed class GroupRequestIdempotencyCache
     /// <summary>
     /// 幂等命中/未命中回调，用于 metrics 记录。
     /// 参数：true=命中缓存；false=未命中（将调用 Realtime）。
+    /// 冲突（同一 RequestId 不同指纹）不计入命中或未命中——由调用方单独处理。
     /// </summary>
     public Action<bool>? OnLookup { get; set; }
 
@@ -54,20 +58,32 @@ public sealed class GroupRequestIdempotencyCache
     /// <summary>
     /// 尝试获取缓存的 Realtime 结果。
     /// </summary>
-    /// <returns>命中时返回结果；未命中或已过期返回 null。</returns>
-    public GroupConversationResult? TryGet(long userId, string requestId)
+    /// <param name="operation">群组操作类型（Create/AddMembers/RemoveMember/...）。
+    /// 加入缓存键防止同一 RequestId 跨操作误命中。</param>
+    /// <param name="payloadHash">命令负载指纹（不含 RequestId/ActorUserId/ActorSessionId）。
+    /// 用于检测同一 (UserId, Operation, RequestId) 但不同负载的冲突。</param>
+    /// <returns>
+    /// <see cref="GroupIdempotencyLookup.Hit"/> = 命中缓存；
+    /// <see cref="GroupIdempotencyLookup.Miss"/> = 未命中或已过期；
+    /// <see cref="GroupIdempotencyLookup.Conflict"/> = 同一 RequestId 但负载指纹不匹配。
+    /// </returns>
+    public GroupIdempotencyLookup TryGet(
+        long userId,
+        int operation,
+        string requestId,
+        int payloadHash)
     {
         if (string.IsNullOrEmpty(requestId))
         {
             OnLookup?.Invoke(false);
-            return null;
+            return GroupIdempotencyLookup.Miss;
         }
 
-        var key = new CacheKey(userId, requestId);
+        var key = new CacheKey(userId, operation, requestId);
         if (!_cache.TryGetValue(key, out var entry))
         {
             OnLookup?.Invoke(false);
-            return null;
+            return GroupIdempotencyLookup.Miss;
         }
 
         var now = _timeProvider.GetUtcNow().Ticks;
@@ -76,24 +92,33 @@ public sealed class GroupRequestIdempotencyCache
             // 过期：尝试移除（失败说明已被其他线程处理，无所谓）。
             _cache.TryRemove(key, out _);
             OnLookup?.Invoke(false);
-            return null;
+            return GroupIdempotencyLookup.Miss;
         }
 
+        // 负载指纹不匹配：同一 RequestId 但不同操作参数，返回冲突。
+        if (entry.PayloadHash != payloadHash)
+            return GroupIdempotencyLookup.Conflict;
+
         OnLookup?.Invoke(true);
-        return entry.Result;
+        return GroupIdempotencyLookup.Hit(entry.Result);
     }
 
     /// <summary>
     /// 缓存 Realtime 返回的结果。容量超限时先回收过期条目。
     /// 不缓存 null 结果。
     /// </summary>
-    public void TryAdd(long userId, string requestId, GroupConversationResult result)
+    public void TryAdd(
+        long userId,
+        int operation,
+        string requestId,
+        int payloadHash,
+        GroupConversationResult result)
     {
         if (string.IsNullOrEmpty(requestId) || result is null)
             return;
 
         var now = _timeProvider.GetUtcNow().Ticks;
-        var key = new CacheKey(userId, requestId);
+        var key = new CacheKey(userId, operation, requestId);
 
         // 容量检查：超限时触发 sweep（CAS 防并发 sweep）。
         if (_cache.Count >= _maxCapacity)
@@ -104,7 +129,7 @@ public sealed class GroupRequestIdempotencyCache
                 return;
         }
 
-        _cache[key] = new Entry(result, now + _ttlTicks);
+        _cache[key] = new Entry(result, now + _ttlTicks, payloadHash);
 
         // 周期性 sweep：即使未达容量也定期清理过期条目，避免内存滞留。
         TryPeriodicSweep(now);
@@ -162,7 +187,41 @@ public sealed class GroupRequestIdempotencyCache
         }
     }
 
-    private readonly record struct CacheKey(long UserId, string RequestId);
+    private readonly record struct CacheKey(long UserId, int Operation, string RequestId);
 
-    private readonly record struct Entry(GroupConversationResult Result, long ExpiresAtTicks);
+    private readonly record struct Entry(
+        GroupConversationResult Result,
+        long ExpiresAtTicks,
+        int PayloadHash);
+}
+
+/// <summary>
+/// 幂等缓存查找结果：区分命中、未命中与冲突。
+/// </summary>
+public readonly record struct GroupIdempotencyLookup
+{
+    /// <summary>缓存的结果；未命中或冲突时为 null。</summary>
+    public GroupConversationResult? Result { get; }
+
+    /// <summary>是否为冲突（同一 RequestId 但负载指纹不匹配）。</summary>
+    public bool IsConflict { get; }
+
+    private GroupIdempotencyLookup(GroupConversationResult? result, bool isConflict)
+    {
+        Result = result;
+        IsConflict = isConflict;
+    }
+
+    /// <summary>未命中（缓存中不存在或已过期）。</summary>
+    public static GroupIdempotencyLookup Miss => default;
+
+    /// <summary>冲突（同一 RequestId 但负载指纹不匹配）。</summary>
+    public static GroupIdempotencyLookup Conflict => new(null, isConflict: true);
+
+    /// <summary>命中缓存。</summary>
+    public static GroupIdempotencyLookup Hit(GroupConversationResult result) =>
+        new(result, isConflict: false);
+
+    /// <summary>是否命中缓存（有缓存结果且无冲突）。</summary>
+    public bool IsHit => !IsConflict && Result is not null;
 }

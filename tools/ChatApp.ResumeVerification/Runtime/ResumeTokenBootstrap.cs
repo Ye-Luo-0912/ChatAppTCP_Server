@@ -1,0 +1,97 @@
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
+using ChatApp.TcpGateway.Infrastructure.Authentication.Models;
+using ChatApp.TcpGateway.Infrastructure.Serialization.Json;
+using StackExchange.Redis;
+
+namespace ChatApp.ResumeVerification.Runtime;
+
+/// <summary>
+/// 在 Redis 中引导写入 AccessToken，供网关认证使用。
+/// 镜像 <c>TcpAuthenticationBootstrap</c> 的行为，但使用源生成 JSON 上下文，
+/// 并允许设置 <see cref="AccessTokenRecord.DeviceIdHash"/> 以便设备绑定场景验证。
+/// </summary>
+internal sealed class ResumeTokenBootstrap : IAsyncDisposable
+{
+    private const string CacheKeyPrefix = "cache:AT:";
+    private const string ValueField = "value";
+
+    private readonly ConnectionMultiplexer _connection;
+    private readonly RedisKey _cacheKey;
+
+    private ResumeTokenBootstrap(
+        ConnectionMultiplexer connection,
+        RedisKey cacheKey,
+        string token)
+    {
+        _connection = connection;
+        _cacheKey = cacheKey;
+        Token = token;
+    }
+
+    /// <summary>引导写入的 AccessToken 明文（客户端发送给网关）。</summary>
+    public string Token { get; }
+
+    /// <summary>
+    /// 创建引导实例：连接 Redis，生成随机 Token，写入 AccessToken 记录。
+    /// </summary>
+    public static async Task<ResumeTokenBootstrap> CreateAsync(
+        string connectionString,
+        long userId,
+        ulong? deviceIdHash,
+        CancellationToken cancellationToken)
+    {
+        var connection = await ConnectionMultiplexer
+            .ConnectAsync(connectionString)
+            .WaitAsync(cancellationToken)
+            .ConfigureAwait(false);
+        try
+        {
+            var token = Convert.ToHexString(RandomNumberGenerator.GetBytes(32));
+            var tokenHash = SHA256.HashData(Encoding.UTF8.GetBytes(token));
+            var cacheKey = CacheKeyPrefix + Convert.ToHexString(tokenHash);
+
+            var record = new AccessTokenRecord
+            {
+                UserId = userId,
+                UserName = "resume-verification",
+                Roles = [],
+                ExpiresAtMs = DateTimeOffset.UtcNow.AddHours(1)
+                    .ToUnixTimeMilliseconds(),
+                SessionId = $"rv-{userId}",
+                DeviceIdHash = deviceIdHash
+            };
+
+            var payload = JsonSerializer.SerializeToUtf8Bytes(
+                record,
+                GatewayJsonSerializerContext.Default.AccessTokenRecord);
+
+            await connection.GetDatabase()
+                .HashSetAsync(cacheKey, ValueField, payload)
+                .WaitAsync(cancellationToken)
+                .ConfigureAwait(false);
+
+            return new ResumeTokenBootstrap(connection, cacheKey, token);
+        }
+        catch
+        {
+            await connection.DisposeAsync().ConfigureAwait(false);
+            throw;
+        }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        try
+        {
+            await _connection.GetDatabase()
+                .KeyDeleteAsync(_cacheKey)
+                .ConfigureAwait(false);
+        }
+        finally
+        {
+            await _connection.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+}

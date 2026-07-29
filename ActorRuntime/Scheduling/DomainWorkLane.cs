@@ -9,12 +9,14 @@ namespace ChatApp.ActorRuntime.Scheduling;
 /// <para>
 /// 与 <see cref="AsyncOperationExecutor"/> 相比：
 /// <list type="bullet">
-/// <item><b>不装箱</b>：<typeparamref name="TWork"/> 是 struct，直接存储在 <see cref="BoundedMpscRing{T}"/> 数组中，
+/// <item><b>不装箱</b>：<typeparamref name="TWork"/> 是 struct，直接存储在 <see cref="BoundedMpmcRing{T}"/> 数组中，
 /// 不像 <c>Channel&lt;IAsyncOperation&gt;</c> 那样把 struct 装箱到接口引用；</item>
-/// <item><b>无 Per-op Linked CTS</b>：用 <see cref="CancellationTokenSourcePool"/> 复用 CTS 实例，
-/// 消除每次操作 <c>CreateLinkedTokenSource</c> + <c>CancelAfter</c> 的 CTS+Timer 分配；</item>
+/// <item><b>无 Per-op CTS 分配</b>：每 Worker 持有一个可复用 CTS，CancelAfter 仅设置内部 Timer。
+/// stop 信号通过 stopToken.Register 回调显式 Cancel（替代 linked CTS）；</item>
+/// <item><b>异步唤醒</b>：队列空时 Worker 通过 SemaphoreSlim.WaitAsync 真正休眠，空闲时接近零 CPU；</item>
+/// <item><b>批量 drain</b>：Worker 唤醒后连续 TryDequeue 直到队列空，减少信号开销；</item>
 /// <item><b>共享 Worker 池</b>：固定数量 Worker 串行 await，跨 Actor 并行；</item>
-/// <item><b>Stop 信号传递</b>：Worker 循环退出 + 显式取消 in-flight CTS，不依赖 linked CTS。</item>
+/// <item><b>Stop 信号传递</b>：stopToken.Cancel → workerCts.Cancel → in-flight work 取消 + Worker 循环退出。</item>
 /// </list>
 /// </para>
 /// <para>
@@ -26,8 +28,7 @@ namespace ChatApp.ActorRuntime.Scheduling;
 public sealed class DomainWorkLane<TWork> : IAsyncDisposable
     where TWork : struct, IAsyncOperation
 {
-    private readonly BoundedMpscRing<TWork> _ring;
-    private readonly CancellationTokenSourcePool _ctsPool;
+    private readonly BoundedMpmcRing<TWork> _ring;
     private readonly CacheLinePaddedCounter _submittedCount = new();
     private readonly CacheLinePaddedCounter _completedCount = new();
     private readonly CacheLinePaddedCounter _rejectedCount = new();
@@ -38,6 +39,9 @@ public sealed class DomainWorkLane<TWork> : IAsyncDisposable
     private readonly TimeSpan _operationTimeout;
     private readonly List<Task> _workers = new();
     private readonly CancellationTokenSource _stopCts = new();
+    // 异步唤醒信号：替代 spin+yield 的忙等。
+    // 入队时 Release()，Worker 队列空时 WaitAsync() 真正休眠。
+    private readonly SemaphoreSlim _signal = new(0, int.MaxValue);
 
     private int _queuedCount;
     private int _inflightCount;
@@ -56,8 +60,7 @@ public sealed class DomainWorkLane<TWork> : IAsyncDisposable
 
         _maxConcurrency = maxConcurrency;
         _operationTimeout = operationTimeout;
-        _ring = new BoundedMpscRing<TWork>(ringCapacity);
-        _ctsPool = new CancellationTokenSourcePool(maxConcurrency * 2);
+        _ring = new BoundedMpmcRing<TWork>(ringCapacity);
     }
 
     public int PendingCount => Volatile.Read(ref _outstandingCount);
@@ -88,6 +91,9 @@ public sealed class DomainWorkLane<TWork> : IAsyncDisposable
         }
 
         _submittedCount.Increment();
+        // 唤醒一个等待中的 Worker。SemaphoreSlim 内部线程安全，
+        // 多次 Release 会累积计数，确保所有入队的 work 都有对应的唤醒信号。
+        _signal.Release();
         return true;
     }
 
@@ -104,64 +110,73 @@ public sealed class DomainWorkLane<TWork> : IAsyncDisposable
 
     private async Task RunWorkerAsync(CancellationToken stopToken)
     {
-        // Worker 循环：忙等 + 少量 SpinWait，避免空 ring 时立即休眠造成延迟。
-        // 生产环境通常队列非空；空转极少发生。
-        var spin = new SpinWait();
+        // 每 Worker 持有一个可复用 CTS：消除 per-work CreateLinkedTokenSource 分配。
+        // stopToken 触发时通过注册回调显式 Cancel 当前 CTS，替代 linked CTS。
+        var workerCts = new CancellationTokenSource();
+        using var stopRegistration = stopToken.Register(
+            static state => ((CancellationTokenSource)state!).Cancel(),
+            workerCts);
+
         while (true)
         {
-            if (stopToken.IsCancellationRequested)
-                break;
-
-            if (!_ring.TryDequeue(out var work))
+            // 尝试批量 drain：一次唤醒处理尽可能多的 work，减少信号开销。
+            while (_ring.TryDequeue(out var work))
             {
-                // 队列空：spin 后 yield，避免 100% CPU
-                if (spin.Count < 10)
+                Interlocked.Decrement(ref _queuedCount);
+                Interlocked.Increment(ref _inflightCount);
+                try
                 {
-                    spin.SpinOnce();
+                    await ExecuteWorkAsync(work, workerCts, stopToken)
+                        .ConfigureAwait(false);
+                    _completedCount.Increment();
                 }
-                else
+                catch (OperationCanceledException)
+                    when (!stopToken.IsCancellationRequested && workerCts.IsCancellationRequested)
                 {
-                    spin.Reset();
-                    await Task.Yield();
+                    // 超时（非 stop）：workerCts 被 CancelAfter 触发。
+                    _timeoutCount.Increment();
+                    NotifyFailure(work, exception: null, AsyncOperationFailureKind.TimedOut);
                 }
-                continue;
+                catch (OperationCanceledException)
+                    when (stopToken.IsCancellationRequested)
+                {
+                    NotifyFailure(work, exception: null, AsyncOperationFailureKind.RuntimeStopping);
+                }
+                catch (Exception ex)
+                {
+                    _failedCount.Increment();
+                    NotifyFailure(work, ex, AsyncOperationFailureKind.Faulted);
+                }
+                finally
+                {
+                    Interlocked.Decrement(ref _inflightCount);
+                    Interlocked.Decrement(ref _outstandingCount);
+                    // 复用 CTS：TryReset 清除取消状态，供下一个 work 使用。
+                    workerCts.TryReset();
+                }
             }
-            spin.Reset();
 
-            Interlocked.Decrement(ref _queuedCount);
-            Interlocked.Increment(ref _inflightCount);
+            // 队列空：真正异步休眠，等待信号唤醒。空闲时接近零 CPU。
+            // 注意：入队时已 Release，此处 WaitAsync 消费一个信号计数。
+            // 若在 TryDequeue 与 WaitAsync 之间有新入队，信号已累积，WaitAsync 立即返回。
             try
             {
-                await ExecuteWorkAsync(work, stopToken).ConfigureAwait(false);
-                _completedCount.Increment();
+                await _signal.WaitAsync(stopToken).ConfigureAwait(false);
             }
             catch (OperationCanceledException)
-                when (!stopToken.IsCancellationRequested)
             {
-                // 超时（非 stop）：
-                _timeoutCount.Increment();
-                NotifyFailure(work, exception: null, AsyncOperationFailureKind.TimedOut);
-            }
-            catch (OperationCanceledException)
-                when (stopToken.IsCancellationRequested)
-            {
-                NotifyFailure(work, exception: null, AsyncOperationFailureKind.RuntimeStopping);
-            }
-            catch (Exception ex)
-            {
-                _failedCount.Increment();
-                NotifyFailure(work, ex, AsyncOperationFailureKind.Faulted);
-            }
-            finally
-            {
-                Interlocked.Decrement(ref _inflightCount);
-                Interlocked.Decrement(ref _outstandingCount);
+                break;
             }
         }
+
+        workerCts.Dispose();
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private async ValueTask ExecuteWorkAsync(TWork work, CancellationToken stopToken)
+    private async ValueTask ExecuteWorkAsync(
+        TWork work,
+        CancellationTokenSource workerCts,
+        CancellationToken stopToken)
     {
         if (_operationTimeout <= TimeSpan.Zero)
         {
@@ -170,21 +185,10 @@ public sealed class DomainWorkLane<TWork> : IAsyncDisposable
             return;
         }
 
-        // 池化 CTS：复用实例，仅 CancelAfter 设置 Timer
-        // 注意：CancelAfter 内部仍会注册一个 Timer，但 CTS 本身被复用。
-        // 后续可用全局时间轮替代 CancelAfter 的 Timer，进一步消除分配。
-        var cts = _ctsPool.Rent();
-        try
-        {
-            cts.CancelAfter(_operationTimeout);
-            using var linked = CancellationTokenSource.CreateLinkedTokenSource(
-                cts.Token, stopToken);
-            await work.ExecuteAsync(linked.Token).ConfigureAwait(false);
-        }
-        finally
-        {
-            _ctsPool.Return(cts);
-        }
+        // 复用 Worker 级 CTS：CancelAfter 仅设置内部 Timer（无 CTS 分配），
+        // stop 时通过注册回调显式 Cancel（替代 linked CTS 的联动）。
+        workerCts.CancelAfter(_operationTimeout);
+        await work.ExecuteAsync(workerCts.Token).ConfigureAwait(false);
     }
 
     private static void NotifyFailure(
@@ -233,6 +237,7 @@ public sealed class DomainWorkLane<TWork> : IAsyncDisposable
     {
         await StopAsync().ConfigureAwait(false);
         _stopCts.Dispose();
+        _signal.Dispose();
     }
 
     public DomainWorkLaneSnapshot GetSnapshot()

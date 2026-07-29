@@ -32,7 +32,13 @@ internal enum TypingActorMessageKind : byte
     Notify = 0,
 
     /// <summary>授权 I/O 完成（成功或失败，结果在 <see cref="TypingActorMessage.Authorized"/>）。</summary>
-    AuthorizationCompleted = 1
+    AuthorizationCompleted = 1,
+
+    /// <summary>
+    /// 授权失效通知（关系变更触发）：清空 Actor 内缓存的 Authorized=true，
+    /// 下一次 Notify 必须重新走授权 I/O。不携带业务字段。
+    /// </summary>
+    AuthorizationInvalidated = 2
 }
 
 /// <summary>
@@ -77,7 +83,11 @@ internal readonly struct TypingActorMessage
 
     /// <summary>构造授权完成回调。</summary>
     public static TypingActorMessage AuthorizationCompleted(bool authorized)
-        => new(TypingActorMessageKind.AuthorizationCompleted, isTyping: false, timestamp: 0, sessionGeneration: 0, authorized: authorized);
+        => new(TypingActorMessageKind.AuthorizationCompleted, isTyping: false, timestamp: 0, sessionGeneration: 0, authorized);
+
+    /// <summary>构造授权失效通知（关系变更触发）。</summary>
+    public static TypingActorMessage AuthorizationInvalidated()
+        => new(TypingActorMessageKind.AuthorizationInvalidated, isTyping: false, timestamp: 0, sessionGeneration: 0, authorized: false);
 }
 
 /// <summary>
@@ -105,4 +115,17 @@ internal struct TypingActorState
 
     /// <summary>当前会话代次，用于检测会话切换。</summary>
     public long SessionGeneration;
+
+    /// <summary>
+    /// 授权有效期截止时间戳（<see cref="TimeProvider.GetTimestamp"/> 单位）。
+    /// 超过此时间后下一次 Notify 必须重新走授权 I/O，避免关系变更后授权长期不过期。
+    /// 0 表示尚未获得授权或需重新授权。
+    /// </summary>
+    public long AuthorizedUntilTimestamp;
+
+    /// <summary>
+    /// 授权纪元：每次授权 I/O 完成时自增。关系变更失效时自增全局纪元，
+    /// 使 Actor 内缓存的 Authorized=true 立即作废（无需等待 TTL）。
+    /// </summary>
+    public uint AuthorizationEpoch;
 }

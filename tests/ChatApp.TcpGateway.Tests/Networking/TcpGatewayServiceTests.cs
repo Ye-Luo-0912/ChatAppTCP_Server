@@ -51,11 +51,17 @@ public sealed class TcpGatewayServiceTests
         InboundTransportMode.Pipelines,
         OutboundSendMode.OnDemandSendPump)]
     [InlineData(
+        InboundTransportMode.Pipelines,
+        OutboundSendMode.PerSessionDrain)]
+    [InlineData(
         InboundTransportMode.DirectSocket,
         OutboundSendMode.PersistentSendLoop)]
     [InlineData(
         InboundTransportMode.DirectSocket,
         OutboundSendMode.OnDemandSendPump)]
+    [InlineData(
+        InboundTransportMode.DirectSocket,
+        OutboundSendMode.PerSessionDrain)]
     public async Task PublishesIncomingMessageAndDispatchesPersistedEventOverTcp(
         InboundTransportMode inboundTransportMode,
         OutboundSendMode outboundSendMode)

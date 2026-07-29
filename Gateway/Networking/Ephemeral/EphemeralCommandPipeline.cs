@@ -111,7 +111,7 @@ internal sealed class EphemeralCommandPipeline : IAsyncDisposable
             return _legacy.TryEnqueue(connectionId, in command);
 
         var message = EphemeralActorMessage.FromCommand(in command);
-        return _actor!.TryTell(in connectionId, in message) ==
+        return _actor!.TryTellEphemeral(in connectionId, in message) ==
                ActorPostStatus.Accepted;
     }
 

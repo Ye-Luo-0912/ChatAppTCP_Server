@@ -44,10 +44,32 @@ internal sealed partial class GroupCommandHandler
         // ListMembers（查询）同样受益：重复翻页请求可直接返回缓存。
         if (_idempotencyCache is { } cache)
         {
-            var cached = cache.TryGet(command.ActorUserId, command.RequestId);
-            if (cached is not null)
+            var payloadHash = ComputePayloadHash(command);
+            var lookup = cache.TryGet(
+                command.ActorUserId,
+                (int)command.Operation,
+                command.RequestId,
+                payloadHash);
+
+            if (lookup.IsHit)
             {
-                SendGroupMutateResponse(session, responseCommand, responseCodec, map(cached));
+                SendGroupMutateResponse(session, responseCommand, responseCodec, map(lookup.Result!));
+                return;
+            }
+
+            // 同一 RequestId 但负载指纹不匹配：客户端复用 RequestId 提交不同操作参数，
+            // 返回 idempotency_conflict 防止误命中前一次结果。
+            if (lookup.IsConflict)
+            {
+                _metrics.CommandFailed(requestCommand);
+                SendGroupMutateResponse(
+                    session,
+                    responseCommand,
+                    responseCodec,
+                    map(RealtimeGroupConversationResult.Failed(
+                        command.RequestId,
+                        "idempotency_conflict",
+                        "RequestId 已用于不同参数的请求。")));
                 return;
             }
         }
@@ -61,7 +83,12 @@ internal sealed partial class GroupCommandHandler
             // 异常路径的 group_unavailable 不经过此处，不会被缓存，确保瞬态故障可重试。
             if (_idempotencyCache is { } cacheForAdd)
             {
-                cacheForAdd.TryAdd(command.ActorUserId, command.RequestId, result);
+                cacheForAdd.TryAdd(
+                    command.ActorUserId,
+                    (int)command.Operation,
+                    command.RequestId,
+                    ComputePayloadHash(command),
+                    result);
             }
 
             SendGroupMutateResponse(session, responseCommand, responseCodec, map(result));
@@ -114,5 +141,32 @@ internal sealed partial class GroupCommandHandler
                 JoinedAtMs = m.JoinedAtMs
             })
             .ToArray();
+    }
+
+    /// <summary>
+    /// 计算命令负载指纹：包含操作参数（不含 RequestId/ActorUserId/ActorSessionId）。
+    /// 用于检测同一 RequestId 复用不同操作参数的冲突。
+    /// <para>
+    /// MemberUserIds 排序后逐个合并，确保成员集合相同但顺序不同的命令产生相同指纹。
+    /// </para>
+    /// </summary>
+    private static int ComputePayloadHash(RealtimeGroupConversationCommand command)
+    {
+        var hash = new HashCode();
+        hash.Add(command.Operation);
+        hash.Add(command.ConversationId);
+        hash.Add(command.Title);
+        hash.Add(command.TargetUserId);
+        hash.Add(command.NewRole);
+
+        if (command.MemberUserIds is { } members)
+        {
+            // 排序后逐个合并：集合语义（顺序无关）。
+            // MemberUserIds 通常很短（≤100），排序开销可忽略。
+            foreach (var id in members.Order())
+                hash.Add(id);
+        }
+
+        return hash.ToHashCode();
     }
 }

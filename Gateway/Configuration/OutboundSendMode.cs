@@ -30,5 +30,31 @@ public enum OutboundSendMode
     /// burst 限制防止单连接独占 worker。
     /// </para>
     /// </summary>
-    OnDemandSendPump = 1
+    OnDemandSendPump = 1,
+
+    /// <summary>
+    /// 无永久 SendLoop Task，也无共享 worker 池。每连接按需启动自有 async Drain。
+    /// <para>
+    /// 入队时 CAS Idle→Running 成功后启动 Session 自有 drain Task；
+    /// drain 持续消费出站 Channel 直到队列空，然后 CAS Running→Idle 退出。
+    /// Socket.SendAsync 的 continuation 天然恢复同一 drain，无需额外调度。
+    /// </para>
+    /// <para>
+    /// 优点：
+    /// <list type="bullet">
+    /// <item>空闲连接 0 出站 Task（与 OnDemandSendPump 一致）；</item>
+    /// <item>慢 Socket 不占用全局逻辑 Worker 名额（每连接独立 drain）；</item>
+    /// <item>无 ready queue 调度延迟，无 burst 限制；</item>
+    /// <item>同一 Session 天然保持唯一发送所有权（CAS 状态机保证）。</item>
+    /// </list>
+    /// </para>
+    /// <para>
+    /// 缺点：活跃聊天场景频繁启动/停止 drain Task 可能产生更多分配
+    /// （可通过 drain 内连续消费多帧摊薄）。
+    /// </para>
+    /// <para>
+    /// 慢消费者隔离：SendTimeoutTracker 扫描关闭慢 socket。
+    /// </para>
+    /// </summary>
+    PerSessionDrain = 2
 }

@@ -85,9 +85,16 @@ internal sealed partial class GroupCommandHandler
             // Gateway 缓存为前置快速路径，避免重试时重复 Redis/NATS 往返。
             if (_idempotencyCache is { } cache)
             {
-                var cached = cache.TryGet(command.ActorUserId, command.RequestId);
-                if (cached is not null)
+                var payloadHash = ComputePayloadHash(command);
+                var lookup = cache.TryGet(
+                    command.ActorUserId,
+                    (int)command.Operation,
+                    command.RequestId,
+                    payloadHash);
+
+                if (lookup.IsHit)
                 {
+                    var cached = lookup.Result!;
                     SendCreateGroupResponse(session, new CreateGroupResponse
                     {
                         RequestId = cached.RequestId,
@@ -100,6 +107,20 @@ internal sealed partial class GroupCommandHandler
                     });
                     return;
                 }
+
+                // 同一 RequestId 但负载指纹不匹配：返回冲突错误。
+                if (lookup.IsConflict)
+                {
+                    _metrics.CommandFailed(PacketCommand.CreateGroupRequest);
+                    SendCreateGroupResponse(session, new CreateGroupResponse
+                    {
+                        RequestId = command.RequestId,
+                        Succeeded = false,
+                        ErrorCode = "idempotency_conflict",
+                        ErrorMessage = "RequestId 已用于不同参数的请求。"
+                    });
+                    return;
+                }
             }
 
             var result = await _messageBus.MutateGroupConversationAsync(command, cancellationToken)
@@ -108,7 +129,12 @@ internal sealed partial class GroupCommandHandler
             // 缓存 Realtime 正常返回的结果（含业务失败）。
             if (_idempotencyCache is { } cacheForAdd)
             {
-                cacheForAdd.TryAdd(command.ActorUserId, command.RequestId, result);
+                cacheForAdd.TryAdd(
+                    command.ActorUserId,
+                    (int)command.Operation,
+                    command.RequestId,
+                    ComputePayloadHash(command),
+                    result);
             }
 
             SendCreateGroupResponse(session, new CreateGroupResponse

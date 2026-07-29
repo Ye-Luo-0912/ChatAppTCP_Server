@@ -95,6 +95,11 @@ public sealed class GatewayMetrics : IDisposable
     private readonly Histogram<double> _heartbeatRefreshDuration;
     private readonly Counter<long> _heartbeatBucketSkew;
 
+    // Specialized Typing Actor 管道可观测性：覆盖 Generic Actor 指标未暴露的领域维度。
+    // typing_actor.* 反映 Specialized Actor Runtime 真实负载（active/busy/ingress/replaced/admission）；
+    // typing_auth.* 反映授权 I/O DomainWorkLane 状态与耗时，避免开启 Specialized 后仪表盘仅显示空闲数据。
+    private readonly Histogram<double> _typingAuthDuration;
+
     public GatewayMetrics()
     {
         _connectionsAccepted = _meter.CreateCounter<long>(
@@ -202,6 +207,10 @@ public sealed class GatewayMetrics : IDisposable
             "gateway.group.idempotent.hit");
         _groupIdempotentMisses = _meter.CreateCounter<long>(
             "gateway.group.idempotent.miss");
+
+        _typingAuthDuration = _meter.CreateHistogram<double>(
+            "gateway.typing_auth.duration",
+            unit: "ms");
     }
 
     public void ConnectionAccepted()
@@ -288,6 +297,7 @@ public sealed class GatewayMetrics : IDisposable
             ResumeFailureReason.RedisFailure => "redis_failure",
             ResumeFailureReason.CircuitOpen => "circuit_open",
             ResumeFailureReason.LeaseMismatch => "lease_mismatch",
+            ResumeFailureReason.LeaseQueryFailed => "lease_query_failed",
             _ => "unknown"
         };
 
@@ -559,7 +569,8 @@ public sealed class GatewayMetrics : IDisposable
         Func<long>? activeDeadlinesProvider,
         Func<long>? outboundPumpReadyQueueProvider,
         Func<long>? outboundPumpTotalScheduledProvider,
-        Func<int>? outboundPumpWorkerCountProvider)
+        Func<int>? outboundPumpWorkerCountProvider,
+        Func<int>? sendTimeoutActiveSendersProvider = null)
     {
         if (activeDeadlinesProvider is not null)
         {
@@ -567,7 +578,16 @@ public sealed class GatewayMetrics : IDisposable
                 "gateway.deadline_wheel.active_deadlines",
                 () => activeDeadlinesProvider(),
                 unit: "{deadlines}",
-                description: "全局 DeadlineWheel 当前活跃 deadline 数（认证/空闲/发送超时注册，已注册未触发也未取消）。");
+                description: "全局 DeadlineWheel 当前活跃 deadline 数（仅 Auth/Idle 超时；发送超时已迁移到 SendTimeoutTracker）。");
+        }
+
+        if (sendTimeoutActiveSendersProvider is not null)
+        {
+            _meter.CreateObservableGauge(
+                "gateway.send_timeout.active_senders",
+                () => sendTimeoutActiveSendersProvider(),
+                unit: "{sessions}",
+                description: "SendTimeoutTracker 当前活跃发送方数（正在执行 Socket.SendAsync 的 Session）。空闲时为 0。");
         }
 
         if (outboundPumpReadyQueueProvider is not null)
@@ -636,6 +656,152 @@ public sealed class GatewayMetrics : IDisposable
             unit: "{messages}");
     }
 
+    /// <summary>
+    /// 注册 Specialized Typing Actor 的扩展运行时指标。
+    /// 仅在 UseTypingActorPipeline=true 时调用，补充基础 <c>gateway.actor.*</c> 指标未覆盖的领域维度。
+    /// <para>
+    /// 指标列表：
+    /// <list type="bullet">
+    /// <item><c>gateway.typing_actor.active</c>：活跃 Typing Actor 数；</item>
+    /// <item><c>gateway.typing_actor.busy</c>：等待异步授权的 Actor 数；</item>
+    /// <item><c>gateway.typing_actor.ingress.pending</c>：Shard Ingress 待消费消息数；</item>
+    /// <item><c>gateway.typing_actor.replaced</c>：LatestOnly Mailbox 合并丢弃累计数；</item>
+    /// <item><c>gateway.typing_actor.admission_rejected</c>：MaxActiveActors 拒绝激活累计数；</item>
+    /// <item>deadlines/activations/deactivations/mailbox_full/shard_overloaded/async.*：补充领域维度。</item>
+    /// </list>
+    /// </para>
+    /// </summary>
+    public void RegisterTypingActorRuntimeObservers(
+        Func<long> activeActorsProvider,
+        Func<long> busyActorsProvider,
+        Func<long> ingressPendingProvider,
+        Func<long> replacedProvider,
+        Func<long> admissionRejectedProvider,
+        Func<long> pendingDeadlinesProvider,
+        Func<long> activationsProvider,
+        Func<long> deactivationsProvider,
+        Func<long> mailboxFullProvider,
+        Func<long> shardOverloadedProvider,
+        Func<long> asyncSubmittedProvider,
+        Func<long> asyncCompletedProvider,
+        Func<long> asyncRejectedProvider)
+    {
+        _meter.CreateObservableGauge(
+            "gateway.typing_actor.active",
+            () => activeActorsProvider(),
+            unit: "{actors}",
+            description: "Specialized Typing Actor Runtime 当前活跃 Actor 数。");
+        _meter.CreateObservableGauge(
+            "gateway.typing_actor.busy",
+            () => busyActorsProvider(),
+            unit: "{actors}",
+            description: "Specialized Typing Actor Runtime 当前等待异步授权 Completion 的 Actor 数。");
+        _meter.CreateObservableGauge(
+            "gateway.typing_actor.ingress.pending",
+            () => ingressPendingProvider(),
+            unit: "{messages}",
+            description: "Specialized Typing Actor 各 Shard Ingress Ring 待消费消息总数。");
+        _meter.CreateObservableCounter(
+            "gateway.typing_actor.replaced",
+            () => replacedProvider(),
+            unit: "{messages}",
+            description: "LatestOnly Mailbox 因新消息替换旧消息的累计丢弃数，反映快速状态变更合并频率。");
+        _meter.CreateObservableCounter(
+            "gateway.typing_actor.admission_rejected",
+            () => admissionRejectedProvider(),
+            unit: "{actors}",
+            description: "因 MaxActiveActors/MaxActiveActorsPerShard 上限被拒绝的激活累计数。");
+        _meter.CreateObservableGauge(
+            "gateway.typing_actor.deadlines.pending",
+            () => pendingDeadlinesProvider(),
+            unit: "{deadlines}",
+            description: "Specialized Typing Actor 当前已注册未触发的 deadline 数。");
+        _meter.CreateObservableCounter(
+            "gateway.typing_actor.activations",
+            () => activationsProvider(),
+            unit: "{actors}");
+        _meter.CreateObservableCounter(
+            "gateway.typing_actor.deactivations",
+            () => deactivationsProvider(),
+            unit: "{actors}");
+        _meter.CreateObservableCounter(
+            "gateway.typing_actor.mailbox_full",
+            () => mailboxFullProvider(),
+            unit: "{messages}");
+        _meter.CreateObservableCounter(
+            "gateway.typing_actor.shard_overloaded",
+            () => shardOverloadedProvider(),
+            unit: "{messages}");
+        _meter.CreateObservableCounter(
+            "gateway.typing_actor.async.submitted",
+            () => asyncSubmittedProvider(),
+            unit: "{operations}");
+        _meter.CreateObservableCounter(
+            "gateway.typing_actor.async.completed",
+            () => asyncCompletedProvider(),
+            unit: "{operations}");
+        _meter.CreateObservableCounter(
+            "gateway.typing_actor.async.rejected",
+            () => asyncRejectedProvider(),
+            unit: "{operations}");
+    }
+
+    /// <summary>
+    /// 注册 Typing 授权 I/O DomainWorkLane 的低基数运行时指标。
+    /// <para>
+    /// 指标列表：
+    /// <list type="bullet">
+    /// <item><c>gateway.typing_auth.queued</c>：当前排队等待执行的授权操作数；</item>
+    /// <item><c>gateway.typing_auth.inflight</c>：当前正在执行的授权操作数；</item>
+    /// <item><c>gateway.typing_auth.rejected</c>：因 Lane 队列满被拒绝的累计提交数；</item>
+    /// <item><c>gateway.typing_auth.timeout</c>：因操作超时被取消的累计数。</item>
+    /// </list>
+    /// </para>
+    /// <para>
+    /// 授权耗时直方图通过 <see cref="TypingAuthCompleted"/> 实例方法记录（热路径同步 Add），
+    /// 而非 ObservableGauge，避免每次 scrape 触发额外计算。
+    /// </para>
+    /// </summary>
+    public void RegisterTypingAuthLaneObservers(
+        Func<int> queuedProvider,
+        Func<int> inflightProvider,
+        Func<long> rejectedProvider,
+        Func<long> timeoutProvider)
+    {
+        _meter.CreateObservableGauge(
+            "gateway.typing_auth.queued",
+            () => queuedProvider(),
+            unit: "{operations}",
+            description: "Typing 授权 DomainWorkLane 当前排队待执行的授权操作数。");
+        _meter.CreateObservableGauge(
+            "gateway.typing_auth.inflight",
+            () => inflightProvider(),
+            unit: "{operations}",
+            description: "Typing 授权 DomainWorkLane 当前正在执行的授权操作数。");
+        _meter.CreateObservableCounter(
+            "gateway.typing_auth.rejected",
+            () => rejectedProvider(),
+            unit: "{operations}",
+            description: "Typing 授权 DomainWorkLane 因队列满被拒绝的累计提交数。");
+        _meter.CreateObservableCounter(
+            "gateway.typing_auth.timeout",
+            () => timeoutProvider(),
+            unit: "{operations}",
+            description: "Typing 授权 DomainWorkLane 因操作超时被取消的累计数。");
+    }
+
+    /// <summary>
+    /// 记录单次 Typing 授权操作耗时。在授权 I/O 完成后（无论成功/拒绝/失败）调用。
+    /// </summary>
+    /// <param name="durationMs">操作耗时（毫秒）。</param>
+    /// <param name="authorized">是否授权通过。通过 tag 区分缓存命中与远程查询耗时分布。</param>
+    public void TypingAuthCompleted(double durationMs, bool authorized)
+    {
+        _typingAuthDuration.Record(
+            durationMs,
+            new KeyValuePair<string, object?>("outcome", authorized ? "allowed" : "denied"));
+    }
+
     private static string GetFailureKindName(AuthenticationFailureKind kind) =>
         kind switch
         {
@@ -675,5 +841,8 @@ public enum ResumeFailureReason
     CircuitOpen,
 
     /// <summary>设备租约已被新会话接管，代次不匹配。</summary>
-    LeaseMismatch
+    LeaseMismatch,
+
+    /// <summary>设备租约查询依赖不可用（Redis 异常或熔断器开路），fail-closed 拒绝恢复。</summary>
+    LeaseQueryFailed
 }

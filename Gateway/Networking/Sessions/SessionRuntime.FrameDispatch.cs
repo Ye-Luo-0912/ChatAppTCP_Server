@@ -151,11 +151,29 @@ internal sealed partial class SessionRuntime
             // Typing 领域 Actor 快路径：直接解析 payload 并路由到 LatestOnly Actor，
             // 不创建 SessionCommand、不复制 buffer、不预留 inbound budget。
             // 仅在 UseTypingActorPipeline=true 且 TypingNotify 命令时启用。
+            // 独立捕获 JsonException：恶意/损坏 JSON 必须被归类为协议错误并关闭连接，
+            // 不能一路抛到 SessionRuntime 外层被误记为 TransportError。
             if (_typingActorPipeline is not null &&
                 frame.Command == PacketCommand.TypingNotify)
             {
-                _typingActorPipeline.TryHandleFrame(in frame, session);
-                return true;
+                try
+                {
+                    _typingActorPipeline.TryHandleFrame(in frame, session);
+                    return true;
+                }
+                catch (JsonException)
+                {
+                    _metrics.ProtocolError();
+                    _sendProtocolError(
+                        session,
+                        ProtocolErrorCode.ProtocolViolation,
+                        "invalid typing notify payload",
+                        true,
+                        null,
+                        (ushort)frame.Command);
+                    session.Close(SessionCloseReason.ProtocolViolation);
+                    return false;
+                }
             }
 
             if (lane == CommandLane.Inline)

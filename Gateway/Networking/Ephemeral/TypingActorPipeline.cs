@@ -27,7 +27,7 @@ namespace ChatApp.TcpGateway.Gateway.Networking.Ephemeral;
 /// Actor Suspend 期间 LatestOnly Mailbox 仅保留最新 Notify，实现 typing=true→false 授权前合并。
 /// </para>
 /// </summary>
-internal sealed class TypingActorPipeline : IAsyncDisposable
+internal sealed class TypingActorPipeline : IAsyncDisposable, ITypingAuthorizationInvalidator
 {
     private readonly ActorRuntime<TypingActorKey, TypingActorState, TypingActorMessage> _actor;
     private readonly TypingActorBehavior _behavior;
@@ -63,7 +63,11 @@ internal sealed class TypingActorPipeline : IAsyncDisposable
             directConversationAuthorizer,
             typingFanout,
             metrics,
-            logger);
+            logger,
+            timeProvider,
+            // 授权 TTL 与 CachedDirectConversationAuthorizer 默认 allowTtl 对齐（30s）。
+            // 关系变更后由 InvalidateAuthorizationAsync 主动失效，TTL 是兜底。
+            TimeSpan.FromSeconds(30));
         var dropHandler = new TypingActorDropHandler(metrics);
 
         _actor = new ActorRuntime<TypingActorKey, TypingActorState, TypingActorMessage>(
@@ -98,6 +102,32 @@ internal sealed class TypingActorPipeline : IAsyncDisposable
     public ActorRuntimeSnapshot Snapshot => _actor.GetSnapshot();
 
     /// <summary>
+    /// 授权 I/O DomainWorkLane 快照：用于注册 typing_auth.* 指标。
+    /// </summary>
+    public DomainWorkLaneSnapshot AuthLaneSnapshot => _authLane.GetSnapshot();
+
+    /// <summary>
+    /// 关系变更触发的授权失效：向对应 (sender, target) 双向 Actor 投递 AuthorizationInvalidated。
+    /// 清空 Actor 内缓存的 Authorized=true，下一次 Notify 必须重新走授权 I/O。
+    /// <para>
+    /// 调用方（如 RelationshipListHandler）在拉黑/解除好友时对两个方向各调用一次。
+    /// Ephemeral 语义：若 Actor 已被 IdleSweep 回收，TryTell 返回 ActorClosed，调用方无需处理。
+    /// </para>
+    /// </summary>
+    public void InvalidateAuthorization(long senderUserId, long targetUserId)
+    {
+        if (senderUserId <= 0 || targetUserId <= 0)
+            return;
+
+        var forward = new TypingActorKey(senderUserId, targetUserId);
+        var reverse = new TypingActorKey(targetUserId, senderUserId);
+        var message = TypingActorMessage.AuthorizationInvalidated();
+        // 丢弃语义：Actor 不存在或 Shard 满载时静默失败，关系变更后 TTL 兜底。
+        _actor.TryTellEphemeral(in forward, in message);
+        _actor.TryTellEphemeral(in reverse, in message);
+    }
+
+    /// <summary>
     /// 从原始帧解析 TypingNotify 并路由到 Typing Actor。
 /// <para>
 /// 在 TCP Read 路径调用，替代 EphemeralCommandPipeline 的 TryEnqueue。
@@ -128,7 +158,7 @@ internal sealed class TypingActorPipeline : IAsyncDisposable
             timestamp: _timeProvider.GetTimestamp(),
             sessionGeneration: 0);
 
-        var status = _actor.TryTell(in key, in message);
+        var status = _actor.TryTellEphemeral(in key, in message);
         return status == ActorPostStatus.Accepted ||
                status == ActorPostStatus.Replaced;
         // ShardOverloaded / ActorClosed / RuntimeStopped → 丢弃（Ephemeral 语义允许丢弃）

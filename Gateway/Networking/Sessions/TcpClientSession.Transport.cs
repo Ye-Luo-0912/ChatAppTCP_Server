@@ -30,8 +30,9 @@ internal sealed partial class TcpClientSession
         _outbound.Writer.TryComplete();
         _lifetime.Cancel();
 
-        // 取消未触发的 deadline，避免 close 后回调误执行。
+        // 取消未触发的 Auth/Idle deadline，避免 close 后回调误执行。
         // 已触发的回调通过 IsConnected 检查防御。
+        // 发送超时改由 SendTimeoutTracker 扫描管理：从活跃集合移除即可，无需取消 deadline。
         if (_deadlineWheel is not null)
         {
             if (_authDeadlineRegistration.Id != 0)
@@ -44,12 +45,8 @@ internal sealed partial class TcpClientSession
                 _deadlineWheel.Cancel(_idleDeadlineRegistration);
                 _idleDeadlineRegistration = default;
             }
-            if (_sendDeadlineRegistration.Id != 0)
-            {
-                _deadlineWheel.Cancel(_sendDeadlineRegistration);
-                _sendDeadlineRegistration = default;
-            }
         }
+        _sendTimeoutTracker?.OnSessionClosed(this);
 
         try
         {
@@ -76,9 +73,14 @@ internal sealed partial class TcpClientSession
             // PersistentSendLoop 模式：等待 SendLoop 退出（其 finally 会排空 FIFO + mailbox）。
             // OnDemandSendPump 模式：无永久 Task，直接排空残留（in-flight pump 会因
             // _lifetime 取消而快速退出，其 PumpOutboundAsync 的 finally 也会排空）。
+            // PerSessionDrain 模式：等待活跃 drain Task 退出（其 finally 会排空 FIFO + mailbox）。
             if (_sendLoop is not null)
             {
                 await _sendLoop.ConfigureAwait(false);
+            }
+            else if (_perSessionDrainTask is not null)
+            {
+                await _perSessionDrainTask.ConfigureAwait(false);
             }
             else
             {
@@ -87,13 +89,12 @@ internal sealed partial class TcpClientSession
         }
         finally
         {
-            // 取消未触发的 deadline（防止关闭后回调误进入 Close）。
+            // 取消未触发的 Auth/Idle deadline（防止关闭后回调误进入 Close）。
+            // 发送超时已由 SendTimeoutTracker 管理，Close 中已从活跃集合移除。
             if (_deadlineWheel is not null)
             {
                 if (_authDeadlineRegistration.Id != 0)
                     _deadlineWheel.Cancel(_authDeadlineRegistration);
-                if (_sendDeadlineRegistration.Id != 0)
-                    _deadlineWheel.Cancel(_sendDeadlineRegistration);
                 if (_idleDeadlineRegistration.Id != 0)
                     _deadlineWheel.Cancel(_idleDeadlineRegistration);
             }
@@ -132,37 +133,45 @@ internal sealed partial class TcpClientSession
             });
     }
 
+    /// <summary>
+    /// 发送超时检查：由 <see cref="Executor.SendTimeoutTracker"/> 扫描线程周期调用。
+    /// <para>
+    /// generation-aware：通过 <c>_sendInProgress</c> CAS 防止跨发送代次误关。
+    /// 单调时钟校验防止墙钟回拨误判。非发送中立即返回（廉价 volatile 读）。
+    /// </para>
+    /// <para>
+    /// 此方法从原 <see cref="SendFrameAsync"/> 闭包中提取，消除每帧 Action 委托分配。
+    /// </para>
+    /// </summary>
+    internal void CheckSendTimeout()
+    {
+        if (Volatile.Read(ref _sendInProgress) != 1)
+            return;
+
+        var startedAt = Volatile.Read(ref _sendStartedAt);
+        if (startedAt == 0)
+            return;
+
+        if (_timeProvider.GetElapsedTime(startedAt) < _sendTimeout)
+            return;
+
+        // CAS 抢占关闭所有权：仅一个调用方（扫描线程或旧闭包残留）能进入 Close。
+        if (Interlocked.CompareExchange(ref _sendInProgress, 0, 1) == 1)
+            Close(SessionCloseReason.SendTimedOut);
+    }
+
     private async ValueTask SendFrameAsync(
         ReadOnlyMemory<byte> frame,
         CancellationToken lifetimeToken)
     {
-        // 通过全局 DeadlineWheel 注册发送超时 deadline，到期检查 _sendInProgress 后关闭会话。
-        // 顺序：先记 startedAt，再标记发送中，最后注册 deadline。
-        // 先记 startedAt 确保回调看到 _sendInProgress=1 时 startedAt 已更新为本代次的值。
+        // 发送超时改由 SendTimeoutTracker 扫描管理（替代每帧 DeadlineWheel.Register）。
+        // 顺序：先记 startedAt，再标记发送中，最后通知 tracker 开始监控。
+        // 先记 startedAt 确保扫描看到 _sendInProgress=1 时 startedAt 已更新为本代次的值。
         // 单调时钟避免墙钟回拨导致的死锁。
         Volatile.Write(ref _sendStartedAt, _timeProvider.GetTimestamp());
         Interlocked.Exchange(ref _sendInProgress, 1);
-        if (_deadlineWheel is not null && _sendTimeout > TimeSpan.Zero)
-        {
-            // 取消上一代未触发的 deadline（若有），再注册本代 deadline。
-            if (_sendDeadlineRegistration.Id != 0)
-                _deadlineWheel.Cancel(_sendDeadlineRegistration);
-            _sendDeadlineRegistration = _deadlineWheel.Register(_sendTimeout, () =>
-            {
-                if (Volatile.Read(ref _sendInProgress) != 1)
-                    return;
-
-                var startedAt = Volatile.Read(ref _sendStartedAt);
-                if (startedAt == 0)
-                    return;
-
-                if (_timeProvider.GetElapsedTime(startedAt) < _sendTimeout)
-                    return;
-
-                if (Interlocked.CompareExchange(ref _sendInProgress, 0, 1) == 1)
-                    Close(SessionCloseReason.SendTimedOut);
-            });
-        }
+        // TryAdd 幂等：burst 内连续帧为廉价 no-op（仅 hash 查找，无分配、无全局锁）。
+        _sendTimeoutTracker?.OnSendStart(this);
 
         var sent = 0;
         try
@@ -186,14 +195,10 @@ internal sealed partial class TcpClientSession
         }
         finally
         {
-            // 标记发送完成并清除 startedAt；取消本代 deadline。
+            // 标记发送完成并清除 startedAt；从 tracker 活跃集合移除。
             Volatile.Write(ref _sendStartedAt, 0);
             Interlocked.Exchange(ref _sendInProgress, 0);
-            if (_deadlineWheel is not null && _sendDeadlineRegistration.Id != 0)
-            {
-                _deadlineWheel.Cancel(_sendDeadlineRegistration);
-                _sendDeadlineRegistration = default;
-            }
+            _sendTimeoutTracker?.OnSendComplete(this);
         }
     }
 }

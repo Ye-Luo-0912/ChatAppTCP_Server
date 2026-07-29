@@ -15,5 +15,7 @@ internal enum SessionCloseReason : byte
     SessionRevoked,
     TransportError,
     /// <summary>全局入站缓冲预算耗尽。</summary>
-    InboundBudgetExceeded
+    InboundBudgetExceeded,
+    /// <summary>DirectSocket 帧装配超时：客户端发送 Header 或 Payload 过慢。</summary>
+    SlowFrameAssembly
 }

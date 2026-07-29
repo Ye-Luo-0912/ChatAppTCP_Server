@@ -13,6 +13,52 @@ public sealed class TcpGatewayOptions
     public int ReceiveBufferSize { get; set; } = 4 * 1024;
 
     /// <summary>
+    /// DirectSocket 动态接收缓冲区：新连接的初始缓冲区大小（字节）。
+    /// <para>
+    /// 心跳/小帧连接使用小缓冲区减少内存占用；检测到连续大帧时自动升级到
+    /// <see cref="ReceiveBufferMaxSize"/>，长期空闲后降级回此值。
+    /// 仅在 <see cref="InboundTransportMode.DirectSocket"/> 模式下生效。
+    /// </para>
+    /// </summary>
+    public int ReceiveBufferInitialSize { get; set; } = 1024;
+
+    /// <summary>
+    /// DirectSocket 动态接收缓冲区：升级后的最大缓冲区大小（字节）。
+    /// <para>
+    /// 当帧无法容纳在当前缓冲区但可容纳在最大缓冲区时，自动升级。
+    /// 超过此大小的帧仍通过单独租用 Payload 缓冲区处理（已有逻辑）。
+    /// </para>
+    /// </summary>
+    public int ReceiveBufferMaxSize { get; set; } = 4 * 1024;
+
+    /// <summary>
+    /// DirectSocket 动态接收缓冲区：空闲多少秒后降级到 <see cref="ReceiveBufferInitialSize"/>。
+    /// <para>
+    /// 长连接在空闲期后释放大缓冲区槽位，减少 ArrayPool 压力。
+    /// 设为 <see cref="TimeSpan.Zero"/> 禁用降级。
+    /// </para>
+    /// </summary>
+    public TimeSpan ReceiveBufferDowngradeIdleTimeout { get; set; } = TimeSpan.FromSeconds(60);
+
+    /// <summary>
+    /// DirectSocket 帧装配 deadline：不完整 Header 超时后关闭连接（秒）。
+    /// <para>
+    /// 防御慢速攻击：客户端逐字节发送 Header，消耗连接资源。
+    /// 设为 <see cref="TimeSpan.Zero"/> 禁用（仅由 IdleTimeout 兜底）。
+    /// </para>
+    /// </summary>
+    public TimeSpan HeaderAssemblyTimeout { get; set; } = TimeSpan.FromSeconds(10);
+
+    /// <summary>
+    /// DirectSocket 帧装配 deadline：不完整 Payload 超时后关闭连接（秒）。
+    /// <para>
+    /// 防御慢速攻击：客户端逐字节发送 Payload，消耗连接资源。
+    /// 设为 <see cref="TimeSpan.Zero"/> 禁用（仅由 IdleTimeout 兜底）。
+    /// </para>
+    /// </summary>
+    public TimeSpan PayloadAssemblyTimeout { get; set; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>
     /// 入站读取模式。DirectSocket 通过固定池化缓冲区直接执行增量协议解析；
     /// Pipelines 保留为 A/B 基线与快速回退路径。
     /// </summary>
@@ -35,6 +81,8 @@ public sealed class TcpGatewayOptions
     /// 默认 <see cref="OutboundSendMode.PersistentSendLoop"/>：作为 A/B 对照基线，
     /// 行为与历史版本一致。切换为 <see cref="OutboundSendMode.OnDemandSendPump"/> 后，
     /// 空闲连接不再保留 SendLoop Task，改由全局共享 worker 池按需 pump。
+    /// 切换为 <see cref="OutboundSendMode.PerSessionDrain"/> 后，每连接按需启动自有 async drain，
+    /// 慢 Socket 不占用全局 Worker 名额。
     /// </para>
     /// <para>
     /// 切换不影响 wire 协议与出站 FIFO/ephemeral mailbox 语义，仅改变驱动 Task 模型。
@@ -341,6 +389,11 @@ public sealed class TcpGatewayOptions
         EphemeralActorOperationTimeout > TimeSpan.Zero &&
         OnDemandSendWorkerCount >= 0 &&
         OnDemandSendBurstLimit > 0 &&
+        ReceiveBufferInitialSize >= 512 &&
+        ReceiveBufferMaxSize >= ReceiveBufferInitialSize &&
+        ReceiveBufferDowngradeIdleTimeout >= TimeSpan.Zero &&
+        HeaderAssemblyTimeout >= TimeSpan.Zero &&
+        PayloadAssemblyTimeout >= TimeSpan.Zero &&
         MinimumClientProtocolVersion >= PacketProtocol.MinProtocolVersion &&
         MinimumClientProtocolVersion <= PacketProtocol.CurrentProtocolVersion &&
         ResumeTokenTtl > TimeSpan.Zero &&

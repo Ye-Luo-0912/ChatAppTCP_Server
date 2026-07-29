@@ -25,5 +25,14 @@ public enum ActorPostStatus : byte
     StaleGeneration = 5,
 
     /// <summary>Runtime 正在停止或已停止。</summary>
-    RuntimeStopping = 6
+    RuntimeStopping = 6,
+
+    /// <summary>
+    /// Actor 数量配额已满（全局或每 Shard 上限）。
+    /// 仅由 <see cref="IActorRuntime{TKey,TState,TMessage}.TryTellDurable"/> 返回——
+    /// 生产侧同步检查发现配额超限，消息未入队。
+    /// <see cref="IActorRuntime{TKey,TState,TMessage}.TryTellEphemeral"/> 不做此检查，
+    /// 因为临时消息可丢。
+    /// </summary>
+    AdmissionRejected = 7
 }

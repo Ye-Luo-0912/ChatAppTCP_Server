@@ -36,6 +36,12 @@ public readonly struct ActorRuntimeSnapshot
     /// <summary>累计因 MaxActiveActors / MaxActiveActorsPerShard 上限被拒绝的激活总数。</summary>
     public long TotalActiveActorAdmissionRejected { get; init; }
 
+    /// <summary>
+    /// 累计 LatestOnly Mailbox 因新消息替换旧消息而被丢弃的总数。
+    /// 反映 typing=true→false 等快速状态变更的合并频率。
+    /// </summary>
+    public long TotalReplaced { get; init; }
+
     /// <summary>当前已注册但尚未触发的 deadline 数。</summary>
     public long PendingDeadlines { get; init; }
 

@@ -34,6 +34,8 @@ internal sealed class CancellationTokenSourcePool
 {
     private readonly ConcurrentStack<CancellationTokenSource> _stack = new();
     private readonly int _maxCapacity;
+    // 独立原子计数：避免热路径查询 ConcurrentStack.Count 的内部锁竞争。
+    private int _count;
 
     /// <param name="maxCapacity">池上限。超过此数量的归还实例直接丢弃。默认 256。</param>
     public CancellationTokenSourcePool(int maxCapacity = 256)
@@ -54,6 +56,7 @@ internal sealed class CancellationTokenSourcePool
     {
         while (_stack.TryPop(out var cts))
         {
+            Interlocked.Decrement(ref _count);
             if (cts.TryReset())
                 return cts;
             // TryReset 失败（CTS 不可重置，如已 Dispose）：丢弃
@@ -73,11 +76,12 @@ internal sealed class CancellationTokenSourcePool
     public void Return(CancellationTokenSource cts)
     {
         ArgumentNullException.ThrowIfNull(cts);
-        if (_stack.Count >= _maxCapacity)
+        if (Volatile.Read(ref _count) >= _maxCapacity)
         {
             cts.Dispose();
             return;
         }
         _stack.Push(cts);
+        Interlocked.Increment(ref _count);
     }
 }

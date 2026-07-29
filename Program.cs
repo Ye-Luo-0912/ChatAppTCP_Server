@@ -10,6 +10,7 @@ using ChatApp.TcpGateway.Gateway.Commands.Reactions;
 using ChatApp.TcpGateway.Gateway.Configuration;
 using ChatApp.TcpGateway.Gateway.Diagnostics;
 using ChatApp.TcpGateway.Gateway.Dispatching;
+using ChatApp.TcpGateway.Gateway.Networking.Ephemeral;
 using ChatApp.TcpGateway.Gateway.Networking.Sessions;
 using ChatApp.TcpGateway.Infrastructure;
 using ChatApp.TcpGateway.Infrastructure.Caching;
@@ -80,6 +81,11 @@ builder.Services.AddSingleton<UserSessionRegistry>();
 builder.Services.AddSingleton<PresenceWatcherRegistry>();
 builder.Services.AddSingleton<TypingFanoutCoordinator>();
 builder.Services.AddSingleton<IGlobalPresenceStore, RedisGlobalPresenceStore>();
+// Typing 授权失效桥接器：RelationshipListHandler 注入此单例（作为 ITypingAuthorizationInvalidator），
+// TcpGatewayService 创建 TypingActorPipeline 后调用 SetInstance 注册真实实现。
+builder.Services.AddSingleton<TypingAuthorizationInvalidatorAccessor>();
+builder.Services.AddSingleton<ITypingAuthorizationInvalidator>(sp =>
+    sp.GetRequiredService<TypingAuthorizationInvalidatorAccessor>());
 builder.Services.AddSingleton<RealtimeEventDispatcher>();
 builder.Services.AddGatewayInfrastructure();
 builder.Services.AddChatAppRealtimeIntegration(

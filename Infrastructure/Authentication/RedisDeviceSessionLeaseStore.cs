@@ -233,12 +233,12 @@ internal sealed class RedisDeviceSessionLeaseStore : IDeviceSessionLeaseStore
         if (userId <= 0)
             return null;
 
+        // 熔断器开路时抛异常而非返回 null——返回 null 会让 Coordinator 误判为"无租约"
+        // 并放行 Resume（fail-open）。Same-device fencing 属于安全不变量，必须 fail-closed。
+        // Coordinator 在 TryResumeAsync 入口已有 breaker 检查（CircuitOpen 路径），
+        // 此处仅为 race-condition 兜底（breaker 在 Coordinator 检查与 lease 查询之间开路）。
         if (_circuitBreaker is { IsAvailable: false })
-        {
-            // 熔断器开路：查询失败返回 null，退化为不拦截（与原 RedisException 路径一致），
-            // 由 RevokeAsync 兜底防止旧 Token 复活。
-            return null;
-        }
+            throw new RedisException("Redis circuit breaker is open");
 
         var key = CreateKey(userId, deviceIdHash);
         try
@@ -264,8 +264,9 @@ internal sealed class RedisDeviceSessionLeaseStore : IDeviceSessionLeaseStore
                 GatewayDependency.Redis,
                 GatewayDependencyOperation.DeviceLeaseQuery,
                 exception);
-            // 查询失败时返回 null，退化为不拦截（与无租约等同），避免阻断恢复。
-            return null;
+            // 抛异常让 Coordinator fail-closed（拒绝 Resume，要求完整认证）。
+            // 旧实现返回 null 导致 Redis 故障期间旧 Token 绕过设备租约 fencing 校验。
+            throw;
         }
     }
 

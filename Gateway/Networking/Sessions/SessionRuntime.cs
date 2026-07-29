@@ -51,6 +51,7 @@ internal sealed partial class SessionRuntime
     private readonly EphemeralCommandPipeline _ephemeralPipeline;
     private readonly TypingActorPipeline? _typingActorPipeline;
     private readonly GatewayMetrics _metrics;
+    private readonly TimeProvider _timeProvider;
     private readonly ILogger _logger;
 
     private readonly Func<PacketFrame, TcpClientSession, string, CancellationToken, ValueTask> _processPacketAsync;
@@ -66,6 +67,7 @@ internal sealed partial class SessionRuntime
         EphemeralCommandPipeline ephemeralPipeline,
         TypingActorPipeline? typingActorPipeline,
         GatewayMetrics metrics,
+        TimeProvider timeProvider,
         ILogger logger,
         Func<PacketFrame, TcpClientSession, string, CancellationToken, ValueTask> processPacketAsync,
         Action<TcpClientSession, ProtocolErrorCode, string?, bool, int?, ushort?> sendProtocolError,
@@ -79,6 +81,7 @@ internal sealed partial class SessionRuntime
         _ephemeralPipeline = ephemeralPipeline;
         _typingActorPipeline = typingActorPipeline;
         _metrics = metrics;
+        _timeProvider = timeProvider;
         _logger = logger;
         _processPacketAsync = processPacketAsync;
         _sendProtocolError = sendProtocolError;

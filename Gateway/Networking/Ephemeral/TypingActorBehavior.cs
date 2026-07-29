@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using ChatApp.ActorRuntime.Abstractions;
 using ChatApp.ActorRuntime.Runtime;
 using ChatApp.ActorRuntime.Scheduling;
@@ -32,6 +33,8 @@ internal sealed class TypingActorBehavior
     private readonly DomainWorkLane<TypingAuthorizationWork> _authLane;
     private readonly GatewayMetrics _metrics;
     private readonly ILogger _logger;
+    private readonly TimeProvider _timeProvider;
+    private readonly TimeSpan _authorizationTtl;
     private IActorRuntime<TypingActorKey, TypingActorState, TypingActorMessage>? _runtime;
 
     public TypingActorBehavior(
@@ -39,13 +42,17 @@ internal sealed class TypingActorBehavior
         IDirectConversationAuthorizer? authorizer,
         TypingFanoutCoordinator typingFanout,
         GatewayMetrics metrics,
-        ILogger logger)
+        ILogger logger,
+        TimeProvider timeProvider,
+        TimeSpan authorizationTtl)
     {
         _authLane = authLane;
         _authorizer = authorizer;
         _typingFanout = typingFanout;
         _metrics = metrics;
         _logger = logger;
+        _timeProvider = timeProvider;
+        _authorizationTtl = authorizationTtl;
     }
 
     public void Attach(
@@ -72,9 +79,14 @@ internal sealed class TypingActorBehavior
         in TypingActorMessage message,
         ref ActorContext<TypingActorKey, TypingActorState, TypingActorMessage> context)
     {
-        return message.Kind == TypingActorMessageKind.AuthorizationCompleted
-            ? ReceiveAuthorizationCompleted(in key, in message, ref state)
-            : ReceiveNotify(in key, ref state, in message, ref context);
+        return message.Kind switch
+        {
+            TypingActorMessageKind.AuthorizationCompleted =>
+                ReceiveAuthorizationCompleted(in key, in message, ref state),
+            TypingActorMessageKind.AuthorizationInvalidated =>
+                ReceiveAuthorizationInvalidated(ref state),
+            _ => ReceiveNotify(in key, ref state, in message, ref context)
+        };
     }
 
     private ActorTurnResult ReceiveNotify(
@@ -87,11 +99,20 @@ internal sealed class TypingActorBehavior
         state.LastNotifyTimestamp = context.Timestamp;
         state.SessionGeneration = message.SessionGeneration;
 
-        // 授权已缓存：直接发射，无需 I/O。
-        if (state.Authorized)
+        // 授权已缓存且未过 TTL：直接发射，无需 I/O。
+        // TTL 由 TypingAuthorizationTtl 配置（默认与 CachedDirectConversationAuthorizer
+        // 的 allowTtl 对齐）。超过 TTL 后 Authorized 自动失效，下一次 Notify 触发新 I/O。
+        if (state.Authorized && context.Timestamp < state.AuthorizedUntilTimestamp)
         {
             TryEmit(ref state, in key);
             return ActorTurnResult.Continue;
+        }
+
+        // 授权过期：清空缓存，触发重新授权。
+        if (state.Authorized)
+        {
+            state.Authorized = false;
+            state.AuthorizedUntilTimestamp = 0;
         }
 
         // 授权未缓存且无 I/O 进行中：提交授权查询到领域 Lane（不装箱）。
@@ -145,6 +166,11 @@ internal sealed class TypingActorBehavior
             return ActorTurnResult.Continue;
         }
 
+        // 授权通过：记录 TTL 截止时间戳，到期后下一次 Notify 必须重新走 I/O。
+        // 与 CachedDirectConversationAuthorizer 的 allowTtl 对齐（默认 30s）。
+        state.AuthorizedUntilTimestamp = _timeProvider.GetTimestamp() +
+            (long)(_authorizationTtl.TotalSeconds * _timeProvider.TimestampFrequency);
+
         // 授权通过：直接发射当前期望状态。
         // 原始 Notify 在提交 auth I/O 时已从 Mailbox 消费，
         // 若无新 Notify 到达，ResumeMailbox 无消息可恢复——
@@ -153,6 +179,20 @@ internal sealed class TypingActorBehavior
         // ResumeMailbox 会处理它并可能再次 TryEmit（幂等：状态相同则跳过）。
         TryEmit(ref state, in key);
         return ActorTurnResult.ResumeMailbox;
+    }
+
+    /// <summary>
+    /// 关系变更触发的授权失效：清空 Actor 内缓存的 Authorized=true 与 TTL，
+    /// 下一次 Notify 必须重新走授权 I/O。不主动 Deactivate——
+    /// 若有 in-flight Notify 等待授权完成，Completion 仍会到达并按新状态发射。
+    /// </summary>
+    private static ActorTurnResult ReceiveAuthorizationInvalidated(ref TypingActorState state)
+    {
+        state.Authorized = false;
+        state.AuthorizedUntilTimestamp = 0;
+        // AuthPending 保持原值：若授权 I/O 正在进行，Completion 回来后会覆盖 Authorized。
+        // 这里不强行清零 AuthPending，避免 Completion 回来后误以为已缓存而跳过 I/O。
+        return ActorTurnResult.Continue;
     }
 
     /// <summary>
@@ -234,6 +274,8 @@ internal readonly struct TypingAuthorizationWork : IAsyncOperation
 
     public async ValueTask ExecuteAsync(CancellationToken cancellationToken)
     {
+        // 用 Stopwatch 高频时钟记录授权 I/O 耗时，避免向 struct 注入 TimeProvider 增大体积。
+        var startTimestamp = Stopwatch.GetTimestamp();
         bool authorized;
         if (_authorizer is null)
         {
@@ -264,6 +306,11 @@ internal readonly struct TypingAuthorizationWork : IAsyncOperation
                 authorized = false;
             }
         }
+
+        // 记录授权 I/O 耗时直方图：含缓存命中与远程查询，按 outcome 区分。
+        var elapsedMs = (double)(Stopwatch.GetTimestamp() - startTimestamp)
+            / Stopwatch.Frequency * 1000.0;
+        _metrics.TypingAuthCompleted(elapsedMs, authorized);
 
         var completion = TypingActorMessage.AuthorizationCompleted(authorized);
         _runtime.TryTellCompletion(in _key, _activation, in completion);

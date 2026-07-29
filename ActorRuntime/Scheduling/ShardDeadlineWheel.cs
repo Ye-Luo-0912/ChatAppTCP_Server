@@ -1,4 +1,5 @@
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using ChatApp.ActorRuntime.Abstractions;
 
 namespace ChatApp.ActorRuntime.Scheduling;
@@ -54,7 +55,10 @@ internal sealed class ShardDeadlineWheel<TKey, TState, TMessage>
 
     public int PendingCount => Volatile.Read(ref _pendingCount);
 
-    public void Schedule(
+    /// <summary>
+    /// 调度一条 Deadline，返回条目所在桶索引（用于 O(1) 取消）。
+    /// </summary>
+    public int Schedule(
         TimeSpan delay,
         ActivationId activation,
         uint deadlineEpoch,
@@ -62,7 +66,7 @@ internal sealed class ShardDeadlineWheel<TKey, TState, TMessage>
         in TMessage message)
     {
         if (delay <= TimeSpan.Zero)
-            return;
+            return -1;
 
         var delayTimestamps =
             (long)(delay.TotalSeconds * _timeProvider.TimestampFrequency);
@@ -85,6 +89,19 @@ internal sealed class ShardDeadlineWheel<TKey, TState, TMessage>
             Message = message
         });
         _pendingCount++;
+        return targetIndex;
+    }
+
+    /// <summary>
+    /// 标记指定桶中匹配 (activation, deadlineEpoch) 的条目为已取消。
+    /// 条目在桶排空时被跳过，不回调 OnExpired。
+    /// 仅扫描单个桶，O(bucket_size)——桶通常很小（初始容量 8）。
+    /// </summary>
+    public void TryCancelScheduled(int bucketIndex, ActivationId activation, uint deadlineEpoch)
+    {
+        if ((uint)bucketIndex >= (uint)BucketCount)
+            return;
+        _buckets[bucketIndex].TryCancel(activation, deadlineEpoch);
     }
 
     public void PumpExpired()
@@ -136,6 +153,14 @@ internal sealed class ShardDeadlineWheel<TKey, TState, TMessage>
         for (var i = 0; i < entries.Count; i++)
         {
             var entry = entries[i];
+
+            // 已取消的条目直接丢弃，不回调 OnExpired。
+            if (entry.Cancelled)
+            {
+                _pendingCount--;
+                continue;
+            }
+
             if (entry.Rounds > 0)
             {
                 entry.Rounds--;
@@ -161,6 +186,9 @@ internal sealed class ShardDeadlineWheel<TKey, TState, TMessage>
         public uint DeadlineEpoch;
         public TKey Key;
         public TMessage Message;
+#pragma warning disable CS0649 // 通过 CollectionsMarshal.AsSpan ref 赋值
+        public bool Cancelled;
+#pragma warning restore CS0649
     }
 
     private sealed class Bucket
@@ -172,6 +200,26 @@ internal sealed class ShardDeadlineWheel<TKey, TState, TMessage>
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public void Add(TimerEntry entry) => _pending.Add(entry);
+
+        /// <summary>
+        /// 标记 _pending 列表中匹配 (activation, deadlineEpoch) 的条目为已取消。
+        /// 不从 List 移除（避免 RemoveAt 的 O(n) 移位），仅在排空时跳过。
+        /// </summary>
+        public void TryCancel(ActivationId activation, uint deadlineEpoch)
+        {
+            var list = _pending;
+            for (var i = 0; i < list.Count; i++)
+            {
+                ref var entry = ref CollectionsMarshal.AsSpan(list)[i];
+                if (!entry.Cancelled &&
+                    entry.Activation == activation &&
+                    entry.DeadlineEpoch == deadlineEpoch)
+                {
+                    entry.Cancelled = true;
+                    return;
+                }
+            }
+        }
 
         public List<TimerEntry> BeginDrain()
         {

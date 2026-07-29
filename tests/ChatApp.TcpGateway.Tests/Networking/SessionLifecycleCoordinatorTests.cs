@@ -113,6 +113,71 @@ public sealed class SessionLifecycleCoordinatorTests
     }
 
     [Fact]
+    public async Task TryResumeAsync_FailsWithLeaseQueryFailed_WhenLeaseQueryThrows()
+    {
+        // R-3: 设备租约查询失败时必须 fail-closed（拒绝恢复），而非旧行为的 fail-open（继续恢复）。
+        // Same-device fencing 属于安全不变量，依赖不可用时要求完整认证。
+        var ct = TestContext.Current.CancellationToken;
+        using var metrics = new GatewayMetrics();
+        var bus = new CapturingMessageBus();
+        var leaseStore = new FakeDeviceSessionLeaseStore
+        {
+            OnGetCurrentSessionId = _ => throw new InvalidOperationException("simulated lease query failure")
+        };
+        var tokenStore = new FakeResumeTokenStore
+        {
+            OnTryValidate = _ => Task.FromResult<ResumeContext?>(
+                new ResumeContext
+                {
+                    UserId = 1001,
+                    SessionId = "resuming-session",
+                    ConnectionLeaseId = "old-lease",
+                    DeviceIdHash = 0xAA
+                })
+        };
+        var coordinator = CreateCoordinator(metrics, bus, leaseStore, tokenStore);
+        await using var session = CreateSession(metrics);
+
+        var result = await coordinator.TryResumeAsync("valid-token", session, ct);
+
+        // 拒绝恢复（fail-closed）
+        Assert.Null(result);
+        // 不应广播任何事件（未恢复成功）
+        Assert.Empty(bus.PublishedEvents);
+    }
+
+    [Fact]
+    public async Task TryResumeAsync_RecordsLeaseQueryFailedMetric_WhenLeaseQueryThrows()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        using var metrics = new GatewayMetrics();
+        using var failedListener = new SingleCounterListener("gateway.resume.failed");
+        var bus = new CapturingMessageBus();
+        var leaseStore = new FakeDeviceSessionLeaseStore
+        {
+            OnGetCurrentSessionId = _ => throw new InvalidOperationException("simulated lease query failure")
+        };
+        var tokenStore = new FakeResumeTokenStore
+        {
+            OnTryValidate = _ => Task.FromResult<ResumeContext?>(
+                new ResumeContext
+                {
+                    UserId = 1001,
+                    SessionId = "resuming-session",
+                    ConnectionLeaseId = "old-lease",
+                    DeviceIdHash = 0xAA
+                })
+        };
+        var coordinator = CreateCoordinator(metrics, bus, leaseStore, tokenStore);
+        await using var session = CreateSession(metrics);
+
+        await coordinator.TryResumeAsync("valid-token", session, ct);
+
+        Assert.True(failedListener.WaitForIncrement(TimeSpan.FromSeconds(2)),
+            "gateway.resume.failed was not incremented for lease query failure");
+    }
+
+    [Fact]
     public async Task TryResumeAsync_FailsWithInvalidToken_WhenTokenStoreReturnsNullContext()
     {
         var ct = TestContext.Current.CancellationToken;

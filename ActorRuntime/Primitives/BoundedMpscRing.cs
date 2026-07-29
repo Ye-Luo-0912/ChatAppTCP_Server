@@ -5,19 +5,20 @@ namespace ChatApp.ActorRuntime.Primitives;
 
 /// <summary>
 /// 有界多生产者单消费者 (MPSC) 环形队列。基于 Dmitry Vyukov 的 MPMC bounded queue 算法，
-/// 简化为单消费者：消费端无需 CAS，仅原子读 cursor。
+/// 简化为单消费者：消费端无 CAS，仅原子读 cursor 后直接推进。
 /// <para>
 /// 设计要点：
 /// <list type="bullet">
 /// <item>容量必须为 2 的幂，掩码 <c>capacity - 1</c> 替代取模；</item>
 /// <item>每个槽位独立持有 sequence number（带缓存行对齐避免 false sharing）；</item>
 /// <item>生产者通过 CAS 推进 <c>_head</c>，每个槽位写入后发布 sequence；</item>
-/// <item>单消费者无锁推进 <c>_tail</c>，仅读取 sequence 判断可用性；</item>
+/// <item>单消费者无锁推进 <c>_tail</c>，仅读取 sequence 判断可用性——无 CAS 开销；</item>
 /// <item>满返回 false 而非阻塞；调用方按 <see cref="ActorPostStatus.ShardOverloaded"/> 处理。</item>
 /// </list>
 /// </para>
 /// <para>
-/// 用于每 Shard 的 Ingress Ring：多线程 TCP Read / I/O Completion → 单 Shard Consumer。
+/// 用于每 Shard 的 Ingress Ring 与 Completion Ring：多线程 TCP Read / I/O Completion → 单 Shard Consumer。
+/// 多消费者场景（如 DomainWorkLane 共享 Worker 池）应使用 <see cref="BoundedMpmcRing{T}"/>。
 /// </para>
 /// </summary>
 internal sealed class BoundedMpscRing<T> where T : struct
@@ -107,17 +108,16 @@ internal sealed class BoundedMpscRing<T> where T : struct
     }
 
     /// <summary>
-    /// 单消费者或多消费者出队。队列为空或竞争失败时返回 false。
+    /// 单消费者出队。队列为空时返回 false。
     /// <para>
-    /// 通过 CAS 推进 <c>_tail</c> 保证多消费者安全：竞争失败的调用方应重试（spin/yield）。
-    /// 单消费者场景（如 Shard Consumer Loop）CAS 必然成功，无额外开销。
+    /// 单消费者场景无需 CAS：直接推进 <c>_tail</c>，仅通过 volatile 协调可见性。
+    /// 多消费者场景应使用 <see cref="BoundedMpmcRing{T}"/>。
     /// </para>
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool TryDequeue(out T item)
     {
-        var tail = Volatile.Read(ref _tail.Value);
-        // tail 已通过 mask 约束，局部使用 Unsafe.Add 不暴露任意指针。
+        var tail = _tail.Value;
         ref var first = ref MemoryMarshal.GetArrayDataReference(_buffer);
         ref var cell = ref Unsafe.Add(
             ref first,
@@ -127,17 +127,10 @@ internal sealed class BoundedMpscRing<T> where T : struct
 
         if (diff == 0)
         {
-            // 槽位可读：CAS 推进 tail。MPSC 场景下单消费者必然成功；
-            // MPMC 场景下（如 DomainWorkLane）竞争失败者返回 false 由调用方重试。
-            if (Interlocked.CompareExchange(ref _tail.Value, tail + 1, tail) != tail)
-            {
-                item = default!;
-                return false;
-            }
-
-            // CAS 成功：本消费者独占该槽位，安全读值并发布新 sequence。
+            // 槽位可读：单消费者直接推进 tail（无 CAS 开销）。
+            _tail.Value = tail + 1;
             item = cell.Value!;
-            // 在发布槽位可复用前清除引用，避免消息/Key 被 Ring 保留一整圈。
+            // 清除引用，避免消息/Key 被 Ring 保留一整圈。
             cell.Value = default!;
             Volatile.Write(ref cell.Sequence, tail + Capacity);
             return true;

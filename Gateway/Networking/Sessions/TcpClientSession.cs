@@ -29,19 +29,29 @@ internal sealed partial class TcpClientSession : IAsyncDisposable
     private readonly TimeSpan _sendTimeout;
     private readonly GatewayMetrics _metrics;
     private readonly ILogger<TcpClientSession> _logger;
-    // PersistentSendLoop 模式下的永久发送 Task；OnDemandSendPump 模式下为 null。
+    // PersistentSendLoop 模式下的永久发送 Task；OnDemandSendPump/PerSessionDrain 模式下为 null。
     private readonly Task? _sendLoop;
     private readonly long _connectedTimestamp;
 
     // OnDemandSendPump 模式专用：共享出站 pump 协调器。
-    // PersistentSendLoop 模式下为 null，TryQueue/TryQueueEphemeral 不调用 TryScheduleSend。
+    // PersistentSendLoop/PerSessionDrain 模式下为 null。
     private readonly OutboundPumpCoordinator? _outboundPump;
+    // PerSessionDrain 模式专用：当前活跃的按需 drain Task。
+    // 非 null 表示有 drain 正在运行；drain 退出时（CAS Running→Idle）由 GC 回收。
+    // PersistentSendLoop/OnDemandSendPump 模式下为 null。
+    private Task? _perSessionDrainTask;
+    // PerSessionDrain 模式标志：构造时确定，影响 TryScheduleSend 分支。
+    private readonly bool _usePerSessionDrain;
+
     // OnDemandSendPump 三态调度状态机，CAS 驱动：
     //   Idle(0)    → Queued(1)：enqueuer CAS 成功后 TrySchedule 入 ready queue
     //   Queued(1)   → Running(2)：worker 出队后 CAS 取得发送所有权
     //   Running(2)  → Queued(1)：pump 结束但仍有 pending work，重新入队（不经过 Idle）
     //   Running(2)  → Idle(0)：pump 结束且无 pending work，转空闲后重检防丢失唤醒
-    // 关键规则：Session 在 Running 状态下不会自行重新排队；任意时刻最多一个 worker 持有发送所有权。
+    // PerSessionDrain 二态调度状态机（复用 Idle/Running，跳过 Queued）：
+    //   Idle(0)    → Running(2)：enqueuer CAS 成功后启动自有 drain Task
+    //   Running(2)  → Idle(0)：drain 队列空后 CAS 退出，重检防丢失唤醒
+    // 关键规则：任意时刻最多一个 worker/drain 持有发送所有权。
     private const int SendStateIdle = 0;
     private const int SendStateQueued = 1;
     private const int SendStateRunning = 2;
@@ -54,16 +64,17 @@ internal sealed partial class TcpClientSession : IAsyncDisposable
     // 标记是否已有 flush sentinel 在 _outbound 队列中，避免重复入队。
     private volatile bool _ephemeralFlushPending;
 
-    // 发送超时：通过全局 DeadlineWheel 注册 deadline，到期检查 _sendInProgress 后关闭会话。
+    // 发送超时：通过 SendTimeoutTracker 周期扫描管理（替代每帧 DeadlineWheel.Register）。
     // 单调时钟 + generation（_sendInProgress CompareExchange）防止墙钟回拨与跨发送代次误关。
+    // Auth/Idle 超时仍由 DeadlineWheel 管理（低频，符合其设计假设）。
     private readonly DeadlineWheel? _deadlineWheel;
+    private readonly SendTimeoutTracker? _sendTimeoutTracker;
     private int _sendInProgress; // 0 = idle, 1 = sending
     // 当前发送开始时的单调时间戳（GetTimestamp()）。仅在 _sendInProgress=1 时有效，0 表示空闲。
-    // Timer 回调用 GetElapsedTime(startedAt) >= _sendTimeout 判断超时，
+    // 扫描线程用 GetElapsedTime(startedAt) >= _sendTimeout 判断超时，
     // 避免墙钟回拨导致 deadline 永不到达、Socket Send 永不被关闭。
-    // 跨发送代次的旧 Timer 回调通过 _sendInProgress 的 CompareExchange 防止误关后续发送。
+    // 跨发送代次的旧扫描通过 _sendInProgress 的 CompareExchange 防止误关后续发送。
     private long _sendStartedAt;
-    private DeadlineRegistration _sendDeadlineRegistration;
 
     // 鉴权超时：通过全局 DeadlineWheel 注册 deadline，认证成功后取消。
     private DeadlineRegistration _authDeadlineRegistration;
@@ -101,7 +112,9 @@ internal sealed partial class TcpClientSession : IAsyncDisposable
         TimeSpan authenticationTimeout = default,
         DeadlineWheel? deadlineWheel = null,
         TimeSpan idleTimeout = default,
-        OutboundPumpCoordinator? outboundPump = null)
+        OutboundPumpCoordinator? outboundPump = null,
+        SendTimeoutTracker? sendTimeoutTracker = null,
+        bool usePerSessionDrain = false)
     {
         _socket = socket;
         ConnectionId = connectionId;
@@ -111,8 +124,10 @@ internal sealed partial class TcpClientSession : IAsyncDisposable
         _logger = logger;
         _globalOutboundBudget = globalOutboundBudget;
         _deadlineWheel = deadlineWheel;
+        _sendTimeoutTracker = sendTimeoutTracker;
         _idleTimeout = idleTimeout;
         _outboundPump = outboundPump;
+        _usePerSessionDrain = usePerSessionDrain;
         _outboundBudget = new OutboundQueueBudget(
             maxOutboundQueuedBytes);
 
@@ -129,14 +144,6 @@ internal sealed partial class TcpClientSession : IAsyncDisposable
                 AllowSynchronousContinuations = false,
                 FullMode = BoundedChannelFullMode.Wait
             });
-
-        // 发送超时：通过全局 DeadlineWheel 注册。
-        // _sendDeadlineRegistration 初始为 default(Id=0)，在 SendFrameAsync 中按需注册。
-        if (_deadlineWheel is not null && sendTimeout > TimeSpan.Zero)
-        {
-            // 占位：实际注册在每次 SendFrameAsync 开始时。
-            _sendDeadlineRegistration = default;
-        }
 
         // 鉴权超时：通过全局 DeadlineWheel 注册一次性 deadline，认证成功后取消。
         // deadlineWheel=null 时（测试场景）退化为不启用 deadline，由 HeartbeatCoordinator 兜底扫描。
@@ -162,10 +169,12 @@ internal sealed partial class TcpClientSession : IAsyncDisposable
         }
 
         // 出站驱动模型按模式分支：
-        // - PersistentSendLoop（_outboundPump=null）：启动永久 SendLoop Task 消费 _outbound Channel。
-        // - OnDemandSendPump（_outboundPump≠null）：不启动 Task，由 TryQueue/TryQueueEphemeral
-        //   入队后 CAS 唤醒共享 worker 池（PumpOutboundAsync）。
-        _sendLoop = _outboundPump is null ? SendLoopAsync() : null;
+        // - PersistentSendLoop（_outboundPump=null, _usePerSessionDrain=false）：启动永久 SendLoop Task。
+        // - OnDemandSendPump（_outboundPump≠null, _usePerSessionDrain=false）：不启动 Task，
+        //   由 TryQueue/TryQueueEphemeral 入队后 CAS 唤醒共享 worker 池（PumpOutboundAsync）。
+        // - PerSessionDrain（_outboundPump=null, _usePerSessionDrain=true）：不启动 Task，
+        //   由 TryQueue/TryQueueEphemeral 入队后 CAS Idle→Running 启动自有 drain Task。
+        _sendLoop = (_outboundPump is null && !_usePerSessionDrain) ? SendLoopAsync() : null;
     }
 
     public uint ConnectionId { get; }

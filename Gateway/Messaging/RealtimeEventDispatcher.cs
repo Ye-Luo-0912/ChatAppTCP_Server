@@ -8,6 +8,7 @@ using ChatApp.TcpGateway.Core.Serialization;
 using ChatApp.TcpGateway.Gateway.Diagnostics;
 using ChatApp.TcpGateway.Gateway.Messaging.Realtime;
 using ChatApp.TcpGateway.Gateway.Messaging.Realtime.Handlers;
+using ChatApp.TcpGateway.Gateway.Networking.Ephemeral;
 using ChatApp.TcpGateway.Gateway.Networking.Sessions;
 using ChatApp.TcpGateway.Observability.Logging;
 using ChatApp.TcpGateway.Observability.Metrics;
@@ -56,7 +57,8 @@ internal sealed class RealtimeEventDispatcher
         IPayloadCodec<RelationshipListChangedUpdate>? relationshipListChangedCodec = null,
         IPayloadCodec<AttachmentLifecycleUpdate>? attachmentLifecycleCodec = null,
         IResumeTokenStore? resumeTokenStore = null,
-        IDirectConversationAuthorizer? directConversationAuthorizer = null)
+        IDirectConversationAuthorizer? directConversationAuthorizer = null,
+        ITypingAuthorizationInvalidator? typingAuthorizationInvalidator = null)
         : this(
             BuildRegistry(
                 userSessions,
@@ -79,7 +81,8 @@ internal sealed class RealtimeEventDispatcher
                 relationshipListChangedCodec,
                 attachmentLifecycleCodec,
                 resumeTokenStore,
-                directConversationAuthorizer),
+                directConversationAuthorizer,
+                typingAuthorizationInvalidator),
             metrics,
             logger)
     {
@@ -140,7 +143,8 @@ internal sealed class RealtimeEventDispatcher
         IPayloadCodec<RelationshipListChangedUpdate>? relationshipListChangedCodec,
         IPayloadCodec<AttachmentLifecycleUpdate>? attachmentLifecycleCodec,
         IResumeTokenStore? resumeTokenStore,
-        IDirectConversationAuthorizer? directConversationAuthorizer)
+        IDirectConversationAuthorizer? directConversationAuthorizer,
+        ITypingAuthorizationInvalidator? typingAuthorizationInvalidator)
     {
         var delivery = new RealtimeEventDeliveryHelper(userSessions, metrics);
         // 复用 dispatcher 的 logger：原 RejectEvent 也走该 logger，保持日志类别一致。
@@ -162,7 +166,8 @@ internal sealed class RealtimeEventDispatcher
             memberJoinedUpdateCodec, memberLeftUpdateCodec, memberRemovedUpdateCodec,
             roleChangedUpdateCodec, delivery, rejection);
         IRealtimeEventHandler relationshipList = new RelationshipListHandler(
-            relationshipListChangedCodec, delivery, rejection, metrics, directConversationAuthorizer);
+            relationshipListChangedCodec, delivery, rejection, metrics, directConversationAuthorizer,
+            typingAuthorizationInvalidator);
         IRealtimeEventHandler attachmentLifecycle = new AttachmentLifecycleHandler(
             attachmentLifecycleCodec, delivery, rejection, metrics);
         IRealtimeEventHandler sessionRevocation = new SessionRevocationHandler(

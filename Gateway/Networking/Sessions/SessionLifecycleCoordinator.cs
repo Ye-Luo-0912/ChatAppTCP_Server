@@ -204,33 +204,22 @@ internal sealed partial class SessionLifecycleCoordinator
         // 这与同设备替换时调用 RevokeAsync 撤销旧 Token 形成双重防线：
         //   1) RevokeAsync 删除 Redis 中的旧 Token（阻断 Token 复活）
         //   2) 此处代次校验拦截在 Token 被 Revoke 前的 TTL 窗口内已消费的恢复请求
+        //
+        // Fail-closed 策略：当租约查询依赖不可用（Redis 异常或熔断器开路）时，
+        // 拒绝恢复并要求完整认证。Same-device fencing 属于安全不变量，
+        // fail-open 会让旧 Token 在 Redis 部分故障期间绕过"新会话已接管设备"的 fencing 校验。
         if (context.DeviceIdHash is { } resumeDeviceHash
             && !string.IsNullOrWhiteSpace(context.SessionId))
         {
+            string? currentLeaseSessionId;
             try
             {
-                var currentLeaseSessionId = await _deviceSessionLeaseStore
+                currentLeaseSessionId = await _deviceSessionLeaseStore
                     .GetCurrentSessionIdAsync(
                         context.UserId,
                         resumeDeviceHash,
                         cancellationToken)
                     .ConfigureAwait(false);
-
-                if (!string.IsNullOrWhiteSpace(currentLeaseSessionId)
-                    && !string.Equals(
-                        currentLeaseSessionId,
-                        context.SessionId,
-                        StringComparison.Ordinal))
-                {
-                    // 设备租约已归属另一个更新的会话，拒绝恢复旧会话。
-                    _logger.TransportFailed(
-                        GatewayTransportOperation.ClientProcessing,
-                        session.ConnectionId,
-                        new InvalidOperationException(
-                            "Resume rejected: device lease owned by a newer session."));
-                    _metrics.ResumeFailed(ResumeFailureReason.LeaseMismatch);
-                    return null;
-                }
             }
             catch (Exception ex)
             {
@@ -238,7 +227,26 @@ internal sealed partial class SessionLifecycleCoordinator
                     GatewayDependency.Redis,
                     GatewayDependencyOperation.DeviceLeaseQuery,
                     ex);
-                // 查询失败时不阻断恢复（退化为旧行为），由 RevokeAsync 兜底。
+                // Fail-closed：依赖不可用时拒绝恢复，要求完整认证。
+                // 旧行为是 fail-open（继续恢复），会让旧 Token 绕过设备租约 fencing。
+                _metrics.ResumeFailed(ResumeFailureReason.LeaseQueryFailed);
+                return null;
+            }
+
+            if (!string.IsNullOrWhiteSpace(currentLeaseSessionId)
+                && !string.Equals(
+                    currentLeaseSessionId,
+                    context.SessionId,
+                    StringComparison.Ordinal))
+            {
+                // 设备租约已归属另一个更新的会话，拒绝恢复旧会话。
+                _logger.TransportFailed(
+                    GatewayTransportOperation.ClientProcessing,
+                    session.ConnectionId,
+                    new InvalidOperationException(
+                        "Resume rejected: device lease owned by a newer session."));
+                _metrics.ResumeFailed(ResumeFailureReason.LeaseMismatch);
+                return null;
             }
         }
 

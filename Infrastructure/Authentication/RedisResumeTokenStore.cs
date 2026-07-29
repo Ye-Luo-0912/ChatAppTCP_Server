@@ -74,11 +74,12 @@ internal sealed class RedisResumeTokenStore : IResumeTokenStore
         if (string.IsNullOrWhiteSpace(resumeToken))
             return null;
 
+        // 熔断器开路时抛异常而非返回 null——返回 null 会被 Coordinator 误记为 InvalidToken，
+        // 污染 Token 重放率与过期 Token 比例指标。抛异常让 Coordinator 归因为 RedisFailure。
+        // Coordinator 在 TryResumeAsync 入口已有 breaker 检查（CircuitOpen 路径），
+        // 此处仅为 race-condition 兜底（breaker 在 Coordinator 检查与 store 调用之间开路）。
         if (_circuitBreaker is { IsAvailable: false })
-        {
-            // 熔断器开路：拒绝 Resume，客户端走完整认证。
-            return null;
-        }
+            throw new RedisException("Redis circuit breaker is open");
 
         var key = new RedisKey(KeyPrefix + resumeToken.Trim());
 
@@ -86,31 +87,35 @@ internal sealed class RedisResumeTokenStore : IResumeTokenStore
         // 即使客户端误重放，第二次返回 null。
         // DemandMaster：GETDEL 必须落在主节点——若读副本返回 null 但未删除主节点 key，
         // 并发重放会拿到同一 Token，破坏一次性消费语义。
+        byte[]? value;
         try
         {
-            var value = (byte[]?)await _connectionProvider.Database
+            value = (byte[]?)await _connectionProvider.Database
                 .StringGetDeleteAsync(key, CommandFlags.DemandMaster)
                 .ConfigureAwait(false);
             _circuitBreaker?.RecordSuccess();
-
-            if (value is null || value.Length == 0)
-                return null;
-
-            try
-            {
-                return JsonSerializer.Deserialize(
-                    value,
-                    GatewayJsonSerializerContext.Default.ResumeContext);
-            }
-            catch (JsonException)
-            {
-                return null;
-            }
         }
         catch (RedisException)
         {
             _circuitBreaker?.RecordFailure();
-            // 不抛——Resume 路径已有 try/catch 兜底；这里返回 null 让客户端走完整认证。
+            // 抛异常让 Coordinator 归因为 RedisFailure，而非误记为 InvalidToken。
+            // 旧实现返回 null 导致 Redis 故障被污染到 InvalidToken 指标桶。
+            throw;
+        }
+
+        if (value is null || value.Length is 0)
+            return null;
+
+        // 无效 JSON 等同于 Token 损坏，返回 null（InvalidToken）是正确的——
+        // 这不是 Redis 故障，而是 Token 内容无效。
+        try
+        {
+            return JsonSerializer.Deserialize(
+                value,
+                GatewayJsonSerializerContext.Default.ResumeContext);
+        }
+        catch (JsonException)
+        {
             return null;
         }
     }
