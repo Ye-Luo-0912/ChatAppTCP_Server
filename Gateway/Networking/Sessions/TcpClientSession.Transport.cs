@@ -73,16 +73,33 @@ internal sealed partial class TcpClientSession
             // PersistentSendLoop 模式：等待 SendLoop 退出（其 finally 会排空 FIFO + mailbox）。
             // OnDemandSendPump 模式：无永久 Task，直接排空残留（in-flight pump 会因
             // _lifetime 取消而快速退出，其 PumpOutboundAsync 的 finally 也会排空）。
-            // PerSessionDrain 模式：等待活跃 drain Task 退出（其 finally 会排空 FIFO + mailbox）。
+            // PerSessionDrain 模式：等待活跃 drain 退出（其 finally 会排空 FIFO + mailbox）。
             if (_sendLoop is not null)
             {
                 await _sendLoop.ConfigureAwait(false);
             }
-            else if (_perSessionDrainTask is not null)
+            else if (_usePerSessionDrain)
             {
-                await _perSessionDrainTask.ConfigureAwait(false);
-                // 防御性排空：覆盖 CAS 竞争（drain Task 已启动但 _perSessionDrainTask 字段尚未发布）
-                // 与 drain 异常路径 finally 排空失败的理论边缘情况。幂等，多次调用安全。
+                // P1-6：等待 PerSessionDrain 的 drain Task 退出。
+                // _drainOp 同时承担状态（null=Idle）与句柄（non-null=Running），
+                // 消除旧实现 "CAS Idle→Running 成功但 _perSessionDrainTask 未赋值" 的窗口。
+                // Close 已设置 IsConnected=false，新 TryQueue 会失败，故最多一个活跃 drain
+                // 需等待；但 Close→read 窗口内可能有刚 CAS 成功的 drain，循环直到 null。
+                // drain 的 finally 在 Complete() 前已排空 FIFO + 归位 _drainOp + 释放 Tracker，
+                // 故 await 返回后可直接进入 _lifetime.Dispose()。
+                while (Volatile.Read(ref _drainOp) is { } op)
+                {
+                    try
+                    {
+                        await op.Completion.ConfigureAwait(false);
+                    }
+                    catch
+                    {
+                        // drain 内部已处理异常并记录日志；此处仅等待其退出。
+                    }
+                }
+                // 防御性排空：覆盖 Close→Volatile.Read 窗口内入队但 drain 未消费的残留帧。
+                // 幂等，与 drain finally 的 DrainOutboundOnClose 安全并发。
                 DrainOutboundOnClose();
             }
             else

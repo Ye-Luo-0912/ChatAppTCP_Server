@@ -15,7 +15,8 @@ internal sealed partial class SessionRuntime
     /// <list type="bullet">
     /// <item>初始 <see cref="TcpGatewayOptions.ReceiveBufferInitialSize"/>（默认 1 KiB）；</item>
     /// <item>帧无法容纳但可容纳在 <see cref="TcpGatewayOptions.ReceiveBufferMaxSize"/> 时自动升级；</item>
-    /// <item>空闲超过 <see cref="TcpGatewayOptions.ReceiveBufferDowngradeIdleTimeout"/> 后降级回初始大小；</item>
+    /// <item>升级后采用滞后策略：至少 N 帧完成且最近一帧可容纳在初始缓冲区时才降级，
+    ///   防止 burst 大帧场景下 flapping；</item>
     /// <item>帧装配 deadline：<see cref="TcpGatewayOptions.HeaderAssemblyTimeout"/> 与
     ///   <see cref="TcpGatewayOptions.PayloadAssemblyTimeout"/> 防御慢速攻击。</item>
     /// </list>
@@ -38,15 +39,49 @@ internal sealed partial class SessionRuntime
         var end = 0;
         var bufferedReservedBytes = 0;
 
+        // 动态接收缓冲区滞后策略（P1-2）：升级到大缓冲区后，至少保留 N 帧完成才允许降级。
+        // 防止 burst 大帧场景下重复 ArrayPool Rent/Return 和缓冲区复制。
+        // 大帧（超过基础缓冲区）完成时重置计数器以保持大缓冲区；
+        // 小帧完成时递减计数器；计数器归零且最近一帧可容纳在基础缓冲区时才降级。
+        const int LargeBufferHysteresisFrames = 8;
+        var largeBufferFramesRemaining = 0;
+        var lastFrameFitInBaseBuffer = true;
+        var baseBufferSize = Math.Max(
+            _options.ReceiveBufferInitialSize,
+            PacketProtocol.HeaderSize);
+
         // 帧装配 deadline 跟踪：记录第一个不完整字节到达的时间戳。
         // 0 = 当前无不完整帧（buffer 为空或刚完成一帧）。
         var partialFrameStartTimestamp = 0L;
-        // DeadlineWheel 注册句柄：有部分帧时注册超时回调，ReceiveAsync 返回后取消。
+        // DeadlineWheel 注册句柄：帧装配开始时注册一次绝对 deadline，帧完成时取消。
         // 超时回调关闭 Socket，使挂起的 ReceiveAsync 被唤醒，避免永久阻塞。
+        // 不再每次 ReceiveAsync 后取消并重新注册——否则慢速客户端可通过分片字节
+        // 无限延长 deadline（每次 Receive 重置全量 timeout）。
         var assemblyDeadlineReg = default(DeadlineRegistration);
+        // 当前注册对应的装配阶段（true=Header 装配，false=Payload 装配）。
+        // 用于检测 header→payload 阶段切换并重新注册（Payload timeout 通常不同）。
+        var assemblyRegForHeaderPhase = false;
+        // 帧装配 epoch：每次新帧装配开始或阶段切换时递增，注册回调时捕获。
+        // 回调触发时校验 epoch 是否匹配，防止已取消/已过期的旧回调误关 Socket
+        // （DeadlineWheel 的 sweep→fire 窗口内可能已 cancel 并 re-register）。
+        // 使用 int[1] 容器以便在闭包内通过 Volatile.Read 原子读取。
+        var assemblyEpochHolder = new int[1];
 
         // 上次 Receive 的时间戳，用于空闲降级判断。
         var lastReceiveTimestamp = _timeProvider.GetTimestamp();
+
+        // 取消当前帧装配 deadline 并使旧回调失效（epoch 递增）。
+        // 在帧完成、进入 ReceivePayloadRemainderAsync、方法退出时调用。
+        void CancelAssemblyDeadline()
+        {
+            if (assemblyDeadlineReg.Id != 0)
+            {
+                // 递增 epoch 使已进入 DeadlineWheel toFire 列表的旧回调失效。
+                Interlocked.Increment(ref assemblyEpochHolder[0]);
+                _deadlineWheel.Cancel(assemblyDeadlineReg);
+                assemblyDeadlineReg = default;
+            }
+        }
 
         try
         {
@@ -90,7 +125,8 @@ internal sealed partial class SessionRuntime
                         PacketProtocol.HeaderSize + payloadLength;
                     if (available >= frameLength)
                     {
-                        // 完整帧在缓冲区内：标记帧装配完成。
+                        // 完整帧在缓冲区内：取消装配 deadline，标记帧装配完成。
+                        CancelAssemblyDeadline();
                         partialFrameStartTimestamp = 0;
 
                         var frame = new PacketFrame(
@@ -111,6 +147,15 @@ internal sealed partial class SessionRuntime
                         start += frameLength;
                         bufferedReservedBytes -= frameLength;
                         _globalInboundBudget.Release(frameLength);
+
+                        // 帧完成：更新滞后计数器。
+                        // 大帧（超过基础缓冲区）重置计数器，小帧递减。
+                        if (frameLength > baseBufferSize)
+                            largeBufferFramesRemaining = LargeBufferHysteresisFrames;
+                        else if (largeBufferFramesRemaining > 0)
+                            largeBufferFramesRemaining--;
+                        lastFrameFitInBaseBuffer = frameLength <= baseBufferSize;
+
                         if (!keepReading)
                             return;
 
@@ -141,6 +186,8 @@ internal sealed partial class SessionRuntime
                             end,
                             maxBufferSize);
                         currentBufferSize = maxBufferSize;
+                        // 升级后启动滞后计数器：保持大缓冲区至少 N 帧完成。
+                        largeBufferFramesRemaining = LargeBufferHysteresisFrames;
                         start = 0;
                         end = remaining;
                         // 不 break：重新进入 while 循环，frameLength <= receiveBuffer.Length 时走上面路径。
@@ -182,7 +229,12 @@ internal sealed partial class SessionRuntime
                         bufferedReservedBytes -= available;
                         _globalInboundBudget.Release(available);
 
-                        // Payload 装配 deadline 检查：在 ReceivePayloadRemainderAsync 内逐块检查。
+                        // 取消主循环的帧装配 deadline：ReceivePayloadRemainderAsync 内部
+                        // 会注册自己的 payload 装配 deadline（基于 assemblyStartTimestamp 的剩余时间）。
+                        // 避免两套 deadline 并存导致重复 Close。
+                        CancelAssemblyDeadline();
+
+                        // Payload 装配 deadline 检查：在 ReceivePayloadRemainderAsync 内单次注册。
                         var completed = await ReceivePayloadRemainderAsync(
                                 session,
                                 payloadBuffer,
@@ -199,7 +251,8 @@ internal sealed partial class SessionRuntime
                             return;
                         }
 
-                        // Payload 装配完成。
+                        // Payload 装配完成：取消装配 deadline（防御性，已在进入 Remainder 前取消）。
+                        CancelAssemblyDeadline();
                         partialFrameStartTimestamp = 0;
 
                         var frame = new PacketFrame(
@@ -233,7 +286,6 @@ internal sealed partial class SessionRuntime
                         }
                     }
                 }
-
                 if (start > 0)
                 {
                     var remaining = end - start;
@@ -271,43 +323,72 @@ internal sealed partial class SessionRuntime
                     }
                 }
 
-                // 空闲降级：完成一帧后（无残留数据且无进行中的帧装配），
-                // 如果缓冲区大于初始大小，立即归还大缓冲区并租初始大小缓冲区。
-                // 这比"等待空闲 60 秒后降级"更可靠：不依赖额外 Timer，且
-                // 保证空闲 Receive 始终使用基础 buffer，大 buffer 仅在 burst 期间临时持有。
+                // 空闲降级（带滞后）：完成一帧后（无残留数据且无进行中的帧装配），
+                // 仅当滞后计数器归零且最近一帧可容纳在基础缓冲区时，才降级。
+                // 滞后策略防止 burst 大帧场景下重复 Rent/Return 和缓冲区复制（P1-2）。
                 if (end - start == 0 &&
                     partialFrameStartTimestamp == 0 &&
-                    receiveBuffer.Length > Math.Max(
-                        _options.ReceiveBufferInitialSize,
-                        PacketProtocol.HeaderSize))
+                    largeBufferFramesRemaining == 0 &&
+                    lastFrameFitInBaseBuffer &&
+                    receiveBuffer.Length > baseBufferSize)
                 {
                     ArrayPool<byte>.Shared.Return(receiveBuffer);
-                    currentBufferSize = Math.Max(
-                        _options.ReceiveBufferInitialSize,
-                        PacketProtocol.HeaderSize);
+                    currentBufferSize = baseBufferSize;
                     receiveBuffer = ArrayPool<byte>.Shared.Rent(currentBufferSize);
                     start = 0;
                     end = 0;
                 }
-
-                // 帧装配 deadline 注册：若有不完整帧，注册超时回调。
-                // 回调在 DeadlineWheel sweep 线程触发，关闭 Socket 使挂起的 ReceiveAsync 唤醒。
-                // 不给每次 Receive 创建 CTS/Timer，复用全局 DeadlineWheel。
-                if (partialFrameStartTimestamp != 0 && assemblyDeadlineReg.Id == 0)
+                // 帧装配 deadline 注册：单次绝对 deadline per 帧装配。
+                // 不再每次 ReceiveAsync 后取消并重注册——否则慢速客户端可通过分片字节
+                // 无限延长 deadline（每次 Receive 重置全量 timeout）。
+                // 仅在以下情况注册/重注册：
+                // 1. 新帧装配开始（partialFrameStartTimestamp != 0 且无活跃注册）
+                // 2. header→payload 阶段切换（timeout 值可能变化）
+                if (partialFrameStartTimestamp != 0)
                 {
                     var isHeaderAssembly = end - start < PacketProtocol.HeaderSize;
                     var deadline = isHeaderAssembly
                         ? _options.HeaderAssemblyTimeout
                         : _options.PayloadAssemblyTimeout;
+
                     if (deadline > TimeSpan.Zero)
                     {
-                        assemblyDeadlineReg = _deadlineWheel.Register(deadline, () =>
+                        // 检测阶段切换：当前注册阶段与实际阶段不符时重注册。
+                        var phaseChanged = assemblyDeadlineReg.Id != 0 &&
+                                           isHeaderAssembly != assemblyRegForHeaderPhase;
+
+                        if (assemblyDeadlineReg.Id == 0 || phaseChanged)
                         {
-                            // 超时回调：关闭 Socket，使挂起的 ReceiveAsync 抛出异常被唤醒。
-                            // session.Close 是幂等的，重复调用安全。
-                            _metrics.ProtocolError();
-                            session.Close(SessionCloseReason.SlowFrameAssembly);
-                        });
+                            if (phaseChanged)
+                            {
+                                // 阶段切换：取消旧注册（header 阶段），用 payload timeout 重注册。
+                                _deadlineWheel.Cancel(assemblyDeadlineReg);
+                                assemblyDeadlineReg = default;
+                            }
+
+                            // 递增 epoch 并捕获：回调触发时校验 epoch 是否匹配，
+                            // 防止已取消/已过期的旧回调误关 Socket
+                            // （DeadlineWheel 的 sweep→fire 窗口内可能已 cancel 并 re-register）。
+                            Interlocked.Increment(ref assemblyEpochHolder[0]);
+                            var capturedEpoch = assemblyEpochHolder[0];
+
+                            assemblyDeadlineReg = _deadlineWheel.Register(deadline, () =>
+                            {
+                                // Stale callback guard: epoch 不匹配说明此回调属于已取消/已过期的旧注册。
+                                if (Volatile.Read(ref assemblyEpochHolder[0]) != capturedEpoch)
+                                    return;
+                                // 超时回调：关闭 Socket，使挂起的 ReceiveAsync 抛出异常被唤醒。
+                                // session.Close 是幂等的，重复调用安全。
+                                _metrics.ProtocolError();
+                                session.Close(SessionCloseReason.SlowFrameAssembly);
+                            });
+                            assemblyRegForHeaderPhase = isHeaderAssembly;
+                        }
+                    }
+                    else if (assemblyDeadlineReg.Id != 0)
+                    {
+                        // 当前阶段 deadline 被禁用（<= 0）：取消活跃注册。
+                        CancelAssemblyDeadline();
                     }
                 }
 
@@ -319,12 +400,8 @@ internal sealed partial class SessionRuntime
                         cancellationToken)
                     .ConfigureAwait(false);
 
-                // ReceiveAsync 返回后取消装配超时注册（无论成功或异常）。
-                if (assemblyDeadlineReg.Id != 0)
-                {
-                    _deadlineWheel.Cancel(assemblyDeadlineReg);
-                    assemblyDeadlineReg = default;
-                }
+                // 注意：不在 ReceiveAsync 返回后取消 deadline——单次绝对 deadline 跨多次 Receive 保持活跃，
+                // 直到帧完成或超时。这是修复 P0-3 的核心：避免每次 Receive 重置全量 timeout。
                 if (bytesRead == 0)
                 {
                     if (end != 0)
@@ -352,11 +429,7 @@ internal sealed partial class SessionRuntime
         finally
         {
             // 确保取消残留的帧装配超时注册，避免回调在 buffer 已归还后触发。
-            if (assemblyDeadlineReg.Id != 0)
-            {
-                _deadlineWheel.Cancel(assemblyDeadlineReg);
-                assemblyDeadlineReg = default;
-            }
+            CancelAssemblyDeadline();
 
             if (bufferedReservedBytes > 0)
             {
@@ -367,7 +440,6 @@ internal sealed partial class SessionRuntime
             ArrayPool<byte>.Shared.Return(receiveBuffer);
         }
     }
-
     /// <summary>
     /// 升级接收缓冲区：租更大 buffer，复制残留数据，归还旧 buffer。
     /// </summary>
@@ -402,61 +474,77 @@ internal sealed partial class SessionRuntime
             CancellationToken cancellationToken)
     {
         var payloadDeadline = _options.PayloadAssemblyTimeout;
-        while (received < payloadLength)
+
+        // 单次绝对 deadline：基于 assemblyStartTimestamp 计算剩余时间，注册一次。
+        // 不再每块 ReceiveAsync 后取消并重注册——assemblyStartTimestamp 是帧起点，
+        // remaining 随时间单调递减，单次注册即保证总时长不超 payloadDeadline。
+        var payloadReg = default(DeadlineRegistration);
+        var payloadEpochHolder = new int[1];
+
+        if (payloadDeadline > TimeSpan.Zero)
         {
-            // Payload 装配 deadline 检查。
-            if (payloadDeadline > TimeSpan.Zero)
+            var elapsed = _timeProvider.GetElapsedTime(assemblyStartTimestamp);
+            var remaining = payloadDeadline - elapsed;
+            if (remaining <= TimeSpan.Zero)
             {
-                var elapsed = _timeProvider.GetElapsedTime(
-                    assemblyStartTimestamp);
-                if (elapsed >= payloadDeadline)
-                {
-                    _metrics.ProtocolError();
-                    session.Close(SessionCloseReason.SlowFrameAssembly);
-                    return false;
-                }
+                // 已超时。
+                _metrics.ProtocolError();
+                session.Close(SessionCloseReason.SlowFrameAssembly);
+                return false;
             }
 
-            // 注册剩余装配时间的超时回调，防止 ReceiveAsync 永久挂起。
-            // 超时后关闭 Socket，使 ReceiveAsync 被唤醒。
-            DeadlineRegistration payloadReg = default;
-            if (payloadDeadline > TimeSpan.Zero)
+            Interlocked.Increment(ref payloadEpochHolder[0]);
+            var capturedEpoch = payloadEpochHolder[0];
+            payloadReg = _deadlineWheel.Register(remaining, () =>
             {
-                var elapsed = _timeProvider.GetElapsedTime(assemblyStartTimestamp);
-                var remaining = payloadDeadline - elapsed;
-                if (remaining > TimeSpan.Zero)
+                // Stale callback guard: epoch 不匹配说明此回调属于已取消的旧注册。
+                if (Volatile.Read(ref payloadEpochHolder[0]) != capturedEpoch)
+                    return;
+                _metrics.ProtocolError();
+                session.Close(SessionCloseReason.SlowFrameAssembly);
+            });
+        }
+        try
+        {
+            while (received < payloadLength)
+            {
+                // Payload 装配 deadline 内联检查（快速路径，不等 DeadlineWheel sweep）。
+                if (payloadDeadline > TimeSpan.Zero)
                 {
-                    payloadReg = _deadlineWheel.Register(remaining, () =>
+                    var elapsed = _timeProvider.GetElapsedTime(
+                        assemblyStartTimestamp);
+                    if (elapsed >= payloadDeadline)
                     {
                         _metrics.ProtocolError();
                         session.Close(SessionCloseReason.SlowFrameAssembly);
-                    });
+                        return false;
+                    }
                 }
-            }
 
-            int bytesRead;
-            try
-            {
-                bytesRead = await session
+                var bytesRead = await session
                     .ReceiveAsync(
                         payloadBuffer.AsMemory(
                             received,
                             payloadLength - received),
                         cancellationToken)
                     .ConfigureAwait(false);
-            }
-            finally
-            {
-                if (payloadReg.Id != 0)
-                    _deadlineWheel.Cancel(payloadReg);
+
+                if (bytesRead == 0)
+                    return false;
+
+                received += bytesRead;
             }
 
-            if (bytesRead == 0)
-                return false;
-
-            received += bytesRead;
+            return true;
         }
-
-        return true;
+        finally
+        {
+            // 取消注册并使旧回调失效（sweep→fire race guard）。
+            if (payloadReg.Id != 0)
+            {
+                Interlocked.Increment(ref payloadEpochHolder[0]);
+                _deadlineWheel.Cancel(payloadReg);
+            }
+        }
     }
 }

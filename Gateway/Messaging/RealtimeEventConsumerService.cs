@@ -211,29 +211,65 @@ internal sealed class RealtimeEventConsumerService : BackgroundService
             var completed = await Task.WhenAny(mainLoop, workersTask)
                 .ConfigureAwait(false);
 
-            // 无论谁先完成，都取消 cts 以加速终止另一侧。
-            cts.Cancel();
-
-            // 等待两侧都完成，传播最先的异常。
-            // mainLoop 异常优先（通常是宿主停机或 JetStream 错误）；
-            // workers 异常次之（dispatch 错误）。
-            Exception? mainLoopException = null;
-            try { await mainLoop.ConfigureAwait(false); }
-            catch (Exception ex) { mainLoopException = ex; }
-
-            try { await workersTask.ConfigureAwait(false); }
-            catch
+            if (completed == workersTask)
             {
-                // worker 异常已通过 Task 状态传播；若 mainLoop 也有异常，优先抛出 mainLoop 的。
+                // Worker faulted first: cancel main loop to unblock WriteAsync,
+                // then propagate worker exception.
+                cts.Cancel();
+                await mainLoop.ConfigureAwait(false); // should throw OCE
+                await workersTask.ConfigureAwait(false); // propagate worker exception
+                return;
+            }
+
+            // Main loop completed (normally or faulted).
+            // Complete all partition writers so workers can drain remaining deliveries.
+            foreach (var ch in partitions)
+            {
+                ch.Writer.TryComplete();
+            }
+
+            Exception? mainLoopException = null;
+            try
+            {
+                await mainLoop.ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                // Normal shutdown via stoppingToken — not an error.
+            }
+            catch (Exception ex)
+            {
+                mainLoopException = ex;
             }
 
             if (mainLoopException is not null)
-                throw mainLoopException;
-
-            // 若 workers 先 fault 且 mainLoop 被取消（无异常），抛出 workers 的异常。
-            if (completed == workersTask)
             {
-                await workersTask.ConfigureAwait(false);
+                // Main loop faulted: cancel workers, they can't drain meaningfully.
+                cts.Cancel();
+                try { await workersTask.ConfigureAwait(false); }
+                catch { /* propagate mainLoopException below */ }
+                throw mainLoopException;
+            }
+
+            // Main loop ended normally: allow workers to drain remaining deliveries
+            // within a bounded timeout, then cancel if exceeded.
+            using var drainCts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
+            drainCts.CancelAfter(TimeSpan.FromSeconds(30));
+            try
+            {
+                await workersTask.WaitAsync(drainCts.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (drainCts.IsCancellationRequested)
+            {
+                // Drain timeout: cancel workers to prevent indefinite hang.
+                cts.Cancel();
+                try { await workersTask.ConfigureAwait(false); }
+                catch { /* drain timeout — remaining deliveries will be redelivered by broker */ }
+            }
+            catch
+            {
+                // Worker faulted during drain — propagate.
+                throw;
             }
         }
         finally

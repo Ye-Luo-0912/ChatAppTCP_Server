@@ -36,12 +36,54 @@ internal sealed partial class TcpClientSession : IAsyncDisposable
     // OnDemandSendPump 模式专用：共享出站 pump 协调器。
     // PersistentSendLoop/PerSessionDrain 模式下为 null。
     private readonly OutboundPumpCoordinator? _outboundPump;
-    // PerSessionDrain 模式专用：当前活跃的按需 drain Task。
-    // 非 null 表示有 drain 正在运行；drain 退出时（CAS Running→Idle）由 GC 回收。
-    // PersistentSendLoop/OnDemandSendPump 模式下为 null。
-    private Task? _perSessionDrainTask;
+    // PerSessionDrain 模式专用：原子引用同时承担状态（null=Idle）与句柄发布（non-null=Running）。
+    // <para>
+    // P1-6：旧实现用两步——<c>CAS _sendState Idle→Running</c> 然后赋值 <c>_perSessionDrainTask</c>，
+    // 在两步之间 <c>DisposeAsync</c> 可看到 <c>_sendState=Running</c> 但 <c>_perSessionDrainTask=null</c>，
+    // 从而跳过 await 直接 <c>DrainOutboundOnClose</c>，新启动的 drain Task 不被 await 即逃逸。
+    // </para>
+    // <para>
+    // 现在用单一 <see cref="DrainOperation"/> 引用做 CAS：状态转换与句柄发布原子完成，
+    // 消除 "CAS 成功但字段未发布" 的生命周期窗口。<c>DisposeAsync</c> 读 <c>_drainOp</c>：
+    // non-null 则 <c>await op.Completion</c>；null 则无活跃 drain。
+    // </para>
+    // PersistentSendLoop/OnDemandSendPump 模式下永远为 null。
+    private DrainOperation? _drainOp;
+    // Drain 代次：每次 <c>TryScheduleSend</c> 创建新 <see cref="DrainOperation"/> 时递增，
+    // 用于诊断日志区分不同 drain 实例。CAS 用引用相等判定所有权，不依赖此计数器。
+    private int _drainGeneration;
     // PerSessionDrain 模式标志：构造时确定，影响 TryScheduleSend 分支。
     private readonly bool _usePerSessionDrain;
+
+    /// <summary>
+    /// PerSessionDrain 模式的 drain 句柄：封装 <see cref="TaskCompletionSource"/> 作为
+    /// <c>DisposeAsync</c> 可等待的完成信号，以及代次标识用于诊断。
+    /// <para>
+    /// 生命周期：由 <c>TryScheduleSend</c> 创建，通过 <c>CAS _drainOp null→op</c> 原子发布。
+    /// drain Task 退出时在 finally 中 <c>Complete()</c> 通知等待方，并 <c>CAS _drainOp op→null</c> 归位。
+    /// </para>
+    /// </summary>
+    internal sealed class DrainOperation
+    {
+        public readonly int Generation;
+        private readonly TaskCompletionSource _tcs;
+        private int _completed;
+
+        public DrainOperation(int generation)
+        {
+            Generation = generation;
+            _tcs = new TaskCompletionSource(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+        }
+
+        public Task Completion => _tcs.Task;
+
+        public void Complete()
+        {
+            if (Interlocked.Exchange(ref _completed, 1) == 0)
+                _tcs.TrySetResult();
+        }
+    }
 
     // OnDemandSendPump 三态调度状态机，CAS 驱动：
     //   Idle(0)    → Queued(1)：enqueuer CAS 成功后 TrySchedule 入 ready queue

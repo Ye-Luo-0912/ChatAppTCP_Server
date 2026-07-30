@@ -136,6 +136,11 @@ public sealed class TcpGatewayOptions
     /// <para>
     /// 默认 0.2（±20% 的桶间隔）。设为 0 时禁用 jitter。
     /// </para>
+    /// <para>
+    /// <b>已弃用</b>：HeartbeatCoordinator 不再消费此值。负载分散改由固定 Worker 池并发数
+    /// （<see cref="HeartbeatRefreshConcurrency"/>）+ Channel 背压自然实现。
+    /// 保留属性与校验仅为兼容已有配置文件，新配置无需设置。
+    /// </para>
     /// </summary>
     public double HeartbeatRefreshJitterRatio { get; set; } = 0.2;
 

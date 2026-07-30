@@ -125,12 +125,22 @@ internal sealed partial class TcpClientSession
 
         // 写入 mailbox：同 key 原子覆盖旧帧（dispose + 释放预算），不同 key 独立共存。
         // lock + 开放寻址在 EphemeralMailbox.TryStore 内完成，避免与 drain 的竞争。
+        // 达 MaxEphemeralKeys 硬上限时新 key 被拒绝：dispose 新帧、释放预算，不计入队列。
         var newEntry = new EphemeralEntry(frame, byteCount);
-        if (GetOrCreateEphemeralMailbox().TryStore(key, newEntry) is { } oldEntry)
+        if (GetOrCreateEphemeralMailbox().TryStore(key, newEntry, out var rejected) is { } oldEntry)
         {
             // CAS 成功：drain 不会拿到 oldEntry，可安全 dispose 与释放预算。
             oldEntry.Frame.Dispose();
             ReleaseQueuedWrite(oldEntry.ByteCount);
+        }
+        else if (rejected)
+        {
+            // distinct key 数量已达 MaxEphemeralKeys 上限：新 key 未存储。
+            // dispose 新帧、释放预算与计数，记录拒绝指标，不唤醒发送循环（mailbox 无新增条目）。
+            frame.Dispose();
+            ReleaseQueuedWrite(byteCount);
+            _metrics.OutboundRejected("ephemeral-key-limit");
+            return false;
         }
 
         // 唤醒发送循环：若 flush sentinel 未在队列中，写入一个。
@@ -158,52 +168,83 @@ internal sealed partial class TcpClientSession
 
     private async Task SendLoopAsync()
     {
-        // 发送所有权注册：PersistentSendLoop 模式下 Session 在整个连接生命周期内驻留活跃集合。
-        // 帧内仅更新 _sendStartedAt/_sendInProgress，无每帧字典操作。
-        _sendTimeoutTracker?.OnSendOwnershipAcquired(this);
+        // P1-1：PersistentSendLoop 模式下仅在活跃发送期间注册 Tracker，
+        // WaitToReadAsync 等待期间不注册，避免 10K 空闲连接每 100ms 被全量扫描。
+        // 旧实现使用 ReadAllAsync 并在方法入口处常驻 Tracker，导致空闲连接也参与扫描。
+        var trackerActive = false;
+        var ownershipEpoch = 0;
         try
         {
-            await foreach (var write in _outbound.Reader.ReadAllAsync(
-                               _lifetime.Token).ConfigureAwait(false))
+            while (true)
             {
-                if (write.Frame is null)
+                // 等待有数据可读——此期间不在 Tracker 中（空闲连接不参与超时扫描）。
+                // WaitToReadAsync 在 Channel 完成时返回 false，在取消时抛 OperationCanceledException。
+                if (!await _outbound.Reader.WaitToReadAsync(
+                        _lifetime.Token).ConfigureAwait(false))
                 {
-                    // Ephemeral flush sentinel：先重置 flag 再排空 mailbox。
-                    // 先重置允许 drain 期间到达的新 TryQueueEphemeral 写入新 sentinel，
-                    // 避免丢失唤醒（drain 中到达的新帧会被本次 drain 或下次 sentinel 处理）。
-                    _ephemeralFlushPending = false;
-                    await DrainEphemeralMailboxAsync().ConfigureAwait(false);
-                    continue;
+                    break; // Channel completed
                 }
 
-                ReleaseQueuedWrite(write.ByteCount);
-
-                try
+                // 有数据可读：获取发送所有权，注册 Tracker。
+                // P0-1：捕获 Epoch，Release 时传回，防止旧所有权误删新所有权注册。
+                if (!trackerActive)
                 {
-                    await SendFrameAsync(
-                            write.Frame.Memory,
-                            _lifetime.Token)
-                        .ConfigureAwait(false);
-                    _metrics.FrameSent();
+                    ownershipEpoch = _sendTimeoutTracker?.OnSendOwnershipAcquired(this) ?? 0;
+                    trackerActive = true;
+                }
 
-                    if (write.CloseAfterSend is { } closeReason)
+                // 持续消费 burst：处理所有当前可读帧，直到 TryRead 返回 false（队列空）。
+                while (_outbound.Reader.TryRead(out var write))
+                {
+                    if (write.Frame is null)
                     {
-                        Close(closeReason);
-                        return;
+                        // Ephemeral flush sentinel：先重置 flag 再排空 mailbox。
+                        // 先重置允许 drain 期间到达的新 TryQueueEphemeral 写入新 sentinel，
+                        // 避免丢失唤醒（drain 中到达的新帧会被本次 drain 或下次 sentinel 处理）。
+                        _ephemeralFlushPending = false;
+                        await DrainEphemeralMailboxAsync().ConfigureAwait(false);
+                        continue;
+                    }
+
+                    ReleaseQueuedWrite(write.ByteCount);
+
+                    try
+                    {
+                        await SendFrameAsync(
+                                write.Frame.Memory,
+                                _lifetime.Token)
+                            .ConfigureAwait(false);
+                        _metrics.FrameSent();
+
+                        if (write.CloseAfterSend is { } closeReason)
+                        {
+                            Close(closeReason);
+                            return;
+                        }
+                    }
+                    finally
+                    {
+                        write.Frame.Dispose();
+                    }
+
+                    // 机会式排空：处理 sentinel TryWrite 失败（队列满）导致的丢失唤醒。
+                    // 队列满时 sentinel 无法入队，但 mailbox 中有未发送帧；
+                    // 每个 durable write 后检查并排空，确保 ephemeral 不会因队列满而无限滞留。
+                    if (HasEphemeralEntries)
+                    {
+                        _ephemeralFlushPending = false;
+                        await DrainEphemeralMailboxAsync().ConfigureAwait(false);
                     }
                 }
-                finally
-                {
-                    write.Frame.Dispose();
-                }
 
-                // 机会式排空：处理 sentinel TryWrite 失败（队列满）导致的丢失唤醒。
-                // 队列满时 sentinel 无法入队，但 mailbox 中有未发送帧；
-                // 每个 durable write 后检查并排空，确保 ephemeral 不会因队列满而无限滞留。
-                if (HasEphemeralEntries)
+                // Burst 完成（队列空）：释放发送所有权，退出 Tracker。
+                // 进入下一次 WaitToReadAsync 等待，空闲期间不参与超时扫描。
+                if (trackerActive)
                 {
-                    _ephemeralFlushPending = false;
-                    await DrainEphemeralMailboxAsync().ConfigureAwait(false);
+                    if (ownershipEpoch != 0)
+                        _sendTimeoutTracker?.OnSendOwnershipReleased(this, ownershipEpoch);
+                    trackerActive = false;
+                    ownershipEpoch = 0;
                 }
             }
         }
@@ -230,8 +271,10 @@ internal sealed partial class TcpClientSession
         finally
         {
             DrainOutboundOnClose();
-            // 发送所有权释放：从活跃集合移除。Close 路径的 OnSessionClosed 为兜底。
-            _sendTimeoutTracker?.OnSendOwnershipReleased(this);
+            // 确保 Tracker 已释放：异常路径可能在 burst 中间退出，此时 trackerActive 仍为 true。
+            // Close 路径的 OnSessionClosed 为兜底。
+            if (trackerActive && ownershipEpoch != 0)
+                _sendTimeoutTracker?.OnSendOwnershipReleased(this, ownershipEpoch);
         }
     }
 
@@ -239,8 +282,14 @@ internal sealed partial class TcpClientSession
     /// OnDemandSendPump/PerSessionDrain 模式：入队后唤醒发送驱动。
     /// <para>
     /// OnDemandSendPump（三态）：CAS Idle→Queued 成功后 TrySchedule 入 ready queue。
-    /// PerSessionDrain（二态）：CAS Idle→Running 成功后启动自有 drain Task。
+    /// PerSessionDrain（二态）：CAS <c>_drainOp null→op</c> 原子发布状态+句柄，启动自有 drain Task。
     /// PersistentSendLoop 模式下两者均为 null，本方法是 no-op。
+    /// </para>
+    /// <para>
+    /// P1-6：PerSessionDrain 模式下状态转换与句柄发布合并为单次 CAS——
+    /// 旧实现先 CAS <c>_sendState Idle→Running</c> 再赋值 <c>_perSessionDrainTask</c>，
+    /// 两步之间 Dispose 可读到 Running 但 Task 为 null，跳过 await 导致 drain 逃逸。
+    /// 现在 <c>_drainOp</c> 引用本身就是状态（null=Idle），CAS 成功即完成发布。
     /// </para>
     /// <para>
     /// 若 <see cref="OutboundPumpCoordinator.TrySchedule"/> 失败（coordinator 停机），
@@ -249,15 +298,16 @@ internal sealed partial class TcpClientSession
     /// </summary>
     private void TryScheduleSend()
     {
-        // PerSessionDrain 模式：CAS Idle→Running 直接启动自有 drain（跳过 Queued）。
+        // PerSessionDrain 模式：CAS _drainOp null→op 原子发布 Running 状态与 drain 句柄。
         if (_usePerSessionDrain)
         {
-            if (Interlocked.CompareExchange(ref _sendState, SendStateRunning, SendStateIdle) != SendStateIdle)
-                return;
+            var op = new DrainOperation(Interlocked.Increment(ref _drainGeneration));
+            if (Interlocked.CompareExchange(ref _drainOp, op, null) is not null)
+                return; // 已有 drain 在运行，新帧由其 re-check 路径补消费。
 
-            // 启动 Session 自有按需 drain Task。Socket.SendAsync 的 continuation 天然恢复同一 drain。
-            // _perSessionDrainTask 仅用于 DisposeAsync 等待 drain 退出，无需取消（drain 通过 _lifetime 退出）。
-            _perSessionDrainTask = RunPerSessionDrainAsync();
+            // CAS 成功即完成状态转换与句柄发布（原子），Dispose 读 _drainOp 即可 await。
+            // 启动 drain Task；Task 引用不存字段，TCS 承担等待句柄。
+            _ = RunPerSessionDrainAsync(op);
             return;
         }
 
@@ -281,20 +331,22 @@ internal sealed partial class TcpClientSession
     /// 与 <see cref="PumpOutboundAsync"/> 的区别：
     /// <list type="bullet">
     /// <item>无 burst 上限——drain 持续消费直到队列空（每连接独立，无需公平轮转）；</item>
-    /// <item>无 ready queue 调度——CAS Idle→Running 直接启动，Socket continuation 恢复同一 drain；</item>
+    /// <item>无 ready queue 调度——CAS <c>_drainOp null→op</c> 直接启动，Socket continuation 恢复同一 drain；</item>
     /// <item>慢 Socket 不占用全局 Worker 名额——每连接独立 drain。</item>
     /// </list>
     /// </para>
     /// <para>
-    /// 状态机：drain 退出时 CAS Running→Idle，然后重检防丢失唤醒
-    /// （enqueuer 可能在 Running→Idle 转换前入队，其 CAS Idle→Running 会失败，
-    /// 依赖此处 Idle 后的 re-check 来补发 drain）。
+    /// 状态机（P1-6）：drain 持有 <paramref name="op"/> 作为所有权令牌。退出时 CAS
+    /// <c>_drainOp op→null</c> 释放所有权，然后重检防丢失唤醒
+    /// （enqueuer 可能在 op→null 转换前入队，其 CAS null→op 会失败，
+    /// 依赖此处 null 后的 re-check 来补发 drain）。
     /// </para>
     /// </summary>
-    private async Task RunPerSessionDrainAsync()
+    private async Task RunPerSessionDrainAsync(DrainOperation op)
     {
         // 发送所有权注册：drain 活跃期间驻留活跃集合，drain 退出时释放。
-        _sendTimeoutTracker?.OnSendOwnershipAcquired(this);
+        // P0-1：捕获 Epoch，Release 时传回，防止旧 drain 误删新 drain 注册。
+        var ownershipEpoch = _sendTimeoutTracker?.OnSendOwnershipAcquired(this) ?? 0;
         try
         {
             while (IsConnected)
@@ -309,16 +361,22 @@ internal sealed partial class TcpClientSession
                         continue;
                     }
 
-                    // 队列空：CAS Running→Idle 退出 drain。
-                    if (Interlocked.CompareExchange(ref _sendState, SendStateIdle, SendStateRunning) != SendStateRunning)
-                        return; // 状态已变（停机回退等），让出 drain。
+                    // 队列空：CAS _drainOp op→null 释放所有权（等价 Running→Idle）。
+                    // 若当前 _drainOp 已不是 op（被 Dispose 或替换），让出 drain。
+                    if (!ReferenceEquals(
+                            Interlocked.CompareExchange(ref _drainOp, null, op),
+                            op))
+                        return;
 
-                    // 清除后重检：enqueuer 可能在 Running→Idle 转换前入队，
-                    // 其 CAS Idle→Running 会失败（因为状态是 Running），
-                    // 它依赖此处 Idle 后的 re-check 来补发 drain。
+                    // 清除后重检：enqueuer 可能在 op→null 转换前入队，
+                    // 其 CAS null→op 会失败（因为 _drainOp 仍指向 op），
+                    // 它依赖此处 null 后的 re-check 来补发 drain。
                     if (IsConnected && HasPendingWork())
                     {
-                        if (Interlocked.CompareExchange(ref _sendState, SendStateRunning, SendStateIdle) == SendStateIdle)
+                        // 重新夺回所有权：CAS _drainOp null→op。
+                        if (ReferenceEquals(
+                                Interlocked.CompareExchange(ref _drainOp, op, null),
+                                null))
                             continue; // 重新获得 drain 所有权，继续消费。
                     }
                     return; // 真正空闲，drain 退出。
@@ -399,10 +457,14 @@ internal sealed partial class TcpClientSession
             {
                 DrainOutboundOnClose();
             }
-            // 确保 drain 退出时状态归位（异常路径可能未 CAS Running→Idle）。
-            Interlocked.CompareExchange(ref _sendState, SendStateIdle, SendStateRunning);
-            // 发送所有权释放：从活跃集合移除。Close 路径的 OnSessionClosed 为兜底。
-            _sendTimeoutTracker?.OnSendOwnershipReleased(this);
+            // 确保 drain 退出时所有权归位（异常路径可能未 CAS op→null）。
+            Interlocked.CompareExchange(ref _drainOp, null, op);
+            // 发送所有权释放：从活跃集合移除（仅当 Epoch 匹配）。Close 路径的 OnSessionClosed 为兜底。
+            if (ownershipEpoch != 0)
+                _sendTimeoutTracker?.OnSendOwnershipReleased(this, ownershipEpoch);
+            // P1-6：最后通知 Dispose 等待方——此时所有 cleanup（排空/归位/Tracker 释放）已完成，
+            // Dispose 看到 Completion 完成即可安全调用 _lifetime.Dispose()。
+            op.Complete();
         }
     }
 
@@ -427,7 +489,8 @@ internal sealed partial class TcpClientSession
             return;
 
         // 发送所有权注册：pump 活跃期间驻留活跃集合，pump 退出时释放。
-        _sendTimeoutTracker?.OnSendOwnershipAcquired(this);
+        // P0-1：捕获 Epoch，Release 时传回，防止旧 pump 误删新 pump/drain 注册。
+        var ownershipEpoch = _sendTimeoutTracker?.OnSendOwnershipAcquired(this) ?? 0;
         try
         {
             var processed = 0;
@@ -541,8 +604,9 @@ internal sealed partial class TcpClientSession
                 DrainOutboundOnClose();
             }
 
-            // 发送所有权释放：从活跃集合移除。Close 路径的 OnSessionClosed 为兜底。
-            _sendTimeoutTracker?.OnSendOwnershipReleased(this);
+            // 发送所有权释放：从活跃集合移除（仅当 Epoch 匹配）。Close 路径的 OnSessionClosed 为兜底。
+            if (ownershipEpoch != 0)
+                _sendTimeoutTracker?.OnSendOwnershipReleased(this, ownershipEpoch);
         }
     }
 

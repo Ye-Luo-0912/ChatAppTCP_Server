@@ -19,8 +19,9 @@ internal enum HeartbeatRefreshKind : byte
 /// 心跳刷新工作项：值类型，避免每刷新分配 lambda/Task/Timer。
 /// <para>
 /// 由 HeartbeatCoordinator 的 tick 循环产生，写入有界 Channel，
-/// 由固定 Worker 池消费执行。jitter 编码为 <see cref="DueTimestampTicks"/>，
-/// 不为每个刷新创建独立 Timer——Worker 池数量本身就是并发上限与负载分散机制。
+/// 由固定 Worker 池消费执行。负载分散由 Worker 池并发数 + Channel 背压自然实现，
+/// 不为每个刷新创建独立 Timer 或编码 jitter DueTimestamp——Worker 池数量本身就是
+/// 并发上限与负载分散机制。
 /// </para>
 /// </summary>
 internal readonly record struct HeartbeatRefreshWork(
@@ -28,8 +29,7 @@ internal readonly record struct HeartbeatRefreshWork(
     long UserId,
     ulong DeviceHash,
     string? LeaseId,
-    TimeSpan LeaseTtl,
-    long DueTimestampTicks);
+    TimeSpan LeaseTtl);
 
 /// <summary>
 /// 心跳扫描协调器：周期性执行设备租约 TTL 刷新与 Redis 全局在线状态刷新。
@@ -53,8 +53,7 @@ internal readonly record struct HeartbeatRefreshWork(
 /// <list type="bullet">
 /// <item><b>Lambda 闭包</b>：work 是值类型，无闭包捕获；</item>
 /// <item><b>Task 状态机</b>：Worker 在 RunAsync 启动时一次性创建，不随刷新数增长；</item>
-/// <item><b>Task.Delay Timer</b>：jitter 编码为 DueTimestampTicks，Worker 池数量即并发上限，
-/// 不为每个刷新创建独立 Timer；</item>
+/// <item><b>Task.Delay Timer</b>：Worker 池数量即并发上限，不为每个刷新创建独立 Timer；</item>
 /// <item><b>Task.WhenAll</b>：Worker 持续消费 Channel，无需每 tick 同步等待。</item>
 /// </list>
 /// </para>
@@ -82,7 +81,11 @@ internal sealed class HeartbeatCoordinator
     private readonly SessionLifecycleCoordinator _lifecycleCoordinator;
     private readonly GatewayMetrics _metrics;
     private readonly ILogger _logger;
-    private readonly Random _jitterRandom = new();
+
+    // 队列深度观测：tick 入队自增、Worker 出队自减。简单 volatile 计数，无锁。
+    // 用于观测 Redis 慢速时队列积压趋势；精确瞬时值无意义，应关注是否逼近
+    // Channel 容量（WorkerCount × 4）。
+    private volatile int _currentQueueDepth;
 
     public HeartbeatCoordinator(
         TcpGatewayOptions options,
@@ -116,9 +119,6 @@ internal sealed class HeartbeatCoordinator
         var tickInterval = bucketCount > 1
             ? _options.HeartbeatScanInterval / bucketCount
             : _options.HeartbeatScanInterval;
-
-        // jitter 窗口：编码为 DueTimestampTicks，不创建 Timer。
-        var jitterWindowMs = tickInterval.TotalMilliseconds * _options.HeartbeatRefreshJitterRatio;
 
         var workerCount = Math.Max(1, _options.HeartbeatRefreshConcurrency);
         // Channel 容量 = Worker × 4：队列满时 tick 循环阻塞提供背压，
@@ -166,7 +166,6 @@ internal sealed class HeartbeatCoordinator
                 // 指标：当前 tick 扫描的连接数（仅当前桶，非全局总数）。
                 _metrics.HeartbeatSessionsScanned(sessionsInBucket.Count);
 
-                var nowTicks = _timeProvider.GetTimestamp();
                 var leaseTtl = _options.IdleTimeout + TimeSpan.FromMinutes(5);
 
                 // 设备租约刷新：每连接独立租约，按 connectionId 桶遍历。
@@ -180,18 +179,17 @@ internal sealed class HeartbeatCoordinator
                             continue;
 
                         _metrics.HeartbeatRefreshAttempted("lease");
-                        var dueTicks = ApplyJitter(nowTicks, jitterWindowMs);
                         var work = new HeartbeatRefreshWork(
                             HeartbeatRefreshKind.Lease,
                             session.UserId,
                             deviceHash,
                             session.ConnectionLeaseId,
-                            leaseTtl,
-                            dueTicks);
+                            leaseTtl);
 
                         // 队列满时 await 阻塞提供背压（Redis 慢速时 tick 自然降速）。
                         await channel.Writer.WriteAsync(work, cancellationToken)
                             .ConfigureAwait(false);
+                        Interlocked.Increment(ref _currentQueueDepth);
                     }
                 }
 
@@ -201,17 +199,16 @@ internal sealed class HeartbeatCoordinator
                     foreach (var userId in usersInBucket)
                     {
                         _metrics.HeartbeatRefreshAttempted("presence");
-                        var dueTicks = ApplyJitter(nowTicks, jitterWindowMs);
                         var work = new HeartbeatRefreshWork(
                             HeartbeatRefreshKind.Presence,
                             userId,
                             0,
                             null,
-                            TimeSpan.Zero,
-                            dueTicks);
+                            TimeSpan.Zero);
 
                         await channel.Writer.WriteAsync(work, cancellationToken)
                             .ConfigureAwait(false);
+                        Interlocked.Increment(ref _currentQueueDepth);
                     }
                 }
 
@@ -257,6 +254,8 @@ internal sealed class HeartbeatCoordinator
             await foreach (var work in reader.ReadAllAsync(cancellationToken)
                                .ConfigureAwait(false))
             {
+                Interlocked.Decrement(ref _currentQueueDepth);
+
                 var kindLabel = work.Kind == HeartbeatRefreshKind.Lease
                     ? leaseLabel
                     : presenceLabel;
@@ -307,16 +306,12 @@ internal sealed class HeartbeatCoordinator
     }
 
     /// <summary>
-    /// 生成带 jitter 的 DueTimestamp（单调时钟 ticks）。
-    /// jitter 仅修改 DueTimestamp 值，不创建 Timer；Worker 池数量即并发上限与负载分散。
+    /// 当前待刷新工作项队列深度的快照（已入队未消费的数量）。
+    /// <para>
+    /// 简单 volatile 计数：tick 循环 WriteAsync 成功后自增，Worker 取出后自减。
+    /// 用于观测 Redis 慢速时队列积压情况；精确瞬时值无意义，应关注趋势与是否逼近
+    /// Channel 容量（WorkerCount × 4）。
+    /// </para>
     /// </summary>
-    private long ApplyJitter(long nowTicks, double jitterWindowMs)
-    {
-        if (jitterWindowMs <= 0)
-            return nowTicks;
-
-        var jitterMs = _jitterRandom.NextDouble() * jitterWindowMs;
-        var jitterTicks = (long)(jitterMs * _timeProvider.TimestampFrequency / 1000.0);
-        return nowTicks + jitterTicks;
-    }
+    internal int CurrentQueueDepth => _currentQueueDepth;
 }

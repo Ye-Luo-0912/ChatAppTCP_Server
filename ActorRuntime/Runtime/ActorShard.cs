@@ -607,8 +607,8 @@ internal sealed class ActorShard<TKey, TState, TMessage>
         var item = new ActorMailboxItem<TMessage>(
             in envelope.Message,
             admission: null);
-        actor.TryEnqueueInvalidation(in item);
-        _pendingMailboxCount++;
+        if (actor.TryEnqueueInvalidation(in item))
+            _pendingMailboxCount++;
         ScheduleReady(actor);
         actor.LastActiveTimestamp = _timeProvider.GetTimestamp();
     }

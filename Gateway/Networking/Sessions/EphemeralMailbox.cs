@@ -22,12 +22,24 @@ namespace ChatApp.TcpGateway.Gateway.Networking.Sessions;
 /// <para>
 /// 预算管理、帧 retain、sentinel 协调仍由 <see cref="TcpClientSession"/> 持有。
 /// </para>
+/// <para>
+/// 硬上限：<see cref="MaxEphemeralKeys"/> 限制同时持有的 distinct key 数量，防止慢客户端累积大量
+/// 不同 Presence/Typing key 导致开放寻址数组无限扩容。达到上限后新 key 被拒绝（<see cref="TryStore"/>
+/// 返回 <paramref name="rejected"/>=true），由调用者 dispose 帧并释放预算。
+/// </para>
 /// </summary>
 internal sealed class EphemeralMailbox
 {
+    /// <summary>
+    /// 同时持有的 distinct ephemeral key 硬上限。
+    /// 初始 8 槽翻倍扩容序列 8→16→32→64，到达 64 后不再扩容而是拒绝新 key。
+    /// 64 远超常见 2～8 个 distinct key，不影响正常使用；仅在异常累积场景（慢客户端 + 大量不同 key）下触发拒绝。
+    /// </summary>
+    public const int MaxEphemeralKeys = 64;
+
     private readonly object _lock = new();
     // 开放寻址槽：(Key, Entry) 对。Key.Kind == 0 标记空槽（KindTyping=1, KindPresence=2 均非 0）。
-    // 初始 8 槽覆盖常见 2～8 个 distinct ephemeral key；满时翻倍扩容。
+    // 初始 8 槽覆盖常见 2～8 个 distinct ephemeral key；满时翻倍扩容，但不超过 MaxEphemeralKeys。
     private (EphemeralKey Key, EphemeralEntry Entry)[] _slots = new (EphemeralKey, EphemeralEntry)[8];
     private int _count;
 
@@ -43,10 +55,18 @@ internal sealed class EphemeralMailbox
     /// <para>
     /// 线性探测开放寻址：先扫描已存在 key 做覆盖，再找空槽插入，满则扩容。
     /// </para>
+    /// <para>
+    /// 硬上限：当 distinct key 数量已达 <see cref="MaxEphemeralKeys"/> 时，新 key（未命中已存在 key）
+    /// 不再存储也不再扩容，<paramref name="rejected"/> 置 true，调用者负责 dispose 新帧与释放预算。
+    /// 已存在 key 的覆盖不受限制（不增加 _count）。
+    /// </para>
     /// </summary>
-    /// <returns>被覆盖的旧条目（如有）；调用者负责 dispose 旧帧与释放预算。null 表示新插入。</returns>
-    public EphemeralEntry? TryStore(EphemeralKey key, EphemeralEntry newEntry)
+    /// <param name="rejected">true 表示因达到 <see cref="MaxEphemeralKeys"/> 上限新 key 被拒绝存储；
+    /// 此时返回值为 null（无旧条目），新条目未被存储，调用者必须 dispose 新帧并释放预算。</param>
+    /// <returns>被覆盖的旧条目（如有）；调用者负责 dispose 旧帧与释放预算。null 表示新插入或被拒绝（用 <paramref name="rejected"/> 区分）。</returns>
+    public EphemeralEntry? TryStore(EphemeralKey key, EphemeralEntry newEntry, out bool rejected)
     {
+        rejected = false;
         lock (_lock)
         {
             // 先扫描已存在 key：覆盖旧条目（不增加 _count）。
@@ -61,7 +81,16 @@ internal sealed class EphemeralMailbox
                 }
             }
 
-            // 新 key：找第一个空槽（Kind == 0）插入。
+            // 新 key：检查是否已达 MaxEphemeralKeys 硬上限。
+            // 达上限时拒绝存储（不扩容、不覆盖），调用者负责 dispose 新帧与释放预算。
+            // 此检查在插入前进行，保证无论数组容量如何 _count 永不超过 MaxEphemeralKeys。
+            if (_count >= MaxEphemeralKeys)
+            {
+                rejected = true;
+                return null;
+            }
+
+            // 找第一个空槽（Kind == 0）插入。
             for (int i = 0; i < _slots.Length; i++)
             {
                 ref var slot = ref _slots[i];
@@ -74,7 +103,7 @@ internal sealed class EphemeralMailbox
                 }
             }
 
-            // 所有槽已被不同 key 占用：扩容后插入。
+            // 所有槽已被不同 key 占用：扩容后插入（扩容后仍受 MaxEphemeralKeys 检查保护）。
             var oldLen = _slots.Length;
             Array.Resize(ref _slots, oldLen * 2);
             _slots[oldLen] = (key, newEntry);

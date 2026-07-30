@@ -51,8 +51,9 @@ namespace ChatApp.TcpGateway.Gateway.Networking.Executor;
 internal sealed class SendTimeoutTracker : IAsyncDisposable
 {
     // 活跃发送方集合：包含当前持有发送所有权的 Session（drain/pump/loop 处于活跃期）。
-    // PersistentSendLoop：连接生命周期内常驻；PerSessionDrain/OnDemandSendPump：drain/pump 活跃期驻留。
-    private readonly ConcurrentDictionary<TcpClientSession, byte> _activeSenders = new();
+    // Value = SendOwnershipEpoch：每次 Acquire 原子递增，Release 只移除匹配代次的条目，
+    // 防止旧 drain 的 Release 误删新 drain 的注册（跨发送所有权代次竞态）。
+    private readonly ConcurrentDictionary<TcpClientSession, int> _activeSenders = new();
     private readonly TimeProvider _timeProvider;
     private readonly TimeSpan _scanInterval;
     private readonly CancellationTokenSource _cts = new();
@@ -73,20 +74,23 @@ internal sealed class SendTimeoutTracker : IAsyncDisposable
     public int ActiveSenderCount => _activeSenders.Count;
 
     /// <summary>
-    /// drain/pump/loop 获得发送所有权时注册。幂等：重复调用为廉价 TryAdd no-op。
+    /// drain/pump/loop 获得发送所有权时注册，返回本次所有权的 Epoch（单调递增）。
+    /// 调用方必须在对应的 Release 中传回此 Epoch，确保旧所有权的 Release 不能移除新所有权的注册。
     /// <para>
-    /// 注册后扫描线程会周期检查此 Session 的 <c>CheckSendTimeout</c>，
-    /// 非发送中（<c>_sendInProgress=0</c>）仅 volatile 读即返回。
+    /// P0-1 修复：旧实现用 TryAdd（幂等 no-op），旧 drain 的 TryRemove 会误删新 drain 的注册。
+    /// 现在每次 Acquire 原子递增 Epoch 并覆盖字典值，Release 只在 Epoch 匹配时移除。
     /// </para>
     /// </summary>
-    public void OnSendOwnershipAcquired(TcpClientSession session)
-        => _activeSenders.TryAdd(session, 0);
+    public int OnSendOwnershipAcquired(TcpClientSession session)
+        => _activeSenders.AddOrUpdate(session, 1, static (_, current) => current + 1);
 
     /// <summary>
-    /// drain/pump/loop 释放发送所有权时注销。从活跃集合移除，后续扫描不再检查此 Session。
+    /// drain/pump/loop 释放发送所有权时注销。仅在 Epoch 匹配时移除——
+    /// 若新所有权已接管（Epoch 不同），旧 Release 为 no-op，保留新所有权的注册。
     /// </summary>
-    public void OnSendOwnershipReleased(TcpClientSession session)
-        => _activeSenders.TryRemove(session, out _);
+    public void OnSendOwnershipReleased(TcpClientSession session, int epoch)
+        => ((ICollection<KeyValuePair<TcpClientSession, int>>)_activeSenders)
+            .Remove(new KeyValuePair<TcpClientSession, int>(session, epoch));
 
     /// <summary>
     /// 连接关闭时清理：确保 Session 不残留在活跃集合中。

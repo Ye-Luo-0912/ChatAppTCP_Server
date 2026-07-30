@@ -156,11 +156,17 @@ internal abstract class ActorCell<TKey, TState, TMessage>
     /// （多次失效等效于一次，Behavior 自增 epoch 决定拒绝边界）。
     /// 不返回 Replaced——旧 Invalidation 不需要 DropHandler 通知。
     /// </summary>
+    /// <returns>
+    /// true 表示 Invalidation 从无到有（becamePending），调用方应增加 PendingMailbox 计数；
+    /// false 表示槽中已有 Invalidation 被覆盖，计数不应再增加（Actor 只消费一条）。
+    /// </returns>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public void TryEnqueueInvalidation(in ActorMailboxItem<TMessage> item)
+    public bool TryEnqueueInvalidation(in ActorMailboxItem<TMessage> item)
     {
+        var becamePending = !_hasInvalidation;
         _invalidation = item;
         _hasInvalidation = true;
+        return becamePending;
     }
 
     /// <summary>

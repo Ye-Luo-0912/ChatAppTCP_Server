@@ -1,4 +1,4 @@
-﻿using System.Collections.Concurrent;
+using System.Collections.Concurrent;
 
 namespace ChatApp.TcpGateway.Gateway.Networking.Sessions;
 
@@ -112,8 +112,12 @@ internal sealed class UserSessionRegistry
                 if (existing.DeviceIdHash != incoming.DeviceIdHash)
                     continue;
                 if (string.Equals(
-                        existing.SessionId,
-                        incoming.SessionId,
+                        // P0-5: 按 ConnectionLeaseId 区分新旧物理连接，而非 SessionId。
+                        // Resume 复用原 SessionId，若按 SessionId 跳过会让同 Gateway 旧 Transport
+                        // 漏过本机接管，退化为依赖 NATS SessionRevoked 往返才能关闭。
+                        // 不同 ConnectionLeaseId 即不同物理连接，应作为本机 victim 立即关闭。
+                        existing.ConnectionLeaseId,
+                        incoming.ConnectionLeaseId,
                         StringComparison.Ordinal))
                     continue;
 

@@ -263,6 +263,20 @@ internal sealed partial class SessionLifecycleCoordinator
                 .ConfigureAwait(false);
         }
 
+        // P0-5: 本机旧连接立即踢下线。Resume 复用原 SessionId，旧连接若仍在本机注册表中，
+        // 必须按 ConnectionLeaseId 区分（不同 lease = 不同物理连接）直接关闭，
+        // 而非依赖 NATS SessionRevoked 事件往返。TakeOverSameDevice 已按 ConnectionLeaseId 匹配。
+        var localVictims = _userSessions.TakeOverSameDevice(session);
+        if (localVictims.Length > 0)
+        {
+            var localOccurredAtMs = _timeProvider
+                .GetUtcNow()
+                .ToUnixTimeMilliseconds();
+            foreach (var victim in localVictims)
+                await RevokeSessionAsync(victim, localOccurredAtMs, cancellationToken)
+                    .ConfigureAwait(false);
+        }
+
         // 设备租约接管：原 ConnectionLeaseId 已随旧连接释放，这里用新 Session 的 ConnectionLeaseId 重新获取。
         // 仅当原会话携带 DeviceIdHash 时才接管。缺少 DeviceIdHash 的会话不持有设备租约，
         // 不应使用伪设备 0 接管——否则所有无 DeviceIdHash 的会话会落入同一零值设备键，相互覆盖租约。
@@ -289,7 +303,12 @@ internal sealed partial class SessionLifecycleCoordinator
                     session.ConnectionId,
                     ex);
                 _metrics.ResumeFailed(ResumeFailureReason.TakeOverUnavailable);
-                // 回滚已完成的认证状态（上面的 Authenticate 调用）。
+                // P0-4: 回滚已完成的本地状态变更（逆序撤销）。
+                // 上面已执行：session.Authenticate → _userSessions.Add → PublishPresenceChangedAsync → TakeOverSameDevice
+                // 必须撤销 Registry 和 Presence，否则清理路径按 UserId>0 判定已认证，
+                // 但 Listener 尚未 MarkAuthenticated → 准入计数错配 + 无意义 Presence 抖动。
+                await RollbackResumeLocalStateAsync(session, context.UserId, cancellationToken)
+                    .ConfigureAwait(false);
                 session.Close(SessionCloseReason.AuthenticationRejected);
                 return null;
             }
@@ -303,7 +322,10 @@ internal sealed partial class SessionLifecycleCoordinator
                 && !string.Equals(
                     t.PreviousConnectionLeaseId,
                     session.ConnectionLeaseId,
-                    StringComparison.Ordinal))
+                    StringComparison.Ordinal)
+                // P0-5: skip NATS broadcast if already closed locally (by ConnectionLeaseId).
+                && !localVictims.Any(v =>
+                    string.Equals(v.ConnectionLeaseId, t.PreviousConnectionLeaseId, StringComparison.Ordinal)))
             {
                 var occurredAtMs = _timeProvider
                     .GetUtcNow()
@@ -367,6 +389,34 @@ internal sealed partial class SessionLifecycleCoordinator
             DeviceId = context.DeviceId,
             LastConversationSequence = lastConversationSequence
         };
+    }
+
+    /// <summary>
+    /// P0-4: 回滚 Resume 路径中已完成的本地状态变更。
+    /// 当 TakeOver（或其它 Prepare 阶段操作）失败时，必须逆序撤销：
+    ///   1. UserSessionRegistry.Remove（撤销 Add）
+    ///   2. PublishPresenceChangedAsync(isOnline: false)（撤销 online 广播，仅当 Add 返回 true 时）
+    /// 这确保清理路径不会因 session.UserId>0 误判为已认证连接，
+    /// 避免准入计数错配和无意义的 Presence 抖动。
+    /// </summary>
+    private async Task RollbackResumeLocalStateAsync(
+        TcpClientSession session,
+        long userId,
+        CancellationToken cancellationToken)
+    {
+        var removedFromRegistry = _userSessions.Remove(session);
+        if (removedFromRegistry && _options.EnableEphemeralPresenceAndTyping)
+        {
+            try
+            {
+                await PublishPresenceChangedAsync(userId, isOnline: false, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch
+            {
+                // 回滚失败不应阻塞 fail-closed 路径。Presence 下线丢失由 TTL 兜底。
+            }
+        }
     }
 
     /// <summary>

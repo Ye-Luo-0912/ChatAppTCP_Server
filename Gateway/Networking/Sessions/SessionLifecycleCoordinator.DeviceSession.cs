@@ -1,6 +1,8 @@
+using System.Text.Json;
 using ChatApp.Realtime.Abstractions.Events;
 using ChatApp.Realtime.Integration;
 using ChatApp.TcpGateway.Core.Authentication;
+using ChatApp.TcpGateway.Core.Protocol;
 using ChatApp.TcpGateway.Observability.Logging;
 using ChatApp.TcpGateway.Observability.Metrics;
 using Microsoft.Extensions.Logging;
@@ -139,7 +141,12 @@ internal sealed partial class SessionLifecycleCoordinator
                         SessionId = revokedSessionId,
                         // P0-7：携带旧连接的 ConnectionLeaseId 供目标 Gateway 精确匹配，
                         // 避免在 SessionId 相同时（Resume 复用原 SessionId）误关新连接。
-                        PayloadJson = connectionLeaseId,
+                        // P0-6：使用结构化 payload 替代裸字符串，为后续 TransportId/LeaseOwnerToken 拆分铺路。
+                        // 当前 TransportId 仍使用 ConnectionLeaseId 值（承担路由标识）。
+                        PayloadJson = connectionLeaseId is null
+                            ? null
+                            : JsonSerializer.Serialize(
+                                new SessionRevokedPayload { TransportId = connectionLeaseId }),
                         OccurredAtMs = occurredAtMs
                     },
                     cancellationToken)

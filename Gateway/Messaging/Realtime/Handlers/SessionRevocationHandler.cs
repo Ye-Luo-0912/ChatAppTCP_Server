@@ -52,7 +52,16 @@ internal sealed class SessionRevocationHandler : IRealtimeEventHandler
         // P0-7：优先按 ConnectionLeaseId 精确匹配（PayloadJson 携带旧连接的 lease id），
         // 避免在 SessionId 相同时（Resume 复用原 SessionId）误关新连接。
         // PayloadJson 为空时回退到 SessionId 匹配（兼容未携带 lease id 的旧事件）。
-        var targetLeaseId = realtimeEvent.PayloadJson;
+        // P0-6: 兼容解析新结构化 JSON payload 与旧裸字符串格式。
+        // 新格式: {"transportId":"abc123"}，旧格式: "abc123"（裸 ConnectionLeaseId）。
+        string? targetLeaseId = null;
+        if (!string.IsNullOrWhiteSpace(realtimeEvent.PayloadJson))
+        {
+            var payload = realtimeEvent.PayloadJson;
+            targetLeaseId = payload.TrimStart().StartsWith('{')
+                ? TryParseTransportId(payload)
+                : payload;
+        }
         var matchByLeaseId = !string.IsNullOrWhiteSpace(targetLeaseId);
 
         var closedSessions = 0;
@@ -93,6 +102,20 @@ internal sealed class SessionRevocationHandler : IRealtimeEventHandler
         }
 
         _metrics.RealtimeEventHandled(closedSessions);
+    }
+
+    private static string? TryParseTransportId(string json)
+    {
+        try
+        {
+            var payload = System.Text.Json.JsonSerializer.Deserialize<Core.Protocol.SessionRevokedPayload>(json);
+            return payload?.TransportId;
+        }
+        catch
+        {
+            // JSON 解析失败：回退到 null（将使用 SessionId 匹配）
+            return null;
+        }
     }
 
     /// <summary>
