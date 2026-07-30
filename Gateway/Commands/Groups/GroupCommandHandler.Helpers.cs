@@ -155,6 +155,8 @@ internal sealed partial class GroupCommandHandler
     /// 用于检测同一 RequestId 复用不同操作参数的冲突。
     /// <para>
     /// MemberUserIds 排序后逐个合并，确保成员集合相同但顺序不同的命令产生相同指纹。
+    /// ListMembers 的分页参数（PageSize/Cursor）不纳入指纹：幂等缓存保存全量成员，
+    /// 不同分页参数命中同一缓存后由 map 闭包各自切片，提高翻页命中率。
     /// </para>
     /// </summary>
     private static int ComputePayloadHash(RealtimeGroupConversationCommand command)
@@ -175,5 +177,107 @@ internal sealed partial class GroupCommandHandler
         }
 
         return hash.ToHashCode();
+    }
+
+    /// <summary>
+    /// 成员列表 keyset 分页常量与默认值。
+    /// </summary>
+    private const int DefaultMemberPageSize = 50;
+    private const int MaxMemberPageSize = 200;
+
+    /// <summary>
+    /// 对全量成员列表执行 keyset 分页，返回当前页、下一页游标、是否还有更多。
+    /// <para>
+    /// 游标编码最后一条成员的 (role, joined_at_ms, user_id) 元组（base64），
+    /// 下次请求携带游标时定位到该元组之后的第一条。Realtime 侧已按
+    /// role ASC, joined_at_ms ASC, user_id ASC 排序，保证 keyset 稳定性。
+    /// </para>
+    /// </summary>
+    internal static (ConversationMemberItem[] Page, string? NextCursor, bool HasMore) PaginateMembers(
+        ConversationMemberItem[] all,
+        int? pageSize,
+        string? cursor)
+    {
+        var size = pageSize is > 0 and <= MaxMemberPageSize
+            ? pageSize.Value
+            : pageSize > MaxMemberPageSize
+                ? MaxMemberPageSize
+                : DefaultMemberPageSize;
+
+        var start = 0;
+        if (TryDecodeMemberCursor(cursor, out var cursorRole, out var cursorJoinedAt, out var cursorUserId))
+        {
+            // 列表已按 (role, joined_at_ms, user_id) 升序排列，
+            // 线性查找第一条元组大于游标的成员。
+            start = all.Length; // 默认：游标在末尾之后，无更多数据
+            for (var i = 0; i < all.Length; i++)
+            {
+                var m = all[i];
+                var roleByte = (byte)m.Role;
+                if (roleByte > cursorRole
+                    || (roleByte == cursorRole && m.JoinedAtMs > cursorJoinedAt)
+                    || (roleByte == cursorRole && m.JoinedAtMs == cursorJoinedAt && m.UserId > cursorUserId))
+                {
+                    start = i;
+                    break;
+                }
+            }
+        }
+
+        var available = all.Length - start;
+        var take = Math.Min(size, available);
+        var page = new ConversationMemberItem[take];
+        for (var i = 0; i < take; i++)
+            page[i] = all[start + i];
+
+        var hasMore = start + take < all.Length;
+        var nextCursor = hasMore && page.Length > 0
+            ? EncodeMemberCursor(page[^1])
+            : null;
+
+        return (page, nextCursor, hasMore);
+    }
+
+    /// <summary>
+    /// 编码成员游标：base64("role.joined_at_ms.user_id")。
+    /// </summary>
+    private static string EncodeMemberCursor(ConversationMemberItem item) =>
+        Convert.ToBase64String(
+            System.Text.Encoding.UTF8.GetBytes(
+                $"{(byte)item.Role}.{item.JoinedAtMs}.{item.UserId}"));
+
+    /// <summary>
+    /// 解码成员游标。格式非法时返回 false（调用方退化为首页）。
+    /// </summary>
+    private static bool TryDecodeMemberCursor(
+        string? cursor,
+        out byte cursorRole,
+        out long cursorJoinedAt,
+        out long cursorUserId)
+    {
+        cursorRole = 0;
+        cursorJoinedAt = 0;
+        cursorUserId = 0;
+        if (string.IsNullOrEmpty(cursor))
+            return false;
+
+        try
+        {
+            var raw = System.Text.Encoding.UTF8.GetString(Convert.FromBase64String(cursor));
+            var parts = raw.Split('.');
+            if (parts.Length != 3)
+                return false;
+            if (!byte.TryParse(parts[0], out cursorRole))
+                return false;
+            if (!long.TryParse(parts[1], out cursorJoinedAt))
+                return false;
+            if (!long.TryParse(parts[2], out cursorUserId))
+                return false;
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
     }
 }

@@ -283,6 +283,13 @@ internal sealed partial class GroupCommandHandler
             return;
         }
 
+        // P2-1：捕获分页参数供 map 闭包使用。
+        // Realtime 侧返回全量成员（按 role, joined_at_ms, user_id 升序），
+        // Gateway 本地执行 keyset 分页，避免改动 RealtimeServices 协议。
+        // 幂等缓存保存全量结果，不同分页参数命中同一缓存后各自切片。
+        var pageSize = request.PageSize;
+        var cursor = request.Cursor;
+
         await SendGroupCommandAsync(
                 session,
                 PacketCommand.ListGroupMembersRequest,
@@ -294,14 +301,33 @@ internal sealed partial class GroupCommandHandler
                     ConversationId = request.ConversationId.Trim(),
                     ActorSessionId = session.SessionId
                 },
-                result => new ListGroupMembersResponse
+                result =>
                 {
-                    RequestId = result.RequestId,
-                    Succeeded = result.Succeeded,
-                    ErrorCode = result.ErrorCode,
-                    ErrorMessage = result.ErrorMessage,
-                    ConversationId = result.ConversationId,
-                    Members = MapMembers(result.Members)
+                    if (!result.Succeeded)
+                    {
+                        return new ListGroupMembersResponse
+                        {
+                            RequestId = result.RequestId,
+                            Succeeded = false,
+                            ErrorCode = result.ErrorCode,
+                            ErrorMessage = result.ErrorMessage,
+                            ConversationId = result.ConversationId
+                        };
+                    }
+
+                    var all = MapMembers(result.Members) ?? Array.Empty<ConversationMemberItem>();
+                    var (page, nextCursor, hasMore) = PaginateMembers(all, pageSize, cursor);
+                    return new ListGroupMembersResponse
+                    {
+                        RequestId = result.RequestId,
+                        Succeeded = true,
+                        ErrorCode = result.ErrorCode,
+                        ErrorMessage = result.ErrorMessage,
+                        ConversationId = result.ConversationId,
+                        Members = page,
+                        NextCursor = nextCursor,
+                        HasMore = hasMore
+                    };
                 },
                 PacketCommand.ListGroupMembersResponse,
                 _listGroupMembersResponseCodec,
