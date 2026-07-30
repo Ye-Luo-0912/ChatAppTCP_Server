@@ -10,6 +10,11 @@ namespace ChatApp.ActorRuntime.Runtime;
 /// Completion / Deactivate 属于控制信封：不占用 Mailbox 准入容量，直接驱动控制通道或生命周期。
 /// Deadline 触发不经过 Ingress——由 Shard 单线程 DeadlineWheel 在 Consumer Loop 内直接投递控制通道。
 /// </para>
+/// <para>
+/// P1-7：<see cref="HasActorQuotaReservation"/> 标记生产侧（TryTellDurable）已消耗式预留全局 Actor 配额。
+/// 消费侧 RouteEnvelope 据此决定：新 Actor 复用预留（不再 TryAcquire），已存在 Actor 立即 Release。
+/// 这使 TryTellDurable 返回 Accepted 时保证 Actor 配额 + Mailbox credit 均已预留，消除"生产侧接受、消费侧静默丢弃"竞态。
+/// </para>
 /// </summary>
 internal readonly struct ActorEnvelope<TKey, TMessage>
     where TKey : notnull
@@ -21,6 +26,8 @@ internal readonly struct ActorEnvelope<TKey, TMessage>
     public readonly ActivationId Activation;
     public readonly ActorDeactivateReason DeactivateReason;
     public readonly ActorEnvelopeKind Kind;
+    // P1-7：生产侧 TryTellDurable 已 TryAcquire 全局配额。仅对 Durable 消息为 true。
+    public readonly bool HasActorQuotaReservation;
 
     public ActorEnvelope(
         in TKey key,
@@ -28,7 +35,8 @@ internal readonly struct ActorEnvelope<TKey, TMessage>
         ActorAdmission? admission,
         ActivationId activation,
         ActorEnvelopeKind kind,
-        ActorDeactivateReason deactivateReason = default)
+        ActorDeactivateReason deactivateReason = default,
+        bool hasActorQuotaReservation = false)
     {
         Key = key;
         Message = message;
@@ -36,6 +44,7 @@ internal readonly struct ActorEnvelope<TKey, TMessage>
         Activation = activation;
         Kind = kind;
         DeactivateReason = deactivateReason;
+        HasActorQuotaReservation = hasActorQuotaReservation;
     }
 }
 

@@ -204,6 +204,61 @@ internal sealed class ActorShard<TKey, TState, TMessage>
         return ActorPostStatus.Accepted;
     }
 
+    /// <summary>
+    /// P1-7：Durable 消息入队。与 <see cref="TryEnqueue"/> 相同的 FIFO admission 流程，
+    /// 但在 envelope 中标记 <paramref name="hasActorQuotaReservation"/>。
+    /// 调用方（ActorRuntime.TryTellDurable）已在生产侧消耗式 TryAcquire 全局配额，
+    /// 消费侧 RouteEnvelope 据此标记决定复用预留或释放。
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public ActorPostStatus TryEnqueueDurable(
+        in TKey key,
+        in TMessage message,
+        bool hasActorQuotaReservation)
+    {
+        if (_stopping)
+            return ActorPostStatus.RuntimeStopping;
+
+        ActorAdmission? admission = null;
+        if (_fifoAdmissions is not null)
+        {
+            while (true)
+            {
+                admission = _fifoAdmissions.GetOrAdd(
+                    key,
+                    static _ => new ActorAdmission());
+                if (admission.TryReserve(_mailboxCapacity))
+                    break;
+
+                if (!admission.IsRetired)
+                {
+                    Interlocked.Increment(ref _mailboxFullCount);
+                    return ActorPostStatus.MailboxFull;
+                }
+
+                RemoveAdmissionIfSame(in key, admission);
+            }
+        }
+
+        var envelope = new ActorEnvelope<TKey, TMessage>(
+            in key,
+            in message,
+            admission,
+            ActivationId.None,
+            ActorEnvelopeKind.Message,
+            deactivateReason: default,
+            hasActorQuotaReservation: hasActorQuotaReservation);
+        if (!_ingress.TryEnqueue(in envelope))
+        {
+            admission?.Release();
+            Interlocked.Increment(ref _shardOverloadedCount);
+            return ActorPostStatus.ShardOverloaded;
+        }
+
+        _signal.Signal();
+        return ActorPostStatus.Accepted;
+    }
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public ActorPostStatus TryEnqueueCompletion(
         in TKey key,
@@ -453,11 +508,39 @@ internal sealed class ActorShard<TKey, TState, TMessage>
     private void RouteEnvelope(in ActorEnvelope<TKey, TMessage> envelope)
     {
         ref var cellRef = ref _cells.GetOrAddRef(in envelope.Key);
+        // P1-7：已存在 Actor 时，生产侧预留的全局配额用不上，立即释放。
+        // 新 Actor 创建路径（cellRef is null）复用预留配额，不释放。
+        if (cellRef is not null && envelope.HasActorQuotaReservation)
+        {
+            _globalQuota.Release();
+        }
+
         if (cellRef is null)
         {
-            // 新 Actor 准入：每 Shard 上限 + 全局配额双层检查。
-            if (_cells.Count >= _maxActorsPerShard ||
-                !_globalQuota.TryAcquire())
+            // 新 Actor 准入。
+            // P1-7：预留路径（TryTellDurable）已在生产侧消耗式 TryAcquire 全局配额，
+            // 此处复用预留，不再 TryAcquire；仅检查每 Shard 上限。
+            // 非预留路径（TryTell/TryTellEphemeral）仍走消费侧 TryAcquire 安全网。
+            if (envelope.HasActorQuotaReservation)
+            {
+                // _cells.Count 已包含 GetOrAddRef 刚插入的占位条目，
+                // 因此"已存在 Actor 数 == Count - 1"。允许创建当且仅当
+                // (Count - 1) + 1 <= MaxActorsPerShard，即 Count <= MaxActorsPerShard，
+                // 拒绝条件为 Count > MaxActorsPerShard。
+                if (_cells.Count > _maxActorsPerShard)
+                {
+                    _cells.Remove(in envelope.Key);
+                    Interlocked.Increment(ref _admissionRejectedCount);
+                    // 释放生产侧预留的配额（用不上）。
+                    _globalQuota.Release();
+                    DropEnvelope(in envelope, ActorMessageDropReason.AdmissionRejected);
+                    TryRetireAdmission(in envelope.Key);
+                    return;
+                }
+                // 配额已预留，继续创建 Actor。
+            }
+            else if (_cells.Count > _maxActorsPerShard ||
+                     !_globalQuota.TryAcquire())
             {
                 _cells.Remove(in envelope.Key);
                 Interlocked.Increment(ref _admissionRejectedCount);

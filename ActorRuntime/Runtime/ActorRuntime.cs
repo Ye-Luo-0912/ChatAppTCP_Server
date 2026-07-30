@@ -106,8 +106,14 @@ public sealed class ActorRuntime<TKey, TState, TMessage> :
         => TryTell(in key, in message);
 
     /// <summary>
-    /// 持久消息入队：在生产侧同步检查 Actor 数量配额。
+    /// 持久消息入队：在生产侧消耗式预留 Actor 数量配额（TryAcquire）。
     /// 若配额已满，返回 AdmissionRejected 且不入队，避免持久消息被静默丢弃。
+    /// <para>
+    /// P1-7：返回 Accepted 时保证 Actor 配额 + Mailbox credit 均已预留。
+    /// 配额通过 envelope.HasActorQuotaReservation 传递到消费侧：
+    /// 新 Actor 复用预留（不再 TryAcquire），已存在 Actor 立即 Release。
+    /// 入队失败（MailboxFull/ShardOverloaded）时释放预留配额。
+    /// </para>
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public ActorPostStatus TryTellDurable(
@@ -120,16 +126,24 @@ public sealed class ActorRuntime<TKey, TState, TMessage> :
         var shardIndex = GetShardIndex(in key);
         var shard = _shards[shardIndex];
 
-        // 生产侧同步检查：若 Actor 数已达上限，拒绝入队而非静默丢弃。
-        // 注意：这是保守检查——竞态窗口内其他 Shard 可能先创建 Actor 导致全局配额超限，
-        // 消费侧仍保留安全网检查。
+        // 生产侧消耗式预留：TryAcquire 全局配额 + 每 Shard 上限快检。
+        // 快检失败时不消耗全局配额；TryAcquire 失败时直接拒绝。
         if (shard.ActiveActorCount >= shard.MaxActorsPerShard ||
-            !_globalQuota.CanAcquire())
+            !_globalQuota.TryAcquire())
         {
             return ActorPostStatus.AdmissionRejected;
         }
 
-        return shard.TryEnqueue(in key, in message);
+        // 配额已预留，入队并标记。入队失败时释放预留。
+        var status = shard.TryEnqueueDurable(
+            in key,
+            in message,
+            hasActorQuotaReservation: true);
+        if (status != ActorPostStatus.Accepted)
+        {
+            _globalQuota.Release();
+        }
+        return status;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]

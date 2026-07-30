@@ -20,13 +20,6 @@ internal sealed class GlobalActorAdmissionQuota
 
     public int Count => Volatile.Read(ref _count);
 
-    /// <summary>
-    /// 非消耗式检查：是否还有配额可用。用于 TryTellDurable 的生产侧保守检查。
-    /// 注意：返回 true 不保证后续 TryAcquire 成功（竞态窗口内其他线程可能先消耗）。
-    /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public bool CanAcquire() => Volatile.Read(ref _count) < _max;
-
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool TryAcquire()
     {
