@@ -47,6 +47,7 @@ internal sealed partial class TcpClientSession
             }
         }
         _sendTimeoutTracker?.OnSessionClosed(this);
+        _frameAssemblyTracker?.OnSessionClosed(this);
 
         try
         {

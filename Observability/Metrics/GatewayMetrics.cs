@@ -571,7 +571,8 @@ public sealed class GatewayMetrics : IDisposable
         Func<long>? outboundPumpReadyQueueProvider,
         Func<long>? outboundPumpTotalScheduledProvider,
         Func<int>? outboundPumpWorkerCountProvider,
-        Func<int>? sendTimeoutActiveSendersProvider = null)
+        Func<int>? sendTimeoutActiveSendersProvider = null,
+        Func<int>? frameAssemblyActiveProvider = null)
     {
         if (activeDeadlinesProvider is not null)
         {
@@ -579,7 +580,7 @@ public sealed class GatewayMetrics : IDisposable
                 "gateway.deadline_wheel.active_deadlines",
                 () => activeDeadlinesProvider(),
                 unit: "{deadlines}",
-                description: "全局 DeadlineWheel 当前活跃 deadline 数（仅 Auth/Idle 超时；发送超时已迁移到 SendTimeoutTracker）。");
+                description: "全局 DeadlineWheel 当前活跃 deadline 数（仅 Auth/Idle 超时；发送超时已迁移到 SendTimeoutTracker；帧装配超时已迁移到 FrameAssemblyTimeoutTracker）。");
         }
 
         if (sendTimeoutActiveSendersProvider is not null)
@@ -589,6 +590,15 @@ public sealed class GatewayMetrics : IDisposable
                 () => sendTimeoutActiveSendersProvider(),
                 unit: "{sessions}",
                 description: "SendTimeoutTracker 当前活跃发送方数（正在执行 Socket.SendAsync 的 Session）。空闲时为 0。");
+        }
+
+        if (frameAssemblyActiveProvider is not null)
+        {
+            _meter.CreateObservableGauge(
+                "gateway.frame_assembly.active",
+                () => frameAssemblyActiveProvider(),
+                unit: "{sessions}",
+                description: "FrameAssemblyTimeoutTracker 当前正在装配不完整帧的 Session 数。空闲时为 0。");
         }
 
         if (outboundPumpReadyQueueProvider is not null)

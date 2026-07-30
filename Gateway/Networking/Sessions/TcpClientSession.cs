@@ -113,6 +113,8 @@ internal sealed partial class TcpClientSession : IAsyncDisposable
     // Auth/Idle 超时仍由 DeadlineWheel 管理（低频，符合其设计假设）。
     private readonly DeadlineWheel? _deadlineWheel;
     private readonly SendTimeoutTracker? _sendTimeoutTracker;
+    // P1-5：帧装配超时扫描器，替代 DeadlineWheel 管理高频 Header/Payload 装配超时。
+    private readonly FrameAssemblyTimeoutTracker? _frameAssemblyTracker;
     private int _sendInProgress; // 0 = idle, 1 = sending
     // 当前发送开始时的单调时间戳（GetTimestamp()）。仅在 _sendInProgress=1 时有效，0 表示空闲。
     // 扫描线程用 GetElapsedTime(startedAt) >= _sendTimeout 判断超时，
@@ -158,6 +160,7 @@ internal sealed partial class TcpClientSession : IAsyncDisposable
         TimeSpan idleTimeout = default,
         OutboundPumpCoordinator? outboundPump = null,
         SendTimeoutTracker? sendTimeoutTracker = null,
+        FrameAssemblyTimeoutTracker? frameAssemblyTracker = null,
         bool usePerSessionDrain = false)
     {
         _socket = socket;
@@ -169,6 +172,7 @@ internal sealed partial class TcpClientSession : IAsyncDisposable
         _globalOutboundBudget = globalOutboundBudget;
         _deadlineWheel = deadlineWheel;
         _sendTimeoutTracker = sendTimeoutTracker;
+        _frameAssemblyTracker = frameAssemblyTracker;
         _idleTimeout = idleTimeout;
         _outboundPump = outboundPump;
         _usePerSessionDrain = usePerSessionDrain;

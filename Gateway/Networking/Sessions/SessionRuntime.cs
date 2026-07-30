@@ -53,8 +53,11 @@ internal sealed partial class SessionRuntime
     private readonly GatewayMetrics _metrics;
     private readonly TimeProvider _timeProvider;
     private readonly ILogger _logger;
-    // DeadlineWheel：用于注册帧装配超时回调，超时后关闭 Socket 唤醒挂起的 ReceiveAsync。
+    // DeadlineWheel：用于注册 Auth/Idle 超时回调（低频，每连接生命周期内数次）。
     private readonly DeadlineWheel _deadlineWheel;
+    // FrameAssemblyTimeoutTracker：用于 Header/Payload 装配超时（高频，每帧装配 1-2 次）。
+    // P1-5：从 DeadlineWheel 拆分出来，避免高频注册/取消在通用时间轮的全局锁上竞争。
+    private readonly FrameAssemblyTimeoutTracker? _frameAssemblyTracker;
 
     private readonly Func<PacketFrame, TcpClientSession, string, CancellationToken, ValueTask> _processPacketAsync;
     private readonly Action<TcpClientSession, ProtocolErrorCode, string?, bool, int?, ushort?> _sendProtocolError;
@@ -72,6 +75,7 @@ internal sealed partial class SessionRuntime
         TimeProvider timeProvider,
         ILogger logger,
         DeadlineWheel deadlineWheel,
+        FrameAssemblyTimeoutTracker? frameAssemblyTracker,
         Func<PacketFrame, TcpClientSession, string, CancellationToken, ValueTask> processPacketAsync,
         Action<TcpClientSession, ProtocolErrorCode, string?, bool, int?, ushort?> sendProtocolError,
         Action<TcpClientSession, PacketCommand> rejectOversizedPayload)
@@ -87,6 +91,7 @@ internal sealed partial class SessionRuntime
         _timeProvider = timeProvider;
         _logger = logger;
         _deadlineWheel = deadlineWheel;
+        _frameAssemblyTracker = frameAssemblyTracker;
         _processPacketAsync = processPacketAsync;
         _sendProtocolError = sendProtocolError;
         _rejectOversizedPayload = rejectOversizedPayload;

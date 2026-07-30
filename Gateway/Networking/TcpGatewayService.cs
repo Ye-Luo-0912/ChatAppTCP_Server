@@ -104,6 +104,9 @@ internal sealed class TcpGatewayService : BackgroundService
     // 全局发送超时扫描器：替代每帧 DeadlineWheel.Register。周期扫描活跃发送方集合，
     // 不为每帧创建闭包、不竞争 DeadlineWheel 全局锁、不增长 _fired 集合。
     private readonly SendTimeoutTracker _sendTimeoutTracker;
+    // P1-5：全局帧装配超时扫描器：替代 DeadlineWheel 管理高频 Header/Payload 装配超时。
+    // 周期扫描活跃装配集合，不为每次装配创建闭包、不竞争 DeadlineWheel 全局锁。
+    private readonly FrameAssemblyTimeoutTracker _frameAssemblyTracker;
 
     // 全局命令执行器：替代每连接 OrderedWrite/Query/Ephemeral Channel + Consumer Task。
     // 共享 worker 池，按 connectionId 串行保序，跨连接并行。
@@ -262,6 +265,8 @@ internal sealed class TcpGatewayService : BackgroundService
         _deadlineWheel = new DeadlineWheel(_timeProvider);
         // 全局发送超时扫描器：替代每帧 DeadlineWheel.Register（消除闭包分配 + 全局锁竞争）。
         _sendTimeoutTracker = new SendTimeoutTracker(_timeProvider);
+        // P1-5：全局帧装配超时扫描器：替代 DeadlineWheel 管理高频 Header/Payload 装配超时。
+        _frameAssemblyTracker = new FrameAssemblyTimeoutTracker(_timeProvider);
 
         // 全局命令执行器：OrderedWrite lane。
         // 共享 worker 池，按 connectionId 串行保序，跨连接并行。Burst 限制防止单连接独占 worker。
@@ -361,6 +366,7 @@ internal sealed class TcpGatewayService : BackgroundService
         _metrics.RegisterRuntimeV2Observers(
             activeDeadlinesProvider: () => _deadlineWheel.ActiveDeadlineCount,
             sendTimeoutActiveSendersProvider: () => _sendTimeoutTracker.ActiveSenderCount,
+            frameAssemblyActiveProvider: () => _frameAssemblyTracker.ActiveAssemblyCount,
             outboundPumpReadyQueueProvider: _outboundPump is null ? null : () => _outboundPump.ReadyQueueCount,
             outboundPumpTotalScheduledProvider: _outboundPump is null ? null : () => _outboundPump.TotalScheduled,
             outboundPumpWorkerCountProvider: _outboundPump is null ? null : () => _outboundPump.WorkerCount);
@@ -430,6 +436,7 @@ internal sealed class TcpGatewayService : BackgroundService
             _timeProvider,
             _logger,
             _deadlineWheel,
+            _frameAssemblyTracker,
             ProcessPacketAsync,
             SendProtocolError,
             RejectOversizedPayload);
@@ -514,6 +521,11 @@ internal sealed class TcpGatewayService : BackgroundService
         await _sendTimeoutTracker.StartAsync(executionToken)
             .ConfigureAwait(false);
 
+        // P1-5：FrameAssemblyTimeoutTracker：启动定时扫描线程，检测慢速帧装配。
+        // 必须在 Listener 启动前启动，确保所有 Session 注册的装配超时能被检测。
+        await _frameAssemblyTracker.StartAsync(executionToken)
+            .ConfigureAwait(false);
+
         // OnDemandSendPump 模式：启动共享出站 worker 池。
         // PersistentSendLoop 模式下 _outboundPump=null，跳过。
         if (_outboundPump is not null)
@@ -568,6 +580,10 @@ internal sealed class TcpGatewayService : BackgroundService
             await _sendTimeoutTracker.StopAsync()
                 .ConfigureAwait(false);
 
+            // P1-5：FrameAssemblyTimeoutTracker：所有 Session 已关闭后停止扫描。
+            await _frameAssemblyTracker.StopAsync()
+                .ConfigureAwait(false);
+
             // 停止执行器：取消 worker 循环并排空残留命令（释放缓冲区与入站预算）。
             await _orderedWriteExecutor.StopAsync(CancellationToken.None)
                 .ConfigureAwait(false);
@@ -615,6 +631,7 @@ internal sealed class TcpGatewayService : BackgroundService
         _typingActorPipeline?.DisposeAsync().AsTask().GetAwaiter().GetResult();
         _deadlineWheel.DisposeAsync().AsTask().GetAwaiter().GetResult();
         _sendTimeoutTracker.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        _frameAssemblyTracker.DisposeAsync().AsTask().GetAwaiter().GetResult();
         _outboundPump?.Dispose();
         base.Dispose();
     }
@@ -653,6 +670,7 @@ internal sealed class TcpGatewayService : BackgroundService
                 idleTimeout: _options.IdleTimeout,
                 outboundPump: _outboundPump,
                 sendTimeoutTracker: _sendTimeoutTracker,
+                frameAssemblyTracker: _frameAssemblyTracker,
                 usePerSessionDrain: _usePerSessionDrain);
 
             // 注册连接到全局执行器（OrderedWrite/Query/Ephemeral 共享 worker 池）。

@@ -53,33 +53,26 @@ internal sealed partial class SessionRuntime
         // 帧装配 deadline 跟踪：记录第一个不完整字节到达的时间戳。
         // 0 = 当前无不完整帧（buffer 为空或刚完成一帧）。
         var partialFrameStartTimestamp = 0L;
-        // DeadlineWheel 注册句柄：帧装配开始时注册一次绝对 deadline，帧完成时取消。
-        // 超时回调关闭 Socket，使挂起的 ReceiveAsync 被唤醒，避免永久阻塞。
-        // 不再每次 ReceiveAsync 后取消并重新注册——否则慢速客户端可通过分片字节
-        // 无限延长 deadline（每次 Receive 重置全量 timeout）。
-        var assemblyDeadlineReg = default(DeadlineRegistration);
+        // P1-5：FrameAssemblyTimeoutTracker 替代 DeadlineWheel 管理帧装配超时。
+        // 装配开始时 OnAssemblyStarted 注册（返回 FrameAssemblyState 引用），
+        // 帧完成/阶段切换时 OnAssemblyCompleted 注销（引用相等性防 ABA）。
+        // 扫描线程周期检查 GetElapsedTime(start) >= timeout，超时则 session.Close。
+        FrameAssemblyState? assemblyState = null;
         // 当前注册对应的装配阶段（true=Header 装配，false=Payload 装配）。
         // 用于检测 header→payload 阶段切换并重新注册（Payload timeout 通常不同）。
         var assemblyRegForHeaderPhase = false;
-        // 帧装配 epoch：每次新帧装配开始或阶段切换时递增，注册回调时捕获。
-        // 回调触发时校验 epoch 是否匹配，防止已取消/已过期的旧回调误关 Socket
-        // （DeadlineWheel 的 sweep→fire 窗口内可能已 cancel 并 re-register）。
-        // 使用 int[1] 容器以便在闭包内通过 Volatile.Read 原子读取。
-        var assemblyEpochHolder = new int[1];
 
         // 上次 Receive 的时间戳，用于空闲降级判断。
         var lastReceiveTimestamp = _timeProvider.GetTimestamp();
 
-        // 取消当前帧装配 deadline 并使旧回调失效（epoch 递增）。
+        // 注销当前帧装配注册（如有）。
         // 在帧完成、进入 ReceivePayloadRemainderAsync、方法退出时调用。
         void CancelAssemblyDeadline()
         {
-            if (assemblyDeadlineReg.Id != 0)
+            if (assemblyState is { } state)
             {
-                // 递增 epoch 使已进入 DeadlineWheel toFire 列表的旧回调失效。
-                Interlocked.Increment(ref assemblyEpochHolder[0]);
-                _deadlineWheel.Cancel(assemblyDeadlineReg);
-                assemblyDeadlineReg = default;
+                _frameAssemblyTracker?.OnAssemblyCompleted(session, state);
+                assemblyState = null;
             }
         }
 
@@ -338,13 +331,13 @@ internal sealed partial class SessionRuntime
                     start = 0;
                     end = 0;
                 }
-                // 帧装配 deadline 注册：单次绝对 deadline per 帧装配。
-                // 不再每次 ReceiveAsync 后取消并重注册——否则慢速客户端可通过分片字节
-                // 无限延长 deadline（每次 Receive 重置全量 timeout）。
+                // P1-5：帧装配超时注册——FrameAssemblyTimeoutTracker 替代 DeadlineWheel。
+                // 单次绝对超时 per 帧装配：不每次 ReceiveAsync 后重注册，
+                // 否则慢速客户端可通过分片字节无限延长超时（每次 Receive 重置全量 timeout）。
                 // 仅在以下情况注册/重注册：
                 // 1. 新帧装配开始（partialFrameStartTimestamp != 0 且无活跃注册）
                 // 2. header→payload 阶段切换（timeout 值可能变化）
-                if (partialFrameStartTimestamp != 0)
+                if (partialFrameStartTimestamp != 0 && _frameAssemblyTracker is not null)
                 {
                     var isHeaderAssembly = end - start < PacketProtocol.HeaderSize;
                     var deadline = isHeaderAssembly
@@ -354,40 +347,27 @@ internal sealed partial class SessionRuntime
                     if (deadline > TimeSpan.Zero)
                     {
                         // 检测阶段切换：当前注册阶段与实际阶段不符时重注册。
-                        var phaseChanged = assemblyDeadlineReg.Id != 0 &&
+                        var phaseChanged = assemblyState is not null &&
                                            isHeaderAssembly != assemblyRegForHeaderPhase;
 
-                        if (assemblyDeadlineReg.Id == 0 || phaseChanged)
+                        if (assemblyState is null || phaseChanged)
                         {
                             if (phaseChanged)
                             {
-                                // 阶段切换：取消旧注册（header 阶段），用 payload timeout 重注册。
-                                _deadlineWheel.Cancel(assemblyDeadlineReg);
-                                assemblyDeadlineReg = default;
+                                // 阶段切换：注销旧注册（header 阶段），用 payload timeout 重注册。
+                                CancelAssemblyDeadline();
                             }
 
-                            // 递增 epoch 并捕获：回调触发时校验 epoch 是否匹配，
-                            // 防止已取消/已过期的旧回调误关 Socket
-                            // （DeadlineWheel 的 sweep→fire 窗口内可能已 cancel 并 re-register）。
-                            Interlocked.Increment(ref assemblyEpochHolder[0]);
-                            var capturedEpoch = assemblyEpochHolder[0];
-
-                            assemblyDeadlineReg = _deadlineWheel.Register(deadline, () =>
-                            {
-                                // Stale callback guard: epoch 不匹配说明此回调属于已取消/已过期的旧注册。
-                                if (Volatile.Read(ref assemblyEpochHolder[0]) != capturedEpoch)
-                                    return;
-                                // 超时回调：关闭 Socket，使挂起的 ReceiveAsync 抛出异常被唤醒。
-                                // session.Close 是幂等的，重复调用安全。
-                                _metrics.ProtocolError();
-                                session.Close(SessionCloseReason.SlowFrameAssembly);
-                            });
+                            // 注册/重注册：OnAssemblyStarted 返回 FrameAssemblyState 引用。
+                            // 扫描线程用 GetElapsedTime(start) >= timeout 判断超时，超时则 session.Close。
+                            // 无需 epoch int[1] 容器——引用相等性天然防 ABA。
+                            assemblyState = _frameAssemblyTracker.OnAssemblyStarted(session, deadline);
                             assemblyRegForHeaderPhase = isHeaderAssembly;
                         }
                     }
-                    else if (assemblyDeadlineReg.Id != 0)
+                    else if (assemblyState is not null)
                     {
-                        // 当前阶段 deadline 被禁用（<= 0）：取消活跃注册。
+                        // 当前阶段超时被禁用（<= 0）：注销活跃注册。
                         CancelAssemblyDeadline();
                     }
                 }
@@ -475,17 +455,16 @@ internal sealed partial class SessionRuntime
     {
         var payloadDeadline = _options.PayloadAssemblyTimeout;
 
-        // 单次绝对 deadline：基于 assemblyStartTimestamp 计算剩余时间，注册一次。
-        // 不再每块 ReceiveAsync 后取消并重注册——assemblyStartTimestamp 是帧起点，
-        // remaining 随时间单调递减，单次注册即保证总时长不超 payloadDeadline。
-        var payloadReg = default(DeadlineRegistration);
-        var payloadEpochHolder = new int[1];
+        // P1-5：FrameAssemblyTimeoutTracker 替代 DeadlineWheel。
+        // 注册 payload 装配超时：扫描线程检查 GetElapsedTime(assemblyStartTimestamp) >= payloadDeadline。
+        // 由于 assemblyStartTimestamp 是帧起点（header 接收时记录），单次注册即保证
+        // 总时长不超 payloadDeadline，无需每块 ReceiveAsync 后重注册。
+        FrameAssemblyState? payloadState = null;
 
-        if (payloadDeadline > TimeSpan.Zero)
+        if (payloadDeadline > TimeSpan.Zero && _frameAssemblyTracker is not null)
         {
             var elapsed = _timeProvider.GetElapsedTime(assemblyStartTimestamp);
-            var remaining = payloadDeadline - elapsed;
-            if (remaining <= TimeSpan.Zero)
+            if (elapsed >= payloadDeadline)
             {
                 // 已超时。
                 _metrics.ProtocolError();
@@ -493,22 +472,15 @@ internal sealed partial class SessionRuntime
                 return false;
             }
 
-            Interlocked.Increment(ref payloadEpochHolder[0]);
-            var capturedEpoch = payloadEpochHolder[0];
-            payloadReg = _deadlineWheel.Register(remaining, () =>
-            {
-                // Stale callback guard: epoch 不匹配说明此回调属于已取消的旧注册。
-                if (Volatile.Read(ref payloadEpochHolder[0]) != capturedEpoch)
-                    return;
-                _metrics.ProtocolError();
-                session.Close(SessionCloseReason.SlowFrameAssembly);
-            });
+            // 注册：Tracker 用当前时间戳作为扫描起点。内联检查用 assemblyStartTimestamp 保证总时长。
+            // 两者结合：扫描线程作为兜底（100ms 精度），内联检查作为快速路径（每 ReceiveAsync 前）。
+            payloadState = _frameAssemblyTracker.OnAssemblyStarted(session, payloadDeadline);
         }
         try
         {
             while (received < payloadLength)
             {
-                // Payload 装配 deadline 内联检查（快速路径，不等 DeadlineWheel sweep）。
+                // Payload 装配超时内联检查（快速路径，不等 Tracker 扫描）。
                 if (payloadDeadline > TimeSpan.Zero)
                 {
                     var elapsed = _timeProvider.GetElapsedTime(
@@ -539,11 +511,10 @@ internal sealed partial class SessionRuntime
         }
         finally
         {
-            // 取消注册并使旧回调失效（sweep→fire race guard）。
-            if (payloadReg.Id != 0)
+            // P1-5：注销 payload 装配超时注册（引用相等性防 ABA）。
+            if (payloadState is not null)
             {
-                Interlocked.Increment(ref payloadEpochHolder[0]);
-                _deadlineWheel.Cancel(payloadReg);
+                _frameAssemblyTracker?.OnAssemblyCompleted(session, payloadState);
             }
         }
     }
