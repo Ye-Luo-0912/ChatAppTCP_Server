@@ -14,6 +14,8 @@ using ChatApp.TcpGateway.Gateway.Networking.Ephemeral;
 using ChatApp.TcpGateway.Gateway.Networking.Sessions;
 using ChatApp.TcpGateway.Infrastructure;
 using ChatApp.TcpGateway.Infrastructure.Caching;
+using ChatApp.TcpGateway.Infrastructure.GroupIdempotency;
+using ChatApp.TcpGateway.Observability.Metrics;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -97,6 +99,14 @@ builder.Services.AddSingleton<MessagingCommandHandler>();
 builder.Services.AddSingleton<HistoryQueryCommandHandler>();
 builder.Services.AddSingleton<ConversationPrefsCommandHandler>();
 builder.Services.AddSingleton<GroupRequestIdempotencyCache>();
+// 群组命令幂等：L1（内存）+ L2（Redis）Composite。L2 可选——Redis 不可用时退化为仅 L1。
+builder.Services.AddSingleton<IGroupIdempotencyStore>(static provider =>
+{
+    var l1 = provider.GetRequiredService<GroupRequestIdempotencyCache>();
+    var metrics = provider.GetRequiredService<GatewayMetrics>();
+    var l2 = provider.GetService<RedisGroupIdempotencyStore>();
+    return new CompositeGroupIdempotencyStore(l1, l2, metrics);
+});
 builder.Services.AddSingleton<GroupCommandHandler>();
 builder.Services.AddSingleton<TypingCommandHandler>();
 builder.Services.AddSingleton<PresenceCommandHandler>();

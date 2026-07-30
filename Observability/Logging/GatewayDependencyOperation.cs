@@ -26,5 +26,7 @@ public enum GatewayDependencyOperation : byte
     WatcherDirectoryQuery = 18,
     DeviceLeaseQuery = 19,
     ResumeTokenRevoke = 20,
-    ResumeWatermarkQuery = 21
+    ResumeWatermarkQuery = 21,
+    GroupIdempotencyLookup = 22,
+    GroupIdempotencyStore = 23
 }

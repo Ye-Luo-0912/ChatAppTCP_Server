@@ -11,6 +11,7 @@ using ChatApp.TcpGateway.Core.Serialization;
 using ChatApp.TcpGateway.Core.Server;
 using ChatApp.TcpGateway.Infrastructure.Authentication;
 using ChatApp.TcpGateway.Infrastructure.Caching;
+using ChatApp.TcpGateway.Infrastructure.GroupIdempotency;
 using ChatApp.TcpGateway.Infrastructure.Push;
 using ChatApp.TcpGateway.Infrastructure.Routing;
 using ChatApp.TcpGateway.Infrastructure.Serialization.Json;
@@ -56,6 +57,9 @@ public static class InfrastructureServiceCollectionExtensions
         services.AddSingleton<IPushTokenStore, RedisPushTokenStore>();
         services.AddSingleton<IGatewayDirectory, RedisGatewayDirectory>();
         services.AddSingleton<IWatcherGatewayDirectory, RedisWatcherGatewayDirectory>();
+
+        // 群组命令幂等 L2（Redis）存储。具体类型注册——Composite 在 Program.cs 中组装。
+        services.AddSingleton<RedisGroupIdempotencyStore>();
 
         services.AddSingleton<IPayloadCodec<AuthenticationRequest>>(
             static _ => new JsonPayloadCodec<AuthenticationRequest>(

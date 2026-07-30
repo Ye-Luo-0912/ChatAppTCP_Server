@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using ChatApp.Realtime.Abstractions.Conversations;
+using ChatApp.TcpGateway.Infrastructure.GroupIdempotency;
 
 namespace ChatApp.TcpGateway.Gateway.Commands.Groups;
 
@@ -24,7 +25,7 @@ namespace ChatApp.TcpGateway.Gateway.Commands.Groups;
 /// 容量回收使用 <see cref="Interlocked"/> CAS 防止并发 sweep。
 /// </para>
 /// </summary>
-public sealed class GroupRequestIdempotencyCache
+public sealed class GroupRequestIdempotencyCache : IGroupIdempotencyStore
 {
     private readonly ConcurrentDictionary<CacheKey, Entry> _cache;
     private readonly int _maxCapacity;
@@ -152,6 +153,35 @@ public sealed class GroupRequestIdempotencyCache
     /// <summary>当前缓存条目数（诊断/测试用）。</summary>
     public int Count => _cache.Count;
 
+    /// <summary>
+    /// <see cref="IGroupIdempotencyStore.TryGetAsync"/> 的异步包装：
+    /// L1 为纯内存操作，直接包装同步 <see cref="TryGet"/>。
+    /// </summary>
+    public ValueTask<GroupIdempotencyLookup> TryGetAsync(
+        long userId,
+        int operation,
+        string requestId,
+        int payloadHash,
+        CancellationToken cancellationToken)
+        => new(TryGet(userId, operation, requestId, payloadHash));
+
+    /// <summary>
+    /// <see cref="IGroupIdempotencyStore.TryAddAsync"/> 的异步包装：
+    /// L1 为纯内存操作，直接包装同步 <see cref="TryAdd"/>。
+    /// </summary>
+    public ValueTask TryAddAsync(
+        long userId,
+        int operation,
+        string requestId,
+        int payloadHash,
+        GroupConversationResult result,
+        CancellationToken cancellationToken)
+    {
+        TryAdd(userId, operation, requestId, payloadHash, result);
+        return default;
+    }
+
+
     private void TrySweepExpired(long nowTicks)
     {
         var lastSweep = Interlocked.Read(ref _lastSweepTicks);
@@ -193,35 +223,4 @@ public sealed class GroupRequestIdempotencyCache
         GroupConversationResult Result,
         long ExpiresAtTicks,
         int PayloadHash);
-}
-
-/// <summary>
-/// 幂等缓存查找结果：区分命中、未命中与冲突。
-/// </summary>
-public readonly record struct GroupIdempotencyLookup
-{
-    /// <summary>缓存的结果；未命中或冲突时为 null。</summary>
-    public GroupConversationResult? Result { get; }
-
-    /// <summary>是否为冲突（同一 RequestId 但负载指纹不匹配）。</summary>
-    public bool IsConflict { get; }
-
-    private GroupIdempotencyLookup(GroupConversationResult? result, bool isConflict)
-    {
-        Result = result;
-        IsConflict = isConflict;
-    }
-
-    /// <summary>未命中（缓存中不存在或已过期）。</summary>
-    public static GroupIdempotencyLookup Miss => default;
-
-    /// <summary>冲突（同一 RequestId 但负载指纹不匹配）。</summary>
-    public static GroupIdempotencyLookup Conflict => new(null, isConflict: true);
-
-    /// <summary>命中缓存。</summary>
-    public static GroupIdempotencyLookup Hit(GroupConversationResult result) =>
-        new(result, isConflict: false);
-
-    /// <summary>是否命中缓存（有缓存结果且无冲突）。</summary>
-    public bool IsHit => !IsConflict && Result is not null;
 }

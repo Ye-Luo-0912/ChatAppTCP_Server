@@ -4,6 +4,7 @@ using ChatApp.TcpGateway.Core.Protocol;
 using ChatApp.TcpGateway.Core.Serialization;
 using ChatApp.TcpGateway.Gateway.Networking.Buffers;
 using ChatApp.TcpGateway.Gateway.Networking.Sessions;
+using ChatApp.TcpGateway.Infrastructure.GroupIdempotency;
 using ChatApp.TcpGateway.Observability.Logging;
 using ChatApp.TcpGateway.Observability.Metrics;
 using Microsoft.Extensions.Logging;
@@ -45,14 +46,16 @@ internal sealed partial class GroupCommandHandler
         if (_idempotencyCache is { } cache)
         {
             var payloadHash = ComputePayloadHash(command);
-            var lookup = cache.TryGet(
+            var lookup = await cache.TryGetAsync(
                 command.ActorUserId,
                 (int)command.Operation,
                 command.RequestId,
-                payloadHash);
+                payloadHash,
+                cancellationToken).ConfigureAwait(false);
 
             if (lookup.IsHit)
             {
+                _metrics.GroupIdempotentHit();
                 SendGroupMutateResponse(session, responseCommand, responseCodec, map(lookup.Result!));
                 return;
             }
@@ -61,6 +64,7 @@ internal sealed partial class GroupCommandHandler
             // 返回 idempotency_conflict 防止误命中前一次结果。
             if (lookup.IsConflict)
             {
+                _metrics.GroupIdempotentConflict();
                 _metrics.CommandFailed(requestCommand);
                 SendGroupMutateResponse(
                     session,
@@ -72,6 +76,8 @@ internal sealed partial class GroupCommandHandler
                         "RequestId 已用于不同参数的请求。")));
                 return;
             }
+
+            _metrics.GroupIdempotentMiss();
         }
 
         try
@@ -83,12 +89,13 @@ internal sealed partial class GroupCommandHandler
             // 异常路径的 group_unavailable 不经过此处，不会被缓存，确保瞬态故障可重试。
             if (_idempotencyCache is { } cacheForAdd)
             {
-                cacheForAdd.TryAdd(
+                await cacheForAdd.TryAddAsync(
                     command.ActorUserId,
                     (int)command.Operation,
                     command.RequestId,
                     ComputePayloadHash(command),
-                    result);
+                    result,
+                    cancellationToken).ConfigureAwait(false);
             }
 
             SendGroupMutateResponse(session, responseCommand, responseCodec, map(result));

@@ -1,5 +1,6 @@
 using ChatApp.Realtime.Abstractions.Conversations;
 using ChatApp.TcpGateway.Gateway.Commands.Groups;
+using ChatApp.TcpGateway.Infrastructure.GroupIdempotency;
 
 namespace ChatApp.TcpGateway.Tests.Messaging;
 

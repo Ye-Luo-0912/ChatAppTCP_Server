@@ -78,9 +78,17 @@ public sealed class GatewayMetrics : IDisposable
     // 群组命令 RequestId 幂等缓存监控。
     // hit：缓存命中（重复请求从缓存返回，未调用 Realtime）。
     // miss：缓存未命中（新请求，将调用 Realtime 并缓存结果）。
-    // 用于观测客户端重试率与缓存命中率。
+    // conflict：同一 RequestId 但负载指纹不匹配（客户端复用 RequestId 提交不同参数）。
+    // redis_hit：L2（Redis）命中（L1 未命中后 L2 命中，含回填 L1）。
+    // redis_miss：L2（Redis）未命中（含 fail-open Miss）。
+    // redis_failure：L2（Redis）调用失败（异常或熔断器开路，fail-open）。
+    // 用于观测客户端重试率、缓存命中率与 Redis L2 层有效性。
     private readonly Counter<long> _groupIdempotentHits;
     private readonly Counter<long> _groupIdempotentMisses;
+    private readonly Counter<long> _groupIdempotentConflicts;
+    private readonly Counter<long> _groupIdempotentRedisHits;
+    private readonly Counter<long> _groupIdempotentRedisMisses;
+    private readonly Counter<long> _groupIdempotentRedisFailures;
 
     // 心跳分桶扫描监控指标。
     // scan.duration：单次 tick（桶扫描+刷新）总耗时直方图，用于观测周期性脉冲与分桶后的平滑度。
@@ -207,6 +215,14 @@ public sealed class GatewayMetrics : IDisposable
             "gateway.group.idempotent.hit");
         _groupIdempotentMisses = _meter.CreateCounter<long>(
             "gateway.group.idempotent.miss");
+        _groupIdempotentConflicts = _meter.CreateCounter<long>(
+            "gateway.group.idempotent.conflict");
+        _groupIdempotentRedisHits = _meter.CreateCounter<long>(
+            "gateway.group.idempotent.redis_hit");
+        _groupIdempotentRedisMisses = _meter.CreateCounter<long>(
+            "gateway.group.idempotent.redis_miss");
+        _groupIdempotentRedisFailures = _meter.CreateCounter<long>(
+            "gateway.group.idempotent.redis_failure");
 
         _typingAuthDuration = _meter.CreateHistogram<double>(
             "gateway.typing_auth.duration",
@@ -359,6 +375,26 @@ public sealed class GatewayMetrics : IDisposable
     /// 群组命令 RequestId 幂等缓存未命中：新请求，将调用 Realtime 并缓存结果。
     /// </summary>
     public void GroupIdempotentMiss() => _groupIdempotentMisses.Add(1);
+
+    /// <summary>
+    /// 群组命令 RequestId 幂等冲突：同一 RequestId 但负载指纹不匹配。
+    /// </summary>
+    public void GroupIdempotentConflict() => _groupIdempotentConflicts.Add(1);
+
+    /// <summary>
+    /// 群组命令幂等 L2（Redis）命中：L1 未命中后 L2 命中。
+    /// </summary>
+    public void GroupIdempotentRedisHit() => _groupIdempotentRedisHits.Add(1);
+
+    /// <summary>
+    /// 群组命令幂等 L2（Redis）未命中（含 fail-open Miss）。
+    /// </summary>
+    public void GroupIdempotentRedisMiss() => _groupIdempotentRedisMisses.Add(1);
+
+    /// <summary>
+    /// 群组命令幂等 L2（Redis）调用失败（异常或熔断器开路）。
+    /// </summary>
+    public void GroupIdempotentRedisFailure() => _groupIdempotentRedisFailures.Add(1);
 
     // 通用依赖操作失败计数：dependency 与 operation 均为低基数标签。
     public void DependencyOperationFailed(

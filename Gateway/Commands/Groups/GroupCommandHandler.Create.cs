@@ -5,6 +5,7 @@ using ChatApp.TcpGateway.Core.Protocol;
 using ChatApp.TcpGateway.Core.Serialization;
 using ChatApp.TcpGateway.Gateway.Networking.Buffers;
 using ChatApp.TcpGateway.Gateway.Networking.Sessions;
+using ChatApp.TcpGateway.Infrastructure.GroupIdempotency;
 using ChatApp.TcpGateway.Observability.Logging;
 using ChatApp.TcpGateway.Observability.Metrics;
 using Microsoft.Extensions.Logging;
@@ -86,14 +87,16 @@ internal sealed partial class GroupCommandHandler
             if (_idempotencyCache is { } cache)
             {
                 var payloadHash = ComputePayloadHash(command);
-                var lookup = cache.TryGet(
+                var lookup = await cache.TryGetAsync(
                     command.ActorUserId,
                     (int)command.Operation,
                     command.RequestId,
-                    payloadHash);
+                    payloadHash,
+                    cancellationToken).ConfigureAwait(false);
 
                 if (lookup.IsHit)
                 {
+                    _metrics.GroupIdempotentHit();
                     var cached = lookup.Result!;
                     SendCreateGroupResponse(session, new CreateGroupResponse
                     {
@@ -111,6 +114,7 @@ internal sealed partial class GroupCommandHandler
                 // 同一 RequestId 但负载指纹不匹配：返回冲突错误。
                 if (lookup.IsConflict)
                 {
+                    _metrics.GroupIdempotentConflict();
                     _metrics.CommandFailed(PacketCommand.CreateGroupRequest);
                     SendCreateGroupResponse(session, new CreateGroupResponse
                     {
@@ -121,6 +125,8 @@ internal sealed partial class GroupCommandHandler
                     });
                     return;
                 }
+
+                _metrics.GroupIdempotentMiss();
             }
 
             var result = await _messageBus.MutateGroupConversationAsync(command, cancellationToken)
@@ -129,12 +135,13 @@ internal sealed partial class GroupCommandHandler
             // 缓存 Realtime 正常返回的结果（含业务失败）。
             if (_idempotencyCache is { } cacheForAdd)
             {
-                cacheForAdd.TryAdd(
+                await cacheForAdd.TryAddAsync(
                     command.ActorUserId,
                     (int)command.Operation,
                     command.RequestId,
                     ComputePayloadHash(command),
-                    result);
+                    result,
+                    cancellationToken).ConfigureAwait(false);
             }
 
             SendCreateGroupResponse(session, new CreateGroupResponse

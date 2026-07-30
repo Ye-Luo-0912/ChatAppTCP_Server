@@ -114,4 +114,10 @@ namespace ChatApp.TcpGateway.Infrastructure.Serialization.Json;
 [JsonSerializable(typeof(UnregisterPushTokenResponse))]
 [JsonSerializable(typeof(PushTokenRecord))]
 [JsonSerializable(typeof(ResumeContext))]
+[JsonSerializable(typeof(ChatApp.Realtime.Abstractions.Conversations.GroupConversationResult), TypeInfoPropertyName = "RealtimeGroupConversationResult")]
+[JsonSerializable(typeof(ChatApp.Realtime.Abstractions.Conversations.ConversationMemberItem), TypeInfoPropertyName = "RealtimeConversationMemberItem")]
+[JsonSerializable(typeof(ChatApp.Realtime.Abstractions.Conversations.ConversationMemberRole), TypeInfoPropertyName = "RealtimeConversationMemberRole")]
+[JsonSerializable(typeof(ChatApp.Realtime.Abstractions.Conversations.ConversationType), TypeInfoPropertyName = "RealtimeConversationType")]
+[JsonSerializable(typeof(List<ChatApp.Realtime.Abstractions.Conversations.ConversationMemberItem>), TypeInfoPropertyName = "RealtimeConversationMemberItemList")]
+[JsonSerializable(typeof(System.Collections.Generic.IReadOnlyList<ChatApp.Realtime.Abstractions.Conversations.ConversationMemberItem>), TypeInfoPropertyName = "RealtimeConversationMemberItemReadOnlyList")]
 public partial class GatewayJsonSerializerContext : JsonSerializerContext;

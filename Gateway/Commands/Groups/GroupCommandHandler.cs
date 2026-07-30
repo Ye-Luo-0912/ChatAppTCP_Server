@@ -4,6 +4,7 @@ using ChatApp.TcpGateway.Core.Protocol;
 using ChatApp.TcpGateway.Core.Serialization;
 using ChatApp.TcpGateway.Gateway.Dispatching;
 using ChatApp.TcpGateway.Gateway.Networking.Sessions;
+using ChatApp.TcpGateway.Infrastructure.GroupIdempotency;
 using ChatApp.TcpGateway.Observability.Metrics;
 using Microsoft.Extensions.Logging;
 using RealtimeGroupConversationCommand =
@@ -53,7 +54,7 @@ internal sealed partial class GroupCommandHandler : ICommandHandler
     private readonly IPayloadCodec<ListGroupMembersResponse> _listGroupMembersResponseCodec;
     private readonly GatewayMetrics _metrics;
     private readonly ILogger<GroupCommandHandler> _logger;
-    private readonly GroupRequestIdempotencyCache? _idempotencyCache;
+    private readonly IGroupIdempotencyStore? _idempotencyCache;
 
     public GroupCommandHandler(
         IRealtimeMessageBus messageBus,
@@ -71,7 +72,7 @@ internal sealed partial class GroupCommandHandler : ICommandHandler
         IPayloadCodec<ListGroupMembersResponse> listGroupMembersResponseCodec,
         GatewayMetrics metrics,
         ILogger<GroupCommandHandler> logger,
-        GroupRequestIdempotencyCache? idempotencyCache = null)
+        IGroupIdempotencyStore? idempotencyCache = null)
     {
         _messageBus = messageBus;
         _createGroupRequestCodec = createGroupRequestCodec;
@@ -89,19 +90,6 @@ internal sealed partial class GroupCommandHandler : ICommandHandler
         _metrics = metrics;
         _logger = logger;
         _idempotencyCache = idempotencyCache;
-
-        // 将幂等命中/未命中回调绑定到 metrics。
-        // 缓存实例在 DI 中单例，回调只绑定一次；null 时不记录 metrics。
-        if (idempotencyCache is { } cache)
-        {
-            cache.OnLookup = hit =>
-            {
-                if (hit)
-                    metrics.GroupIdempotentHit();
-                else
-                    metrics.GroupIdempotentMiss();
-            };
-        }
     }
 
     public ValueTask ExecuteAsync(
