@@ -3,6 +3,7 @@ using ChatApp.Realtime.Abstractions.Events;
 using ChatApp.Realtime.Integration;
 using ChatApp.TcpGateway.Core.Authentication;
 using ChatApp.TcpGateway.Core.Protocol;
+using ChatApp.TcpGateway.Gateway.Configuration;
 using ChatApp.TcpGateway.Observability.Logging;
 using ChatApp.TcpGateway.Observability.Metrics;
 using Microsoft.Extensions.Logging;
@@ -27,7 +28,20 @@ namespace ChatApp.TcpGateway.Gateway.Networking.Sessions;
 /// </summary>
 internal sealed partial class SessionLifecycleCoordinator
 {
-    private async ValueTask ReplaceSameDeviceSessionsAsync(
+    /// <summary>
+    /// 同设备会话替换：本机旧连接立即踢下线 + 跨 Gateway 旧连接通过 Redis 设备租约 TakeOver 发现并广播 SessionRevoked。
+    /// <para>
+    /// P1-C：返回 <c>true</c> 表示可继续认证；<c>false</c> 表示 fail-closed 拒绝认证
+    /// （仅当 <see cref="TcpGatewayOptions.AuthRedisFailMode"/>=<see cref="RedisFailMode.FailClosed"/>
+    /// 且 TakeOver 依赖不可用时）。
+    /// </para>
+    /// <para>
+    /// FailOpen（旧行为）：TakeOver 依赖不可用仅记录日志，继续完成认证。
+    /// 旧连接依赖设备租约 TTL 自然失效。
+    /// </para>
+    /// </summary>
+    /// <returns><c>true</c> 继续认证；<c>false</c> fail-closed 拒绝认证（调用方需回滚本地状态）。</returns>
+    private async ValueTask<bool> ReplaceSameDeviceSessionsAsync(
         TcpClientSession incoming,
         CancellationToken cancellationToken)
     {
@@ -42,59 +56,74 @@ internal sealed partial class SessionLifecycleCoordinator
             || string.IsNullOrWhiteSpace(incoming.SessionId)
             || incoming.UserId <= 0)
         {
-            return;
+            return true;
         }
 
         // TTL 略长于空闲超时，避免正常心跳间隙丢租约；断开时 ReleaseIfOwner。
         var leaseTtl = _options.IdleTimeout + TimeSpan.FromMinutes(5);
-        DeviceLeaseTakeoverResult? takeover;
-        try
+        // P1-A2：transportId（公开路由标识）与 leaseOwnerToken（私有所有权凭证）分离。
+        // transportId 写入 Redis 值供未来 TakeOver 读取作为 PreviousTransportId 返回；
+        // leaseOwnerToken 用于 Release/Refresh CAS，不写入广播事件。
+        var takeover = await _deviceSessionLeaseStore
+            .TakeOverAsync(
+                incoming.UserId,
+                deviceHash,
+                incoming.SessionId,
+                incoming.ConnectionLeaseId,
+                incoming.LeaseOwnerToken,
+                leaseTtl,
+                cancellationToken)
+            .ConfigureAwait(false);
+
+        // P1-C：依赖不可用时的 fail-mode 处理。
+        if (takeover.Status == TakeOverStatus.DependencyUnavailable)
         {
-            // 传入 ConnectionLeaseId 作为所有权令牌。
-            takeover = await _deviceSessionLeaseStore
-                .TakeOverAsync(
-                    incoming.UserId,
-                    deviceHash,
-                    incoming.SessionId,
-                    incoming.ConnectionLeaseId,
-                    leaseTtl,
-                    cancellationToken)
-                .ConfigureAwait(false);
-        }
-        catch (Exception exception)
-        {
+            // FailClosed：拒绝认证，回滚本地状态，关闭连接。
+            // 与 Resume 路径 fail-closed 行为一致：Same-device fencing 属于安全不变量。
+            if (_options.AuthRedisFailMode == RedisFailMode.FailClosed)
+            {
+                _logger.TransportFailed(
+                    GatewayTransportOperation.ClientProcessing,
+                    incoming.ConnectionId,
+                    takeover.Exception ?? new InvalidOperationException("TakeOver dependency unavailable (FailClosed)"));
+                _metrics.ResumeFailed(ResumeFailureReason.TakeOverUnavailable);
+                return false;
+            }
+
+            // FailOpen：尽力而为路径不阻断登录（旧行为）。
+            // 旧连接依赖设备租约 TTL 自然失效；日志记录便于排查。
             _logger.SessionRevocationFailed(
                 incoming.ConnectionId,
                 incoming.SessionId,
-                exception);
-            return;
+                takeover.Exception ?? new InvalidOperationException("TakeOver dependency unavailable (FailOpen)"));
+            return true;
         }
 
-        // P0-7：按 ConnectionLeaseId 判断是否存在跨 Gateway 旧连接需要吊销。
+        // P0-7：按 TransportId 判断是否存在跨 Gateway 旧连接需要吊销。
         // 仅比较 SessionId 会在 Resume 复用 SessionId 时漏发吊销事件。
-        if (takeover is not { } t
-            || string.IsNullOrWhiteSpace(t.PreviousConnectionLeaseId)
+        if (!takeover.HasPreviousLease
             || string.Equals(
-                t.PreviousConnectionLeaseId,
+                takeover.PreviousTransportId,
                 incoming.ConnectionLeaseId,
                 StringComparison.Ordinal))
         {
-            return;
+            return true;
         }
 
-        // 本机已踢过的连接不必再发；按 ConnectionLeaseId 判断（比 SessionId 更精确）。
+        // 本机已踢过的连接不必再发；按 TransportId 判断（比 SessionId 更精确）。
         var alreadyLocal = localVictims.Any(v =>
-            string.Equals(v.ConnectionLeaseId, t.PreviousConnectionLeaseId, StringComparison.Ordinal));
+            string.Equals(v.ConnectionLeaseId, takeover.PreviousTransportId!, StringComparison.Ordinal));
         if (alreadyLocal)
-            return;
+            return true;
 
         await PublishSessionRevokedEventAsync(
             incoming.UserId,
-            !string.IsNullOrWhiteSpace(t.PreviousSessionId) ? t.PreviousSessionId! : incoming.SessionId!,
+            !string.IsNullOrWhiteSpace(takeover.PreviousSessionId) ? takeover.PreviousSessionId! : incoming.SessionId!,
             occurredAtMs,
             incoming.ConnectionId,
-            t.PreviousConnectionLeaseId,
+            takeover.PreviousTransportId,
             cancellationToken).ConfigureAwait(false);
+        return true;
     }
 
     /// <summary>

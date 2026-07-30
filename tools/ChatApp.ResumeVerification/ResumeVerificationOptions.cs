@@ -27,7 +27,8 @@ internal sealed record ResumeVerificationOptions(
         "[--user-count 50] [--storm-size 1000] " +
         "[--redis-down-delay-seconds 0] [--redis-recovery-delay-seconds 0] " +
         "[--report-directory .artifacts/resume-verification] " +
-        "[--bootstrap-user-id-start 9400000000] [--warmup-seconds 3]";
+        "[--bootstrap-user-id-start 9400000000] [--warmup-seconds 3]\n" +
+        "Storm sizes up to 10000 are supported; concurrency and deadline scale automatically.";
 
     /// <summary>所有可用场景名称（按顺序）。</summary>
     public static readonly string[] AllScenarios =

@@ -184,7 +184,8 @@ internal sealed class ResumeCapableProtocolClient : IAsyncDisposable
             return new ResumeAttemptResult(
                 ResumeAttemptOutcome.Failed,
                 Session: null,
-                ErrorMessage: $"Code={error.Code}; {error.Message}");
+                ErrorMessage: $"Code={error.Code}; {error.Message}",
+                ErrorCode: error.Code);
         }
 
         if (frame.Command == PacketCommand.ServerHello)
@@ -313,10 +314,15 @@ internal enum ResumeAttemptOutcome
 }
 
 /// <summary>Resume 尝试结果详情。</summary>
+/// <param name="Outcome">尝试结果。</param>
+/// <param name="Session">成功时的会话信息；失败时为 null。</param>
+/// <param name="ErrorMessage">错误消息。</param>
+/// <param name="ErrorCode">P1-B：协议错误码（仅 Error 帧时有意义）；用于区分 ResumeFailed 与 DependencyUnavailable。</param>
 internal sealed record ResumeAttemptResult(
     ResumeAttemptOutcome Outcome,
     AuthenticatedSession? Session,
-    string? ErrorMessage);
+    string? ErrorMessage,
+    ProtocolErrorCode? ErrorCode = null);
 
 /// <summary>接收到的帧。</summary>
 internal sealed record ReceivedFrame(PacketCommand Command, byte[] Payload);

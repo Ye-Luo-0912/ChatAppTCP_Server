@@ -348,6 +348,34 @@ public sealed class TcpGatewayOptions
     public TimeSpan ResumeTokenTtl { get; set; } = TimeSpan.FromSeconds(30);
 
     /// <summary>
+    /// P1-C：Resume 路径在 Redis 不可用时的 fail-mode。
+    /// <para>
+    /// 默认 <see cref="RedisFailMode.FailClosed"/>：TakeOver/代次校验依赖不可用时
+    /// 拒绝恢复、回滚本地状态、关闭连接，要求完整认证。Same-device fencing 属于安全不变量。
+    /// </para>
+    /// <para>
+    /// 切换为 <see cref="RedisFailMode.FailOpen"/> 后：跳过 TakeOver/代次校验，
+    /// 继续恢复会话。旧 Transport 不被吊销，依赖租约 TTL 自然释放。
+    /// 仅用于降级模式，需运维明确评估风险。
+    /// </para>
+    /// </summary>
+    public RedisFailMode ResumeRedisFailMode { get; set; } = RedisFailMode.FailClosed;
+
+    /// <summary>
+    /// P1-C：正常 Authentication 路径在 Redis 不可用时的 fail-mode。
+    /// <para>
+    /// 默认 <see cref="RedisFailMode.FailClosed"/>：与 Resume 路径一致，
+    /// TakeOver 依赖不可用时拒绝认证、回滚本地状态、关闭连接。
+    /// </para>
+    /// <para>
+    /// 切换为 <see cref="RedisFailMode.FailOpen"/> 后：TakeOver 失败仅记录日志，
+    /// 继续完成认证（best-effort）。旧连接依赖本机 TakeOverSameDevice + 租约 TTL 自然失效。
+    /// 此为 P1-C 之前的旧行为，保留以兼容需要最大可用性的部署。
+    /// </para>
+    /// </summary>
+    public RedisFailMode AuthRedisFailMode { get; set; } = RedisFailMode.FailClosed;
+
+    /// <summary>
     /// 服务端实例标识（128 位 GUID 的 32 字符十六进制表示）。
     /// <para>
     /// 配置加载场景传入持久化值；null 或空时启动时自动生成。
@@ -414,6 +442,8 @@ public sealed class TcpGatewayOptions
         MinimumClientProtocolVersion >= PacketProtocol.MinProtocolVersion &&
         MinimumClientProtocolVersion <= PacketProtocol.CurrentProtocolVersion &&
         ResumeTokenTtl > TimeSpan.Zero &&
+        Enum.IsDefined(ResumeRedisFailMode) &&
+        Enum.IsDefined(AuthRedisFailMode) &&
         GoAwayDrainTimeout > TimeSpan.Zero &&
         RealtimeEventPartitionCount > 0;
 }

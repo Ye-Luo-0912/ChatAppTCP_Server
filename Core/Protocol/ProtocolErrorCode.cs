@@ -39,6 +39,14 @@ public enum ProtocolErrorCode : ushort
     /// <summary>ResumeToken 无效或已过期。客户端应走完整认证流程。</summary>
     ResumeFailed = 13,
 
+    /// <summary>
+    /// P1-B：依赖不可用（Redis/NATS 异常或熔断器开路），Resume 暂时无法完成。
+    /// 客户端可按 <c>RetryAfterMs</c> 退避后重试 Resume，或回退到完整认证。
+    /// 与 <see cref="ResumeFailed"/> 区分：后者是 Token 本身无效（不可恢复），
+    /// 本码表示服务端依赖临时故障（可重试）。
+    /// </summary>
+    DependencyUnavailable = 14,
+
     /// <summary>请求频率超限。客户端应按 <c>RetryAfterMs</c> 退避后重试。</summary>
     RateLimited = 20,
 

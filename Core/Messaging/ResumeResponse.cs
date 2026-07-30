@@ -10,6 +10,12 @@ public sealed class ResumeResponse
     public bool Success { get; set; }
 
     /// <summary>
+    /// P1-B：失败种类分类（仅 <see cref="Success"/>=false 时有意义）。
+    /// 客户端据此区分不可恢复的 Token 失效与可重试的依赖故障。
+    /// </summary>
+    public ResumeFailureKind FailureKind { get; set; }
+
+    /// <summary>
     /// 恢复成功时返回新的 ResumeToken（旧 Token 已失效）。
     /// 失败时为 null，客户端应走完整认证流程。
     /// </summary>
@@ -32,4 +38,11 @@ public sealed class ResumeResponse
 
     /// <summary>失败时的错误消息（仅调试用）。</summary>
     public string? ErrorMessage { get; set; }
+
+    /// <summary>
+    /// P1-B：依赖不可用时的重试退避建议（毫秒）。
+    /// 仅在 <see cref="FailureKind"/>=<see cref="ResumeFailureKind.DependencyUnavailable"/> 时有意义。
+    /// 客户端应在此时间后重试 Resume，或回退到完整认证。
+    /// </summary>
+    public int? RetryAfterMs { get; set; }
 }

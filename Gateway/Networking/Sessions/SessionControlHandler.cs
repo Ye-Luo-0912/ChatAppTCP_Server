@@ -186,9 +186,25 @@ internal sealed class SessionControlHandler
         _metrics.UnauthenticatedConnectionClosed();
 
         // Session 生命周期（注册、Presence 上线、同设备替换、ResumeToken 颁发）委托协调器。
-        var resumeToken = await _lifecycleCoordinator.OnAuthenticatedAsync(
+        // P1-C：AuthRedisFailMode=FailClosed 时 TakeOver 不可用 → 返回失败，
+        // 调用方发送 AuthenticationResponse(Success=false) 并关闭连接。
+        var authResult = await _lifecycleCoordinator.OnAuthenticatedAsync(
                 session, result, cancellationToken)
             .ConfigureAwait(false);
+
+        if (!authResult.Success)
+        {
+            // FailClosed：依赖不可用，拒绝认证。客户端可按 RetryAfterMs 退避后重试。
+            SendAuthenticationFailure(
+                session,
+                authResult.FailureKind == AuthFailureKind.DependencyUnavailable
+                    ? "authentication dependency unavailable, retry after backoff"
+                    : "authentication failed",
+                AuthenticationFailureKind.DependencyUnavailable);
+            return;
+        }
+
+        var resumeToken = authResult.ResumeToken;
 
         var response = new AuthenticationResponse
         {
@@ -303,49 +319,61 @@ internal sealed class SessionControlHandler
                  !string.IsNullOrWhiteSpace(hello.ResumeToken))
         {
             // _resumeResponseCodec 未注入（测试场景）时跳过 Resume 尝试，回退到完整认证。
-            ResumeLifecycleResult? resumeResult = null;
+            ResumeAttemptResult? resumeAttempt = null;
             if (_resumeResponseCodec is not null)
             {
-                resumeResult = await _lifecycleCoordinator
+                resumeAttempt = await _lifecycleCoordinator
                     .TryResumeAsync(hello.ResumeToken!, session, cancellationToken)
                     .ConfigureAwait(false);
             }
 
-            if (resumeResult is not null)
+            if (resumeAttempt is not null)
             {
-                // 恢复成功：admission 跟踪 + 发送 ResumeResponse。
-                _listenerHost.MarkAuthenticated();
-                _metrics.UnauthenticatedConnectionClosed();
-                session.CompleteHandshake(
-                    negotiatedProtocolVersion,
-                    negotiatedFeatureBits);
-
-                var resumeResponse = new ResumeResponse
+                if (resumeAttempt.Success && resumeAttempt.Result is not null)
                 {
-                    Success = true,
-                    ResumeToken = resumeResult.ResumeToken,
-                    UserId = resumeResult.UserId,
-                    SessionId = resumeResult.SessionId,
-                    DeviceId = resumeResult.DeviceId,
-                    // 来自 SyncBootstrap 查询的 ServerTimeMs；查询失败或超时为 null，
-                    // 客户端应回退到“始终 SyncBootstrap”策略。
-                    LastConversationSequence = resumeResult.LastConversationSequence
-                };
-                using var resumeFrame = OutboundFrameFactory.Create(
-                    PacketCommand.ResumeResponse,
-                    _resumeResponseCodec!,
-                    resumeResponse);
-                session.TryQueue(resumeFrame);
-                return; // 恢复成功，ResumeResponse 已发送。
-            }
+                    // 恢复成功：admission 跟踪 + 发送 ResumeResponse。
+                    var result = resumeAttempt.Result;
+                    _listenerHost.MarkAuthenticated();
+                    _metrics.UnauthenticatedConnectionClosed();
+                    session.CompleteHandshake(
+                        negotiatedProtocolVersion,
+                        negotiatedFeatureBits);
 
-            // 恢复失败：记录准入失败用于限流统计，再发送 Error 帧，客户端应走完整认证流程。
-            _listenerHost.RecordAuthenticationFailure(remoteIp);
-            SendProtocolError(
-                session,
-                ProtocolErrorCode.ResumeFailed,
-                "resume token invalid or expired");
-            // 继续发送 ServerHello，客户端可选择重新认证。
+                    var resumeResponse = new ResumeResponse
+                    {
+                        Success = true,
+                        ResumeToken = result.ResumeToken,
+                        UserId = result.UserId,
+                        SessionId = result.SessionId,
+                        DeviceId = result.DeviceId,
+                        // 来自 SyncBootstrap 查询的 ServerTimeMs；查询失败或超时为 null，
+                        // 客户端应回退到“始终 SyncBootstrap”策略。
+                        LastConversationSequence = result.LastConversationSequence
+                    };
+                    using var resumeFrame = OutboundFrameFactory.Create(
+                        PacketCommand.ResumeResponse,
+                        _resumeResponseCodec!,
+                        resumeResponse);
+                    session.TryQueue(resumeFrame);
+                    return; // 恢复成功，ResumeResponse 已发送。
+                }
+
+                // P1-B：恢复失败——按 FailureKind 区分错误码。
+                // InvalidToken → ResumeFailed（客户端必须完整认证）
+                // DependencyUnavailable → DependencyUnavailable（客户端可退避后重试 Resume）
+                _listenerHost.RecordAuthenticationFailure(remoteIp);
+                var failureKind = resumeAttempt.FailureKind;
+                var errorCode = failureKind.ToErrorCode();
+                var errorMessage = failureKind == ResumeFailureKind.DependencyUnavailable
+                    ? "resume dependency unavailable, retry after backoff"
+                    : "resume token invalid or expired";
+                SendProtocolError(
+                    session,
+                    errorCode,
+                    errorMessage,
+                    retryAfterMs: resumeAttempt.RetryAfterMs);
+                // 继续发送 ServerHello，客户端可选择重新认证或重试 Resume。
+            }
         }
 
         // 发送 ServerHello 握手响应。FeatureBits 为双方能力交集；

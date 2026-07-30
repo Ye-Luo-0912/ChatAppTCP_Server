@@ -228,9 +228,15 @@ internal sealed partial class TcpClientSession : IAsyncDisposable
     public uint ConnectionId { get; }
 
     /// <summary>
-    /// 每次 TCP 连接生成的唯一所有权令牌（GUID），用于设备租约的 compare-and-delete/refresh。
-    /// 与 <see cref="SessionId"/> 分离：SessionId 是用户可见会话标识，ConnectionLeaseId 是内部所有权凭证。
+    /// 每次 TCP 连接生成的公开路由标识（GUID），用于：
+    /// <list type="bullet">
+    /// <item>跨 Gateway 吊销路由匹配（<see cref="Core.Protocol.SessionRevokedPayload.TransportId"/>）；</item>
+    /// <item>本机新旧连接区分（<see cref="UserSessionRegistry.TakeOverSameDevice"/>）；</item>
+    /// <item>写入 <see cref="Core.Authentication.ResumeContext"/> 供客户端跟踪。</item>
+    /// </list>
     /// <para>
+    /// P1-A2：与 <see cref="LeaseOwnerToken"/> 分离。<c>ConnectionLeaseId</c> 是公开标识，
+    /// 可出现在日志/NATS 事件中；<c>LeaseOwnerToken</c> 是私有所有权凭证，仅用于 Redis CAS。
     /// 内部存储为 <see cref="Guid"/>（16 字节），仅首次访问时格式化为 "N" 字符串。
     /// 未认证即断开的连接不产生字符串分配。
     /// </para>
@@ -238,6 +244,22 @@ internal sealed partial class TcpClientSession : IAsyncDisposable
     private readonly Guid _connectionLeaseId = Guid.NewGuid();
     private string? _connectionLeaseIdString;
     public string ConnectionLeaseId => _connectionLeaseIdString ??= _connectionLeaseId.ToString("N");
+
+    /// <summary>
+    /// 每次 TCP 连接生成的私有所有权凭证（GUID），仅用于 Redis 设备租约的
+    /// compare-and-delete/refresh（<see cref="Core.Authentication.IDeviceSessionLeaseStore"/>）。
+    /// <para>
+    /// P1-A2：与 <see cref="ConnectionLeaseId"/> 分离，遵循最小权限原则——
+    /// 即使 <c>ConnectionLeaseId</c>（公开 TransportId）泄漏到日志或客户端，
+    /// 攻击者也无法据此构造伪造的 Release/Refresh 请求释放他人租约。
+    /// </para>
+    /// <para>
+    /// 内部存储为 <see cref="Guid"/>（16 字节），仅首次访问时格式化为 "N" 字符串。
+    /// </para>
+    /// </summary>
+    private readonly Guid _leaseOwnerToken = Guid.NewGuid();
+    private string? _leaseOwnerTokenString;
+    public string LeaseOwnerToken => _leaseOwnerTokenString ??= _leaseOwnerToken.ToString("N");
 
     public bool IsConnected => Volatile.Read(ref _closeState) == 0;
 

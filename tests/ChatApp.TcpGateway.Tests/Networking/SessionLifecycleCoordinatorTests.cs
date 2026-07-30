@@ -15,6 +15,7 @@ using ChatApp.TcpGateway.Gateway.Networking.Sessions;
 using ChatApp.TcpGateway.Infrastructure.Caching;
 using ChatApp.TcpGateway.Infrastructure.Serialization.Json;
 using Microsoft.Extensions.Logging.Abstractions;
+using StackExchange.Redis;
 using RealtimeHistory = ChatApp.Realtime.Abstractions.Messaging.History;
 
 namespace ChatApp.TcpGateway.Tests.Networking;
@@ -44,13 +45,9 @@ public sealed class SessionLifecycleCoordinatorTests
         var leaseStore = new FakeDeviceSessionLeaseStore
         {
             // TakeOver 发现旧 SessionId（跨 Gateway），应触发 SessionRevoked 广播。
-            // P0-7：返回 DeviceLeaseTakeoverResult 携带旧 SessionId 和旧 ConnectionLeaseId。
-            OnTakeOver = _ => ValueTask.FromResult<DeviceLeaseTakeoverResult?>(
-                new DeviceLeaseTakeoverResult
-                {
-                    PreviousSessionId = "old-remote-session",
-                    PreviousConnectionLeaseId = "old-remote-lease"
-                })
+            // P0-7：TakeOverResult.Success 携带旧 SessionId 和旧 ConnectionLeaseId。
+            OnTakeOver = _ => ValueTask.FromResult(
+                TakeOverResult.Success("old-remote-session", "old-remote-lease"))
         };
         var tokenStore = new FakeResumeTokenStore
         {
@@ -72,9 +69,10 @@ public sealed class SessionLifecycleCoordinatorTests
 
         // Resume 成功
         Assert.NotNull(result);
-        Assert.Equal("new-token", result!.ResumeToken);
-        Assert.Equal(1001, result.UserId);
-        Assert.Equal("resuming-session", result.SessionId);
+        Assert.True(result!.Success);
+        Assert.Equal("new-token", result.Result!.ResumeToken);
+        Assert.Equal(1001, result.Result.UserId);
+        Assert.Equal("resuming-session", result.Result.SessionId);
 
         // 应广播 SessionRevoked 关闭跨 Gateway 旧连接
         var revoked = Assert.Single(bus.PublishedEvents,
@@ -112,7 +110,9 @@ public sealed class SessionLifecycleCoordinatorTests
         var result = await coordinator.TryResumeAsync("valid-token", session, ct);
 
         // 拒绝恢复
-        Assert.Null(result);
+        Assert.NotNull(result);
+        Assert.False(result!.Success);
+        Assert.Equal(ResumeFailureKind.InvalidToken, result.FailureKind);
         // 不应广播 SessionRevoked（拒绝恢复 ≠ 关闭旧连接）
         Assert.DoesNotContain(bus.PublishedEvents,
             e => e.Type == RealtimeEventType.SessionRevoked);
@@ -147,7 +147,9 @@ public sealed class SessionLifecycleCoordinatorTests
         var result = await coordinator.TryResumeAsync("valid-token", session, ct);
 
         // 拒绝恢复（fail-closed）
-        Assert.Null(result);
+        Assert.NotNull(result);
+        Assert.False(result!.Success);
+        Assert.Equal(ResumeFailureKind.DependencyUnavailable, result.FailureKind);
         // 不应广播任何事件（未恢复成功）
         Assert.Empty(bus.PublishedEvents);
     }
@@ -199,7 +201,9 @@ public sealed class SessionLifecycleCoordinatorTests
 
         var result = await coordinator.TryResumeAsync("invalid-token", session, ct);
 
-        Assert.Null(result);
+        Assert.NotNull(result);
+        Assert.False(result!.Success);
+        Assert.Equal(ResumeFailureKind.InvalidToken, result.FailureKind);
         // 不应触发任何事件
         Assert.Empty(bus.PublishedEvents);
     }
@@ -220,7 +224,9 @@ public sealed class SessionLifecycleCoordinatorTests
 
         var result = await coordinator.TryResumeAsync("any-token", session, ct);
 
-        Assert.Null(result);
+        Assert.NotNull(result);
+        Assert.False(result!.Success);
+        Assert.Equal(ResumeFailureKind.DependencyUnavailable, result.FailureKind);
         Assert.Empty(bus.PublishedEvents);
     }
 
@@ -245,7 +251,9 @@ public sealed class SessionLifecycleCoordinatorTests
 
         var result = await coordinator.TryResumeAsync("any-token", session, ct);
 
-        Assert.Null(result);
+        Assert.NotNull(result);
+        Assert.False(result!.Success);
+        Assert.Equal(ResumeFailureKind.DependencyUnavailable, result.FailureKind);
         // 熔断器开路时不应调用 Redis 存储
         Assert.False(tokenStore.TryValidateCalled);
         Assert.Empty(bus.PublishedEvents);
@@ -261,7 +269,7 @@ public sealed class SessionLifecycleCoordinatorTests
         {
             // 当前租约归属待恢复 SessionId（无冲突）
             OnGetCurrentSessionId = _ => ValueTask.FromResult<string?>("resuming-session"),
-            OnTakeOver = _ => ValueTask.FromResult<DeviceLeaseTakeoverResult?>(null) // 无旧 Session
+            OnTakeOver = _ => ValueTask.FromResult(TakeOverResult.NoPreviousLease()) // 无旧 Session
         };
         var tokenStore = new FakeResumeTokenStore
         {
@@ -282,8 +290,9 @@ public sealed class SessionLifecycleCoordinatorTests
         var result = await coordinator.TryResumeAsync("valid-token", session, ct);
 
         Assert.NotNull(result);
-        Assert.Equal("fresh-token", result!.ResumeToken);
-        Assert.Equal(2002, result.UserId);
+        Assert.True(result!.Success);
+        Assert.Equal("fresh-token", result.Result!.ResumeToken);
+        Assert.Equal(2002, result.Result.UserId);
         // 无旧 Session，不应广播 SessionRevoked
         Assert.DoesNotContain(bus.PublishedEvents,
             e => e.Type == RealtimeEventType.SessionRevoked);
@@ -298,7 +307,7 @@ public sealed class SessionLifecycleCoordinatorTests
         var bus = new CapturingMessageBus();
         var leaseStore = new FakeDeviceSessionLeaseStore
         {
-            OnTakeOver = _ => ValueTask.FromResult<DeviceLeaseTakeoverResult?>(null)
+            OnTakeOver = _ => ValueTask.FromResult(TakeOverResult.NoPreviousLease())
         };
         var tokenStore = new FakeResumeTokenStore
         {
@@ -374,7 +383,8 @@ public sealed class SessionLifecycleCoordinatorTests
         var leaseStore = new FakeDeviceSessionLeaseStore
         {
             OnGetCurrentSessionId = _ => ValueTask.FromResult<string?>(null), // 租约查询通过
-            OnTakeOver = _ => throw new InvalidOperationException("simulated takeover failure")
+            OnTakeOver = _ => ValueTask.FromResult(
+                TakeOverResult.Unavailable(new InvalidOperationException("simulated takeover failure")))
         };
         var tokenStore = new FakeResumeTokenStore
         {
@@ -393,7 +403,9 @@ public sealed class SessionLifecycleCoordinatorTests
         var result = await coordinator.TryResumeAsync("valid-token", session, ct);
 
         // 拒绝恢复（fail-closed）
-        Assert.Null(result);
+        Assert.NotNull(result);
+        Assert.False(result!.Success);
+        Assert.Equal(ResumeFailureKind.DependencyUnavailable, result.FailureKind);
         // 不应广播任何事件（未恢复成功）
         Assert.Empty(bus.PublishedEvents);
     }
@@ -408,7 +420,8 @@ public sealed class SessionLifecycleCoordinatorTests
         var leaseStore = new FakeDeviceSessionLeaseStore
         {
             OnGetCurrentSessionId = _ => ValueTask.FromResult<string?>(null),
-            OnTakeOver = _ => throw new InvalidOperationException("simulated takeover failure")
+            OnTakeOver = _ => ValueTask.FromResult(
+                TakeOverResult.Unavailable(new InvalidOperationException("simulated takeover failure")))
         };
         var tokenStore = new FakeResumeTokenStore
         {
@@ -430,14 +443,299 @@ public sealed class SessionLifecycleCoordinatorTests
             "gateway.resume.failed was not incremented");
     }
 
+    [Fact]
+    public async Task TryResumeAsync_FailOpen_ProceedsWhenLeaseQueryThrows()
+    {
+        // P1-C：ResumeRedisFailMode=FailOpen 时，代次校验依赖不可用应跳过校验继续恢复，
+        // 而非默认的 FailClosed（拒绝恢复）。
+        var ct = TestContext.Current.CancellationToken;
+        using var metrics = new GatewayMetrics();
+        var bus = new CapturingMessageBus();
+        var leaseStore = new FakeDeviceSessionLeaseStore
+        {
+            // GetCurrentSessionId 抛异常模拟 Redis 故障
+            OnGetCurrentSessionId = _ => throw new RedisException("simulated redis failure"),
+            // TakeOver 成功（无旧租约）
+            OnTakeOver = _ => ValueTask.FromResult(TakeOverResult.NoPreviousLease())
+        };
+        var tokenStore = new FakeResumeTokenStore
+        {
+            OnTryValidate = _ => Task.FromResult<ResumeContext?>(
+                new ResumeContext
+                {
+                    UserId = 1001,
+                    SessionId = "resuming-session",
+                    ConnectionLeaseId = "old-lease",
+                    DeviceIdHash = 0xAA
+                }),
+            OnIssue = _ => Task.FromResult("new-token")
+        };
+        var options = new TcpGatewayOptions
+        {
+            EnableResume = true,
+            ResumeTokenTtl = TimeSpan.FromSeconds(30),
+            EnableEphemeralPresenceAndTyping = false,
+            ReplaceSameDeviceSession = false,
+            IdleTimeout = TimeSpan.FromSeconds(90),
+            ResumeRedisFailMode = RedisFailMode.FailOpen
+        };
+        var coordinator = CreateCoordinator(metrics, bus, leaseStore, tokenStore, options: options);
+        await using var session = CreateSession(metrics);
+
+        var result = await coordinator.TryResumeAsync("valid-token", session, ct);
+
+        // FailOpen：恢复成功，跳过代次校验
+        Assert.NotNull(result);
+        Assert.True(result!.Success);
+        Assert.NotNull(result.Result);
+        Assert.Equal("new-token", result.Result!.ResumeToken);
+    }
+
+    [Fact]
+    public async Task TryResumeAsync_FailClosed_RejectsWhenLeaseQueryThrows()
+    {
+        // P1-C：ResumeRedisFailMode=FailClosed（默认）时，代次校验依赖不可用应拒绝恢复。
+        var ct = TestContext.Current.CancellationToken;
+        using var metrics = new GatewayMetrics();
+        var bus = new CapturingMessageBus();
+        var leaseStore = new FakeDeviceSessionLeaseStore
+        {
+            OnGetCurrentSessionId = _ => throw new RedisException("simulated redis failure")
+        };
+        var tokenStore = new FakeResumeTokenStore
+        {
+            OnTryValidate = _ => Task.FromResult<ResumeContext?>(
+                new ResumeContext
+                {
+                    UserId = 1001,
+                    SessionId = "resuming-session",
+                    ConnectionLeaseId = "old-lease",
+                    DeviceIdHash = 0xAA
+                })
+        };
+        // 默认 ResumeRedisFailMode=FailClosed，无需显式设置
+        var coordinator = CreateCoordinator(metrics, bus, leaseStore, tokenStore);
+        await using var session = CreateSession(metrics);
+
+        var result = await coordinator.TryResumeAsync("valid-token", session, ct);
+
+        // FailClosed：拒绝恢复
+        Assert.NotNull(result);
+        Assert.False(result!.Success);
+        Assert.Equal(ResumeFailureKind.DependencyUnavailable, result.FailureKind);
+        Assert.Equal(ResumeFailureReason.LeaseQueryFailed, result.FailureReason);
+    }
+
+    [Fact]
+    public async Task OnAuthenticatedAsync_FailClosed_RejectsAuthWhenTakeOverUnavailable()
+    {
+        // P1-C：AuthRedisFailMode=FailClosed 时，TakeOver 依赖不可用应拒绝认证、回滚本地状态。
+        var ct = TestContext.Current.CancellationToken;
+        using var metrics = new GatewayMetrics();
+        var bus = new CapturingMessageBus();
+        var leaseStore = new FakeDeviceSessionLeaseStore
+        {
+            OnTakeOver = _ => ValueTask.FromResult(
+                TakeOverResult.Unavailable(new InvalidOperationException("simulated takeover failure")))
+        };
+        var tokenStore = new FakeResumeTokenStore();
+        var options = new TcpGatewayOptions
+        {
+            EnableResume = true,
+            ResumeTokenTtl = TimeSpan.FromSeconds(30),
+            EnableEphemeralPresenceAndTyping = false,
+            ReplaceSameDeviceSession = true, // 启用 TakeOver 路径
+            IdleTimeout = TimeSpan.FromSeconds(90),
+            AuthRedisFailMode = RedisFailMode.FailClosed
+        };
+        var coordinator = CreateCoordinator(metrics, bus, leaseStore, tokenStore, options: options);
+        await using var session = CreateSession(metrics);
+
+        var authResult = new RealtimeAuthenticationResult
+        {
+            Succeeded = true,
+            UserId = 2001,
+            SessionId = "auth-session",
+            DeviceIdHash = 0xBB,
+            DeviceId = "dev-2"
+        };
+
+        var result = await coordinator.OnAuthenticatedAsync(session, authResult, ct);
+
+        // FailClosed：认证被拒绝
+        Assert.False(result.Success);
+        Assert.Equal(AuthFailureKind.DependencyUnavailable, result.FailureKind);
+        Assert.NotNull(result.RetryAfterMs);
+        // 未颁发 ResumeToken
+        Assert.Null(result.ResumeToken);
+    }
+
+    [Fact]
+    public async Task OnAuthenticatedAsync_FailOpen_ProceedsWhenTakeOverUnavailable()
+    {
+        // P1-C：AuthRedisFailMode=FailOpen 时，TakeOver 依赖不可用应继续完成认证（旧行为）。
+        var ct = TestContext.Current.CancellationToken;
+        using var metrics = new GatewayMetrics();
+        var bus = new CapturingMessageBus();
+        var leaseStore = new FakeDeviceSessionLeaseStore
+        {
+            OnTakeOver = _ => ValueTask.FromResult(
+                TakeOverResult.Unavailable(new InvalidOperationException("simulated takeover failure")))
+        };
+        var tokenStore = new FakeResumeTokenStore
+        {
+            OnIssue = _ => Task.FromResult("auth-issued-token")
+        };
+        var options = new TcpGatewayOptions
+        {
+            EnableResume = true,
+            ResumeTokenTtl = TimeSpan.FromSeconds(30),
+            EnableEphemeralPresenceAndTyping = false,
+            ReplaceSameDeviceSession = true,
+            IdleTimeout = TimeSpan.FromSeconds(90),
+            AuthRedisFailMode = RedisFailMode.FailOpen
+        };
+        var coordinator = CreateCoordinator(metrics, bus, leaseStore, tokenStore, options: options);
+        await using var session = CreateSession(metrics);
+
+        var authResult = new RealtimeAuthenticationResult
+        {
+            Succeeded = true,
+            UserId = 2002,
+            SessionId = "auth-session-2",
+            DeviceIdHash = 0xCC,
+            DeviceId = "dev-3"
+        };
+
+        var result = await coordinator.OnAuthenticatedAsync(session, authResult, ct);
+
+        // FailOpen：认证成功，TakeOver 失败被吞掉
+        Assert.True(result.Success);
+        Assert.Equal("auth-issued-token", result.ResumeToken);
+    }
+
+    [Fact]
+    public async Task TryResumeAsync_AbortRollsBackLocalState_WhenTakeOverFails()
+    {
+        // P1-D：Commit 阶段 TakeOver 失败时，Abort 必须回滚已完成的本地状态变更
+        // （UserSessionRegistry.Remove + Presence 下线）。
+        // 验证：TakeOver 失败后，OnDisconnectedAsync 不应再次移除/广播（已 Abort）。
+        var ct = TestContext.Current.CancellationToken;
+        using var metrics = new GatewayMetrics();
+        var bus = new CapturingMessageBus();
+        var leaseStore = new FakeDeviceSessionLeaseStore
+        {
+            OnGetCurrentSessionId = _ => ValueTask.FromResult<string?>(null),
+            OnTakeOver = _ => ValueTask.FromResult(
+                TakeOverResult.Unavailable(new InvalidOperationException("simulated takeover failure")))
+        };
+        var tokenStore = new FakeResumeTokenStore
+        {
+            OnTryValidate = _ => Task.FromResult<ResumeContext?>(
+                new ResumeContext
+                {
+                    UserId = 1001,
+                    SessionId = "resuming-session",
+                    ConnectionLeaseId = "old-lease",
+                    DeviceIdHash = 0xAA
+                })
+        };
+        var coordinator = CreateCoordinator(metrics, bus, leaseStore, tokenStore);
+        await using var session = CreateSession(metrics);
+
+        var result = await coordinator.TryResumeAsync("valid-token", session, ct);
+
+        // 拒绝恢复（fail-closed）
+        Assert.NotNull(result);
+        Assert.False(result!.Success);
+        // P1-D：Abort 应已回滚本地状态——session 不应在注册表中残留。
+        // 验证：OnDisconnectedAsync 中 Remove 返回 false（已 Abort 移除），不再广播 Presence。
+        var eventsBefore = bus.PublishedEvents.Count;
+        await coordinator.OnDisconnectedAsync(session, ct);
+        Assert.Equal(eventsBefore, bus.PublishedEvents.Count);
+    }
+
+    [Fact]
+    public async Task TryResumeAsync_PrepareFailsOnInvalidToken_DoesNotCallCommit()
+    {
+        // P1-D：Prepare 阶段失败（InvalidToken）时不应进入 Commit，无副作用。
+        var ct = TestContext.Current.CancellationToken;
+        using var metrics = new GatewayMetrics();
+        var bus = new CapturingMessageBus();
+        var takeOverCalled = false;
+        var leaseStore = new FakeDeviceSessionLeaseStore
+        {
+            OnTakeOver = _ =>
+            {
+                takeOverCalled = true;
+                return ValueTask.FromResult(TakeOverResult.NoPreviousLease());
+            }
+        };
+        var tokenStore = new FakeResumeTokenStore
+        {
+            OnTryValidate = _ => Task.FromResult<ResumeContext?>(null) // Token 无效
+        };
+        var coordinator = CreateCoordinator(metrics, bus, leaseStore, tokenStore);
+        await using var session = CreateSession(metrics);
+
+        var result = await coordinator.TryResumeAsync("invalid-token", session, ct);
+
+        // Prepare 失败：InvalidToken
+        Assert.NotNull(result);
+        Assert.False(result!.Success);
+        Assert.Equal(ResumeFailureKind.InvalidToken, result.FailureKind);
+        // Commit 未执行：TakeOver 未被调用
+        Assert.False(takeOverCalled);
+        Assert.Empty(bus.PublishedEvents);
+    }
+
+    [Fact]
+    public async Task TryResumeAsync_PrepareSucceeds_CommitExecutesAndSucceeds()
+    {
+        // P1-D：Prepare 成功 → Commit 执行 → 恢复成功（两阶段提交正常路径）。
+        var ct = TestContext.Current.CancellationToken;
+        using var metrics = new GatewayMetrics();
+        var bus = new CapturingMessageBus();
+        var leaseStore = new FakeDeviceSessionLeaseStore
+        {
+            OnGetCurrentSessionId = _ => ValueTask.FromResult<string?>(null),
+            OnTakeOver = _ => ValueTask.FromResult(TakeOverResult.NoPreviousLease())
+        };
+        var tokenStore = new FakeResumeTokenStore
+        {
+            OnTryValidate = _ => Task.FromResult<ResumeContext?>(
+                new ResumeContext
+                {
+                    UserId = 3001,
+                    SessionId = "prepare-commit-session",
+                    ConnectionLeaseId = "old-lease-3001",
+                    DeviceIdHash = 0xDD
+                }),
+            OnIssue = _ => Task.FromResult("new-token-3001")
+        };
+        var coordinator = CreateCoordinator(metrics, bus, leaseStore, tokenStore);
+        await using var session = CreateSession(metrics);
+
+        var result = await coordinator.TryResumeAsync("valid-token", session, ct);
+
+        // Prepare + Commit 成功
+        Assert.NotNull(result);
+        Assert.True(result!.Success);
+        Assert.NotNull(result.Result);
+        Assert.Equal("new-token-3001", result.Result!.ResumeToken);
+        Assert.Equal(3001, result.Result.UserId);
+        Assert.Equal("prepare-commit-session", result.Result.SessionId);
+    }
+
     private static SessionLifecycleCoordinator CreateCoordinator(
         GatewayMetrics metrics,
         IRealtimeMessageBus bus,
         IDeviceSessionLeaseStore leaseStore,
         IResumeTokenStore tokenStore,
-        IRedisCircuitBreaker? circuitBreaker = null)
+        IRedisCircuitBreaker? circuitBreaker = null,
+        TcpGatewayOptions? options = null)
     {
-        var options = new TcpGatewayOptions
+        options ??= new TcpGatewayOptions
         {
             EnableResume = true,
             ResumeTokenTtl = TimeSpan.FromSeconds(30),
@@ -630,29 +928,30 @@ public sealed class SessionLifecycleCoordinatorTests
 
     private sealed class FakeDeviceSessionLeaseStore : IDeviceSessionLeaseStore
     {
-        public Func<long, ValueTask<DeviceLeaseTakeoverResult?>>? OnTakeOver { get; set; }
+        public Func<long, ValueTask<TakeOverResult>>? OnTakeOver { get; set; }
         public Func<long, ValueTask<string?>>? OnGetCurrentSessionId { get; set; }
 
-        public ValueTask<DeviceLeaseTakeoverResult?> TakeOverAsync(
+        public ValueTask<TakeOverResult> TakeOverAsync(
             long userId,
             ulong deviceIdHash,
             string sessionId,
-            string connectionLeaseId,
+            string transportId,
+            string leaseOwnerToken,
             TimeSpan ttl,
             CancellationToken cancellationToken) =>
-            OnTakeOver?.Invoke(userId) ?? ValueTask.FromResult<DeviceLeaseTakeoverResult?>(null);
+            OnTakeOver?.Invoke(userId) ?? ValueTask.FromResult(TakeOverResult.NoPreviousLease());
 
         public ValueTask ReleaseIfOwnerAsync(
             long userId,
             ulong deviceIdHash,
-            string connectionLeaseId,
+            string leaseOwnerToken,
             CancellationToken cancellationToken) =>
             ValueTask.CompletedTask;
 
         public ValueTask<bool> RefreshIfOwnerAsync(
             long userId,
             ulong deviceIdHash,
-            string connectionLeaseId,
+            string leaseOwnerToken,
             TimeSpan ttl,
             CancellationToken cancellationToken) =>
             ValueTask.FromResult(true);

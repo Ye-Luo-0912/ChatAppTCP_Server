@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using ChatApp.ResumeVerification.Diagnostics;
 using ChatApp.ResumeVerification.Runtime;
+using ChatApp.TcpGateway.Core.Protocol;
 
 namespace ChatApp.ResumeVerification.Scenarios;
 
@@ -89,8 +90,12 @@ internal sealed class RecoveryConvergenceScenario : IResumeScenario
             // 阶段 2：故障期间排空一批 Resume 尝试（应失败）。
             // 注意：Docker pause 可能不会立即阻断已有 TCP 连接，部分 Resume 可能在
             // 故障窗口早期成功（Token 被消费）。这些会话视为已收敛，不再参与恢复阶段。
+            // P1-E：验证失败时的错误码区分——DependencyUnavailable（可重试）vs ResumeFailed（不可恢复）。
             var backlogFailures = 0;
             var backlogSuccesses = 0;
+            var backlogDependencyUnavailable = 0;
+            var backlogResumeFailed = 0;
+            var backlogOtherFailures = 0;
             var backlogConsumed = new bool[sessions.Count];
             if (downDelay > 0)
             {
@@ -101,6 +106,13 @@ internal sealed class RecoveryConvergenceScenario : IResumeScenario
                     if (result.Outcome != ResumeAttemptOutcome.Success)
                     {
                         backlogFailures++;
+                        // P1-B：按错误码分类统计失败原因。
+                        if (result.ErrorCode == ProtocolErrorCode.DependencyUnavailable)
+                            backlogDependencyUnavailable++;
+                        else if (result.ErrorCode == ProtocolErrorCode.ResumeFailed)
+                            backlogResumeFailed++;
+                        else
+                            backlogOtherFailures++;
                     }
                     else
                     {
@@ -110,17 +122,37 @@ internal sealed class RecoveryConvergenceScenario : IResumeScenario
                     }
                 }
 
+                var now1 = context.TimeProvider.GetUtcNow();
                 metrics.Add(new MetricSample
                 {
                     Name = "rv_recovery_convergence_backlog_failures",
                     Value = backlogFailures,
-                    SampledAtUtc = context.TimeProvider.GetUtcNow()
+                    SampledAtUtc = now1
                 });
                 metrics.Add(new MetricSample
                 {
                     Name = "rv_recovery_convergence_backlog_successes",
                     Value = backlogSuccesses,
-                    SampledAtUtc = context.TimeProvider.GetUtcNow()
+                    SampledAtUtc = now1
+                });
+                // P1-E：错误码分类指标——验证客户端能区分可重试与不可恢复失败。
+                metrics.Add(new MetricSample
+                {
+                    Name = "rv_recovery_convergence_backlog_dependency_unavailable",
+                    Value = backlogDependencyUnavailable,
+                    SampledAtUtc = now1
+                });
+                metrics.Add(new MetricSample
+                {
+                    Name = "rv_recovery_convergence_backlog_resume_failed",
+                    Value = backlogResumeFailed,
+                    SampledAtUtc = now1
+                });
+                metrics.Add(new MetricSample
+                {
+                    Name = "rv_recovery_convergence_backlog_other_failures",
+                    Value = backlogOtherFailures,
+                    SampledAtUtc = now1
                 });
             }
 
@@ -198,7 +230,8 @@ internal sealed class RecoveryConvergenceScenario : IResumeScenario
             // 收敛阈值：80%。Docker pause/unpause 后 StackExchange.Redis 连接可能不立即恢复。
             const double convergenceThreshold = 0.8;
             var passed = backlogPassed && convergenceRate >= convergenceThreshold;
-            var summary = $"backlog_failures={backlogFailures}/{sessions.Count}, " +
+            var summary = $"backlog_failures={backlogFailures}/{sessions.Count} " +
+                          $"(dep_unavailable={backlogDependencyUnavailable}, resume_failed={backlogResumeFailed}, other={backlogOtherFailures}), " +
                           $"backlog_successes={backlogSuccesses}, " +
                           $"converged={convergedCount}/{sessions.Count} in {convergenceElapsed.TotalSeconds:F2}s";
             if (convergenceRate < convergenceThreshold)

@@ -612,26 +612,27 @@ public sealed class TcpGatewayAttachmentValidationTests
 
     private sealed class NoopLeaseStore : IDeviceSessionLeaseStore
     {
-        public ValueTask<DeviceLeaseTakeoverResult?> TakeOverAsync(
+        public ValueTask<TakeOverResult> TakeOverAsync(
             long userId,
             ulong deviceIdHash,
             string sessionId,
-            string connectionLeaseId,
+            string transportId,
+            string leaseOwnerToken,
             TimeSpan ttl,
             CancellationToken cancellationToken) =>
-            ValueTask.FromResult<DeviceLeaseTakeoverResult?>(null);
+            ValueTask.FromResult(TakeOverResult.NoPreviousLease());
 
         public ValueTask ReleaseIfOwnerAsync(
             long userId,
             ulong deviceIdHash,
-            string connectionLeaseId,
+            string leaseOwnerToken,
             CancellationToken cancellationToken) =>
             ValueTask.CompletedTask;
 
         public ValueTask<bool> RefreshIfOwnerAsync(
             long userId,
             ulong deviceIdHash,
-            string connectionLeaseId,
+            string leaseOwnerToken,
             TimeSpan ttl,
             CancellationToken cancellationToken) =>
             ValueTask.FromResult(true);

@@ -23,12 +23,16 @@ internal enum HeartbeatRefreshKind : byte
 /// 不为每个刷新创建独立 Timer 或编码 jitter DueTimestamp——Worker 池数量本身就是
 /// 并发上限与负载分散机制。
 /// </para>
+/// <para>
+/// P1-A2：<see cref="LeaseOwnerToken"/> 携带私有所有权凭证（非公开 TransportId），
+/// 用于 Redis RefreshIfOwner CAS。
+/// </para>
 /// </summary>
 internal readonly record struct HeartbeatRefreshWork(
     HeartbeatRefreshKind Kind,
     long UserId,
     ulong DeviceHash,
-    string? LeaseId,
+    string? LeaseOwnerToken,
     TimeSpan LeaseTtl);
 
 /// <summary>
@@ -183,7 +187,7 @@ internal sealed class HeartbeatCoordinator
                             HeartbeatRefreshKind.Lease,
                             session.UserId,
                             deviceHash,
-                            session.ConnectionLeaseId,
+                            session.LeaseOwnerToken,
                             leaseTtl);
 
                         // 队列满时 await 阻塞提供背压（Redis 慢速时 tick 自然降速）。
@@ -270,7 +274,7 @@ internal sealed class HeartbeatCoordinator
                             gate: null,
                             work.UserId,
                             work.DeviceHash,
-                            work.LeaseId!,
+                            work.LeaseOwnerToken!,
                             work.LeaseTtl,
                             cancellationToken).ConfigureAwait(false);
                     }
