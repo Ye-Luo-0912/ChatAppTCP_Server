@@ -727,13 +727,69 @@ public sealed class SessionLifecycleCoordinatorTests
         Assert.Equal("prepare-commit-session", result.Result.SessionId);
     }
 
+    [Fact]
+    public async Task TryResumeAsync_ClosesLocalVictimEvenWhenNatsPublishFails()
+    {
+        // P1-H：NATS 吊销事件发布失败时，本机旧连接仍被立即关闭。
+        // RevokeSessionAsync 顺序：RevokeResumeTokenSafeAsync → PublishSessionRevokedEventAsync（best-effort）
+        // → victim.Close。NATS 发布是 try/catch 仅日志，不阻断后续 victim.Close。
+        // 这保证 NATS 故障时本机 TakeOver 仍形成完整闭环——旧 Transport 无法继续通信。
+        var ct = TestContext.Current.CancellationToken;
+        using var metrics = new GatewayMetrics();
+        var bus = new CapturingMessageBus { ThrowOnPublish = true };
+        var leaseStore = new FakeDeviceSessionLeaseStore
+        {
+            OnGetCurrentSessionId = _ => ValueTask.FromResult<string?>(null),
+            // 本机 victim 路径：TakeOver 无跨 Gateway 旧租约（victim 在本机注册表）。
+            OnTakeOver = _ => ValueTask.FromResult(TakeOverResult.NoPreviousLease())
+        };
+        var tokenStore = new FakeResumeTokenStore
+        {
+            OnTryValidate = _ => Task.FromResult<ResumeContext?>(
+                new ResumeContext
+                {
+                    UserId = 1001,
+                    SessionId = "resuming-session",
+                    ConnectionLeaseId = "old-lease",
+                    DeviceIdHash = 0xAA,
+                    DeviceId = "dev-1"
+                }),
+            OnIssue = _ => Task.FromResult("new-token")
+        };
+
+        // 共享注册表，预置本机 victim 会话（同 UserId + 同 DeviceIdHash）。
+        var registry = new UserSessionRegistry();
+        var coordinator = CreateCoordinator(metrics, bus, leaseStore, tokenStore, registry: registry);
+
+        await using var victim = CreateSession(metrics, connectionId: 1);
+        victim.Authenticate(userId: 1001, sessionId: "victim-session", deviceIdHash: 0xAA, deviceId: "dev-1");
+        victim.CurrentResumeToken = "victim-old-token";
+        Assert.True(registry.Add(victim));
+        Assert.True(victim.IsConnected); // 前置条件：victim 未关闭
+
+        // incoming：新的 Resume 请求（不同 ConnectionId，故不同 ConnectionLeaseId）。
+        await using var incoming = CreateSession(metrics, connectionId: 2);
+
+        var result = await coordinator.TryResumeAsync("valid-token", incoming, ct);
+
+        // Resume 成功：NATS 故障不阻断恢复。
+        Assert.NotNull(result);
+        Assert.True(result!.Success);
+        Assert.Equal("new-token", result.Result!.ResumeToken);
+
+        // P1-H 核心：本机 victim 已被立即关闭，即使 NATS SessionRevoked 发布失败。
+        Assert.False(victim.IsConnected, "victim must be closed even when NATS publish fails");
+        Assert.Equal(SessionCloseReason.SessionRevoked, victim.CloseReason);
+    }
+
     private static SessionLifecycleCoordinator CreateCoordinator(
         GatewayMetrics metrics,
         IRealtimeMessageBus bus,
         IDeviceSessionLeaseStore leaseStore,
         IResumeTokenStore tokenStore,
         IRedisCircuitBreaker? circuitBreaker = null,
-        TcpGatewayOptions? options = null)
+        TcpGatewayOptions? options = null,
+        UserSessionRegistry? registry = null)
     {
         options ??= new TcpGatewayOptions
         {
@@ -748,7 +804,7 @@ public sealed class SessionLifecycleCoordinatorTests
             leaseStore,
             new NoopGlobalPresenceStore(),
             tokenStore,
-            new UserSessionRegistry(),
+            registry ?? new UserSessionRegistry(),
             new PresenceWatcherRegistry(),
             bus,
             IntegrationOptions,
@@ -761,10 +817,10 @@ public sealed class SessionLifecycleCoordinatorTests
             circuitBreaker);
     }
 
-    private static TcpClientSession CreateSession(GatewayMetrics metrics) =>
+    private static TcpClientSession CreateSession(GatewayMetrics metrics, uint connectionId = 1) =>
         new(
             new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp),
-            connectionId: 1,
+            connectionId,
             outboundQueueCapacity: 8,
             maxOutboundQueuedBytes: 128 * 1024,
             sendTimeout: TimeSpan.FromSeconds(1),
@@ -774,13 +830,25 @@ public sealed class SessionLifecycleCoordinatorTests
 
     /// <summary>
     /// 捕获 PublishEventAsync 与 QuerySyncBootstrapAsync 调用，验证 Resume 路径事件广播。
+    /// <para>
+    /// <see cref="ThrowOnPublish"/> = true 时 <see cref="PublishEventAsync"/> 抛异常，
+    /// 用于验证 NATS/Realtime bus 故障时本机旧连接仍被立即关闭（best-effort 发布不阻断关闭）。
+    /// </para>
     /// </summary>
     private sealed class CapturingMessageBus : IRealtimeMessageBus
     {
         public List<RealtimeEvent> PublishedEvents { get; } = [];
 
+        /// <summary>
+        /// 为 true 时 <see cref="PublishEventAsync"/> 抛 <see cref="InvalidOperationException"/>，
+        /// 模拟 NATS/Realtime bus 发布失败。
+        /// </summary>
+        public bool ThrowOnPublish { get; set; }
+
         public Task PublishEventAsync(RealtimeEvent evt, CancellationToken ct = default)
         {
+            if (ThrowOnPublish)
+                throw new InvalidOperationException("simulated NATS publish failure");
             PublishedEvents.Add(evt);
             return Task.CompletedTask;
         }

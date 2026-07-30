@@ -45,6 +45,7 @@ internal sealed class TakeoverCompetitionScenario : IResumeScenario
         var metrics = new List<MetricSample>();
 
         AuthenticatedConnection? connectionA = null;
+        RedisLeaseProbe? leaseProbe = null;
         try
         {
             // 阶段 1：在网关 A 认证会话，保持连接活跃。
@@ -64,6 +65,28 @@ internal sealed class TakeoverCompetitionScenario : IResumeScenario
             }
 
             var resumeToken = connectionA.Session.ResumeToken;
+            var deviceIdHash = connectionA.Bootstrap.DeviceIdHash;
+            var userIdLong = connectionA.Session.UserId;
+
+            // Phase H：Resume 前读取 Redis 租约快照，捕获旧 transportId。
+            // 用于 TakeOver 后验证 owner 已更新为新 transportId。
+            // 仅当 DeviceIdHash 有值时才查询（无设备绑定的会话不持有设备租约）。
+            DeviceLeaseSnapshot? leaseBeforeTakeover = null;
+            try
+            {
+                if (deviceIdHash is { } deviceHash)
+                {
+                    leaseProbe = await RedisLeaseProbe.ConnectAsync(
+                        context.RedisConnectionString, cancellationToken).ConfigureAwait(false);
+                    leaseBeforeTakeover = await leaseProbe.ReadLeaseAsync(
+                        userIdLong, deviceHash, cancellationToken).ConfigureAwait(false);
+                }
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                // Redis 不可用不阻断场景——Phase H 验证为 best-effort。
+                errors.Add($"Phase H: Redis lease probe (before) failed: {ex.Message}");
+            }
 
             // 阶段 2：A 仍活跃时，在 B 用同一 Token Resume。
             var fencingResult = await TryResumeWithTimeoutAsync(
@@ -126,13 +149,90 @@ internal sealed class TakeoverCompetitionScenario : IResumeScenario
                         $"detail={probeResult.Detail}");
                 }
 
+                // Phase H：验证 Redis 租约 owner 已更新为新 transportId。
+                // 断言：
+                // 1. 租约存在（key 非空）
+                // 2. transportId 已变更（不等于 Resume 前的旧 transportId）
+                // 3. sessionId 与恢复的会话一致
+                // 这三项共同证明"Redis 当前 owner 等于新 ConnectionLeaseId"且"同一设备只有一个 Transport"。
+                var redisOwnerValid = false;
+                var redisOwnerDetail = string.Empty;
+                if (leaseProbe is not null && deviceIdHash is { } devHash)
+                {
+                    try
+                    {
+                        var leaseAfter = await leaseProbe.ReadLeaseAsync(
+                            userIdLong, devHash, cancellationToken).ConfigureAwait(false);
+                        var redisNow = context.TimeProvider.GetUtcNow();
+                        metrics.Add(new MetricSample
+                        {
+                            Name = "rv_takeover_lease_exists_after",
+                            Value = leaseAfter is not null ? 1 : 0,
+                            SampledAtUtc = redisNow
+                        });
+
+                        if (leaseAfter is null)
+                        {
+                            redisOwnerDetail = "lease key missing after takeover";
+                            errors.Add("Phase H: Redis lease missing after takeover; expected owner update.");
+                        }
+                        else
+                        {
+                            // transportId 应已变更（旧 owner 被新 TakeOver 覆盖）。
+                            var transportChanged = leaseBeforeTakeover is null
+                                || !string.Equals(
+                                    leaseBeforeTakeover.TransportId,
+                                    leaseAfter.TransportId,
+                                    StringComparison.Ordinal);
+                            // sessionId 应与恢复的会话一致。
+                            var sessionMatches = fencingResult.Session is not null
+                                && string.Equals(
+                                    fencingResult.Session.SessionId,
+                                    leaseAfter.SessionId,
+                                    StringComparison.Ordinal);
+
+                            metrics.Add(new MetricSample
+                            {
+                                Name = "rv_takeover_lease_transport_changed",
+                                Value = transportChanged ? 1 : 0,
+                                SampledAtUtc = redisNow
+                            });
+                            metrics.Add(new MetricSample
+                            {
+                                Name = "rv_takeover_lease_session_matches",
+                                Value = sessionMatches ? 1 : 0,
+                                SampledAtUtc = redisNow
+                            });
+
+                            redisOwnerValid = transportChanged && sessionMatches;
+                            if (!redisOwnerValid)
+                            {
+                                redisOwnerDetail = $"transport_changed={transportChanged}, " +
+                                                   $"session_matches={sessionMatches} " +
+                                                   $"(before_transport={leaseBeforeTakeover?.TransportId ?? "null"}, " +
+                                                   $"after_transport={leaseAfter.TransportId}, " +
+                                                   $"after_session={leaseAfter.SessionId})";
+                                errors.Add($"Phase H: Redis owner verification failed: {redisOwnerDetail}");
+                            }
+                        }
+                    }
+                    catch (Exception ex) when (ex is not OperationCanceledException)
+                    {
+                        redisOwnerDetail = $"Redis lease probe (after) failed: {ex.Message}";
+                        errors.Add($"Phase H: {redisOwnerDetail}");
+                    }
+                }
+
                 metrics.AddRange(await ScenarioHelpers.SampleMetricsAsync(context, cancellationToken)
                     .ConfigureAwait(false));
 
-                var takeoverSummary = oldSocketClosed
-                    ? "fencing=Success (ReplaceSameDeviceSession=true), old_socket=closed (read+write failed)"
-                    : $"fencing=Success, old_socket=NOT closed (read={probeResult.ReadClosed}, write={probeResult.WriteClosed})";
-                return oldSocketClosed
+                // 通过条件：旧 Socket 关闭 + Redis owner 已更新。
+                var fencingPathPassed = oldSocketClosed && redisOwnerValid;
+                var takeoverSummary = fencingPathPassed
+                    ? "fencing=Success (ReplaceSameDeviceSession=true), old_socket=closed, redis_owner=updated"
+                    : $"fencing=Success, old_socket={(oldSocketClosed ? "closed" : "open")}, " +
+                      $"redis_owner={(redisOwnerValid ? "valid" : "invalid")}";
+                return fencingPathPassed
                     ? ScenarioHelpers.Pass(Name, startedAt, takeoverSummary, metrics, errors)
                     : ScenarioHelpers.Fail(Name, startedAt, takeoverSummary, metrics, errors);
             }
@@ -178,6 +278,12 @@ internal sealed class TakeoverCompetitionScenario : IResumeScenario
             if (connectionA is not null)
             {
                 await connectionA.DisposeAsync().ConfigureAwait(false);
+            }
+
+            // Phase H：释放 Redis 租约探测连接。
+            if (leaseProbe is not null)
+            {
+                await leaseProbe.DisposeAsync().ConfigureAwait(false);
             }
         }
     }
