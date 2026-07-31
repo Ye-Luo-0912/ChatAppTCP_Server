@@ -71,4 +71,25 @@ public static partial class GatewayLog
         this ILogger logger,
         string realtimeEventId,
         string realtimeEventType);
+
+    [LoggerMessage(
+        GatewayEventIds.PushDeliveryDispatched,
+        LogLevel.Information,
+        "Push delivery for user {TargetUserId} dispatched: attempted={AttemptedCount}, succeeded={SucceededCount}.",
+        EventName = "TcpGateway.PushDeliveryDispatched")]
+    public static partial void PushDeliveryDispatched(
+        this ILogger logger,
+        long targetUserId,
+        int attemptedCount,
+        int succeededCount);
+
+    [LoggerMessage(
+        GatewayEventIds.PushDeliveryFailed,
+        LogLevel.Error,
+        "Push delivery for user {TargetUserId} failed; redelivery requested.",
+        EventName = "TcpGateway.PushDeliveryFailed")]
+    public static partial void PushDeliveryFailed(
+        this ILogger logger,
+        long targetUserId,
+        Exception exception);
 }

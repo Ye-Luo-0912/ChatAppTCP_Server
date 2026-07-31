@@ -34,6 +34,8 @@ public static class GatewayEventIds
     public const int RealtimeNakFailed = 1403;
     public const int RealtimeEventRejected = 1404;
     public const int RealtimeEventUnsupported = 1405;
+    public const int PushDeliveryDispatched = 1406;
+    public const int PushDeliveryFailed = 1407;
 
     // Ephemeral events: 1500–1599
     public const int EphemeralDisabled = 1500;

@@ -32,6 +32,8 @@ public sealed class GatewayMetrics : IDisposable
     private readonly Counter<long> _historyQueriesCompleted;
     private readonly Counter<long> _historyQueryFailures;
     private readonly Counter<long> _realtimeEventsReceived;
+    private readonly Counter<long> _pushDeliveriesReceived;
+    private readonly Counter<long> _pushDeliveriesFailed;
     private readonly Counter<long> _realtimeEventsHandled;
     private readonly Counter<long> _realtimeEventDeliveries;
     private readonly Counter<long> _realtimeEventsRejected;
@@ -145,6 +147,8 @@ public sealed class GatewayMetrics : IDisposable
             "gateway.history.queries.failures");
         _realtimeEventsReceived = _meter.CreateCounter<long>(
             "gateway.realtime.events.received");
+        _pushDeliveriesReceived = _meter.CreateCounter<long>("gateway.push.received");
+        _pushDeliveriesFailed = _meter.CreateCounter<long>("gateway.push.failed");
         _realtimeEventsHandled = _meter.CreateCounter<long>(
             "gateway.realtime.events.handled");
         _realtimeEventDeliveries = _meter.CreateCounter<long>(
@@ -331,6 +335,10 @@ public sealed class GatewayMetrics : IDisposable
     public void HistoryQueryFailed() => _historyQueryFailures.Add(1);
 
     public void RealtimeEventReceived() => _realtimeEventsReceived.Add(1);
+
+    public void PushDeliveryReceived() => _pushDeliveriesReceived.Add(1);
+
+    public void PushDeliveryFailed() => _pushDeliveriesFailed.Add(1);
 
     public void RealtimeEventHandled(int queuedDeliveries)
     {

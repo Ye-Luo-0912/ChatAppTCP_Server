@@ -18,6 +18,7 @@ using ChatApp.TcpGateway.Infrastructure.Serialization.Json;
 using ChatApp.TcpGateway.Infrastructure.Server;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 
 namespace ChatApp.TcpGateway.Infrastructure;
 
@@ -59,6 +60,19 @@ public static class InfrastructureServiceCollectionExtensions
         services.AddSingleton<IWatcherGatewayDirectory, RedisWatcherGatewayDirectory>();
 
         // 群组命令幂等 L2（Redis）存储。具体类型注册——Composite 在 Program.cs 中组装。
+        // 离线推送：IPushDispatcher 编排令牌拉取 + 多平台 Provider 分发。
+        // Provider 默认使用 Noop（开发/测试）；生产环境应在 Program.cs 覆盖为 FCM/APNs/WebPush。
+        services.AddSingleton<IPushProvider>(static sp =>
+            new NoopPushProvider(Core.Messaging.Push.PushPlatform.Fcm,
+                sp.GetRequiredService<ILogger<NoopPushProvider>>()));
+        services.AddSingleton<IPushProvider>(static sp =>
+            new NoopPushProvider(Core.Messaging.Push.PushPlatform.Apns,
+                sp.GetRequiredService<ILogger<NoopPushProvider>>()));
+        services.AddSingleton<IPushProvider>(static sp =>
+            new NoopPushProvider(Core.Messaging.Push.PushPlatform.WebPush,
+                sp.GetRequiredService<ILogger<NoopPushProvider>>()));
+        services.AddSingleton<Realtime.Integration.Push.IPushDispatcher, PushDispatcher>();
+
         services.AddSingleton<RedisGroupIdempotencyStore>();
 
         services.AddSingleton<IPayloadCodec<AuthenticationRequest>>(

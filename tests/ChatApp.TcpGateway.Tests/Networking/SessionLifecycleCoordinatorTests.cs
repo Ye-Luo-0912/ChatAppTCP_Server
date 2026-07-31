@@ -6,6 +6,7 @@ using ChatApp.Realtime.Abstractions.Events;
 using ChatApp.Realtime.Abstractions.Messaging;
 using ChatApp.Realtime.Abstractions.Sync;
 using ChatApp.Realtime.Integration;
+using ChatApp.Realtime.Integration.Push;
 using ChatApp.Realtime.Integration.Configuration;
 using ChatApp.Realtime.Integration.Ephemeral;
 using ChatApp.TcpGateway.Core.Authentication;
@@ -989,6 +990,17 @@ public sealed class SessionLifecycleCoordinatorTests
             Func<PresenceAuthorizeQuery, CancellationToken, ValueTask<PresenceAuthorizeResponse>> handler,
             CancellationToken ct = default) =>
             Task.CompletedTask;
+
+        public Task PublishPushDeliveryAsync(PushDeliveryCommand command, CancellationToken ct = default) =>
+            Task.CompletedTask;
+
+        public async IAsyncEnumerable<PushDelivery> ConsumePushDeliveriesAsync(
+            [EnumeratorCancellation] CancellationToken ct = default)
+        {
+            ct.ThrowIfCancellationRequested();
+            await Task.CompletedTask;
+            yield break;
+        }
 
         public Task<TimeSpan> PingAsync(CancellationToken ct = default) =>
             Task.FromResult(TimeSpan.Zero);

@@ -9,5 +9,6 @@ public enum RealtimeSubscriptionKind : byte
 {
     DurableEvents = 1,
     EphemeralTyping = 2,
-    EphemeralPresence = 3
+    EphemeralPresence = 3,
+    PushDeliveries = 4
 }

@@ -5,6 +5,7 @@ using ChatApp.Realtime.Abstractions.Events;
 using ChatApp.Realtime.Abstractions.Messaging;
 using ChatApp.Realtime.Abstractions.Sync;
 using ChatApp.Realtime.Integration;
+using ChatApp.Realtime.Integration.Push;
 using ChatApp.TcpGateway.Core.Messaging;
 using ChatApp.TcpGateway.Core.Messaging.Conversations;
 using ChatApp.TcpGateway.Gateway.Configuration;
@@ -331,6 +332,17 @@ public sealed class RealtimeMessagingTests
                 ValueTask<ChatApp.Realtime.Integration.Ephemeral.PresenceAuthorizeResponse>> handler,
             CancellationToken ct = default) =>
             Task.CompletedTask;
+
+        public Task PublishPushDeliveryAsync(PushDeliveryCommand command, CancellationToken ct = default) =>
+            Task.CompletedTask;
+
+        public async IAsyncEnumerable<PushDelivery> ConsumePushDeliveriesAsync(
+            [EnumeratorCancellation] CancellationToken ct = default)
+        {
+            ct.ThrowIfCancellationRequested();
+            await Task.CompletedTask;
+            yield break;
+        }
 
         public Task<TimeSpan> PingAsync(
             CancellationToken ct = default) =>

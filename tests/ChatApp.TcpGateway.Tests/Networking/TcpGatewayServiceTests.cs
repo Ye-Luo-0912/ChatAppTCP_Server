@@ -9,6 +9,7 @@ using ChatApp.Realtime.Abstractions.Messaging;
 using ChatApp.Realtime.Abstractions.Routing;
 using ChatApp.Realtime.Abstractions.Sync;
 using ChatApp.Realtime.Integration;
+using ChatApp.Realtime.Integration.Push;
 using ChatApp.Realtime.Integration.Configuration;
 using ChatApp.TcpGateway.Core.Authentication;
 using ChatApp.TcpGateway.Core.Messaging;
@@ -1110,6 +1111,17 @@ public sealed class TcpGatewayServiceTests
                 ValueTask<ChatApp.Realtime.Integration.Ephemeral.PresenceAuthorizeResponse>> handler,
             CancellationToken ct = default) =>
             Task.CompletedTask;
+
+        public Task PublishPushDeliveryAsync(PushDeliveryCommand command, CancellationToken ct = default) =>
+            Task.CompletedTask;
+
+        public async IAsyncEnumerable<PushDelivery> ConsumePushDeliveriesAsync(
+            [EnumeratorCancellation] CancellationToken ct = default)
+        {
+            ct.ThrowIfCancellationRequested();
+            await Task.CompletedTask;
+            yield break;
+        }
 
         public Task<TimeSpan> PingAsync(
             CancellationToken ct = default) =>
