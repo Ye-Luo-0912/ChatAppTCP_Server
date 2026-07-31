@@ -282,14 +282,14 @@ internal sealed partial class TcpClientSession
     /// OnDemandSendPump/PerSessionDrain 模式：入队后唤醒发送驱动。
     /// <para>
     /// OnDemandSendPump（三态）：CAS Idle→Queued 成功后 TrySchedule 入 ready queue。
-    /// PerSessionDrain（二态）：CAS <c>_drainOp null→op</c> 原子发布状态+句柄，启动自有 drain Task。
+    /// PerSessionDrain（二态）：CAS <c>_drainStateGen Idle→Running</c> 原子发布状态+代次，启动自有 drain Task。
     /// PersistentSendLoop 模式下两者均为 null，本方法是 no-op。
     /// </para>
     /// <para>
     /// P1-6：PerSessionDrain 模式下状态转换与句柄发布合并为单次 CAS——
     /// 旧实现先 CAS <c>_sendState Idle→Running</c> 再赋值 <c>_perSessionDrainTask</c>，
     /// 两步之间 Dispose 可读到 Running 但 Task 为 null，跳过 await 导致 drain 逃逸。
-    /// 现在 <c>_drainOp</c> 引用本身就是状态（null=Idle），CAS 成功即完成发布。
+    /// 现在 <c>_drainStateGen</c> packed state+gen 原子 CAS，CAS 成功即完成发布。
     /// </para>
     /// <para>
     /// 若 <see cref="OutboundPumpCoordinator.TrySchedule"/> 失败（coordinator 停机），
@@ -298,16 +298,24 @@ internal sealed partial class TcpClientSession
     /// </summary>
     private void TryScheduleSend()
     {
-        // PerSessionDrain 模式：CAS _drainOp null→op 原子发布 Running 状态与 drain 句柄。
+        // 八.1：PerSessionDrain 模式——零分配 CAS on packed state+gen，不再每次创建 DrainOperation。
         if (_usePerSessionDrain)
         {
-            var op = new DrainOperation(Interlocked.Increment(ref _drainGeneration));
-            if (Interlocked.CompareExchange(ref _drainOp, op, null) is not null)
+            // 原子读取当前 state+gen。Interlocked.Read 确保 64 位原子读（32 位平台防撕裂）。
+            var observed = Interlocked.Read(ref _drainStateGen);
+            if ((observed & DrainStateRunningBit) != 0)
                 return; // 已有 drain 在运行，新帧由其 re-check 路径补消费。
 
-            // CAS 成功即完成状态转换与句柄发布（原子），Dispose 读 _drainOp 即可 await。
-            // 启动 drain Task；Task 引用不存字段，TCS 承担等待句柄。
-            _ = RunPerSessionDrainAsync(op);
+            // CAS Idle(anyGen) → Running(newGen)。newGen 递增区分不同 drain 实例。
+            var newGen = (int)(observed & 0xFFFFFFFF) + 1;
+            var desired = DrainStateRunningBit | (uint)newGen;
+            if (Interlocked.CompareExchange(ref _drainStateGen, desired, observed) != observed)
+                return; // CAS 失败（其他 enqueuer 赢），赢者会启动 drain 消费我们的帧。
+
+            // CAS 成功：激活可复用 DrainOperation（惰性初始化一次），启动 drain。
+            var op = _drainOp ?? LazyInitializer.EnsureInitialized(ref _drainOp, static () => new DrainOperation())!;
+            op.Reset(newGen);
+            _ = RunPerSessionDrainAsync(op, newGen);
             return;
         }
 
@@ -331,18 +339,18 @@ internal sealed partial class TcpClientSession
     /// 与 <see cref="PumpOutboundAsync"/> 的区别：
     /// <list type="bullet">
     /// <item>无 burst 上限——drain 持续消费直到队列空（每连接独立，无需公平轮转）；</item>
-    /// <item>无 ready queue 调度——CAS <c>_drainOp null→op</c> 直接启动，Socket continuation 恢复同一 drain；</item>
+    /// <item>无 ready queue 调度——CAS <c>_drainStateGen Idle→Running</c> 直接启动，Socket continuation 恢复同一 drain；</item>
     /// <item>慢 Socket 不占用全局 Worker 名额——每连接独立 drain。</item>
     /// </list>
     /// </para>
     /// <para>
     /// 状态机（P1-6）：drain 持有 <paramref name="op"/> 作为所有权令牌。退出时 CAS
-    /// <c>_drainOp op→null</c> 释放所有权，然后重检防丢失唤醒
+    /// <c>_drainStateGen Running→Idle</c> 释放所有权，然后重检防丢失唤醒
     /// （enqueuer 可能在 op→null 转换前入队，其 CAS null→op 会失败，
     /// 依赖此处 null 后的 re-check 来补发 drain）。
     /// </para>
     /// </summary>
-    private async Task RunPerSessionDrainAsync(DrainOperation op)
+    private async Task RunPerSessionDrainAsync(DrainOperation op, int generation)
     {
         // 发送所有权注册：drain 活跃期间驻留活跃集合，drain 退出时释放。
         // P0-1：捕获 Epoch，Release 时传回，防止旧 drain 误删新 drain 注册。
@@ -361,22 +369,21 @@ internal sealed partial class TcpClientSession
                         continue;
                     }
 
-                    // 队列空：CAS _drainOp op→null 释放所有权（等价 Running→Idle）。
-                    // 若当前 _drainOp 已不是 op（被 Dispose 或替换），让出 drain。
-                    if (!ReferenceEquals(
-                            Interlocked.CompareExchange(ref _drainOp, null, op),
-                            op))
-                        return;
+                    // 八.1：队列空——CAS _drainStateGen Running(gen)→Idle(gen) 释放所有权。
+                    // CAS 完整 64 位值（含代次）防止 ABA：若代次已变（新 drain 接管），CAS 失败退出。
+                    var runningGen = DrainStateRunningBit | (uint)generation;
+                    var idleGen = (uint)generation;
+                    if (Interlocked.CompareExchange(ref _drainStateGen, idleGen, runningGen) != runningGen)
+                        return; // 代次已变（被 Dispose 或新 drain 接管），让出 drain。
 
                     // 清除后重检：enqueuer 可能在 op→null 转换前入队，
                     // 其 CAS null→op 会失败（因为 _drainOp 仍指向 op），
                     // 它依赖此处 null 后的 re-check 来补发 drain。
                     if (IsConnected && HasPendingWork())
                     {
-                        // 重新夺回所有权：CAS _drainOp null→op。
-                        if (ReferenceEquals(
-                                Interlocked.CompareExchange(ref _drainOp, op, null),
-                                null))
+                        // 八.1：重新夺回所有权——CAS Idle(gen)→Running(gen)。
+                        // 仅当代次未变（无新 drain 接管）时成功。
+                        if (Interlocked.CompareExchange(ref _drainStateGen, runningGen, idleGen) == idleGen)
                             continue; // 重新获得 drain 所有权，继续消费。
                     }
                     return; // 真正空闲，drain 退出。
@@ -457,14 +464,15 @@ internal sealed partial class TcpClientSession
             {
                 DrainOutboundOnClose();
             }
-            // 确保 drain 退出时所有权归位（异常路径可能未 CAS op→null）。
-            Interlocked.CompareExchange(ref _drainOp, null, op);
+            // 八.1：确保 drain 退出时所有权归位（异常路径可能未 CAS Running→Idle）。
+            Interlocked.CompareExchange(
+                ref _drainStateGen, (uint)generation, DrainStateRunningBit | (uint)generation);
             // 发送所有权释放：从活跃集合移除（仅当 Epoch 匹配）。Close 路径的 OnSessionClosed 为兜底。
             if (ownershipEpoch != 0)
                 _sendTimeoutTracker?.OnSendOwnershipReleased(this, ownershipEpoch);
-            // P1-6：最后通知 Dispose 等待方——此时所有 cleanup（排空/归位/Tracker 释放）已完成，
-            // Dispose 看到 Completion 完成即可安全调用 _lifetime.Dispose()。
-            op.Complete();
+            // 八.1：最后通知 Dispose 等待方——代次匹配时 SetResult MRVTSC。
+            // 此时所有 cleanup（排空/归位/Tracker 释放）已完成，Dispose 看到完成即可安全 _lifetime.Dispose()。
+            op.Complete(generation);
         }
     }
 

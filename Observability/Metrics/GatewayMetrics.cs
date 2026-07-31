@@ -105,6 +105,16 @@ public sealed class GatewayMetrics : IDisposable
     private readonly Histogram<double> _heartbeatRefreshDuration;
     private readonly Counter<long> _heartbeatBucketSkew;
 
+    // 八.4：心跳队列延迟与周期安全门禁指标。
+    // queue.depth：当前待刷新工作项数（ObservableGauge，拉取式）。
+    // queue.oldest_age：最老待处理项的排队年龄 ms（ObservableGauge）——超过 LeaseTtl 安全余量即告警。
+    // refresh.schedule_lag：tick 实际触发时间相对计划时间的延迟 ms（Redis 慢 → WriteAsync 阻塞 → tick 延迟）。
+    // refresh.overdue：排队等待超过阈值的刷新计数（tag: kind=lease/presence）。
+    // full_cycle.duration：完成一个完整扫描周期（bucketCount 个 tick）的耗时 ms。
+    private readonly Histogram<double> _heartbeatScheduleLag;
+    private readonly Counter<long> _heartbeatRefreshOverdue;
+    private readonly Histogram<double> _heartbeatFullCycleDuration;
+
     // Specialized Typing Actor 管道可观测性：覆盖 Generic Actor 指标未暴露的领域维度。
     // typing_actor.* 反映 Specialized Actor Runtime 真实负载（active/busy/ingress/replaced/admission）；
     // typing_auth.* 反映授权 I/O DomainWorkLane 状态与耗时，避免开启 Specialized 后仪表盘仅显示空闲数据。
@@ -215,6 +225,14 @@ public sealed class GatewayMetrics : IDisposable
             unit: "ms");
         _heartbeatBucketSkew = _meter.CreateCounter<long>(
             "gateway.heartbeat.bucket.skew");
+        _heartbeatScheduleLag = _meter.CreateHistogram<double>(
+            "gateway.heartbeat.schedule_lag",
+            unit: "ms");
+        _heartbeatRefreshOverdue = _meter.CreateCounter<long>(
+            "gateway.heartbeat.refresh.overdue");
+        _heartbeatFullCycleDuration = _meter.CreateHistogram<double>(
+            "gateway.heartbeat.full_cycle.duration",
+            unit: "ms");
         _groupIdempotentHits = _meter.CreateCounter<long>(
             "gateway.group.idempotent.hit");
         _groupIdempotentMisses = _meter.CreateCounter<long>(
@@ -510,6 +528,51 @@ public sealed class GatewayMetrics : IDisposable
     /// </summary>
     public void HeartbeatBucketSkew(int skew) =>
         _heartbeatBucketSkew.Add(skew);
+
+    /// <summary>
+    /// 八.4：tick 实际触发时间相对计划时间的延迟。
+    /// Redis 慢速时 WriteAsync 阻塞导致 tick 延迟，schedule_lag 持续增长意味着
+    /// 完整扫描周期可能超过 LeaseTtl 安全窗口。
+    /// </summary>
+    public void HeartbeatScheduleLag(TimeSpan lag) =>
+        _heartbeatScheduleLag.Record(lag.TotalMilliseconds);
+
+    /// <summary>
+    /// 八.4：排队等待超过阈值的刷新计数。kind 为 "lease"/"presence"。
+    /// 阈值由调用方判定后调用此方法——安全门禁：overdue 应持续为 0。
+    /// </summary>
+    public void HeartbeatRefreshOverdue(string kind) =>
+        _heartbeatRefreshOverdue.Add(
+            1,
+            new KeyValuePair<string, object?>("kind", kind));
+
+    /// <summary>
+    /// 八.4：完成一个完整扫描周期（bucketCount 个 tick）的耗时。
+    /// 正常应接近 HeartbeatScanInterval（默认 30s）。显著超过意味着 Redis 慢速
+    /// 导致 tick 积压，可能使部分会话租约在刷新前过期。
+    /// </summary>
+    public void HeartbeatFullCycleCompleted(TimeSpan duration) =>
+        _heartbeatFullCycleDuration.Record(duration.TotalMilliseconds);
+
+    /// <summary>
+    /// 八.4：注册心跳队列 ObservableGauge——queue.depth 与 queue.oldest_age。
+    /// 调用方须持有 provider 委托引用避免 GC 回收（与 RegisterInboundBudgetObservers 同模式）。
+    /// </summary>
+    public void RegisterHeartbeatQueueObservers(
+        Func<int> queueDepthProvider,
+        Func<double> oldestAgeMsProvider)
+    {
+        _meter.CreateObservableGauge(
+            "gateway.heartbeat.queue.depth",
+            () => queueDepthProvider(),
+            unit: "{work_items}",
+            description: "心跳刷新队列当前待处理工作项数。逼近 Channel 容量(WorkerCount×4)时 tick 循环阻塞。");
+        _meter.CreateObservableGauge(
+            "gateway.heartbeat.queue.oldest_age",
+            () => oldestAgeMsProvider(),
+            unit: "ms",
+            description: "队列中最老待处理项的排队年龄。持续增长超过 LeaseTtl 安全余量时告警。");
+    }
 
     // ===== 入站预算可观测性 =====
     //

@@ -81,25 +81,32 @@ internal sealed partial class TcpClientSession
             }
             else if (_usePerSessionDrain)
             {
-                // P1-6：等待 PerSessionDrain 的 drain Task 退出。
-                // _drainOp 同时承担状态（null=Idle）与句柄（non-null=Running），
-                // 消除旧实现 "CAS Idle→Running 成功但 _perSessionDrainTask 未赋值" 的窗口。
-                // Close 已设置 IsConnected=false，新 TryQueue 会失败，故最多一个活跃 drain
-                // 需等待；但 Close→read 窗口内可能有刚 CAS 成功的 drain，循环直到 null。
-                // drain 的 finally 在 Complete() 前已排空 FIFO + 归位 _drainOp + 释放 Tracker，
+                // 八.1：等待 PerSessionDrain 活跃 drain 退出。
+                // _drainStateGen packed state+gen 单次 CAS 原子发布，消除旧实现窗口。
+                // Close 已设置 IsConnected=false，新 TryQueue 会失败，故最多一个活跃 drain 需等待。
+                // Close 后无新 drain 启动 → MRVTSC Version 稳定 → ValueTask 不会因 Reset 失效。
+                // drain 的 finally 在 Complete(gen) 前已排空 FIFO + 归位 _drainStateGen + 释放 Tracker，
                 // 故 await 返回后可直接进入 _lifetime.Dispose()。
-                while (Volatile.Read(ref _drainOp) is { } op)
+                while (true)
                 {
+                    var stateGen = Interlocked.Read(ref _drainStateGen);
+                    if ((stateGen & DrainStateRunningBit) == 0)
+                        break; // Idle：无活跃 drain。
+
+                    var op = Volatile.Read(ref _drainOp);
+                    if (op is null)
+                        break; // 从未启动过 drain。
+
                     try
                     {
-                        await op.Completion.ConfigureAwait(false);
+                        await op.WaitAsync().ConfigureAwait(false);
                     }
                     catch
                     {
                         // drain 内部已处理异常并记录日志；此处仅等待其退出。
                     }
                 }
-                // 防御性排空：覆盖 Close→Volatile.Read 窗口内入队但 drain 未消费的残留帧。
+                // 防御性排空：覆盖 Close→Read 窗口内入队但 drain 未消费的残留帧。
                 // 幂等，与 drain finally 的 DrainOutboundOnClose 安全并发。
                 DrainOutboundOnClose();
             }

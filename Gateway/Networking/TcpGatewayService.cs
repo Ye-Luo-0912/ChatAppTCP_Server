@@ -456,6 +456,12 @@ internal sealed class TcpGatewayService : BackgroundService
             _metrics,
             _logger);
 
+        // 八.4：注册心跳队列 ObservableGauge——queue.depth 与 queue.oldest_age。
+        // 委托捕获 _heartbeatCoordinator 引用，避免 GC 回收（与 RegisterInboundBudgetObservers 同模式）。
+        _metrics.RegisterHeartbeatQueueObservers(
+            () => _heartbeatCoordinator.CurrentQueueDepth,
+            () => _heartbeatCoordinator.CurrentOldestQueueAgeMs);
+
         // 会话控制命令处理器：内部创建，注入握手/鉴权所需 codec 与准入/生命周期依赖。
         _sessionControlHandler = new SessionControlHandler(
             _options,

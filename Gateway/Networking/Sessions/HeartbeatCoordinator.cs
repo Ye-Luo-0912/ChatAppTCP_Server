@@ -33,7 +33,8 @@ internal readonly record struct HeartbeatRefreshWork(
     long UserId,
     ulong DeviceHash,
     string? LeaseOwnerToken,
-    TimeSpan LeaseTtl);
+    TimeSpan LeaseTtl,
+    long EnqueuedAtTimestamp);
 
 /// <summary>
 /// 心跳扫描协调器：周期性执行设备租约 TTL 刷新与 Redis 全局在线状态刷新。
@@ -91,6 +92,14 @@ internal sealed class HeartbeatCoordinator
     // Channel 容量（WorkerCount × 4）。
     private volatile int _currentQueueDepth;
 
+    // 八.4：最老待处理项入队时间戳（GetTimestamp() 单位）。0 = 队列空。
+    // 由 tick 循环入队时 CAS 设置（仅当队列从空→非空），Worker 排空时清零。
+    // 并发近似值——ObservableGauge 拉取时读取，瞬时不一致可接受。
+    private long _oldestEnqueueTimestamp;
+
+    // 八.4：tick 间隔——用于 Worker 判定排队超时阈值。
+    private TimeSpan _tickInterval;
+
     public HeartbeatCoordinator(
         TcpGatewayOptions options,
         TimeProvider timeProvider,
@@ -123,6 +132,7 @@ internal sealed class HeartbeatCoordinator
         var tickInterval = bucketCount > 1
             ? _options.HeartbeatScanInterval / bucketCount
             : _options.HeartbeatScanInterval;
+        _tickInterval = tickInterval;
 
         var workerCount = Math.Max(1, _options.HeartbeatRefreshConcurrency);
         // Channel 容量 = Worker × 4：队列满时 tick 循环阻塞提供背压，
@@ -148,6 +158,12 @@ internal sealed class HeartbeatCoordinator
 
         using var timer = new PeriodicTimer(tickInterval, _timeProvider);
         var tickCounter = 0;
+        // 八.4：schedule_lag 跟踪——记录上次 tick 的预期下次触发时间戳。
+        var tickFrequency = _timeProvider.TimestampFrequency;
+        var tickIntervalTicks = (long)(tickInterval.TotalSeconds * tickFrequency);
+        long? expectedNextTickTs = null;
+        // 八.4：full_cycle.duration 跟踪——每 bucketCount 个 tick 记录一次周期耗时。
+        var cycleStartTs = _timeProvider.GetTimestamp();
 
         try
         {
@@ -155,10 +171,19 @@ internal sealed class HeartbeatCoordinator
                        .WaitForNextTickAsync(cancellationToken)
                        .ConfigureAwait(false))
             {
+                // 八.4：schedule_lag——实际触发时间 vs 计划时间。
+                var actualTickStart = _timeProvider.GetTimestamp();
+                if (expectedNextTickTs is { } expected)
+                {
+                    var lag = _timeProvider.GetElapsedTime(expected);
+                    if (lag > TimeSpan.Zero)
+                        _metrics.HeartbeatScheduleLag(lag);
+                }
+                expectedNextTickTs = actualTickStart + tickIntervalTicks;
+
                 var currentBucket = tickCounter % bucketCount;
                 tickCounter++;
 
-                var tickStart = _timeProvider.GetTimestamp();
                 _listenerHost.SweepAdmission();
 
                 // 仅枚举当前桶，不再 ToArray 全量会话。
@@ -188,12 +213,16 @@ internal sealed class HeartbeatCoordinator
                             session.UserId,
                             deviceHash,
                             session.LeaseOwnerToken,
-                            leaseTtl);
+                            leaseTtl,
+                            actualTickStart);
 
                         // 队列满时 await 阻塞提供背压（Redis 慢速时 tick 自然降速）。
                         await channel.Writer.WriteAsync(work, cancellationToken)
                             .ConfigureAwait(false);
                         Interlocked.Increment(ref _currentQueueDepth);
+                        // 八.4：队列从空→非空时记录最老项时间戳。
+                        if (_currentQueueDepth == 1)
+                            Interlocked.CompareExchange(ref _oldestEnqueueTimestamp, actualTickStart, 0);
                     }
                 }
 
@@ -208,16 +237,26 @@ internal sealed class HeartbeatCoordinator
                             userId,
                             0,
                             null,
-                            TimeSpan.Zero);
+                            TimeSpan.Zero,
+                            actualTickStart);
 
                         await channel.Writer.WriteAsync(work, cancellationToken)
                             .ConfigureAwait(false);
                         Interlocked.Increment(ref _currentQueueDepth);
+                        Interlocked.CompareExchange(ref _oldestEnqueueTimestamp, actualTickStart, 0);
                     }
                 }
 
-                var tickDuration = _timeProvider.GetElapsedTime(tickStart);
+                var tickDuration = _timeProvider.GetElapsedTime(actualTickStart);
                 _metrics.HeartbeatScanCompleted(tickDuration);
+
+                // 八.4：每 bucketCount 个 tick 记录一次完整扫描周期耗时。
+                if (tickCounter % bucketCount == 0)
+                {
+                    var cycleDuration = _timeProvider.GetElapsedTime(cycleStartTs);
+                    _metrics.HeartbeatFullCycleCompleted(cycleDuration);
+                    cycleStartTs = _timeProvider.GetTimestamp();
+                }
             }
         }
         catch (OperationCanceledException)
@@ -259,10 +298,18 @@ internal sealed class HeartbeatCoordinator
                                .ConfigureAwait(false))
             {
                 Interlocked.Decrement(ref _currentQueueDepth);
+                // 八.4：队列排空时清除最老项时间戳。
+                if (_currentQueueDepth == 0)
+                    Interlocked.Exchange(ref _oldestEnqueueTimestamp, 0);
 
                 var kindLabel = work.Kind == HeartbeatRefreshKind.Lease
                     ? leaseLabel
                     : presenceLabel;
+
+                // 八.4：测量排队等待时长，超阈值计为 overdue。
+                var queueAge = _timeProvider.GetElapsedTime(work.EnqueuedAtTimestamp);
+                if (queueAge > _tickInterval)
+                    _metrics.HeartbeatRefreshOverdue(kindLabel);
 
                 var opStart = _timeProvider.GetTimestamp();
                 try
@@ -318,4 +365,18 @@ internal sealed class HeartbeatCoordinator
     /// </para>
     /// </summary>
     internal int CurrentQueueDepth => _currentQueueDepth;
+
+    /// <summary>
+    /// 八.4：当前最老待处理项的排队年龄（ms）。队列空时返回 0。
+    /// </summary>
+    internal double CurrentOldestQueueAgeMs
+    {
+        get
+        {
+            var ts = Volatile.Read(ref _oldestEnqueueTimestamp);
+            if (ts == 0 || _currentQueueDepth == 0)
+                return 0;
+            return _timeProvider.GetElapsedTime(ts).TotalMilliseconds;
+        }
+    }
 }

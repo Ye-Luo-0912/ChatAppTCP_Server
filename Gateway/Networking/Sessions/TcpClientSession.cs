@@ -1,5 +1,6 @@
 using System.Net.Sockets;
 using System.Threading.Channels;
+using System.Threading.Tasks.Sources;
 using ChatApp.TcpGateway.Core.Protocol;
 using ChatApp.TcpGateway.Gateway.Networking.Buffers;
 using ChatApp.TcpGateway.Gateway.Networking.Executor;
@@ -36,53 +37,106 @@ internal sealed partial class TcpClientSession : IAsyncDisposable
     // OnDemandSendPump 模式专用：共享出站 pump 协调器。
     // PersistentSendLoop/PerSessionDrain 模式下为 null。
     private readonly OutboundPumpCoordinator? _outboundPump;
-    // PerSessionDrain 模式专用：原子引用同时承担状态（null=Idle）与句柄发布（non-null=Running）。
+    // 八.1：PerSessionDrain 状态机——packed state (bit 32) + generation (bits 0-31) 到单个 long，
+    // 单次 CAS 原子完成 Idle→Running 转换 + 代次发布，消除每次 enqueue 的 DrainOperation 分配。
     // <para>
-    // P1-6：旧实现用两步——<c>CAS _sendState Idle→Running</c> 然后赋值 <c>_perSessionDrainTask</c>，
-    // 在两步之间 <c>DisposeAsync</c> 可看到 <c>_sendState=Running</c> 但 <c>_perSessionDrainTask=null</c>，
-    // 从而跳过 await 直接 <c>DrainOutboundOnClose</c>，新启动的 drain Task 不被 await 即逃逸。
+    // 状态：0=Idle，1=Running（bit 32）。代次：每次 Idle→Running 转换递增，区分不同 drain 实例。
+    // drain 释放/重夺所有权时 CAS 完整 64 位值（含代次），防止 ABA（旧 drain 重夺已被新 drain 接管的代次）。
     // </para>
     // <para>
-    // 现在用单一 <see cref="DrainOperation"/> 引用做 CAS：状态转换与句柄发布原子完成，
-    // 消除 "CAS 成功但字段未发布" 的生命周期窗口。<c>DisposeAsync</c> 读 <c>_drainOp</c>：
-    // non-null 则 <c>await op.Completion</c>；null 则无活跃 drain。
+    // P1-6 不变量保留：状态转换与代次发布在单次 CAS 中原子完成。Dispose 读 _drainStateGen：
+    // Running 则 <c>await _drainOp.WaitAsync()</c>；Idle 则无活跃 drain。
     // </para>
+    // PersistentSendLoop/OnDemandSendPump 模式下永远为 0（Idle, gen 0）。
+    private long _drainStateGen;
+    private const long DrainStateRunningBit = 1L << 32;
+    // 八.1：可复用 drain 句柄——惰性初始化一次，跨代次通过 <see cref="DrainOperation.Reset"/> 重用。
+    // 旧实现每次 <c>TryScheduleSend</c> 都 <c>new DrainOperation(含 TCS)</c>，CAS 失败时立即成为垃圾。
     // PersistentSendLoop/OnDemandSendPump 模式下永远为 null。
     private DrainOperation? _drainOp;
-    // Drain 代次：每次 <c>TryScheduleSend</c> 创建新 <see cref="DrainOperation"/> 时递增，
-    // 用于诊断日志区分不同 drain 实例。CAS 用引用相等判定所有权，不依赖此计数器。
-    private int _drainGeneration;
     // PerSessionDrain 模式标志：构造时确定，影响 TryScheduleSend 分支。
     private readonly bool _usePerSessionDrain;
 
     /// <summary>
-    /// PerSessionDrain 模式的 drain 句柄：封装 <see cref="TaskCompletionSource"/> 作为
-    /// <c>DisposeAsync</c> 可等待的完成信号，以及代次标识用于诊断。
+    /// 八.1：可复用的 PerSessionDrain 句柄，封装 <see cref="ManualResetValueTaskSourceCore{T}"/>
+    /// 替代每次 drain 分配 <see cref="TaskCompletionSource"/>。
     /// <para>
-    /// 生命周期：由 <c>TryScheduleSend</c> 创建，通过 <c>CAS _drainOp null→op</c> 原子发布。
-    /// drain Task 退出时在 finally 中 <c>Complete()</c> 通知等待方，并 <c>CAS _drainOp op→null</c> 归位。
+    /// 旧实现每次 <c>TryScheduleSend</c> 都 <c>new DrainOperation(含 TCS)</c>，CAS 失败时立即成为垃圾。
+    /// 现改为 Session 内复用单实例，MRVTSC 可 <c>Reset()</c> 跨代次重用——普通入队路径只做 CAS，零分配。
+    /// </para>
+    /// <para>
+    /// Reset/Complete 通过 <see cref="SpinLock"/> 串行化，防止跨代次 SetResult 竞态
+    /// （旧代次 Complete 的 SetResult 误完成新代次的 MRVTSC）。临界区极短（~10ns），
+    /// 且仅在 drain 启动/退出时执行，不在每次 enqueue 热路径上。
     /// </para>
     /// </summary>
-    internal sealed class DrainOperation
+    internal sealed class DrainOperation : IValueTaskSource
     {
-        public readonly int Generation;
-        private readonly TaskCompletionSource _tcs;
-        private int _completed;
+        private ManualResetValueTaskSourceCore<bool> _core;
+        private int _completed;          // 1 if Complete() was called for the current generation
+        private int _activeGeneration;   // the generation this handle is currently bound to
+        private SpinLock _lock;          // serializes Reset/Complete (very short critical sections)
 
-        public DrainOperation(int generation)
+        public DrainOperation()
         {
-            Generation = generation;
-            _tcs = new TaskCompletionSource(
-                TaskCreationOptions.RunContinuationsAsynchronously);
+            _core.RunContinuationsAsynchronously = true;
+            _lock = new SpinLock(false);
         }
 
-        public Task Completion => _tcs.Task;
-
-        public void Complete()
+        /// <summary>绑定到新 drain 代次。重置 MRVTSC 以跨代次重用。</summary>
+        public void Reset(int generation)
         {
-            if (Interlocked.Exchange(ref _completed, 1) == 0)
-                _tcs.TrySetResult();
+            var lockTaken = false;
+            _lock.Enter(ref lockTaken);
+            try
+            {
+                _activeGeneration = generation;
+                _core.Reset();
+                Volatile.Write(ref _completed, 0);
+            }
+            finally
+            {
+                if (lockTaken) _lock.Exit();
+            }
         }
+
+        /// <summary>
+        /// 通知等待方 drain 已完成。仅当代次匹配时生效——防止旧代次的 Complete
+        /// 误完成新代次的 MRVTSC（跨代次 SetResult 竞态）。
+        /// </summary>
+        public void Complete(int generation)
+        {
+            var lockTaken = false;
+            _lock.Enter(ref lockTaken);
+            try
+            {
+                if (_activeGeneration != generation)
+                    return; // 旧代次：新代次已 Reset，不操作 MRVTSC。
+                if (Volatile.Read(ref _completed) == 1)
+                    return; // 当前代次已完成（幂等）。
+                Volatile.Write(ref _completed, 1);
+                _core.SetResult(true);
+            }
+            finally
+            {
+                if (lockTaken) _lock.Exit();
+            }
+        }
+
+        /// <summary>获取可等待的 <see cref="ValueTask"/>。Version 随 Reset 递增，使旧 token 失效。</summary>
+        public ValueTask WaitAsync() => new(this, _core.Version);
+
+        ValueTaskSourceStatus IValueTaskSource.GetStatus(short token) =>
+            _core.GetStatus(token);
+
+        void IValueTaskSource.OnCompleted(
+            Action<object?> continuation,
+            object? state,
+            short token,
+            ValueTaskSourceOnCompletedFlags flags) =>
+            _core.OnCompleted(continuation, state, token, flags);
+
+        void IValueTaskSource.GetResult(short token) => _core.GetResult(token);
     }
 
     // OnDemandSendPump 三态调度状态机，CAS 驱动：
