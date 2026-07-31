@@ -29,6 +29,13 @@ internal sealed class RealtimeEventConsumerService : BackgroundService
     private static readonly TimeSpan DeliveryRetryDelay =
         TimeSpan.FromSeconds(1);
 
+    /// <summary>
+    /// 七：Drain 超时——主循环结束后 worker 排空已入队 delivery 的独立预算。
+    /// 不链接 stoppingToken（宿主已取消时 linked CTS 立即取消，Drain 退化为 0）；
+    /// 宿主总 ShutdownTimeout（Program.cs 配置 20s）约束整体停机时长。
+    /// </summary>
+    private static readonly TimeSpan DrainTimeout = TimeSpan.FromSeconds(30);
+
     private readonly IRealtimeMessageBus _messageBus;
     private readonly RealtimeEventDispatcher _dispatcher;
     private readonly GatewayMetrics _metrics;
@@ -159,7 +166,6 @@ internal sealed class RealtimeEventConsumerService : BackgroundService
         CancellationToken stoppingToken)
     {
         // 每分区容量：从 MaxAckPending 派生，保证全局在途消息受 broker 背压约束。
-        // 使用 ConfigureAwait(false) 避免 partition worker 的同步上下文捕获。
         var perPartitionCapacity = Math.Max(16, 512 / partitionCount);
         var partitions = new Channel<RealtimeEventDelivery>[partitionCount];
         for (var i = 0; i < partitionCount; i++)
@@ -174,14 +180,19 @@ internal sealed class RealtimeEventConsumerService : BackgroundService
         }
 
         // 启动分区 worker。
-        using var cts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
+        // 七：Worker token 独立于 stoppingToken——宿主停机时主循环停止拉取，
+        // 但 worker 继续排空已入队 delivery（在 DrainTimeout 内），减少 broker 重投。
+        // 宿主总 ShutdownTimeout（Program.cs 配置 20s）约束整体停机时长。
+        using var workerStopCts = new CancellationTokenSource();
+        // 主循环 token 链接 stoppingToken：宿主请求停机时立即停止从 broker 拉取。
+        using var mainLoopCts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
         var workers = new Task[partitionCount];
         for (var i = 0; i < partitionCount; i++)
         {
             var partitionIndex = i;
             workers[i] = ConsumePartitionWorkerAsync(
                 partitions[partitionIndex].Reader,
-                cts.Token);
+                workerStopCts.Token);
         }
 
         // 主循环：从 JetStream 拉取消息，路由到分区 channel。
@@ -192,17 +203,17 @@ internal sealed class RealtimeEventConsumerService : BackgroundService
             mainLoop = Task.Run(async () =>
             {
                 await foreach (var delivery in _messageBus
-                                   .ConsumeEventsAsync(cts.Token)
+                                   .ConsumeEventsAsync(mainLoopCts.Token)
                                    .ConfigureAwait(false))
                 {
                     var partitionIndex = GetPartitionIndex(
                         delivery.Event.TargetUserId,
                         partitionCount);
                     await partitions[partitionIndex].Writer
-                        .WriteAsync(delivery, cts.Token)
+                        .WriteAsync(delivery, mainLoopCts.Token)
                         .ConfigureAwait(false);
                 }
-            }, cts.Token);
+            }, mainLoopCts.Token);
 
             // 使用 Task.WhenAny 竞争 mainLoop 与 workers：
             // 若 worker 先 Fault → 取消 mainLoop（避免 channel 满后永久阻塞 WriteAsync）；
@@ -213,11 +224,22 @@ internal sealed class RealtimeEventConsumerService : BackgroundService
 
             if (completed == workersTask)
             {
-                // Worker faulted first: cancel main loop to unblock WriteAsync,
-                // then propagate worker exception.
-                cts.Cancel();
-                await mainLoop.ConfigureAwait(false); // should throw OCE
-                await workersTask.ConfigureAwait(false); // propagate worker exception
+                // 七：Worker 先 Fault——必须先捕获 worker 根因，再取消 mainLoop。
+                // 旧实现先 cts.Cancel() 再 await mainLoop，OCE 会掩盖真正的 worker 异常，
+                // 导致 `await workersTask` 永远到不了。改为：先观测 workersTask 拿到根因，
+                // 再取消 mainLoop（解除 WriteAsync 阻塞），观测 mainLoop（吞掉预期 OCE），
+                // 最后抛出原始 worker 异常。
+                Exception? workerException = null;
+                try { await workersTask.ConfigureAwait(false); }
+                catch (Exception ex) { workerException = ex; }
+
+                mainLoopCts.Cancel();
+                try { await mainLoop.ConfigureAwait(false); }
+                catch (OperationCanceledException) { /* 预期：mainLoop 被取消 */ }
+                catch { /* 次要故障——丢弃，传播原始 workerException */ }
+
+                if (workerException is not null)
+                    throw workerException;
                 return;
             }
 
@@ -245,32 +267,26 @@ internal sealed class RealtimeEventConsumerService : BackgroundService
             if (mainLoopException is not null)
             {
                 // Main loop faulted: cancel workers, they can't drain meaningfully.
-                cts.Cancel();
+                workerStopCts.Cancel();
                 try { await workersTask.ConfigureAwait(false); }
                 catch { /* propagate mainLoopException below */ }
                 throw mainLoopException;
             }
 
-            // Main loop ended normally: allow workers to drain remaining deliveries
-            // within a bounded timeout, then cancel if exceeded.
-            using var drainCts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
-            drainCts.CancelAfter(TimeSpan.FromSeconds(30));
+            // 七：主循环正常结束——允许 worker 在独立 DrainTimeout 内排空剩余 delivery。
+            // 旧实现 drainCts = CreateLinkedTokenSource(stoppingToken)：宿主 stoppingToken 已取消时
+            // linked CTS 立即取消，Drain 窗口退化为 0。改为对 workerStopCts 直接 CancelAfter，
+            // 不链接 stoppingToken——宿主总 ShutdownTimeout 约束整体时长。
+            workerStopCts.CancelAfter(DrainTimeout);
             try
             {
-                await workersTask.WaitAsync(drainCts.Token).ConfigureAwait(false);
+                await workersTask.ConfigureAwait(false);
             }
-            catch (OperationCanceledException) when (drainCts.IsCancellationRequested)
+            catch (OperationCanceledException) when (workerStopCts.IsCancellationRequested)
             {
-                // Drain timeout: cancel workers to prevent indefinite hang.
-                cts.Cancel();
-                try { await workersTask.ConfigureAwait(false); }
-                catch { /* drain timeout — remaining deliveries will be redelivered by broker */ }
+                // Drain 超时：剩余 delivery 由 broker 重投。
             }
-            catch
-            {
-                // Worker faulted during drain — propagate.
-                throw;
-            }
+            // Worker faulted during drain — propagate.
         }
         finally
         {
@@ -280,7 +296,8 @@ internal sealed class RealtimeEventConsumerService : BackgroundService
                 ch.Writer.TryComplete();
             }
 
-            // 确保所有 worker 已退出（上方已 await，此处为防御性等待）。
+            // 防御性：确保 worker 已退出。CancelAfter 可能尚未触发，此处显式取消。
+            workerStopCts.Cancel();
             try
             {
                 await Task.WhenAll(workers).ConfigureAwait(false);

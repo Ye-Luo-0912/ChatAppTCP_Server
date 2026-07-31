@@ -14,7 +14,8 @@ namespace ChatApp.TcpGateway.Infrastructure.GroupIdempotency;
 /// Redis L2 实现的群组命令幂等存储。
 /// <para>
 /// Key 格式：<c>group:idem:{userId}:{operation}:{requestId}</c>（均为字符串）。
-/// Value 为 Redis HASH，包含 <c>payloadHash</c>（int 字符串）与 <c>result</c>（JSON 字符串）两个字段。
+/// Value 为 Redis HASH，包含 <c>payloadHash</c>（五.1：SHA-256 hex 字符串）、
+/// <c>result</c>（JSON 字符串）与 <c>status</c>（<c>completed</c>）三个字段。
 /// TTL 默认 30 秒（与 L1 一致），通过 Lua 内 <c>PEXPIRE</c> 原子设置。
 /// </para>
 /// <para>
@@ -24,6 +25,11 @@ namespace ChatApp.TcpGateway.Infrastructure.GroupIdempotency;
 /// <para>
 /// 可选注入 <see cref="IRedisCircuitBreaker"/>：Redis 故障期间快速失败返回 Miss，
 /// 避免跨 Gateway 重试风暴串行触发 Redis 超时。未注入时跳过熔断器逻辑。
+/// </para>
+/// <para>
+/// 五.2：TryAdd 改为条件写——仅当 key 不存在或已存指纹相同时写入，不覆盖不同指纹的既有结果。
+/// 旧实现无条件 HSET 导致两个 Gateway 并发 Miss 后最后写入者覆盖前者。真正的幂等主防线
+/// 是 RealtimeServices 数据库中的不可变幂等 Ledger，L2 仅作跨 Gateway 短缓存。
 /// </para>
 /// </summary>
 internal sealed class RedisGroupIdempotencyStore(
@@ -39,7 +45,7 @@ internal sealed class RedisGroupIdempotencyStore(
     /// <summary>
     /// TryGet Lua 脚本：HMGET key payloadHash result，校验 payloadHash 匹配。
     /// <para>
-    /// ARGV 顺序：expectedPayloadHash。
+    /// ARGV 顺序：expectedPayloadHash（SHA-256 hex 字符串）。
     /// 返回：
     /// <list type="bullet">
     /// <item>Redis nil（false）→ Miss（key 不存在或字段缺失）</item>
@@ -67,9 +73,15 @@ return resultJson
 ";
 
     /// <summary>
-    /// TryAdd Lua 脚本：HSET key payloadHash result + PEXPIRE key ttl。
+    /// 五.2：TryAdd 条件写 Lua 脚本。
     /// <para>
     /// ARGV 顺序：payloadHash, resultJson, ttlMs。
+    /// 语义：
+    /// <list type="bullet">
+    /// <item>key 不存在 → 写入 payloadHash/result/status=completed + PEXPIRE（首次缓存）。</item>
+    /// <item>已存指纹相同 → 仅刷新 TTL，不覆盖 result（同请求重试，幂等）。</item>
+    /// <item>已存指纹不同 → 不写入，返回 false（避免并发 Miss 后最后写入者覆盖前者）。</item>
+    /// </list>
     /// </para>
     /// </summary>
     private const string TryAddScript = @"
@@ -78,16 +90,26 @@ local payloadHash = ARGV[1]
 local resultJson = ARGV[2]
 local ttl = tonumber(ARGV[3])
 
-redis.call('HSET', key, 'payloadHash', payloadHash, 'result', resultJson)
-redis.call('PEXPIRE', key, ttl)
-return true
+local storedHash = redis.call('HGET', key, 'payloadHash')
+if storedHash == false then
+    redis.call('HSET', key, 'payloadHash', payloadHash, 'result', resultJson, 'status', 'completed')
+    redis.call('PEXPIRE', key, ttl)
+    return true
+end
+
+if storedHash == payloadHash then
+    redis.call('PEXPIRE', key, ttl)
+    return true
+end
+
+return false
 ";
 
     public async ValueTask<GroupIdempotencyLookup> TryGetAsync(
         long userId,
         int operation,
         string requestId,
-        int payloadHash,
+        string payloadHash,
         CancellationToken cancellationToken)
     {
         if (string.IsNullOrEmpty(requestId))
@@ -107,7 +129,7 @@ return true
                 .ScriptEvaluateAsync(
                     TryGetScript,
                     new RedisKey[] { key },
-                    new RedisValue[] { payloadHash.ToString(CultureInfo.InvariantCulture) })
+                    new RedisValue[] { payloadHash })
                 .WaitAsync(cancellationToken)
                 .ConfigureAwait(false);
 
@@ -160,7 +182,7 @@ return true
         long userId,
         int operation,
         string requestId,
-        int payloadHash,
+        string payloadHash,
         GroupConversationResult result,
         CancellationToken cancellationToken)
     {
@@ -186,7 +208,7 @@ return true
                     new RedisKey[] { key },
                     new RedisValue[]
                     {
-                        payloadHash.ToString(CultureInfo.InvariantCulture),
+                        payloadHash,
                         resultJson,
                         DefaultTtlMs
                     })

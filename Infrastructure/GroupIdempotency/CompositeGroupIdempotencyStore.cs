@@ -18,6 +18,10 @@ namespace ChatApp.TcpGateway.Infrastructure.GroupIdempotency;
 /// <para>
 /// L2 可选——为 null 时 Composite 退化为仅 L1，不记录 Redis 层 metrics。
 /// </para>
+/// <para>
+/// 五.1：<c>payloadHash</c> 为 SHA-256 hex 字符串（跨进程稳定），L1/L2 透传一致。
+/// 五.2：L2 TryAdd 为条件写，不覆盖不同指纹的既有结果。
+/// </para>
 /// </summary>
 internal sealed class CompositeGroupIdempotencyStore(
     IGroupIdempotencyStore l1Cache,
@@ -28,14 +32,13 @@ internal sealed class CompositeGroupIdempotencyStore(
         long userId,
         int operation,
         string requestId,
-        int payloadHash,
+        string payloadHash,
         CancellationToken cancellationToken)
     {
         // L1 快速路径：命中或冲突时直接返回，不查 L2。
         var l1Lookup = await l1Cache.TryGetAsync(
             userId, operation, requestId, payloadHash, cancellationToken)
             .ConfigureAwait(false);
-
         if (l1Lookup.IsHit || l1Lookup.IsConflict)
             return l1Lookup;
 
@@ -47,7 +50,6 @@ internal sealed class CompositeGroupIdempotencyStore(
         var l2Lookup = await l2Cache.TryGetAsync(
             userId, operation, requestId, payloadHash, cancellationToken)
             .ConfigureAwait(false);
-
         if (l2Lookup.IsHit)
         {
             // L2 命中：回填 L1，后续重试可从 L1 快速命中。
@@ -58,7 +60,6 @@ internal sealed class CompositeGroupIdempotencyStore(
                 .ConfigureAwait(false);
             return l2Lookup;
         }
-
         if (l2Lookup.IsConflict)
         {
             // L2 冲突：L2 找到条目但负载指纹不匹配，记为 Redis 命中。
@@ -75,7 +76,7 @@ internal sealed class CompositeGroupIdempotencyStore(
         long userId,
         int operation,
         string requestId,
-        int payloadHash,
+        string payloadHash,
         GroupConversationResult result,
         CancellationToken cancellationToken)
     {
@@ -83,7 +84,6 @@ internal sealed class CompositeGroupIdempotencyStore(
         await l1Cache.TryAddAsync(
             userId, operation, requestId, payloadHash, result, cancellationToken)
             .ConfigureAwait(false);
-
         if (l2Cache is null)
             return;
 

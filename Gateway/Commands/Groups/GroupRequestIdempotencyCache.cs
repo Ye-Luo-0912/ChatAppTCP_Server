@@ -24,6 +24,10 @@ namespace ChatApp.TcpGateway.Gateway.Commands.Groups;
 /// 线程安全：基于 <see cref="ConcurrentDictionary{TKey, TValue}"/>，读取无锁；
 /// 容量回收使用 <see cref="Interlocked"/> CAS 防止并发 sweep。
 /// </para>
+/// <para>
+/// 五.1：<see cref="Entry.PayloadHash"/> 改为 SHA-256 hex 字符串（跨进程稳定），
+/// 替代原 32 位 <c>System.HashCode</c>（进程随机种子，跨 Gateway 不一致）。
+/// </para>
 /// </summary>
 public sealed class GroupRequestIdempotencyCache : IGroupIdempotencyStore
 {
@@ -72,7 +76,7 @@ public sealed class GroupRequestIdempotencyCache : IGroupIdempotencyStore
         long userId,
         int operation,
         string requestId,
-        int payloadHash)
+        string payloadHash)
     {
         if (string.IsNullOrEmpty(requestId))
         {
@@ -97,7 +101,7 @@ public sealed class GroupRequestIdempotencyCache : IGroupIdempotencyStore
         }
 
         // 负载指纹不匹配：同一 RequestId 但不同操作参数，返回冲突。
-        if (entry.PayloadHash != payloadHash)
+        if (!string.Equals(entry.PayloadHash, payloadHash, StringComparison.Ordinal))
             return GroupIdempotencyLookup.Conflict;
 
         OnLookup?.Invoke(true);
@@ -112,7 +116,7 @@ public sealed class GroupRequestIdempotencyCache : IGroupIdempotencyStore
         long userId,
         int operation,
         string requestId,
-        int payloadHash,
+        string payloadHash,
         GroupConversationResult result)
     {
         if (string.IsNullOrEmpty(requestId) || result is null)
@@ -161,7 +165,7 @@ public sealed class GroupRequestIdempotencyCache : IGroupIdempotencyStore
         long userId,
         int operation,
         string requestId,
-        int payloadHash,
+        string payloadHash,
         CancellationToken cancellationToken)
         => new(TryGet(userId, operation, requestId, payloadHash));
 
@@ -173,7 +177,7 @@ public sealed class GroupRequestIdempotencyCache : IGroupIdempotencyStore
         long userId,
         int operation,
         string requestId,
-        int payloadHash,
+        string payloadHash,
         GroupConversationResult result,
         CancellationToken cancellationToken)
     {
@@ -222,5 +226,5 @@ public sealed class GroupRequestIdempotencyCache : IGroupIdempotencyStore
     private readonly record struct Entry(
         GroupConversationResult Result,
         long ExpiresAtTicks,
-        int PayloadHash);
+        string PayloadHash);
 }

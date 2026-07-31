@@ -10,7 +10,7 @@ namespace ChatApp.TcpGateway.Tests.Messaging;
 public sealed class GroupRequestIdempotencyCacheTests
 {
     private const int DefaultOperation = 1;
-    private const int DefaultPayloadHash = 0;
+    private const string DefaultPayloadHash = "0";
 
     [Fact]
     public void TryGet_ReturnsMiss_ForNewKey()
@@ -270,10 +270,10 @@ public sealed class GroupRequestIdempotencyCacheTests
         var cache = CreateCache();
         var original = GroupConversationResult.Success("req-1", "conv-1");
 
-        cache.TryAdd(1001, DefaultOperation, "req-1", payloadHash: 111, original);
+        cache.TryAdd(1001, DefaultOperation, "req-1", payloadHash: "111", original);
 
         // 同一 (UserId, Operation, RequestId) 但不同 PayloadHash → 冲突。
-        var lookup = cache.TryGet(1001, DefaultOperation, "req-1", payloadHash: 222);
+        var lookup = cache.TryGet(1001, DefaultOperation, "req-1", payloadHash: "222");
 
         Assert.True(lookup.IsConflict);
         Assert.False(lookup.IsHit);
@@ -286,9 +286,9 @@ public sealed class GroupRequestIdempotencyCacheTests
         var cache = CreateCache();
         var original = GroupConversationResult.Success("req-1", "conv-1");
 
-        cache.TryAdd(1001, DefaultOperation, "req-1", payloadHash: 111, original);
+        cache.TryAdd(1001, DefaultOperation, "req-1", payloadHash: "111", original);
 
-        var lookup = cache.TryGet(1001, DefaultOperation, "req-1", payloadHash: 111);
+        var lookup = cache.TryGet(1001, DefaultOperation, "req-1", payloadHash: "111");
 
         Assert.True(lookup.IsHit);
         Assert.NotNull(lookup.Result);
@@ -302,11 +302,11 @@ public sealed class GroupRequestIdempotencyCacheTests
         var callbackInvoked = false;
         cache.OnLookup = _ => callbackInvoked = true;
 
-        cache.TryAdd(1001, DefaultOperation, "req-1", payloadHash: 111, original);
+        cache.TryAdd(1001, DefaultOperation, "req-1", payloadHash: "111", original);
         callbackInvoked = false;
 
         // 冲突不应触发 hit/miss 回调。
-        var lookup = cache.TryGet(1001, DefaultOperation, "req-1", payloadHash: 222);
+        var lookup = cache.TryGet(1001, DefaultOperation, "req-1", payloadHash: "222");
 
         Assert.True(lookup.IsConflict);
         Assert.False(callbackInvoked);

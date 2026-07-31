@@ -154,29 +154,56 @@ internal sealed partial class GroupCommandHandler
     /// 计算命令负载指纹：包含操作参数（不含 RequestId/ActorUserId/ActorSessionId）。
     /// 用于检测同一 RequestId 复用不同操作参数的冲突。
     /// <para>
-    /// MemberUserIds 排序后逐个合并，确保成员集合相同但顺序不同的命令产生相同指纹。
+    /// 五.1：改用 SHA-256 over 规范化二进制表示，替代 <c>System.HashCode</c>。
+    /// <c>HashCode</c> 使用进程随机种子，跨 Gateway 进程共享 Redis L2 时同一请求会
+    /// 产生不同 32 位指纹，被 L2 错误判为 idempotency_conflict；且 32 位存在碰撞风险。
+    /// </para>
+    /// <para>
+    /// 规范化字段顺序（长度前缀，避免分隔符歧义）：
+    /// FingerprintVersion、Operation、ConversationId、Title、TargetUserId、NewRole、
+    /// 排序后的 MemberUserIds。数值使用小端序（<see cref="System.IO.BinaryWriter"/> 默认），
+    /// 字符串使用 7-bit 编码长度前缀 + UTF-8（<see cref="System.IO.BinaryWriter.Write(string)"/>
+    /// 规范，跨进程稳定）。输出 256 位（64 字符小写 hex）。
+    /// </para>
+    /// <para>
+    /// MemberUserIds 排序后逐个写入，确保成员集合相同但顺序不同的命令产生相同指纹。
     /// ListMembers 的分页参数（PageSize/Cursor）不纳入指纹：幂等缓存保存全量成员，
     /// 不同分页参数命中同一缓存后由 map 闭包各自切片，提高翻页命中率。
     /// </para>
     /// </summary>
-    private static int ComputePayloadHash(RealtimeGroupConversationCommand command)
+    private static string ComputePayloadHash(RealtimeGroupConversationCommand command)
     {
-        var hash = new HashCode();
-        hash.Add(command.Operation);
-        hash.Add(command.ConversationId);
-        hash.Add(command.Title);
-        hash.Add(command.TargetUserId);
-        hash.Add(command.NewRole);
+        using var stream = new System.IO.MemoryStream(256);
+        using var writer = new System.IO.BinaryWriter(stream, System.Text.Encoding.UTF8, leaveOpen: false);
+
+        writer.Write(1); // FingerprintVersion——前向兼容
+        writer.Write((int)command.Operation);
+        writer.Write(command.ConversationId ?? string.Empty);
+        writer.Write(command.Title ?? string.Empty);
+
+        writer.Write(command.TargetUserId.HasValue);
+        if (command.TargetUserId.HasValue)
+            writer.Write(command.TargetUserId.GetValueOrDefault());
+
+        writer.Write(command.NewRole.HasValue);
+        if (command.NewRole.HasValue)
+            writer.Write((int)command.NewRole.GetValueOrDefault());
 
         if (command.MemberUserIds is { } members)
         {
-            // 排序后逐个合并：集合语义（顺序无关）。
-            // MemberUserIds 通常很短（≤100），排序开销可忽略。
+            writer.Write(members.Count);
             foreach (var id in members.Order())
-                hash.Add(id);
+                writer.Write(id);
+        }
+        else
+        {
+            writer.Write(0);
         }
 
-        return hash.ToHashCode();
+        writer.Flush();
+        var hash = System.Security.Cryptography.SHA256.HashData(
+            stream.GetBuffer().AsSpan(0, (int)stream.Length));
+        return Convert.ToHexString(hash).ToLowerInvariant();
     }
 
     /// <summary>

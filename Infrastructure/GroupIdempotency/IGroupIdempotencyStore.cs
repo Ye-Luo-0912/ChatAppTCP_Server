@@ -14,21 +14,27 @@ public interface IGroupIdempotencyStore
     /// 尝试获取缓存的结果。返回 Hit（含缓存结果）、Miss（未命中/已过期）或
     /// Conflict（同一 RequestId 但 PayloadHash 不匹配）。
     /// </summary>
+    /// <param name="payloadHash">命令负载指纹（五.1：SHA-256 hex 字符串，跨进程稳定）。
+    /// 用于检测同一 (UserId, Operation, RequestId) 但不同负载的冲突。</param>
     ValueTask<GroupIdempotencyLookup> TryGetAsync(
         long userId,
         int operation,
         string requestId,
-        int payloadHash,
+        string payloadHash,
         CancellationToken cancellationToken);
 
     /// <summary>
     /// 缓存 Realtime 返回的结果。尽力而为：容量超限或失败时可能静默跳过。
+    /// <para>
+    /// 五.2：Redis L2 实现为条件写——仅当 key 不存在或已存指纹相同时写入，
+    /// 不覆盖不同指纹的既有结果（避免并发 Miss 后最后写入者覆盖前者）。
+    /// </para>
     /// </summary>
     ValueTask TryAddAsync(
         long userId,
         int operation,
         string requestId,
-        int payloadHash,
+        string payloadHash,
         GroupConversationResult result,
         CancellationToken cancellationToken);
 
