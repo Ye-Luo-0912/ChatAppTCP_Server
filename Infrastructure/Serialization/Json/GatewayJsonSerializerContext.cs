@@ -1,6 +1,7 @@
 using System.Text.Json.Serialization;
 using ChatApp.TcpGateway.Core.Authentication;
 using ChatApp.TcpGateway.Core.Messaging;
+using ChatApp.TcpGateway.Core.Messaging.Attachments;
 using ChatApp.TcpGateway.Core.Messaging.Conversations;
 using ChatApp.TcpGateway.Core.Messaging.History;
 using ChatApp.TcpGateway.Core.Messaging.Push;
@@ -106,6 +107,14 @@ namespace ChatApp.TcpGateway.Infrastructure.Serialization.Json;
 [JsonSerializable(typeof(ResumeResponse))]
 [JsonSerializable(typeof(RelationshipListChangedUpdate))]
 [JsonSerializable(typeof(AttachmentLifecycleUpdate))]
+[JsonSerializable(typeof(AttachmentFinalizeRequest))]
+[JsonSerializable(typeof(AttachmentFinalizeResponse))]
+[JsonSerializable(typeof(RelationshipCommandRequest))]
+[JsonSerializable(typeof(RelationshipCommandResponse))]
+[JsonSerializable(typeof(RelationshipListRequest))]
+[JsonSerializable(typeof(RelationshipListResponse))]
+[JsonSerializable(typeof(RelationshipItem))]
+[JsonSerializable(typeof(RelationshipItem[]))]
 [JsonSerializable(typeof(RealtimeAttachmentLifecyclePayload))]
 [JsonSerializable(typeof(RealtimeDomainNotificationPayload))]
 [JsonSerializable(typeof(RegisterPushTokenRequest))]

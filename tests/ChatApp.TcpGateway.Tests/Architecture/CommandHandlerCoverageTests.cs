@@ -56,6 +56,10 @@ public sealed class CommandHandlerCoverageTests
         // Presence
         PacketCommand.PresenceQuery,
         PacketCommand.PresenceUnwatch,
+        // 主线四：附件与关系命令
+        PacketCommand.AttachmentFinalizeRequest,
+        PacketCommand.RelationshipCommandRequest,
+        PacketCommand.RelationshipListRequest,
     };
 
     /// <summary>

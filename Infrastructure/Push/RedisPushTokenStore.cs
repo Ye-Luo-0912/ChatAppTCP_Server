@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Security.Cryptography;
 using System.Text.Json;
 using ChatApp.TcpGateway.Core.Messaging.Push;
 using ChatApp.TcpGateway.Core.Push;
@@ -33,6 +34,7 @@ namespace ChatApp.TcpGateway.Infrastructure.Push;
 internal sealed class RedisPushTokenStore(
     RedisConnectionProvider connectionProvider,
     TimeProvider timeProvider,
+    IPushTokenProtector tokenProtector,
     ILogger<RedisPushTokenStore> logger)
     : IPushTokenStore
 {
@@ -151,6 +153,9 @@ return remaining
             record,
             GatewayJsonSerializerContext.Default.PushTokenRecord);
 
+        // 主线一10：加密 PushTokenRecord JSON，防止 Redis 数据泄露时暴露令牌。
+        var protectedValue = tokenProtector.Protect(valueJson);
+
         try
         {
             var result = await connectionProvider.Database
@@ -160,7 +165,7 @@ return remaining
                     new RedisValue[]
                     {
                         field,
-                        valueJson,
+                        protectedValue,
                         nowMs,
                         DefaultTtlMs,
                         PushTokenLimits.MaxTokensPerUser
@@ -237,19 +242,7 @@ return remaining
             var fieldsToDelete = new List<RedisValue>();
             foreach (var entry in entries)
             {
-                PushTokenRecord? record;
-                try
-                {
-                    record = JsonSerializer.Deserialize(
-                        (byte[]?)entry.Value,
-                        GatewayJsonSerializerContext.Default.PushTokenRecord);
-                }
-                catch (JsonException)
-                {
-                    // 损坏数据：跳过，不参与本次删除。
-                    continue;
-                }
-
+                var record = TryDeserializeEntry(entry.Value);
                 if (record is not null
                     && string.Equals(record.Token, token, StringComparison.Ordinal))
                 {
@@ -305,21 +298,9 @@ return remaining
             var result = new List<PushTokenRecord>(entries.Length);
             foreach (var entry in entries)
             {
-                try
-                {
-                    var record = JsonSerializer.Deserialize(
-                        (byte[]?)entry.Value,
-                        GatewayJsonSerializerContext.Default.PushTokenRecord);
-                    if (record is not null)
-                        result.Add(record);
-                }
-                catch (JsonException ex)
-                {
-                    logger.DependencyDataInvalid(
-                        GatewayDependency.Redis,
-                        GatewayDependencyOperation.PushTokenList,
-                        ex);
-                }
+                var record = TryDeserializeEntry(entry.Value);
+                if (record is not null)
+                    result.Add(record);
             }
 
             return result;
@@ -336,6 +317,51 @@ return remaining
 
     private static string FormatField(ulong deviceIdHash) =>
         deviceIdHash.ToString("D20", CultureInfo.InvariantCulture);
+
+    /// <summary>
+    /// 主线一10：解密 Redis 中存储的值并反序列化为 <see cref="PushTokenRecord"/>。
+    /// <para>
+    /// 向后兼容：若解密失败（旧明文数据），尝试直接反序列化。
+    /// 旧数据在下次 Register 时被加密值覆盖，自然迁移。
+    /// </para>
+    /// </summary>
+    private PushTokenRecord? TryDeserializeEntry(RedisValue value)
+    {
+        if (!value.HasValue)
+            return null;
+
+        string json;
+        try
+        {
+            // 尝试解密（加密数据）。
+            json = tokenProtector.Unprotect((string)value!);
+        }
+        catch (FormatException)
+        {
+            // 非 Base64 数据：尝试直接当 JSON 处理（旧明文数据）。
+            json = (string)value!;
+        }
+        catch (CryptographicException)
+        {
+            // 解密失败：可能是旧明文 JSON 数据，尝试直接反序列化。
+            json = (string)value!;
+        }
+
+        try
+        {
+            return JsonSerializer.Deserialize(
+                json,
+                GatewayJsonSerializerContext.Default.PushTokenRecord);
+        }
+        catch (JsonException ex)
+        {
+            logger.DependencyDataInvalid(
+                GatewayDependency.Redis,
+                GatewayDependencyOperation.PushTokenList,
+                ex);
+            return null;
+        }
+    }
 
     private static (RedisKey HashKey, RedisKey ZsetKey) CreateKeys(long userId)
     {

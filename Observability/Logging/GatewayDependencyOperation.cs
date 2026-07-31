@@ -28,5 +28,6 @@ public enum GatewayDependencyOperation : byte
     ResumeTokenRevoke = 20,
     ResumeWatermarkQuery = 21,
     GroupIdempotencyLookup = 22,
-    GroupIdempotencyStore = 23
+    GroupIdempotencyStore = 23,
+    PushIdempotencyCheck = 24
 }

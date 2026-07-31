@@ -16,9 +16,9 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <Compile Remove="Core\**;Infrastructure\**;Observability\**;tests\**;tools\**;ActorRuntime\**" />
-    <EmbeddedResource Remove="Core\**;Infrastructure\**;Observability\**;tests\**;tools\**;ActorRuntime\**" />
-    <None Remove="Core\**;Infrastructure\**;Observability\**;tests\**;tools\**;ActorRuntime\**" />
+    <Compile Remove="Core\**;Infrastructure\**;Observability\**;tests\**;tools\**;ActorRuntime\**;PushWorker\**" />
+    <EmbeddedResource Remove="Core\**;Infrastructure\**;Observability\**;tests\**;tools\**;ActorRuntime\**;PushWorker\**" />
+    <None Remove="Core\**;Infrastructure\**;Observability\**;tests\**;tools\**;ActorRuntime\**;PushWorker\**" />
   </ItemGroup>
 
   <ItemGroup>

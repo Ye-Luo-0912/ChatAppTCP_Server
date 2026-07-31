@@ -1,6 +1,7 @@
 using System.Net.Sockets;
 using System.Threading.Channels;
 using System.Threading.Tasks.Sources;
+using ChatApp.TcpGateway.Core.Authentication;
 using ChatApp.TcpGateway.Core.Protocol;
 using ChatApp.TcpGateway.Gateway.Networking.Buffers;
 using ChatApp.TcpGateway.Gateway.Networking.Executor;
@@ -198,8 +199,9 @@ internal sealed partial class TcpClientSession : IAsyncDisposable
     private int _negotiatedFeatureBits;
     private int _closeState;
     private int _closeReason;
-    // P0-4：admission 提升标记，独立于 _authenticated 以避免 Resume Commit 失败时泄漏未认证计数。
-    private int _admissionPromoted;
+    // P0-4 / 主线二子项2：admission 状态机，独立于 _authenticated 以避免 Resume Commit 失败时泄漏未认证计数。
+    // 三态：Unauthenticated(0) → Promoted(1) → Released(2)，CAS 转换防止重复递减。
+    private int _admissionState = (int)AdmissionState.Unauthenticated;
 
     public TcpClientSession(
         Socket socket,
@@ -322,22 +324,49 @@ internal sealed partial class TcpClientSession : IAsyncDisposable
     public bool IsAuthenticated => Volatile.Read(ref _authenticated) != 0;
 
     /// <summary>
-    /// P0-4：admission 是否已被提升为已认证。
+    /// P0-4 / 主线二子项2：admission 状态机。
     /// <para>
-    /// 仅当 <c>TcpListenerHost.MarkAuthenticated()</c> 被调用时设置为 true，
-    /// 用于连接清理时正确释放未认证计数。不能通过 <see cref="UserId"/> &gt; 0 推断——
-    /// Resume Commit 失败时 <see cref="Authenticate"/> 已设置 UserId 但
-    /// <c>MarkAuthenticated</c> 从未调用，此时未认证计数未被递减，
-    /// 清理必须递减否则泄漏 <c>MaxUnauthenticatedConnections</c> 槽位。
+    /// 三态：<c>Unauthenticated</c> → <c>Promoted</c>（认证成功）→ <c>Released</c>（连接关闭）。
+    /// 仅当 <c>Promoted</c> 时占用已认证槽位；<c>Released</c> 防止重复递减。
+    /// </para>
+    /// <para>
+    /// 不能通过 <see cref="UserId"/> &gt; 0 推断——Resume Commit 失败时
+    /// <see cref="Authenticate"/> 已设置 UserId 但状态仍为 <c>Unauthenticated</c>，
+    /// 清理必须递减未认证计数否则泄漏 <c>MaxUnauthenticatedConnections</c> 槽位。
     /// </para>
     /// </summary>
-    public bool AdmissionPromoted => Volatile.Read(ref _admissionPromoted) != 0;
+    public AdmissionState AdmissionState => (AdmissionState)Volatile.Read(ref _admissionState);
 
     /// <summary>
-    /// P0-4：标记 admission 已提升。仅由 SessionControlHandler 在
-    /// <c>_listenerHost.MarkAuthenticated()</c> 后调用。
+    /// P0-4：admission 是否已被提升为已认证（向后兼容）。
     /// </summary>
-    public void MarkAdmissionPromoted() => Volatile.Write(ref _admissionPromoted, 1);
+    public bool AdmissionPromoted => AdmissionState == AdmissionState.Promoted;
+
+    /// <summary>
+    /// P0-4 / 主线二子项2：标记 admission 已提升为 Promoted。
+    /// 仅由 SessionControlHandler 在 <c>_listenerHost.MarkAuthenticated()</c> 后调用。
+    /// CAS 从 Unauthenticated → Promoted，已 Promoted/Released 时为 no-op。
+    /// </summary>
+    public void MarkAdmissionPromoted()
+    {
+        Interlocked.CompareExchange(
+            ref _admissionState,
+            (int)AdmissionState.Promoted,
+            (int)AdmissionState.Unauthenticated);
+    }
+
+    /// <summary>
+    /// 主线二子项2：标记 admission 已释放。仅由清理路径调用，CAS 从 Promoted → Released。
+    /// 返回 true 表示本次调用完成了 Promoted → Released 转换（调用方据此递减已认证计数）。
+    /// 已 Released 或 Unauthenticated 时返回 false（不重复递减）。
+    /// </summary>
+    public bool TryReleaseAdmission()
+    {
+        return Interlocked.CompareExchange(
+            ref _admissionState,
+            (int)AdmissionState.Released,
+            (int)AdmissionState.Promoted) == (int)AdmissionState.Promoted;
+    }
 
     /// <summary>
     /// 是否已完成 ClientHello 握手。RequireClientHello=true 时认证前必须为 true。

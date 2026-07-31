@@ -1,5 +1,6 @@
 using ChatApp.Realtime.Integration.Configuration;
 using ChatApp.Realtime.Integration.DependencyInjection;
+using ChatApp.TcpGateway.Gateway.Commands.Attachments;
 using ChatApp.TcpGateway.Gateway.Commands.Conversations;
 using ChatApp.TcpGateway.Gateway.Commands.Groups;
 using ChatApp.TcpGateway.Gateway.Commands.Messaging;
@@ -7,6 +8,7 @@ using ChatApp.TcpGateway.Gateway.Commands.Presence;
 using ChatApp.TcpGateway.Gateway.Commands.Push;
 using ChatApp.TcpGateway.Gateway.Commands.Queries;
 using ChatApp.TcpGateway.Gateway.Commands.Reactions;
+using ChatApp.TcpGateway.Gateway.Commands.Relationships;
 using ChatApp.TcpGateway.Gateway.Configuration;
 using ChatApp.TcpGateway.Gateway.Diagnostics;
 using ChatApp.TcpGateway.Gateway.Dispatching;
@@ -22,9 +24,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using EphemeralPresenceTypingConsumerService = ChatApp.TcpGateway.Gateway.Messaging.EphemeralPresenceTypingConsumerService;
-using PushDeliveryConsumerService = ChatApp.TcpGateway.Gateway.Messaging.PushDeliveryConsumerService;
 using PushDispatcher = ChatApp.TcpGateway.Infrastructure.Push.PushDispatcher;
-using PushProviderStartupValidator = ChatApp.TcpGateway.Gateway.Messaging.PushProviderStartupValidator;
 using RealtimeEventConsumerService = ChatApp.TcpGateway.Gateway.Messaging.RealtimeEventConsumerService;
 using RealtimeEventDispatcher = ChatApp.TcpGateway.Gateway.Messaging.RealtimeEventDispatcher;
 using RedisGlobalPresenceStore = ChatApp.TcpGateway.Gateway.Networking.Sessions.RedisGlobalPresenceStore;
@@ -123,46 +123,16 @@ builder.Services.AddSingleton<IGroupIdempotencyStore>(static provider =>
 builder.Services.AddSingleton<GroupCommandHandler>();
 builder.Services.AddSingleton<TypingCommandHandler>();
 builder.Services.AddSingleton<PresenceCommandHandler>();
+// 主线四：附件与关系后端端口（当前 stub，待 sibling 仓库 IRealtimeMessageBus 接入后替换）。
+builder.Services.AddSingleton<IAttachmentBackend, StubAttachmentBackend>();
+builder.Services.AddSingleton<IRelationshipBackend, StubRelationshipBackend>();
+builder.Services.AddSingleton<AttachmentCommandHandler>();
+builder.Services.AddSingleton<RelationshipCommandHandler>();
 builder.Services.AddSingleton<CommandDispatcher>();
 builder.Services.AddHostedService<RealtimeEventConsumerService>();
 
-// P0-1：Push 注册根据 PushOptions 门控。
-//   Enabled=false 或 ProviderMode=Disabled：不注册 Consumer 与 Provider。
-//     离线推送命令留在 JetStream，由独立 Push Worker 消费，避免 Noop 静默 ACK 吞掉真实推送。
-//   ProviderMode=TestNoop：注册 3 个 NoopPushProvider + Consumer + Dispatcher。
-//     NoopPushProvider 返回 provider_unavailable，Consumer 据 Disposition NAK 重投，不静默成功。
-//   ProviderMode=Production：注册 Consumer + Dispatcher；Provider 由部署在此处或外部覆盖注册。
-//     启动时 PushProviderStartupValidator 校验三个平台均注册了非 Noop 的 IPushProvider。
-var pushOptions = builder.Configuration
-    .GetSection(PushOptions.SectionName)
-    .Get<PushOptions>() ?? new PushOptions();
-
-if (pushOptions.Enabled && pushOptions.ProviderMode != PushProviderMode.Disabled)
-{
-    builder.Services.AddSingleton<ChatApp.Realtime.Integration.Push.IPushDispatcher, PushDispatcher>();
-
-    if (pushOptions.ProviderMode == PushProviderMode.TestNoop)
-    {
-        builder.Services.AddSingleton<IPushProvider>(static sp =>
-            new NoopPushProvider(ChatApp.TcpGateway.Core.Messaging.Push.PushPlatform.Fcm,
-                sp.GetRequiredService<ILogger<NoopPushProvider>>()));
-        builder.Services.AddSingleton<IPushProvider>(static sp =>
-            new NoopPushProvider(ChatApp.TcpGateway.Core.Messaging.Push.PushPlatform.Apns,
-                sp.GetRequiredService<ILogger<NoopPushProvider>>()));
-        builder.Services.AddSingleton<IPushProvider>(static sp =>
-            new NoopPushProvider(ChatApp.TcpGateway.Core.Messaging.Push.PushPlatform.WebPush,
-                sp.GetRequiredService<ILogger<NoopPushProvider>>()));
-    }
-    // Production 模式：部署须在此前（或通过外部 DI 覆盖）注册真实 FcmPushProvider /
-    // ApnsPushProvider / WebPushProvider。PushProviderStartupValidator 启动时校验非 Noop。
-
-    builder.Services.AddHostedService<PushDeliveryConsumerService>();
-
-    if (pushOptions.ProviderMode == PushProviderMode.Production)
-    {
-        builder.Services.AddHostedService<PushProviderStartupValidator>();
-    }
-}
+// 主线一9：Push 注册抽取到 AddPushServices 扩展方法，Gateway 与独立 PushWorker 共用。
+builder.Services.AddPushServices(builder.Configuration);
 
 builder.Services.AddHostedService<EphemeralPresenceTypingConsumerService>();
 builder.Services.AddHostedService<TcpGatewayService>();

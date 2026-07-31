@@ -342,6 +342,24 @@ internal static class CommandCatalog
         PacketCommand.AttachmentLifecycleChanged => new(
             PacketCommand.AttachmentLifecycleChanged, CommandDirection.ServerToClient,
             ConnectionPhase.Authenticated, CommandLane.Inline, -1, 1),
+        PacketCommand.AttachmentFinalizeRequest => new(
+            PacketCommand.AttachmentFinalizeRequest, CommandDirection.ClientToServer,
+            ConnectionPhase.Authenticated, CommandLane.OrderedWrite, 4096, 2),
+        PacketCommand.AttachmentFinalizeResponse => new(
+            PacketCommand.AttachmentFinalizeResponse, CommandDirection.ServerToClient,
+            ConnectionPhase.Authenticated, CommandLane.Inline, -1, 1),
+        PacketCommand.RelationshipCommandRequest => new(
+            PacketCommand.RelationshipCommandRequest, CommandDirection.ClientToServer,
+            ConnectionPhase.Authenticated, CommandLane.OrderedWrite, 4096, 2),
+        PacketCommand.RelationshipCommandResponse => new(
+            PacketCommand.RelationshipCommandResponse, CommandDirection.ServerToClient,
+            ConnectionPhase.Authenticated, CommandLane.Inline, -1, 1),
+        PacketCommand.RelationshipListRequest => new(
+            PacketCommand.RelationshipListRequest, CommandDirection.ClientToServer,
+            ConnectionPhase.Authenticated, CommandLane.Query, 4096, 1),
+        PacketCommand.RelationshipListResponse => new(
+            PacketCommand.RelationshipListResponse, CommandDirection.ServerToClient,
+            ConnectionPhase.Authenticated, CommandLane.Inline, -1, 1),
 
         // 离线推送
         PacketCommand.RegisterPushTokenRequest => new(

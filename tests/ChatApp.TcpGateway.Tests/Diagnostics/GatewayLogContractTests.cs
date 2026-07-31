@@ -78,7 +78,8 @@ public sealed class GatewayLogContractTests
             (Start: 1200, End: 1299), // TCP commands
             (Start: 1300, End: 1399), // Dependencies
             (Start: 1400, End: 1499), // Realtime
-            (Start: 1500, End: 1599)  // Ephemeral
+            (Start: 1500, End: 1599), // Ephemeral
+            (Start: 1600, End: 1699)  // Stubs (主线四 placeholder backends)
         };
 
         var definitions = GetDefinitions();

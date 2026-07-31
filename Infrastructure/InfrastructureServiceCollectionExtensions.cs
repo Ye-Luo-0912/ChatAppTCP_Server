@@ -1,6 +1,8 @@
 using ChatApp.Realtime.Abstractions.Routing;
+using ChatApp.Realtime.Integration.Push;
 using ChatApp.TcpGateway.Core.Authentication;
 using ChatApp.TcpGateway.Core.Messaging;
+using ChatApp.TcpGateway.Core.Messaging.Attachments;
 using ChatApp.TcpGateway.Core.Messaging.Conversations;
 using ChatApp.TcpGateway.Core.Messaging.History;
 using ChatApp.TcpGateway.Core.Messaging.Push;
@@ -16,6 +18,7 @@ using ChatApp.TcpGateway.Infrastructure.Push;
 using ChatApp.TcpGateway.Infrastructure.Routing;
 using ChatApp.TcpGateway.Infrastructure.Serialization.Json;
 using ChatApp.TcpGateway.Infrastructure.Server;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -58,6 +61,16 @@ public static class InfrastructureServiceCollectionExtensions
         services.AddSingleton<IServerIdentity, ServerIdentity>();
         services.AddSingleton<IDirectConversationAuthorizer, CachedDirectConversationAuthorizer>();
         services.AddSingleton<IPushTokenStore, RedisPushTokenStore>();
+        // 主线一10：Push Token 加密保护器。配置 TokenEncryptionKey 时使用 AES-GCM，否则明文（向后兼容）。
+        services.AddSingleton<IPushTokenProtector>(static provider =>
+        {
+            var options = provider
+                .GetRequiredService<Microsoft.Extensions.Options.IOptions<PushOptions>>()
+                .Value;
+            if (!string.IsNullOrEmpty(options.TokenEncryptionKey))
+                return new AesGcmPushTokenProtector(options.TokenEncryptionKey);
+            return new NullPushTokenProtector();
+        });
         services.AddSingleton<IGatewayDirectory, RedisGatewayDirectory>();
         services.AddSingleton<IWatcherGatewayDirectory, RedisWatcherGatewayDirectory>();
 
@@ -294,6 +307,28 @@ public static class InfrastructureServiceCollectionExtensions
             static _ => new JsonPayloadCodec<AttachmentLifecycleUpdate>(
                 GatewayJsonSerializerContext.Default.AttachmentLifecycleUpdate));
 
+        // 主线四：附件上传确认协议
+        services.AddSingleton<IPayloadCodec<AttachmentFinalizeRequest>>(
+            static _ => new JsonPayloadCodec<AttachmentFinalizeRequest>(
+                GatewayJsonSerializerContext.Default.AttachmentFinalizeRequest));
+        services.AddSingleton<IPayloadCodec<AttachmentFinalizeResponse>>(
+            static _ => new JsonPayloadCodec<AttachmentFinalizeResponse>(
+                GatewayJsonSerializerContext.Default.AttachmentFinalizeResponse));
+
+        // 主线四：关系命令协议
+        services.AddSingleton<IPayloadCodec<RelationshipCommandRequest>>(
+            static _ => new JsonPayloadCodec<RelationshipCommandRequest>(
+                GatewayJsonSerializerContext.Default.RelationshipCommandRequest));
+        services.AddSingleton<IPayloadCodec<RelationshipCommandResponse>>(
+            static _ => new JsonPayloadCodec<RelationshipCommandResponse>(
+                GatewayJsonSerializerContext.Default.RelationshipCommandResponse));
+        services.AddSingleton<IPayloadCodec<RelationshipListRequest>>(
+            static _ => new JsonPayloadCodec<RelationshipListRequest>(
+                GatewayJsonSerializerContext.Default.RelationshipListRequest));
+        services.AddSingleton<IPayloadCodec<RelationshipListResponse>>(
+            static _ => new JsonPayloadCodec<RelationshipListResponse>(
+                GatewayJsonSerializerContext.Default.RelationshipListResponse));
+
         return services;
     }
 
@@ -310,5 +345,58 @@ public static class InfrastructureServiceCollectionExtensions
         return new RedisCircuitBreaker(
             failureThreshold: options.CircuitBreakerFailureThreshold,
             openDuration: options.CircuitBreakerOpenDuration);
+    }
+
+    /// <summary>
+    /// 主线一9：注册离线推送相关服务（PushDispatcher / PushProvider / Consumer / IdempotencyStore）。
+    /// <para>
+    /// 根据 <see cref="PushOptions.Enabled"/> 与 <see cref="PushOptions.ProviderMode"/> 门控注册：
+    /// <list type="bullet">
+    /// <item>Disabled / Enabled=false：不注册 Consumer 与 Provider，推送命令留在 JetStream 等待独立 Push Worker 消费。</item>
+    /// <item>TestNoop：注册 3 个 NoopPushProvider + Consumer + Dispatcher + IdempotencyStore。</item>
+    /// <item>Production：注册 Consumer + Dispatcher + IdempotencyStore；启动校验三个平台均非 Noop。</item>
+    /// </list>
+    /// </para>
+    /// <para>
+    /// 主线一5：同时注册 <see cref="IPushIdempotencyStore"/>（Redis 实现），防止 JetStream NAK 重投导致重复推送。
+    /// </para>
+    /// </summary>
+    public static IServiceCollection AddPushServices(
+        this IServiceCollection services,
+        IConfiguration configuration)
+    {
+        var pushOptions = configuration
+            .GetSection(PushOptions.SectionName)
+            .Get<PushOptions>() ?? new PushOptions();
+
+        if (!pushOptions.Enabled || pushOptions.ProviderMode == PushProviderMode.Disabled)
+            return services;
+
+        services.AddSingleton<IPushDispatcher, PushDispatcher>();
+        services.AddSingleton<IPushIdempotencyStore, RedisPushIdempotencyStore>();
+
+        if (pushOptions.ProviderMode == PushProviderMode.TestNoop)
+        {
+            services.AddSingleton<IPushProvider>(static sp =>
+                new NoopPushProvider(PushPlatform.Fcm,
+                    sp.GetRequiredService<ILogger<NoopPushProvider>>()));
+            services.AddSingleton<IPushProvider>(static sp =>
+                new NoopPushProvider(PushPlatform.Apns,
+                    sp.GetRequiredService<ILogger<NoopPushProvider>>()));
+            services.AddSingleton<IPushProvider>(static sp =>
+                new NoopPushProvider(PushPlatform.WebPush,
+                    sp.GetRequiredService<ILogger<NoopPushProvider>>()));
+        }
+        // Production 模式：部署须在此前（或通过外部 DI 覆盖）注册真实 FcmPushProvider /
+        // ApnsPushProvider / WebPushProvider。PushProviderStartupValidator 启动时校验非 Noop。
+
+        services.AddHostedService<PushDeliveryConsumerService>();
+
+        if (pushOptions.ProviderMode == PushProviderMode.Production)
+        {
+            services.AddHostedService<PushProviderStartupValidator>();
+        }
+
+        return services;
     }
 }

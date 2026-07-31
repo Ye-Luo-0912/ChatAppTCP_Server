@@ -271,6 +271,13 @@ internal sealed partial class SessionLifecycleCoordinator
             }
         }
 
+        // 步骤 4-8：本机旧连接踢下线、跨 Gateway 广播、Token 颁发、水位查询、Commit Claim。
+        // 主线二子项4：TakeOver 成功后若后续步骤因未预期异常失败，主动释放新 lease
+        // （而非仅依赖 OnDisconnectedAsync 兜底），避免 lease 残留窗口。
+        TakeOverResult? capturedTakeover = takeoverResult;
+        ulong? capturedDeviceHash = context.DeviceIdHash;
+        try
+        {
         // 步骤 4：本机旧连接立即踢下线（P0-5：移至 TakeOver 之后）。
         // Resume 复用原 SessionId，旧连接按 ConnectionLeaseId 区分直接关闭，
         // 而非依赖 NATS SessionRevoked 事件往返。
@@ -359,6 +366,50 @@ internal sealed partial class SessionLifecycleCoordinator
                 DeviceId = context.DeviceId,
                 LastConversationSequence = lastConversationSequence
             });
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // 停机取消：正常传播，不视为 Commit 失败。lease 由 OnDisconnectedAsync 兜底。
+            throw;
+        }
+        catch (Exception ex)
+        {
+            // 主线二子项4：TakeOver 成功但后续步骤失败，主动释放新 lease。
+            _logger.TransportFailed(
+                GatewayTransportOperation.ClientProcessing,
+                session.ConnectionId,
+                ex);
+            _metrics.ResumeFailed(ResumeFailureReason.TakeOverUnavailable);
+
+            // 主动释放新 lease（若 TakeOver 成功且携带 DeviceIdHash）。
+            if (capturedTakeover is not null && capturedDeviceHash is { } dh)
+            {
+                try
+                {
+                    await _deviceSessionLeaseStore
+                        .ReleaseIfOwnerAsync(
+                            context.UserId,
+                            dh,
+                            session.LeaseOwnerToken,
+                            cancellationToken)
+                        .ConfigureAwait(false);
+                }
+                catch
+                {
+                    // 释放失败不阻塞 fail-closed 路径，lease 由 TTL 兜底过期。
+                }
+            }
+
+            await ReleaseClaimSafeAsync(prepared, cancellationToken)
+                .ConfigureAwait(false);
+            await AbortLocalStateAsync(session, context.UserId, cancellationToken)
+                .ConfigureAwait(false);
+            session.Close(SessionCloseReason.AuthenticationRejected);
+            return ResumeAttemptResult.Failed(
+                ResumeFailureKind.DependencyUnavailable,
+                ResumeFailureReason.TakeOverUnavailable,
+                RetryAfterMsForDependency);
+        }
     }
 
     /// <summary>

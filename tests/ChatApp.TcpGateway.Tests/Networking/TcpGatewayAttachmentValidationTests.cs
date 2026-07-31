@@ -12,11 +12,14 @@ using ChatApp.Realtime.Integration.Push;
 using ChatApp.Realtime.Integration.Configuration;
 using ChatApp.TcpGateway.Core.Authentication;
 using ChatApp.TcpGateway.Core.Messaging;
+using ChatApp.TcpGateway.Core.Messaging.Attachments;
 using ChatApp.TcpGateway.Core.Messaging.Conversations;
 using ChatApp.TcpGateway.Core.Messaging.History;
 using ChatApp.TcpGateway.Core.Messaging.Push;
+using ChatApp.TcpGateway.Core.Messaging.Relationships;
 using ChatApp.TcpGateway.Core.Messaging.Sync;
 using ChatApp.TcpGateway.Core.Protocol;
+using ChatApp.TcpGateway.Gateway.Commands.Attachments;
 using ChatApp.TcpGateway.Gateway.Commands.Conversations;
 using ChatApp.TcpGateway.Gateway.Commands.Groups;
 using ChatApp.TcpGateway.Gateway.Commands.Messaging;
@@ -24,6 +27,7 @@ using ChatApp.TcpGateway.Gateway.Commands.Presence;
 using ChatApp.TcpGateway.Gateway.Commands.Push;
 using ChatApp.TcpGateway.Gateway.Commands.Queries;
 using ChatApp.TcpGateway.Gateway.Commands.Reactions;
+using ChatApp.TcpGateway.Gateway.Commands.Relationships;
 using ChatApp.TcpGateway.Gateway.Configuration;
 using ChatApp.TcpGateway.Gateway.Diagnostics;
 using ChatApp.TcpGateway.Gateway.Dispatching;
@@ -512,6 +516,27 @@ public sealed class TcpGatewayAttachmentValidationTests
                 metrics,
                 NullLogger<PresenceCommandHandler>.Instance);
 
+            var attachmentHandler = new AttachmentCommandHandler(
+                new StubAttachmentBackend(NullLogger<StubAttachmentBackend>.Instance),
+                new JsonPayloadCodec<AttachmentFinalizeRequest>(
+                    GatewayJsonSerializerContext.Default.AttachmentFinalizeRequest),
+                new JsonPayloadCodec<AttachmentFinalizeResponse>(
+                    GatewayJsonSerializerContext.Default.AttachmentFinalizeResponse),
+                metrics,
+                NullLogger<AttachmentCommandHandler>.Instance);
+            var relationshipHandler = new RelationshipCommandHandler(
+                new StubRelationshipBackend(NullLogger<StubRelationshipBackend>.Instance),
+                new JsonPayloadCodec<RelationshipCommandRequest>(
+                    GatewayJsonSerializerContext.Default.RelationshipCommandRequest),
+                new JsonPayloadCodec<RelationshipCommandResponse>(
+                    GatewayJsonSerializerContext.Default.RelationshipCommandResponse),
+                new JsonPayloadCodec<RelationshipListRequest>(
+                    GatewayJsonSerializerContext.Default.RelationshipListRequest),
+                new JsonPayloadCodec<RelationshipListResponse>(
+                    GatewayJsonSerializerContext.Default.RelationshipListResponse),
+                metrics,
+                NullLogger<RelationshipCommandHandler>.Instance);
+
             var dispatcher = new CommandDispatcher(
                 pushHandler,
                 reactionHandler,
@@ -520,7 +545,9 @@ public sealed class TcpGatewayAttachmentValidationTests
                 conversationPrefsHandler,
                 groupHandler,
                 typingHandler,
-                presenceHandler);
+                presenceHandler,
+                attachmentHandler,
+                relationshipHandler);
 
             var service = new TcpGatewayService(
                 Options.Create(options),

@@ -39,4 +39,9 @@ public static class GatewayEventIds
 
     // Ephemeral events: 1500–1599
     public const int EphemeralDisabled = 1500;
+
+    // Stubs (主线四 placeholder backends): 1600–1699
+    public const int AttachmentBackendUnavailable = 1600;
+    public const int RelationshipMutateBackendUnavailable = 1601;
+    public const int RelationshipListBackendUnavailable = 1602;
 }

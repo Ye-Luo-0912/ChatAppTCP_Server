@@ -10,9 +10,9 @@ namespace ChatApp.TcpGateway.Infrastructure.Push;
 /// 而非 <c>Ok</c>。这样推送命令会被 Consumer NAK 重投，不会被静默吞掉。
 /// </para>
 /// <para>
-/// 仅用于开发/测试环境（<see cref="Gateway.Configuration.PushProviderMode.TestNoop"/>）。
+/// 仅用于开发/测试环境（<see cref="PushProviderMode.TestNoop"/>）。
 /// 生产环境必须注册真实 FcmPushProvider / ApnsPushProvider / WebPushProvider，
-/// 并通过 <see cref="Gateway.Configuration.PushProviderMode.Production"/> 启动校验。
+/// 并通过 <see cref="PushProviderMode.Production"/> 启动校验。
 /// </para>
 /// <para>
 /// 日志级别为 Debug，且不记录推送正文（避免敏感信息泄露与 Information 级别噪音）。

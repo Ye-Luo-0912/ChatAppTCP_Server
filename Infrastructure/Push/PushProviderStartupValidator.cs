@@ -3,7 +3,7 @@ using ChatApp.TcpGateway.Infrastructure.Push;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
-namespace ChatApp.TcpGateway.Gateway.Messaging;
+namespace ChatApp.TcpGateway.Infrastructure.Push;
 
 /// <summary>
 /// P0-1：Production 模式启动校验器。

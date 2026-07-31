@@ -5,7 +5,7 @@ using ChatApp.TcpGateway.Observability.Metrics;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
-namespace ChatApp.TcpGateway.Gateway.Messaging;
+namespace ChatApp.TcpGateway.Infrastructure.Push;
 
 /// <summary>
 /// 离线推送消费者：从 JetStream 拉取 <see cref="PushDeliveryCommand"/> 后调用本地 <see cref="IPushDispatcher"/>。
@@ -137,7 +137,7 @@ internal sealed class PushDeliveryConsumerService : BackgroundService
     }
 
     /// <summary>
-    /// P0-2：基于 <see cref="PushDeliveryResult"/> 现有字段推导处置分类。
+    /// P0-2 / 主线一3：基于 <see cref="PushDeliveryResult"/> 现有字段推导处置分类。
     /// <para>
     /// 不修改 RealtimeServices 共享契约——处置是 Consumer 侧决策，使用本地字段即可推导：
     /// <list type="bullet">
@@ -145,8 +145,18 @@ internal sealed class PushDeliveryConsumerService : BackgroundService
     /// <item>SucceededCount=AttemptedCount → <see cref="PushDispatchDisposition.FullySucceeded"/></item>
     /// <item>RetryableFailureCount=0 → <see cref="PushDispatchDisposition.PermanentlyCompleted"/>
     ///   （仅有 invalid_token / payload_too_large 等永久失败，重投无意义）</item>
-    /// <item>RetryableFailureCount&gt;0 → <see cref="PushDispatchDisposition.Retryable"/></item>
+    /// <item>SucceededCount&gt;0 且 RetryableFailureCount&gt;0 →
+    ///   <see cref="PushDispatchDisposition.PartiallyRetryable"/>
+    ///   （部分成功部分可重试，ACK 避免成功 token 重复推送；失败 token 已由 PushDispatcher 内部重试）</item>
+    /// <item>SucceededCount=0 且 RetryableFailureCount&gt;0 →
+    ///   <see cref="PushDispatchDisposition.Retryable"/>（全部失败且可重试，NAK 重投）</item>
     /// </list>
+    /// </para>
+    /// <para>
+    /// 主线一3：PartiallyRetryable → ACK。PushDispatcher 已对失败 token 做内部重试
+    /// （<see cref="PushOptions.TokenRetryCount"/>），ACK 避免已成功 token 在 JetStream
+    /// 重投后重复收到推送。这是比"NAK 整条命令"更优的选择——重复推送比丢失好，
+    /// 但不必要重复（成功 token 已送达）应避免。
     /// </para>
     /// </summary>
     private static PushDispatchDisposition ClassifyDisposition(
@@ -158,6 +168,9 @@ internal sealed class PushDeliveryConsumerService : BackgroundService
             return PushDispatchDisposition.FullySucceeded;
         if (result.RetryableFailureCount == 0)
             return PushDispatchDisposition.PermanentlyCompleted;
+        // 主线一3：有成功且有可重试失败 → PartiallyRetryable（ACK，避免成功 token 重复）。
+        if (result.SucceededCount > 0)
+            return PushDispatchDisposition.PartiallyRetryable;
         return PushDispatchDisposition.Retryable;
     }
 
@@ -183,10 +196,15 @@ internal sealed class PushDeliveryConsumerService : BackgroundService
 }
 
 /// <summary>
-/// P0-2：推送投递处置分类。Consumer 据此决定 JetStream ACK / NAK。
+/// P0-2 / 主线一3：推送投递处置分类。Consumer 据此决定 JetStream ACK / NAK。
 /// <para>
 /// 替代"DispatchAsync 正常返回即 ACK"的旧行为——可重试失败必须 NAK 重投，
 /// 否则 FCM 503 / APNs 429 / Provider 超时等场景会永久丢失推送。
+/// </para>
+/// <para>
+/// 主线一3：新增 <see cref="PartiallyRetryable"/>——部分成功部分可重试时 ACK，
+/// 避免已成功 token 在 JetStream 重投后重复收到推送。失败 token 已由 PushDispatcher
+/// 内部重试（<see cref="PushOptions.TokenRetryCount"/>），ACK 不会丢失投递。
 /// </para>
 /// </summary>
 internal enum PushDispatchDisposition
@@ -208,12 +226,14 @@ internal enum PushDispatchDisposition
     PermanentlyCompleted = 2,
 
     /// <summary>
-    /// 存在可重试失败（provider_unavailable / rate_limited）。
-    /// NAK 并延迟重投，让 Provider 恢复后再次尝试。
-    /// <para>
-    /// 已成功 token 在重投后会重复收到推送——这是当前命令粒度 NAK 的已知权衡。
-    /// 长期应拆分为每 token 独立工作项，支持 PartiallyRetryable 仅重试失败 token。
-    /// </para>
+    /// 主线一3：部分成功部分可重试（SucceededCount>0 且 RetryableFailureCount>0）。
+    /// ACK——PushDispatcher 已对失败 token 做内部重试，ACK 避免成功 token 重复推送。
     /// </summary>
-    Retryable = 3
+    PartiallyRetryable = 3,
+
+    /// <summary>
+    /// 全部失败且可重试（SucceededCount=0 且 RetryableFailureCount>0）。
+    /// NAK 并延迟重投，让 Provider 恢复后再次尝试。
+    /// </summary>
+    Retryable = 4
 }

@@ -69,6 +69,18 @@ public enum PacketCommand : ushort
     RegisterPushTokenResponse = 156,
     UnregisterPushTokenRequest = 157,
     UnregisterPushTokenResponse = 158,
+    /// <summary>主线四：客户端确认附件上传完成（C2S）。触发 Realtime 侧 Ticketed→Uploaded 转换。</summary>
+    AttachmentFinalizeRequest = 159,
+    /// <summary>主线四：附件上传确认响应（S2C）。</summary>
+    AttachmentFinalizeResponse = 160,
+    /// <summary>主线四：关系命令请求（C2S）：发送好友请求、接受/拒绝、删除好友、拉黑/取消拉黑。</summary>
+    RelationshipCommandRequest = 161,
+    /// <summary>主线四：关系命令响应（S2C）。</summary>
+    RelationshipCommandResponse = 162,
+    /// <summary>主线四：关系列表查询请求（C2S）：好友列表、好友请求列表、黑名单列表。</summary>
+    RelationshipListRequest = 163,
+    /// <summary>主线四：关系列表查询响应（S2C）。</summary>
+    RelationshipListResponse = 164,
     HeartbeatAcknowledgement = 1000,
     Error = 500
 }

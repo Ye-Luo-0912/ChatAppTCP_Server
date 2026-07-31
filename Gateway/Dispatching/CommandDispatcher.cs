@@ -1,4 +1,5 @@
 using ChatApp.TcpGateway.Core.Protocol;
+using ChatApp.TcpGateway.Gateway.Commands.Attachments;
 using ChatApp.TcpGateway.Gateway.Commands.Conversations;
 using ChatApp.TcpGateway.Gateway.Commands.Groups;
 using ChatApp.TcpGateway.Gateway.Commands.Messaging;
@@ -6,6 +7,7 @@ using ChatApp.TcpGateway.Gateway.Commands.Presence;
 using ChatApp.TcpGateway.Gateway.Commands.Push;
 using ChatApp.TcpGateway.Gateway.Commands.Queries;
 using ChatApp.TcpGateway.Gateway.Commands.Reactions;
+using ChatApp.TcpGateway.Gateway.Commands.Relationships;
 
 namespace ChatApp.TcpGateway.Gateway.Dispatching;
 
@@ -30,6 +32,8 @@ internal sealed class CommandDispatcher
     private readonly GroupCommandHandler _groupHandler;
     private readonly TypingCommandHandler _typingHandler;
     private readonly PresenceCommandHandler _presenceHandler;
+    private readonly AttachmentCommandHandler _attachmentHandler;
+    private readonly RelationshipCommandHandler _relationshipHandler;
 
     public CommandDispatcher(
         PushTokenCommandHandler pushTokenHandler,
@@ -39,7 +43,9 @@ internal sealed class CommandDispatcher
         ConversationPrefsCommandHandler conversationPrefsHandler,
         GroupCommandHandler groupHandler,
         TypingCommandHandler typingHandler,
-        PresenceCommandHandler presenceHandler)
+        PresenceCommandHandler presenceHandler,
+        AttachmentCommandHandler attachmentHandler,
+        RelationshipCommandHandler relationshipHandler)
     {
         _pushTokenHandler = pushTokenHandler;
         _reactionHandler = reactionHandler;
@@ -49,6 +55,8 @@ internal sealed class CommandDispatcher
         _groupHandler = groupHandler;
         _typingHandler = typingHandler;
         _presenceHandler = presenceHandler;
+        _attachmentHandler = attachmentHandler;
+        _relationshipHandler = relationshipHandler;
     }
 
     /// <summary>
@@ -107,6 +115,15 @@ internal sealed class CommandDispatcher
         PacketCommand.PresenceQuery
         or PacketCommand.PresenceUnwatch =>
             InvokeAsync(_presenceHandler, frame, context, cancellationToken),
+
+        // Attachments (主线四)
+        PacketCommand.AttachmentFinalizeRequest =>
+            InvokeAsync(_attachmentHandler, frame, context, cancellationToken),
+
+        // Relationships (主线四)
+        PacketCommand.RelationshipCommandRequest
+        or PacketCommand.RelationshipListRequest =>
+            InvokeAsync(_relationshipHandler, frame, context, cancellationToken),
 
         _ => new ValueTask<bool>(false)
     };

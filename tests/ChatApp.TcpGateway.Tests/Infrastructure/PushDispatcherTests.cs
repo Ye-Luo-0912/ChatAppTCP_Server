@@ -1,8 +1,10 @@
 using ChatApp.Realtime.Integration.Push;
 using ChatApp.TcpGateway.Core.Messaging.Push;
 using ChatApp.TcpGateway.Core.Push;
+using ChatApp.TcpGateway.Gateway.Configuration;
 using ChatApp.TcpGateway.Infrastructure.Push;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 
 namespace ChatApp.TcpGateway.Tests.Infrastructure;
 
@@ -20,12 +22,21 @@ public sealed class PushDispatcherTests
     private static readonly ILogger<NoopPushProvider> NoopLogger =
         LoggerFactory.Create(b => b.AddDebug()).CreateLogger<NoopPushProvider>();
 
+    /// <summary>测试用默认 PushOptions（禁用重试与并发限制，保持原有测试行为）。</summary>
+    private static IOptions<PushOptions> DefaultOptions =>
+        Options.Create(new PushOptions
+        {
+            TokenRetryCount = 0,
+            MaxConcurrentSendsPerProvider = 0,
+            InvalidTokenUnregisterRetryCount = 0
+        });
+
     [Fact]
     public async Task DispatchAsync_NoTokens_ReturnsSkipped()
     {
         var ct = TestContext.Current.CancellationToken;
         var tokenStore = new FakePushTokenStore();
-        var dispatcher = new PushDispatcher(tokenStore, Array.Empty<IPushProvider>(), Logger);
+        var dispatcher = new PushDispatcher(tokenStore, Array.Empty<IPushProvider>(), DefaultOptions, Logger);
 
         var result = await dispatcher.DispatchAsync(
             new PushDeliveryCommand
@@ -51,7 +62,7 @@ public sealed class PushDispatcherTests
             ]
         };
         var provider = new FakePushProvider(PushPlatform.Fcm);
-        var dispatcher = new PushDispatcher(tokenStore, new[] { provider }, Logger);
+        var dispatcher = new PushDispatcher(tokenStore, new[] { provider }, DefaultOptions, Logger);
 
         var result = await dispatcher.DispatchAsync(
             new PushDeliveryCommand
@@ -87,7 +98,7 @@ public sealed class PushDispatcherTests
         var apnsProvider = new FakePushProvider(PushPlatform.Apns);
         var webProvider = new FakePushProvider(PushPlatform.WebPush);
         var dispatcher = new PushDispatcher(
-            tokenStore, new[] { fcmProvider, apnsProvider, webProvider }, Logger);
+            tokenStore, new[] { fcmProvider, apnsProvider, webProvider }, DefaultOptions, Logger);
 
         var result = await dispatcher.DispatchAsync(
             new PushDeliveryCommand
@@ -119,7 +130,7 @@ public sealed class PushDispatcherTests
         // Provider 对 bad-token 返回 invalid_token，对 good-token 返回成功
         var provider = new FakePushProvider(PushPlatform.Fcm);
         provider.FailTokens["bad-token"] = ("invalid_token", null);
-        var dispatcher = new PushDispatcher(tokenStore, new[] { provider }, Logger);
+        var dispatcher = new PushDispatcher(tokenStore, new[] { provider }, DefaultOptions, Logger);
 
         var result = await dispatcher.DispatchAsync(
             new PushDeliveryCommand
@@ -152,7 +163,7 @@ public sealed class PushDispatcherTests
         };
         var provider = new FakePushProvider(PushPlatform.Fcm);
         provider.ThrowOnToken = "throw-token";
-        var dispatcher = new PushDispatcher(tokenStore, new[] { provider }, Logger);
+        var dispatcher = new PushDispatcher(tokenStore, new[] { provider }, DefaultOptions, Logger);
 
         var result = await dispatcher.DispatchAsync(
             new PushDeliveryCommand
@@ -181,7 +192,7 @@ public sealed class PushDispatcherTests
             ]
         };
         // 不注册 Fcm Provider
-        var dispatcher = new PushDispatcher(tokenStore, Array.Empty<IPushProvider>(), Logger);
+        var dispatcher = new PushDispatcher(tokenStore, Array.Empty<IPushProvider>(), DefaultOptions, Logger);
 
         var result = await dispatcher.DispatchAsync(
             new PushDeliveryCommand
