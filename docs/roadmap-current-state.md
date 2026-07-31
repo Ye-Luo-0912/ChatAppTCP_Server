@@ -107,7 +107,7 @@ Infrastructure 和 Gateway 共享。跨进程消息使用同级仓库 `../ChatAp
 - `CommandDescriptor` 含 `Deprecated` 标志，弃用命令返回 `UnsupportedCommand`。
 - 详见 `docs/protocol-capabilities.md`。
 
-### Resume
+### Resume（已完成事务化）
 
 - Resume 同步水位恢复：`ResumeResponse.LastConversationSequence` 通过 SyncBootstrap
   `ServerTimeMs` 填充（500ms 超时兜底 null）。
@@ -117,10 +117,13 @@ Infrastructure 和 Gateway 共享。跨进程消息使用同级仓库 `../ChatAp
 - Resume 路径广播 `SessionRevoked`，跨 Gateway 旧 session 不继续发送出站帧。
 - Resume 可观测性：`gateway.resume.attempts/succeeded/failed`（tag: reason）、
   `gateway.redis.circuit_breaker.open`。
-- **仍待事务化**：Token Claim/Commit/Abort、Admission 显式状态、TakeOver 顺序与回滚，
-  见 `roadmap-todo.md` 主线二。
-
-### Push（Gateway 侧基础）
+- **事务化已完成（8 项全部实现）**：Token Claim/Commit/Abort（Lua 原子）、
+  AdmissionState 三态（Unauthenticated/Promoted/Released）、TakeOver 顺序（先 TakeOver 后关旧连接）
+  与回滚（`RollbackResumeLocalStateAsync`）、DependencyUnavailable 可重试、
+  同设备 fencing（确定性 `DeviceIdHash`）、旧 Socket 关闭验证（`ReadClosed`/`WriteClosed`，800ms 传播）、
+  `SessionRevokedPayload` 结构化（`{ transportId }`）。
+  见 `roadmap-changelog.md` 2026-08-01 条目。
+### Push（Gateway 侧已完成，跨仓库待补）
 
 - `IPushTokenStore` / `RedisPushTokenStore`：原子化 Lua 注册/注销，Hash tag `{userId}`
   确保 Cluster 同 slot，90 天 TTL，超限淘汰最旧，多设备上限 8。
@@ -129,9 +132,13 @@ Infrastructure 和 Gateway 共享。跨进程消息使用同级仓库 `../ChatAp
 - `PushPlatform` 枚举：`Fcm=1` / `Apns=2` / `WebPush=3`。
 - Presence 基础设施：`IGlobalPresenceStore`（Redis ZSET 0↔1 转换）+
   `IGatewayDirectory.GetOnlineGatewaysWithStatusAsync`（区分 `UserOffline` vs `LookupFailure`）。
-- **仍需跨仓库实现**：真实 Provider、Disposition、Retry、DLQ、Token 注销、Worker 拆出等，
-  见 `roadmap-todo.md` 主线一。
-
+- **Gateway 侧闭环已全部完成**：配置 Fail-fast（`Push.Enabled` 默认 false / `ProviderMode` 校验）、
+  `PushDispatchDisposition`（NoTargets/FullySucceeded/PermanentlyCompleted/Retryable/PartiallyRetryable）、
+  Token Retry（仅重试失败 Token）、幂等（复合键 UserId+CommandKind+RequestId+CanonicalPayloadHash + Redis L2）、
+  DLQ、Provider 并发限制、无效 Token 注销、PushWorker 拆出（独立服务隔离网络资源）、
+  AES-GCM Token 加密、Push delivery payload 不在 Information 级别记录。
+- **跨仓库待补**：真实 FCM/APNs/WebPush Provider、`IPushTokenStore` 提取到共享 Abstractions、
+  Publisher 侧 Push 触发（`UserOffline` 入队），见 `roadmap-todo.md` 主线一。
 ### 群组
 
 - 廉价结构校验（`GroupCommandHandler.Validation.cs`）：成员上限/正 ID/去重、Title 长度、
@@ -143,21 +150,30 @@ Infrastructure 和 Gateway 共享。跨进程消息使用同级仓库 `../ChatAp
 - 权限矩阵/群主转让/最后 Owner 退群/审计事件仍由 RealtimeServices 承担。
 - **仍待补**：稳定指纹强化、DB keyset pagination、不可变 Cursor，见 `roadmap-todo.md` 主线三。
 
-### Relationship（Gateway 侧下游）
+### Relationship（Gateway 侧协议层已完成，跨仓库待补）
 
 - `RelationshipListChanged=153`（S2C）+ `RelationshipListHandler`：消费
   `FriendRequestListChanged` / `FriendListChanged` / `BlockedListChanged` 事件。
 - `IDirectConversationAuthorizer` 缓存主动失效：friendship/blocked-user 变更双向失效。
-- **仍待补**：C2S 协议命令、RealtimeServices 侧域、watermark，见 `roadmap-todo.md` 主线四。
-
-### 附件（Gateway 侧下游）
+- **Gateway 协议层已完成**：`RelationshipCommandHandler` + `IRelationshipBackend` 端口就绪
+  （当前 Stub 返回 `relationship_service_unavailable`），C2S 命令路由已接入 `CommandDispatcher`。
+- **跨仓库待补**：`IRealtimeMessageBus` 新增 `MutateRelationshipAsync` /
+  `QueryRelationshipListAsync`；RealtimeServices 侧域（Store/QueryProcessor/CommandProcessor/
+  Postgres migration/NATS consumer）；Relationship Watermark；增量同步，
+  见 `roadmap-todo.md` 主线四。
+### 附件（Gateway 侧协议层已完成，跨仓库待补）
 
 - `InboundPayloadEarlyValidator`：ChatMessage 入站前廉价结构校验（附件数 ≤32、ID 长度 1..64）。
 - `AttachmentLifecycleHandler`：消费 `AttachmentLifecycleChanged` 事件，推送 `AttachmentLifecycleUpdate`。
 - `AttachmentWireMapper` + `AttachmentRef` wire DTO：6 状态枚举 + DownloadApiHint/DownloadToken。
-- **仍待补**：Initiate/Finalize 协议命令、所有权校验、过期清理、下载授权、Migration012 约束放宽、
-  枚举对齐，见 `roadmap-todo.md` 主线四。
-
+- **Gateway 协议层已完成**：`AttachmentCommandHandler` + `IAttachmentBackend` 端口就绪
+  （当前 Stub 返回 `attachment_service_unavailable`），Initiate/Finalize C2S 命令路由已接入
+  `CommandDispatcher`。Gateway `AttachmentWireStatus` 6 状态 vs Realtime Abstractions 2 状态
+  前 2 值已对齐，扩展状态（UploadConfirmed/Rejected/Expired/ThumbnailUpdated）仅由
+  `AttachmentLifecycleHandler` 下游推送使用，不参与 `AttachmentWireMapper` 映射。
+- **跨仓库待补**：Attachment Finalize 后端（`FinalizeAttachmentUploadAsync`）、所有权校验、
+  扫描/审核、过期清理（sweep worker）、下载授权、Migration012 约束放宽，
+  见 `roadmap-todo.md` 主线四。
 ### 可观测性
 
 - Gateway 与 RealtimeServices 接入 OpenTelemetry Metrics/Tracing，支持 OTLP 导出。

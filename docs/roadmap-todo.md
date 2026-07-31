@@ -3,16 +3,11 @@
 本文件列出**尚未完成**的工作。当前状态见 `roadmap-current-state.md`，
 历史变更见 `roadmap-changelog.md`。完成的项目从本文件移除并记入 changelog。
 
-## 主线一：Push 正式闭环
+## 主线一：Push 正式闭环（Gateway 侧已完成，跨仓库待补）
 
-当前 Push 仅为基础桥接完成，未达到生产闭环。按以下顺序依次完成：
-
-1. **Push Feature 配置与生产 Fail-fast**
-   - `Push.Enabled` 默认 false；`Push.ProviderMode` 必须为 `Disabled` / `TestNoop` / `Production`。
-   - `Production` 模式启动校验：任何平台使用 `NoopPushProvider` 即启动失败。
-   - `NoopPushProvider` 仅用于 Development/Test，须返回 retryable 失败，不得返回成功送达。
-   - `PushOptions` 须 gated，防止静默吞没 Push。
-   - 启动校验覆盖 Push 配置完整性。
+Gateway 侧 Push 闭环已全部完成（配置 Fail-fast、Disposition、Token Retry、幂等、DLQ、
+Provider 并发限制、无效 Token 注销、PushWorker 拆出、AES-GCM Token 加密）。
+以下为跨仓库待补项：
 
 2. **真实 FCM/APNs/WebPush Provider**
    - 跨仓库实现 Provider client 与 payload builder。
@@ -21,83 +16,16 @@
      （见 `AGENTS.md` "Long-term: publish shared Realtime contracts as a versioned package"）。
    - Publisher 侧 Push 触发：`GetOnlineGatewaysWithStatusAsync` 返回 `UserOffline` 时入队 Push 任务。
 
-3. **投递 Disposition**
-   - `PushDispatcher` 返回 `PushDispatchDisposition`：
-     `NoTargets` / `FullySucceeded` / `PermanentlyCompleted` / `Retryable` / `PartiallyRetryable`。
-   - `PushConsumer` ACK 规则：`FullySucceeded` / `NoTargets` / `PermanentlyCompleted` → ACK；
-     `Retryable` → NAK；`PartiallyRetryable` → 仅重试失败 token。
+## 主线二：Resume 真正事务化（已完成）
 
-4. **Token 粒度 Retry**
-   - 失败 token 独立重试，不整体重投。
+全部 8 项已实现：Token Claim/Commit/Abort、AdmissionState 三态、TakeOver 顺序与回滚、
+DependencyUnavailable 可重试、同设备 fencing、旧 Socket 关闭验证、SessionRevokedPayload 结构化。
+见 `roadmap-changelog.md` 2026-08-01 条目。
 
-5. **DeliveryId 幂等**
-   - Push 投递幂等，防止重复推送。
+## 主线三：Group 后端分页和稳定指纹（Gateway 侧已完成，跨仓库待补）
 
-6. **Retry / DLQ**
-   - 重试退避策略 + 死信队列。
-
-7. **Provider 并发和速率限制**
-   - FCM/APNs/WebPush 各自的并发与速率限制。
-
-8. **无效 Token 可靠注销**
-   - Provider 返回无效 Token 时回调 `IPushTokenStore.UnregisterByTokenAsync`。
-
-9. **将 Provider Worker 从 Gateway 拆出**
-   - `PushConsumer` 与 Provider 调用从 TCP Gateway 迁移到独立 `PushWorker` 服务，
-     隔离网络资源。
-
-10. **加密或最小权限保护 Push Token**
-    - 当前 Token 明文存储于 Redis，需评估加密方案或最小权限保护。
-
-## 主线二：Resume 真正事务化
-
-1. **Token Claim/Commit/Abort**
-   - Resume Prepare 阶段使用原子 token claiming（`TryClaim` / `CommitClaim` / `ReleaseClaim` via Lua），
-     替代 `GETDEL`，防止 token 在 Commit 前被消费。
-
-2. **Admission 状态显式化**
-   - Session 跟踪显式 `AdmissionState`（`Unauthenticated` / `Promoted` / `Released`），
-     替代从 `UserId` 推断，防止连接计数泄漏。
-   - Resume Commit 使用 `AdmissionPromoted` 显式状态标记。
-
-3. **Redis TakeOver 先于本机旧连接关闭**
-   - Redis 接管流程必须先 `TakeOver` 再关闭本机旧连接。
-
-4. **TakeOver 成功但本地 Commit 失败时释放新 Lease**
-   - TakeOver 成功后本地 Commit 失败须回滚：`RollbackResumeLocalStateAsync`
-     反转 `UserSessionRegistry.Add` 与 Presence 发布。
-
-5. **客户端可真正重试 DependencyUnavailable**
-   - `ResumeTokenValidationResult` 含 `DependencyUnavailable` 状态，区分 Redis 失败与无效 token。
-   - `RedisResumeTokenStore.TryValidateAsync` Redis 失败时抛 `RedisException`（非返回 null），
-     确保 fail-closed。
-   - `RedisDeviceSessionLeaseStore.TakeOverAsync` 熔断器开路或 Redis 异常时抛 `RedisException`。
-
-6. **Redis Failover 恢复阶段完整验证**
-   - 同设备 fencing：`TakeOverSameDevice` 匹配 UserId + DeviceIdHash + 不同 ConnectionLeaseId
-     （忽略 SessionId）。`DeviceIdHash` 按 userId 确定性派生（黄金比例乘子 + 1，确保非零）。
-   - `ResumeVerification` 注入确定性 `DeviceIdHash`，跨连接/网关一致。
-   - `TakeOverUnavailable` 指标记录 + `AuthenticationRejected` 关闭连接。
-
-7. **旧 Socket 读写必须失败**
-   - `TakeoverCompetitionScenario` 验证旧 Socket 的 `ReadClosed` 与 `WriteClosed`
-     （800ms 传播延迟后检查）。
-   - `SessionRevoked` 事件使用结构化 `SessionRevokedPayload { transportId }`，非裸 ConnectionLeaseId。
-   - `SessionLifecycleCoordinator` 即使 NATS 发布失败也关闭本机 victim transport。
-
-8. **最终同设备唯一 Transport**
-   - Redis lease 探针验证 transportId 变更与 sessionId 一致性。
-
-## 主线三：Group 后端分页和稳定指纹
-
-1. **稳定 128/256 位 Fingerprint**
-   - 群组幂等 payload hash 已改用 SHA-256（归一化二进制表示），需持续验证稳定性。
-   - 归一化字段：FingerprintVersion, Operation, ConversationId, Title, TargetUserId, NewRole,
-     sorted MemberUserIds。**不可**使用 `System.HashCode`（进程随机种子，跨进程不稳定）。
-
-2. **Redis Put-if-absent-or-compare**
-   - Redis L2 idempotency `TryAdd` 使用条件 Lua 写（仅当 key 缺失或存储的 payloadHash 匹配才写），
-     **非**无条件 HSET，防止并发 Miss last-writer-wins 覆写。
+Gateway 侧 SHA-256 稳定指纹、Redis 条件 Lua 写、keyset 分页均已实现。
+以下为跨仓库待补项：
 
 3. **Realtime DB Ledger 作为唯一权威**
    - Gateway 不重复实现权限矩阵（Owner/Admin/Member）、群主转让、最后 Owner 退群、审计事件。
@@ -111,18 +39,19 @@
 6. **权限和审计继续由 RealtimeServices 承担**
    - 禁止移除自己/群主等业务规则在 Realtime 侧判定。
 
-## 主线四：附件和 Relationship
+## 主线四：附件和 Relationship（Gateway 侧协议层已完成，跨仓库待补）
 
-**前置依赖**：Push 和 Resume 收敛后再补。
+Gateway 侧协议命令、DTO、Handler、端口 + Stub 已全部实现。
+以下为跨仓库待补项：
 
 ### 附件
 
-1. **Attachment Initiate/Finalize**
-   - 新增 `PacketCommand.AttachmentFinalizeRequest/Response` 等 C2S 协议命令
-     （当前仅有 S2C `AttachmentLifecycleChanged=154`）。
-   - Realtime 侧需 `IRealtimeAttachmentStore.FinalizeUploadAsync`（Ticketed→Uploaded 转换）。
+1. **Attachment Finalize 后端**
+   - Gateway `AttachmentCommandHandler` + `IAttachmentBackend` 端口已就绪（当前 Stub）。
+   - Realtime 侧需实现 `FinalizeUploadAsync`（Ticketed→Uploaded 转换）并接入
+     `IRealtimeMessageBus`（新增 `FinalizeAttachmentUploadAsync` 方法）。
 
-2. **所有权**
+2. **所有权校验**
    - `MessagingCommandHandler` 当前不校验 `AttachmentIds` 归属，由 Realtime `BindToMessageAsync` 拒绝。
    - 如需 Gateway 前置校验，新增 `IRealtimeMessageBus.VerifyAttachmentOwnershipAsync`。
 
@@ -140,14 +69,15 @@
 6. **Migration012 / 枚举对齐**
    - Migration012 CHECK 约束 `status IN (0,1,2,3)` 过期，需新增 migration 放宽
      （含 `Uploaded=4` / `Scanning=5` / `Rejected=6`）。
-   - Gateway `AttachmentWireStatus` 6 状态 vs Realtime Abstractions 2 状态（Scanning/Available），
-     需对齐。
+   - Gateway `AttachmentWireStatus` 6 状态 vs Realtime Abstractions 2 状态（Scanning/Available）
+     前 2 值已对齐，扩展状态（UploadConfirmed/Rejected/Expired/ThumbnailUpdated）仅由
+     `AttachmentLifecycleHandler` 下游推送使用，不参与 `AttachmentWireMapper` 映射。
 
 ### Relationship
 
-1. **Relationship 请求、接受、拒绝、拉黑**
-   - 新增 PacketCommand 值（159+ 范围）+ DTO + CommandCatalog 描述符 + `RelationshipCommandHandler`。
-   - `IRealtimeMessageBus` 新增对应查询/命令方法。
+1. **Relationship 后端**
+   - Gateway `RelationshipCommandHandler` + `IRelationshipBackend` 端口已就绪（当前 Stub）。
+   - `IRealtimeMessageBus` 需新增 `MutateRelationshipAsync` / `QueryRelationshipListAsync` 方法。
    - RealtimeServices 侧域：无 `IRelationshipStore` / `IRelationshipQueryProcessor` /
      `IRelationshipCommandProcessor` / Postgres migration / NATS consumer。
      三个事件类型（`FriendRequestListChanged=1` / `FriendListChanged=2` / `BlockedListChanged=3`）

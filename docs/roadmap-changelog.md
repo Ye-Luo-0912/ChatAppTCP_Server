@@ -3,6 +3,70 @@
 本文件记录已完成的历史变更，按时间倒序排列。当前状态见 `roadmap-current-state.md`，
 未完成工作见 `roadmap-todo.md`。本文件不再保留过期测试数字（当时通过数仅作参考）。
 
+## 2026-08-01
+
+### 主线二：Resume 真正事务化（已完成）
+
+全部 8 项已实现：
+
+- **Token Claim/Commit/Abort**：Resume Prepare 阶段改用 `TryClaim`/`CommitClaim`/`ReleaseClaim`
+  Lua 原子操作，替代 `GETDEL`，防止 token 在 Commit 前被消费。
+- **AdmissionState 三态**：Session 跟踪显式 `AdmissionState`（Unauthenticated/Promoted/Released），
+  防止连接计数泄漏；Resume Commit 使用 `AdmissionPromoted` 显式状态标记。
+- **TakeOver 顺序与回滚**：Redis 接管流程先 TakeOver 后关本地旧连接；
+  TakeOver 失败时 `RollbackResumeLocalStateAsync` 回滚 `UserSessionRegistry.Add` 与 Presence 发布。
+- **DependencyUnavailable 可重试**：`ResumeTokenValidationResult` 新增 `DependencyUnavailable` 状态，
+  区分 Redis 失败与无效 token；`RedisResumeTokenStore.TryValidateAsync` Redis 失败时抛
+  `RedisException`（非返回 null），确保 fail-closed。
+- **同设备 fencing**：`ResumeVerification` 注入确定性 `DeviceIdHash`（按 userId 派生，黄金比例乘子 +1
+  保证非零），`TakeOverSameDevice` 按 UserId + DeviceIdHash + 不同 ConnectionLeaseId 匹配
+  （忽略 SessionId）。
+- **旧 Socket 关闭验证**：`TakeoverCompetitionScenario` 校验旧 Socket `ReadClosed`/`WriteClosed`
+  （800ms 传播延迟）+ Redis lease 探针验证 transportId 变更与 sessionId 一致。
+- **SessionRevokedPayload 结构化**：`SessionRevoked` 事件改用 `SessionRevokedPayload { transportId }`
+  结构化负载，替代裸 `ConnectionLeaseId`。
+- **TakeOverUnavailable 指标**：`GatewayMetrics` 新增 `ResumeFailureReason.TakeOverUnavailable`
+  （takeover_unavailable）；`SessionLifecycleCoordinator` 捕获 TakeOver 异常并以
+  `AuthenticationRejected` 关闭连接，确保 fail-closed。
+
+### 主线一：Push 正式闭环（Gateway 侧已完成）
+
+Gateway 侧 Push 闭环已全部完成，跨仓库待补项见 `roadmap-todo.md` 主线一：
+
+- **配置 Fail-fast**：`Push.Enabled` 默认 false；`Push.ProviderMode` 须为
+  `Disabled` / `TestNoop` / `Production`；`Production` 模式下任一平台使用 `NoopPushProvider`
+  启动失败；`NoopPushProvider` 仅用于 Development/Test 且返回 retryable 失败；
+  `PushOptions` 门控防止静默吞推；启动校验 push 配置。
+- **PushDispatchDisposition**：`PushDispatcher` 返回 `PushDispatchDisposition`
+  （NoTargets / FullySucceeded / PermanentlyCompleted / Retryable / PartiallyRetryable）
+  决定 ACK/NAK 行为；`PushConsumer` 仅对 FullySucceeded/NoTargets/PermanentlyCompleted ACK，
+  Retryable NAK，PartiallyRetryable 仅重试失败 Token。
+- **Token Retry**：仅重试失败 Token，非整批重投。
+- **幂等**：复合键 UserId + CommandKind + RequestId + CanonicalPayloadHash；Redis L2 缓存。
+- **DLQ**：永久失败消息进入死信队列。
+- **Provider 并发限制**：限制并发调用 Provider client。
+- **无效 Token 注销**：Provider 返回无效 Token 时自动注销。
+- **PushWorker 拆出**：`PushConsumer` 与 Provider 调用从 TCP Gateway 移至独立 PushWorker 服务，
+  隔离网络资源。
+- **AES-GCM Token 加密**：Push Token 静态加密。
+- **日志降级**：Push delivery payload 不在 Information 级别记录。
+
+### 主线四：附件和 Relationship（Gateway 协议层已完成）
+
+Gateway 侧协议命令、DTO、Handler、端口 + Stub 已全部实现，跨仓库待补项见 `roadmap-todo.md` 主线四：
+
+- **Attachment 协议层**：`IAttachmentBackend` 端口 + `AttachmentCommandHandler`（当前 Stub 返回
+  `attachment_service_unavailable`）；Initiate/Finalize C2S 命令路由接入 `CommandDispatcher`。
+- **Relationship 协议层**：`IRelationshipBackend` 端口 + `RelationshipCommandHandler`
+  （当前 Stub 返回 `relationship_service_unavailable`）；C2S 命令路由接入 `CommandDispatcher`。
+- **DI 注册**：`Program.cs` 注册端口接口与 Handler。
+- **GatewayLog Stubs**：`GatewayLog.Stubs.cs` 为新命令提供日志存根。
+- **测试调整**：3 个测试文件 + `GatewayLogContractTests.cs` 同步调整。
+- **枚举对齐**：Gateway `AttachmentWireStatus` 6 状态 vs Realtime 2 状态前 2 值对齐，
+  扩展状态（UploadConfirmed/Rejected/Expired/ThumbnailUpdated）仅由
+  `AttachmentLifecycleHandler` 下游推送使用，不参与 `AttachmentWireMapper` 映射。
+
+提交 `bc09d1b`：48 文件，+2020/-181 行，366/366 测试通过。
 ## 2026-07-31
 
 ### 八.1 PerSessionDrain 零分配 CAS
