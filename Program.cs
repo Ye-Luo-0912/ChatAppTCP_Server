@@ -15,6 +15,7 @@ using ChatApp.TcpGateway.Gateway.Networking.Sessions;
 using ChatApp.TcpGateway.Infrastructure;
 using ChatApp.TcpGateway.Infrastructure.Caching;
 using ChatApp.TcpGateway.Infrastructure.GroupIdempotency;
+using ChatApp.TcpGateway.Infrastructure.Push;
 using ChatApp.TcpGateway.Observability.Metrics;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
@@ -22,6 +23,8 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using EphemeralPresenceTypingConsumerService = ChatApp.TcpGateway.Gateway.Messaging.EphemeralPresenceTypingConsumerService;
 using PushDeliveryConsumerService = ChatApp.TcpGateway.Gateway.Messaging.PushDeliveryConsumerService;
+using PushDispatcher = ChatApp.TcpGateway.Infrastructure.Push.PushDispatcher;
+using PushProviderStartupValidator = ChatApp.TcpGateway.Gateway.Messaging.PushProviderStartupValidator;
 using RealtimeEventConsumerService = ChatApp.TcpGateway.Gateway.Messaging.RealtimeEventConsumerService;
 using RealtimeEventDispatcher = ChatApp.TcpGateway.Gateway.Messaging.RealtimeEventDispatcher;
 using RedisGlobalPresenceStore = ChatApp.TcpGateway.Gateway.Networking.Sessions.RedisGlobalPresenceStore;
@@ -62,6 +65,15 @@ builder.Services
             !string.IsNullOrWhiteSpace(options.ConnectionString) &&
             options.StartupTimeout > TimeSpan.Zero,
         "Redis configuration is invalid.")
+    .ValidateOnStart();
+
+// P0-1：Push 配置门控。默认 Enabled=false / ProviderMode=Disabled，
+// 未显式启用时不注册 PushDeliveryConsumerService，推送命令留在 JetStream 等待 Push Worker。
+// Production 模式启动校验三个平台均非 Noop，发现 Noop 立即启动失败。
+builder.Services
+    .AddOptions<PushOptions>()
+    .Bind(builder.Configuration.GetSection(PushOptions.SectionName))
+    .Validate(static options => options.IsValid(), "Push configuration is invalid.")
     .ValidateOnStart();
 
 builder.Services.Configure<HostOptions>(options =>
@@ -113,7 +125,45 @@ builder.Services.AddSingleton<TypingCommandHandler>();
 builder.Services.AddSingleton<PresenceCommandHandler>();
 builder.Services.AddSingleton<CommandDispatcher>();
 builder.Services.AddHostedService<RealtimeEventConsumerService>();
-builder.Services.AddHostedService<PushDeliveryConsumerService>();
+
+// P0-1：Push 注册根据 PushOptions 门控。
+//   Enabled=false 或 ProviderMode=Disabled：不注册 Consumer 与 Provider。
+//     离线推送命令留在 JetStream，由独立 Push Worker 消费，避免 Noop 静默 ACK 吞掉真实推送。
+//   ProviderMode=TestNoop：注册 3 个 NoopPushProvider + Consumer + Dispatcher。
+//     NoopPushProvider 返回 provider_unavailable，Consumer 据 Disposition NAK 重投，不静默成功。
+//   ProviderMode=Production：注册 Consumer + Dispatcher；Provider 由部署在此处或外部覆盖注册。
+//     启动时 PushProviderStartupValidator 校验三个平台均注册了非 Noop 的 IPushProvider。
+var pushOptions = builder.Configuration
+    .GetSection(PushOptions.SectionName)
+    .Get<PushOptions>() ?? new PushOptions();
+
+if (pushOptions.Enabled && pushOptions.ProviderMode != PushProviderMode.Disabled)
+{
+    builder.Services.AddSingleton<ChatApp.Realtime.Integration.Push.IPushDispatcher, PushDispatcher>();
+
+    if (pushOptions.ProviderMode == PushProviderMode.TestNoop)
+    {
+        builder.Services.AddSingleton<IPushProvider>(static sp =>
+            new NoopPushProvider(ChatApp.TcpGateway.Core.Messaging.Push.PushPlatform.Fcm,
+                sp.GetRequiredService<ILogger<NoopPushProvider>>()));
+        builder.Services.AddSingleton<IPushProvider>(static sp =>
+            new NoopPushProvider(ChatApp.TcpGateway.Core.Messaging.Push.PushPlatform.Apns,
+                sp.GetRequiredService<ILogger<NoopPushProvider>>()));
+        builder.Services.AddSingleton<IPushProvider>(static sp =>
+            new NoopPushProvider(ChatApp.TcpGateway.Core.Messaging.Push.PushPlatform.WebPush,
+                sp.GetRequiredService<ILogger<NoopPushProvider>>()));
+    }
+    // Production 模式：部署须在此前（或通过外部 DI 覆盖）注册真实 FcmPushProvider /
+    // ApnsPushProvider / WebPushProvider。PushProviderStartupValidator 启动时校验非 Noop。
+
+    builder.Services.AddHostedService<PushDeliveryConsumerService>();
+
+    if (pushOptions.ProviderMode == PushProviderMode.Production)
+    {
+        builder.Services.AddHostedService<PushProviderStartupValidator>();
+    }
+}
+
 builder.Services.AddHostedService<EphemeralPresenceTypingConsumerService>();
 builder.Services.AddHostedService<TcpGatewayService>();
 builder.Services.AddHostedService<PresenceMaintenanceService>();

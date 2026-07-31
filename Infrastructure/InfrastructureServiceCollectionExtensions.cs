@@ -32,25 +32,27 @@ public static class InfrastructureServiceCollectionExtensions
             static provider =>
                 provider.GetRequiredService<RedisConnectionProvider>());
 
-        // 应用层 Redis 熔断器：所有 Resume/设备租约相关 Redis 调用共享同一实例，
-        // 连续失败阈值由 RedisOptions.CircuitBreakerFailureThreshold 控制（0 = 关闭）。
+        // P0-6：按 Redis 域拆分熔断器，避免 Group 幂等 / DeviceLease 故障耦合到 ResumeToken。
+        // ResumeToken 域：TcpGatewayService / SessionLifecycleCoordinator + RedisResumeTokenStore 共享。
         services.AddSingleton<IRedisCircuitBreaker>(
+            static provider => CreateDomainCircuitBreaker(
+                provider
+                    .GetRequiredService<Microsoft.Extensions.Options.IOptions<RedisOptions>>()
+                    .Value));
+
+        services.AddSingleton<IAccessTokenStore, RedisAccessTokenStore>();
+        // P0-6：DeviceLease 域使用独立熔断器，与 ResumeToken 域隔离。
+        services.AddSingleton<IDeviceSessionLeaseStore>(
             static provider =>
             {
                 var options = provider
                     .GetRequiredService<Microsoft.Extensions.Options.IOptions<RedisOptions>>()
                     .Value;
-                if (options.CircuitBreakerFailureThreshold <= 0)
-                    return new RedisCircuitBreaker(
-                        failureThreshold: int.MaxValue,
-                        openDuration: TimeSpan.FromSeconds(1));
-                return new RedisCircuitBreaker(
-                    failureThreshold: options.CircuitBreakerFailureThreshold,
-                    openDuration: options.CircuitBreakerOpenDuration);
+                return new RedisDeviceSessionLeaseStore(
+                    provider.GetRequiredService<RedisConnectionProvider>(),
+                    provider.GetRequiredService<Microsoft.Extensions.Logging.ILogger<RedisDeviceSessionLeaseStore>>(),
+                    CreateDomainCircuitBreaker(options));
             });
-
-        services.AddSingleton<IAccessTokenStore, RedisAccessTokenStore>();
-        services.AddSingleton<IDeviceSessionLeaseStore, RedisDeviceSessionLeaseStore>();
         services.AddSingleton<IResumeTokenStore, RedisResumeTokenStore>();
         services.AddSingleton<IRealtimeAuthenticator, RealtimeAuthenticator>();
         services.AddSingleton<IServerIdentity, ServerIdentity>();
@@ -60,20 +62,24 @@ public static class InfrastructureServiceCollectionExtensions
         services.AddSingleton<IWatcherGatewayDirectory, RedisWatcherGatewayDirectory>();
 
         // 群组命令幂等 L2（Redis）存储。具体类型注册——Composite 在 Program.cs 中组装。
-        // 离线推送：IPushDispatcher 编排令牌拉取 + 多平台 Provider 分发。
-        // Provider 默认使用 Noop（开发/测试）；生产环境应在 Program.cs 覆盖为 FCM/APNs/WebPush。
-        services.AddSingleton<IPushProvider>(static sp =>
-            new NoopPushProvider(Core.Messaging.Push.PushPlatform.Fcm,
-                sp.GetRequiredService<ILogger<NoopPushProvider>>()));
-        services.AddSingleton<IPushProvider>(static sp =>
-            new NoopPushProvider(Core.Messaging.Push.PushPlatform.Apns,
-                sp.GetRequiredService<ILogger<NoopPushProvider>>()));
-        services.AddSingleton<IPushProvider>(static sp =>
-            new NoopPushProvider(Core.Messaging.Push.PushPlatform.WebPush,
-                sp.GetRequiredService<ILogger<NoopPushProvider>>()));
-        services.AddSingleton<Realtime.Integration.Push.IPushDispatcher, PushDispatcher>();
-
-        services.AddSingleton<RedisGroupIdempotencyStore>();
+        // P0-1：离线推送 Provider 与 IPushDispatcher 不在此处无条件注册。
+        // 由 Program.cs 根据 PushOptions.Enabled / ProviderMode 决定：
+        //   Disabled     — 不注册 Consumer / Provider（推送留在 JetStream 等待 Worker）。
+        //   TestNoop     — 注册 3 个 NoopPushProvider + Consumer（Noop 返回 provider_unavailable 不会静默 ACK）。
+        //   Production   — 注册 Consumer；启动校验三个平台均非 Noop，否则 fail-fast。
+        // P0-6：GroupIdempotency 域使用独立熔断器（fail-open 缓存不能影响安全关键的 fail-closed 设备 fencing）。
+        services.AddSingleton<RedisGroupIdempotencyStore>(
+            static provider =>
+            {
+                var options = provider
+                    .GetRequiredService<Microsoft.Extensions.Options.IOptions<RedisOptions>>()
+                    .Value;
+                return new RedisGroupIdempotencyStore(
+                    provider.GetRequiredService<RedisConnectionProvider>(),
+                    provider.GetRequiredService<Observability.Metrics.GatewayMetrics>(),
+                    provider.GetRequiredService<Microsoft.Extensions.Logging.ILogger<RedisGroupIdempotencyStore>>(),
+                    CreateDomainCircuitBreaker(options));
+            });
 
         services.AddSingleton<IPayloadCodec<AuthenticationRequest>>(
             static _ => new JsonPayloadCodec<AuthenticationRequest>(
@@ -289,5 +295,20 @@ public static class InfrastructureServiceCollectionExtensions
                 GatewayJsonSerializerContext.Default.AttachmentLifecycleUpdate));
 
         return services;
+    }
+
+    /// <summary>
+    /// P0-6：为每个 Redis 域创建独立的熔断器实例。
+    /// 阈值 0 = 关闭（int.MaxValue 阈值 + 1s 开路窗口，实际永不触发）。
+    /// </summary>
+    private static RedisCircuitBreaker CreateDomainCircuitBreaker(RedisOptions options)
+    {
+        if (options.CircuitBreakerFailureThreshold <= 0)
+            return new RedisCircuitBreaker(
+                failureThreshold: int.MaxValue,
+                openDuration: TimeSpan.FromSeconds(1));
+        return new RedisCircuitBreaker(
+            failureThreshold: options.CircuitBreakerFailureThreshold,
+            openDuration: options.CircuitBreakerOpenDuration);
     }
 }

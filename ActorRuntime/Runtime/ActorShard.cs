@@ -160,6 +160,24 @@ internal sealed class ActorShard<TKey, TState, TMessage>
     public int PendingDeadlines => _deadlines.PendingCount;
     public int MaxActorsPerShard => _maxActorsPerShard;
 
+    /// <summary>
+    /// P0-8：判断指定 Key 的 Actor 是否已存在。
+    /// <para>
+    /// <see cref="ActorCellTable{TKey,TState,TMessage}"/> 内部为普通 <see cref="Dictionary{TKey,TValue}"/>，
+    /// .NET 10 的 ref 字典支持并发读 + 单写（Shard Consumer 为唯一写者），因此生产侧可安全调用
+    /// <see cref="ActorCellTable{TKey,TState,TMessage}.TryGetValue"/> 进行存在性探测。
+    /// </para>
+    /// <para>
+    /// 用途：<see cref="TryEnqueueDurable"/> 在生产侧区分"新 Actor 激活"与"已存在 Actor 投递"——
+    /// 仅新 Actor 激活需检查 <see cref="MaxActorsPerShard"/> 上限，已存在 Actor 即使 Shard 满也必须收消息。
+    /// 探测与消费侧 <see cref="RouteEnvelope"/> 之间存在 TOCTOU 竞态：若探测时不存在、消费时已存在
+    /// （或反之），消费侧 RouteEnvelope 仍会按实际状态二次校验，不会破坏不变量。
+    /// </para>
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public bool ContainsActor(in TKey key)
+        => _cells.TryGetValue(in key, out _);
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public ActorPostStatus TryEnqueue(in TKey key, in TMessage message)
     {

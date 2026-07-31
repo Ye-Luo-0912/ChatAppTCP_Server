@@ -183,6 +183,8 @@ internal sealed class SessionControlHandler
 
         // 认证成功，递减未认证计数，释放槽位给新连接。
         _listenerHost.MarkAuthenticated();
+        // P0-4：显式标记 admission 已提升，避免 Resume Commit 失败时通过 UserId>0 误判导致泄漏。
+        session.MarkAdmissionPromoted();
         _metrics.UnauthenticatedConnectionClosed();
 
         // Session 生命周期（注册、Presence 上线、同设备替换、ResumeToken 颁发）委托协调器。
@@ -334,6 +336,8 @@ internal sealed class SessionControlHandler
                     // 恢复成功：admission 跟踪 + 发送 ResumeResponse。
                     var result = resumeAttempt.Result;
                     _listenerHost.MarkAuthenticated();
+                    // P0-4：显式标记 admission 已提升，避免清理时通过 UserId>0 误判导致泄漏。
+                    session.MarkAdmissionPromoted();
                     _metrics.UnauthenticatedConnectionClosed();
                     session.CompleteHandshake(
                         negotiatedProtocolVersion,

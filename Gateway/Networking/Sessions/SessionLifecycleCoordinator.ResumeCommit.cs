@@ -39,16 +39,23 @@ internal sealed partial class SessionLifecycleCoordinator
     /// <summary>
     /// P1-D：Prepare 阶段——只读校验，无可观测副作用。
     /// <para>
+    /// P0-3：改用 Claim/Commit/Release 原子模式替代破坏性 GETDEL。
+    /// Prepare 调用 <see cref="IResumeTokenStore.TryClaimAsync"/> 原子占用 Token（不删除原 Key），
+    /// Commit 成功后调用 <see cref="IResumeTokenStore.CommitClaimAsync"/> 最终消费；
+    /// Commit 失败（Abort）调用 <see cref="IResumeTokenStore.ReleaseClaimAsync"/> 归还 Token。
+    /// </para>
+    /// <para>
     /// 执行步骤：
     /// <list type="number">
     /// <item>熔断器检查（快速失败，不发起 Redis 调用）</item>
-    /// <item>ResumeToken 验证（Redis 读）→ 获取 <see cref="ResumeContext"/></item>
+    /// <item>ResumeToken Claim（Redis 原子 Lua）→ 获取 <see cref="ResumeContext"/> + attemptId</item>
     /// <item>设备租约代次校验（Redis 读，受 <see cref="TcpGatewayOptions.ResumeRedisFailMode"/> 控制）</item>
     /// </list>
     /// </para>
     /// <para>
     /// 成功时返回 <see cref="ResumePrepareResult.Succeeded"/>，携带 <see cref="PreparedResumeContext"/>
-    /// 供 Commit 阶段使用。失败时返回 <see cref="ResumePrepareResult.Failed"/>，携带失败种类与原因。
+    /// （含 attemptId）供 Commit/Abort 使用。失败时返回 <see cref="ResumePrepareResult.Failed"/>，
+    /// 携带失败种类与原因。Claim 失败时 Token 已被占用，需通过 Release 归还。
     /// </para>
     /// </summary>
     /// <param name="resumeToken">客户端提供的 ResumeToken。</param>
@@ -74,11 +81,14 @@ internal sealed partial class SessionLifecycleCoordinator
                 RetryAfterMsForDependency);
         }
 
-        ResumeContext? context;
+        // P0-3：原子 Claim 替代破坏性 GETDEL。
+        // Claim 占用 Token（GETDEL 原 Key + SET claim Key），但不删除——
+        // Commit 成功后 CommitClaim 才最终消费；Abort 时 ReleaseClaim 归还 Token。
+        ResumeClaimResult? claim;
         try
         {
-            context = await _resumeTokenStore
-                .TryValidateAsync(resumeToken, cancellationToken)
+            claim = await _resumeTokenStore
+                .TryClaimAsync(resumeToken, cancellationToken)
                 .ConfigureAwait(false);
         }
         catch (Exception ex)
@@ -94,13 +104,16 @@ internal sealed partial class SessionLifecycleCoordinator
                 RetryAfterMsForDependency);
         }
 
-        if (context is null)
+        if (claim is null)
         {
             _metrics.ResumeFailed(ResumeFailureReason.InvalidToken);
             return ResumePrepareResult.Failed(
                 ResumeFailureKind.InvalidToken,
                 ResumeFailureReason.InvalidToken);
         }
+
+        var context = claim.Context;
+        var attemptId = claim.AttemptId;
 
         // 代次校验：若待恢复会话携带 DeviceIdHash，查询当前设备租约持有者。
         // 若租约已被另一个 SessionId 接管，说明此 ResumeContext 来自已被替换的旧会话，拒绝恢复。
@@ -170,7 +183,9 @@ internal sealed partial class SessionLifecycleCoordinator
 
         return ResumePrepareResult.Succeeded(new PreparedResumeContext
         {
-            Context = context
+            Context = context,
+            AttemptId = attemptId,
+            ResumeToken = resumeToken
         });
     }
 
@@ -181,15 +196,18 @@ internal sealed partial class SessionLifecycleCoordinator
     /// <list type="number">
     /// <item><c>session.Authenticate</c> — 复用原身份</item>
     /// <item><c>_userSessions.Add</c> + Presence 上线广播</item>
+    /// <item>Redis 设备租约接管（<c>TakeOverAsync</c>）— P0-5 前置于本机旧连接踢下线，
+    ///   若 TakeOver 失败本机旧连接仍存活，避免用户失去所有连接</item>
     /// <item>本机旧连接踢下线（<c>TakeOverSameDevice</c> + <c>RevokeSessionAsync</c>）</item>
-    /// <item>Redis 设备租约接管（<c>TakeOverAsync</c>）</item>
-    /// <item>跨 Gateway SessionRevoked 广播（仅当旧 TransportId 不同且非本机）</item>
+    /// <item>跨 Gateway SessionRevoked 广播（仅当旧 TransportId 不同且非本机已踢）</item>
     /// <item>新 ResumeToken 颁发（<c>IssueAsync</c>）</item>
     /// <item>同步水位查询（<c>QueryResumeWatermarkAsync</c>，best-effort）</item>
+    /// <item>P0-3：<c>CommitClaimSafeAsync</c> 最终消费原 Token</item>
     /// </list>
     /// </para>
     /// <para>
-    /// 步骤 4（TakeOver）失败时调用 <see cref="AbortLocalStateAsync"/> 回滚步骤 1-2，
+    /// 步骤 3（TakeOver）失败时先调用 <see cref="ReleaseClaimSafeAsync"/> 归还 Token
+    /// （允许客户端重试 Resume），再调用 <see cref="AbortLocalStateAsync"/> 回滚步骤 1-2，
     /// 关闭连接并返回 <see cref="ResumeFailureKind.DependencyUnavailable"/>。
     /// 步骤 6（Token 颁发）失败不阻断恢复（best-effort，客户端下次重连走完整认证）。
     /// </para>
@@ -215,7 +233,45 @@ internal sealed partial class SessionLifecycleCoordinator
                 .ConfigureAwait(false);
         }
 
-        // 步骤 3：本机旧连接立即踢下线。
+        // 步骤 3：Redis 设备租约接管（P0-5：前置于本机旧连接踢下线）。
+        // 仅当原会话携带 DeviceIdHash 时才接管。缺少 DeviceIdHash 的会话不持有设备租约。
+        // 若 TakeOver 失败，本机旧连接仍存活，避免用户失去所有连接。
+        TakeOverResult? takeoverResult = null;
+        if (context.DeviceIdHash is { } deviceHash)
+        {
+            var takeover = await _deviceSessionLeaseStore.TakeOverAsync(
+                context.UserId,
+                deviceHash,
+                context.SessionId,
+                session.ConnectionLeaseId,
+                session.LeaseOwnerToken,
+                _options.IdleTimeout + TimeSpan.FromMinutes(5),
+                cancellationToken).ConfigureAwait(false);
+            takeoverResult = takeover;
+
+            if (takeover.Status == TakeOverStatus.DependencyUnavailable)
+            {
+                // Fail-closed：TakeOver 依赖不可用时拒绝恢复，要求完整认证。
+                _logger.TransportFailed(
+                    GatewayTransportOperation.ClientProcessing,
+                    session.ConnectionId,
+                    takeover.Exception ?? new InvalidOperationException("TakeOver dependency unavailable"));
+                _metrics.ResumeFailed(ResumeFailureReason.TakeOverUnavailable);
+                // P0-3：Release 归还 Token，允许客户端重试 Resume。
+                await ReleaseClaimSafeAsync(prepared, cancellationToken)
+                    .ConfigureAwait(false);
+                // P1-D：Abort 回滚步骤 1-2（Authenticate + Add + Presence）。
+                await AbortLocalStateAsync(session, context.UserId, cancellationToken)
+                    .ConfigureAwait(false);
+                session.Close(SessionCloseReason.AuthenticationRejected);
+                return ResumeAttemptResult.Failed(
+                    ResumeFailureKind.DependencyUnavailable,
+                    ResumeFailureReason.TakeOverUnavailable,
+                    RetryAfterMsForDependency);
+            }
+        }
+
+        // 步骤 4：本机旧连接立即踢下线（P0-5：移至 TakeOver 之后）。
         // Resume 复用原 SessionId，旧连接按 ConnectionLeaseId 区分直接关闭，
         // 而非依赖 NATS SessionRevoked 事件往返。
         var localVictims = _userSessions.TakeOverSameDevice(session);
@@ -229,57 +285,26 @@ internal sealed partial class SessionLifecycleCoordinator
                     .ConfigureAwait(false);
         }
 
-        // 步骤 4：Redis 设备租约接管。
-        // 仅当原会话携带 DeviceIdHash 时才接管。缺少 DeviceIdHash 的会话不持有设备租约。
-        if (context.DeviceIdHash is { } deviceHash)
-        {
-            var takeover = await _deviceSessionLeaseStore.TakeOverAsync(
-                context.UserId,
-                deviceHash,
-                context.SessionId,
+        // 步骤 5：跨 Gateway SessionRevoked 广播（仅当旧 TransportId 不同且非本机已踢）。
+        if (takeoverResult is { } tr
+            && tr.HasPreviousLease
+            && !string.Equals(
+                tr.PreviousTransportId,
                 session.ConnectionLeaseId,
-                session.LeaseOwnerToken,
-                _options.IdleTimeout + TimeSpan.FromMinutes(5),
+                StringComparison.Ordinal)
+            && !localVictims.Any(v =>
+                string.Equals(v.ConnectionLeaseId, tr.PreviousTransportId!, StringComparison.Ordinal)))
+        {
+            var occurredAtMs = _timeProvider
+                .GetUtcNow()
+                .ToUnixTimeMilliseconds();
+            await PublishSessionRevokedEventAsync(
+                context.UserId,
+                !string.IsNullOrWhiteSpace(tr.PreviousSessionId) ? tr.PreviousSessionId! : context.SessionId!,
+                occurredAtMs,
+                session.ConnectionId,
+                tr.PreviousTransportId,
                 cancellationToken).ConfigureAwait(false);
-
-            if (takeover.Status == TakeOverStatus.DependencyUnavailable)
-            {
-                // Fail-closed：TakeOver 依赖不可用时拒绝恢复，要求完整认证。
-                _logger.TransportFailed(
-                    GatewayTransportOperation.ClientProcessing,
-                    session.ConnectionId,
-                    takeover.Exception ?? new InvalidOperationException("TakeOver dependency unavailable"));
-                _metrics.ResumeFailed(ResumeFailureReason.TakeOverUnavailable);
-                // P1-D：Abort 回滚步骤 1-2（Authenticate + Add + Presence）。
-                await AbortLocalStateAsync(session, context.UserId, cancellationToken)
-                    .ConfigureAwait(false);
-                session.Close(SessionCloseReason.AuthenticationRejected);
-                return ResumeAttemptResult.Failed(
-                    ResumeFailureKind.DependencyUnavailable,
-                    ResumeFailureReason.TakeOverUnavailable,
-                    RetryAfterMsForDependency);
-            }
-
-            // 步骤 5：跨 Gateway SessionRevoked 广播（仅当旧 TransportId 不同且非本机已踢）。
-            if (takeover.HasPreviousLease
-                && !string.Equals(
-                    takeover.PreviousTransportId,
-                    session.ConnectionLeaseId,
-                    StringComparison.Ordinal)
-                && !localVictims.Any(v =>
-                    string.Equals(v.ConnectionLeaseId, takeover.PreviousTransportId!, StringComparison.Ordinal)))
-            {
-                var occurredAtMs = _timeProvider
-                    .GetUtcNow()
-                    .ToUnixTimeMilliseconds();
-                await PublishSessionRevokedEventAsync(
-                    context.UserId,
-                    !string.IsNullOrWhiteSpace(takeover.PreviousSessionId) ? takeover.PreviousSessionId! : context.SessionId!,
-                    occurredAtMs,
-                    session.ConnectionId,
-                    takeover.PreviousTransportId,
-                    cancellationToken).ConfigureAwait(false);
-            }
         }
 
         // 步骤 6：颁发新的 ResumeToken（旧 Token 已被消费）。
@@ -319,6 +344,10 @@ internal sealed partial class SessionLifecycleCoordinator
                 cancellationToken)
             .ConfigureAwait(false);
 
+        // P0-3：Commit Claim 最终消费原 Token。
+        await CommitClaimSafeAsync(prepared, cancellationToken)
+            .ConfigureAwait(false);
+
         _metrics.ResumeSucceeded();
 
         return ResumeAttemptResult.Succeeded(
@@ -330,6 +359,56 @@ internal sealed partial class SessionLifecycleCoordinator
                 DeviceId = context.DeviceId,
                 LastConversationSequence = lastConversationSequence
             });
+    }
+
+    /// <summary>
+    /// P0-3：安全调用 CommitClaimAsync，吞掉异常（claim Key 依赖 TTL 过期兜底）。
+    /// </summary>
+    private async Task CommitClaimSafeAsync(
+        PreparedResumeContext prepared,
+        CancellationToken cancellationToken)
+    {
+        if (_resumeTokenStore is null || string.IsNullOrEmpty(prepared.AttemptId))
+            return;
+
+        try
+        {
+            await _resumeTokenStore
+                .CommitClaimAsync(prepared.ResumeToken, prepared.AttemptId, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.DependencyOperationFailed(
+                GatewayDependency.Redis,
+                GatewayDependencyOperation.ResumeTokenLookup,
+                ex);
+        }
+    }
+
+    /// <summary>
+    /// P0-3：安全调用 ReleaseClaimAsync，吞掉异常（claim Key 依赖 TTL 过期兜底）。
+    /// </summary>
+    private async Task ReleaseClaimSafeAsync(
+        PreparedResumeContext prepared,
+        CancellationToken cancellationToken)
+    {
+        if (_resumeTokenStore is null || string.IsNullOrEmpty(prepared.AttemptId))
+            return;
+
+        try
+        {
+            await _resumeTokenStore
+                .ReleaseClaimAsync(prepared.ResumeToken, prepared.AttemptId, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.DependencyOperationFailed(
+                GatewayDependency.Redis,
+                GatewayDependencyOperation.ResumeTokenLookup,
+                ex);
+        }
     }
 
     /// <summary>
@@ -357,7 +436,7 @@ internal sealed partial class SessionLifecycleCoordinator
     /// <item>Redis 租约：若 TakeOver 已成功则保留（新会话拥有租约），连接关闭时由
     ///   <see cref="OnDisconnectedAsync"/> 的 ReleaseIfOwner 释放；</item>
     /// <item>NATS SessionRevoked：已广播的吊销事件不撤回（旧连接本就应被关闭）；</item>
-    /// <item>本机旧连接踢下线（步骤 3）：不撤回（旧连接本就应被关闭）。</item>
+    /// <item>本机旧连接踢下线（步骤 4）：不撤回（旧连接本就应被关闭）。</item>
     /// </list>
     /// </para>
     /// </summary>
@@ -434,4 +513,14 @@ internal sealed class PreparedResumeContext
 {
     /// <summary>从 ResumeToken 恢复的会话上下文（UserId/SessionId/DeviceId 等）。</summary>
     public required ResumeContext Context { get; init; }
+
+    /// <summary>
+    /// P0-3：Claim 返回的 attemptId，用于 Commit/Release 时验证 Token 所有权。
+    /// </summary>
+    public string AttemptId { get; init; } = string.Empty;
+
+    /// <summary>
+    /// P0-3：客户端提交的原始 ResumeToken，用于 Commit/Release 调用。
+    /// </summary>
+    public string ResumeToken { get; init; } = string.Empty;
 }

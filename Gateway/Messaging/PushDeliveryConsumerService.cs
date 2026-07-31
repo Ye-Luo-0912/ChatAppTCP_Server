@@ -14,8 +14,18 @@ namespace ChatApp.TcpGateway.Gateway.Messaging;
 /// （令牌拉取 + Provider 调用 + 无效令牌注销）。
 /// </para>
 /// <para>
-/// ACK 语义：DispatchAsync 成功（无论是否有令牌）后 ACK；异常时 NAK 延迟重投。
-/// JetStream MaxDeliver 控制最终放弃，超出后消息进入 DLQ。
+/// P0-2 ACK 语义（基于 <see cref="PushDispatchDisposition"/>）：
+/// <list type="bullet">
+/// <item><see cref="PushDispatchDisposition.NoTargets"/> / <see cref="PushDispatchDisposition.FullySucceeded"/> /
+///   <see cref="PushDispatchDisposition.PermanentlyCompleted"/> → ACK（重投不会改变结果）。</item>
+/// <item><see cref="PushDispatchDisposition.Retryable"/> → NAK 延迟重投
+///   （FCM 503 / APNs 429 / Provider 超时等可重试失败必须重投，避免永久丢失）。</item>
+/// </list>
+/// 异常时 NAK 延迟重投。JetStream MaxDeliver 控制最终放弃，超出后消息进入 DLQ。
+/// </para>
+/// <para>
+/// <b>已知权衡</b>：Retryable 场景下 NAK 整条命令会导致已成功 token 在重投后重复收到推送。
+/// 长期应拆分为每 token 独立工作项以支持 PartiallyRetryable（仅重试失败 token）。
 /// </para>
 /// </summary>
 internal sealed class PushDeliveryConsumerService : BackgroundService
@@ -93,8 +103,21 @@ internal sealed class PushDeliveryConsumerService : BackgroundService
                     result.AttemptedCount,
                     result.SucceededCount);
 
-                await delivery.AckAsync(stoppingToken)
-                    .ConfigureAwait(false);
+                // P0-2：基于 Disposition 决定 ACK / NAK，而非无条件 ACK。
+                // 可重试失败（provider_unavailable / rate_limited）必须 NAK 重投，
+                // 否则 FCM 503 / APNs 429 / Provider 超时等场景会永久丢失推送。
+                var disposition = ClassifyDisposition(result);
+                if (disposition == PushDispatchDisposition.Retryable)
+                {
+                    await delivery
+                        .NakAsync(DeliveryRetryDelay, stoppingToken)
+                        .ConfigureAwait(false);
+                }
+                else
+                {
+                    await delivery.AckAsync(stoppingToken)
+                        .ConfigureAwait(false);
+                }
             }
             catch (OperationCanceledException)
                 when (stoppingToken.IsCancellationRequested)
@@ -111,6 +134,31 @@ internal sealed class PushDeliveryConsumerService : BackgroundService
                     .ConfigureAwait(false);
             }
         }
+    }
+
+    /// <summary>
+    /// P0-2：基于 <see cref="PushDeliveryResult"/> 现有字段推导处置分类。
+    /// <para>
+    /// 不修改 RealtimeServices 共享契约——处置是 Consumer 侧决策，使用本地字段即可推导：
+    /// <list type="bullet">
+    /// <item>AttemptedCount=0 → <see cref="PushDispatchDisposition.NoTargets"/></item>
+    /// <item>SucceededCount=AttemptedCount → <see cref="PushDispatchDisposition.FullySucceeded"/></item>
+    /// <item>RetryableFailureCount=0 → <see cref="PushDispatchDisposition.PermanentlyCompleted"/>
+    ///   （仅有 invalid_token / payload_too_large 等永久失败，重投无意义）</item>
+    /// <item>RetryableFailureCount&gt;0 → <see cref="PushDispatchDisposition.Retryable"/></item>
+    /// </list>
+    /// </para>
+    /// </summary>
+    private static PushDispatchDisposition ClassifyDisposition(
+        PushDeliveryResult result)
+    {
+        if (result.AttemptedCount == 0)
+            return PushDispatchDisposition.NoTargets;
+        if (result.SucceededCount == result.AttemptedCount)
+            return PushDispatchDisposition.FullySucceeded;
+        if (result.RetryableFailureCount == 0)
+            return PushDispatchDisposition.PermanentlyCompleted;
+        return PushDispatchDisposition.Retryable;
     }
 
     private static async Task TryNakAsync(
@@ -132,4 +180,40 @@ internal sealed class PushDeliveryConsumerService : BackgroundService
             // NAK 失败由 JetStream AckWait 兜底重投。
         }
     }
+}
+
+/// <summary>
+/// P0-2：推送投递处置分类。Consumer 据此决定 JetStream ACK / NAK。
+/// <para>
+/// 替代"DispatchAsync 正常返回即 ACK"的旧行为——可重试失败必须 NAK 重投，
+/// 否则 FCM 503 / APNs 429 / Provider 超时等场景会永久丢失推送。
+/// </para>
+/// </summary>
+internal enum PushDispatchDisposition
+{
+    /// <summary>
+    /// 用户无注册令牌（AttemptedCount=0）。ACK——重投也不会有令牌可投。
+    /// </summary>
+    NoTargets = 0,
+
+    /// <summary>
+    /// 全部令牌投递成功。ACK。
+    /// </summary>
+    FullySucceeded = 1,
+
+    /// <summary>
+    /// 无可重试失败，仅有永久失败（invalid_token / payload_too_large）。
+    /// ACK——重投不会改变结果，无效令牌已被注销。
+    /// </summary>
+    PermanentlyCompleted = 2,
+
+    /// <summary>
+    /// 存在可重试失败（provider_unavailable / rate_limited）。
+    /// NAK 并延迟重投，让 Provider 恢复后再次尝试。
+    /// <para>
+    /// 已成功 token 在重投后会重复收到推送——这是当前命令粒度 NAK 的已知权衡。
+    /// 长期应拆分为每 token 独立工作项，支持 PartiallyRetryable 仅重试失败 token。
+    /// </para>
+    /// </summary>
+    Retryable = 3
 }

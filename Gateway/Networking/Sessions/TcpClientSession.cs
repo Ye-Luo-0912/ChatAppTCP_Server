@@ -144,6 +144,8 @@ internal sealed partial class TcpClientSession : IAsyncDisposable
     private int _negotiatedFeatureBits;
     private int _closeState;
     private int _closeReason;
+    // P0-4：admission 提升标记，独立于 _authenticated 以避免 Resume Commit 失败时泄漏未认证计数。
+    private int _admissionPromoted;
 
     public TcpClientSession(
         Socket socket,
@@ -264,6 +266,24 @@ internal sealed partial class TcpClientSession : IAsyncDisposable
     public bool IsConnected => Volatile.Read(ref _closeState) == 0;
 
     public bool IsAuthenticated => Volatile.Read(ref _authenticated) != 0;
+
+    /// <summary>
+    /// P0-4：admission 是否已被提升为已认证。
+    /// <para>
+    /// 仅当 <c>TcpListenerHost.MarkAuthenticated()</c> 被调用时设置为 true，
+    /// 用于连接清理时正确释放未认证计数。不能通过 <see cref="UserId"/> &gt; 0 推断——
+    /// Resume Commit 失败时 <see cref="Authenticate"/> 已设置 UserId 但
+    /// <c>MarkAuthenticated</c> 从未调用，此时未认证计数未被递减，
+    /// 清理必须递减否则泄漏 <c>MaxUnauthenticatedConnections</c> 槽位。
+    /// </para>
+    /// </summary>
+    public bool AdmissionPromoted => Volatile.Read(ref _admissionPromoted) != 0;
+
+    /// <summary>
+    /// P0-4：标记 admission 已提升。仅由 SessionControlHandler 在
+    /// <c>_listenerHost.MarkAuthenticated()</c> 后调用。
+    /// </summary>
+    public void MarkAdmissionPromoted() => Volatile.Write(ref _admissionPromoted, 1);
 
     /// <summary>
     /// 是否已完成 ClientHello 握手。RequireClientHello=true 时认证前必须为 true。

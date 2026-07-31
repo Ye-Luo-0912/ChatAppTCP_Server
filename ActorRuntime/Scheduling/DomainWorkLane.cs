@@ -126,42 +126,34 @@ public sealed class DomainWorkLane<TWork> : IAsyncDisposable
 
         try
         {
-            while (true)
+            // P0-7：改为单 Work 处理 + 每项检查 stopToken，替代批量 drain。
+            // 旧实现把 Channel 内全部 Work 移到 List 再串行执行，导致：
+            // 1. 一个 Worker 可吞掉整批，其他 Worker 无事可做（并发远低于 maxConcurrency）
+            // 2. 每次唤醒有 List 分配和扩容
+            // 3. Stop 后仍可能执行已 drain 到 List 的剩余 Work（不检查 stopToken）
+            while (await _channel.Reader.WaitToReadAsync(stopToken).ConfigureAwait(false))
             {
-                TWork work;
-                try
+                var processed = 0;
+                // P0-7：burst 限制单 Worker 单轮处理量，Channel 负责唤醒多个 Reader 实现真正并发。
+                while (processed < BurstLimit &&
+                       _channel.Reader.TryRead(out var work))
                 {
-                    work = await _channel.Reader.ReadAsync(stopToken).ConfigureAwait(false);
-                }
-                catch (OperationCanceledException)
-                {
-                    break;
-                }
-                catch (ChannelClosedException)
-                {
-                    break;
-                }
+                    // P0-7：每项处理前检查 stopToken，避免 Stop 后继续执行已读出的 Work。
+                    if (stopToken.IsCancellationRequested)
+                    {
+                        NotifyFailure(work, exception: null, AsyncOperationFailureKind.RuntimeStopping);
+                        Interlocked.Decrement(ref _queuedCount);
+                        Interlocked.Decrement(ref _outstandingCount);
+                        break;
+                    }
 
-                Interlocked.Decrement(ref _queuedCount);
-                Interlocked.Increment(ref _inflightCount);
-
-                // 批量 drain：一次唤醒处理尽可能多的 work，减少唤醒开销。
-                var batch = new List<TWork>(4);
-                batch.Add(work);
-                while (_channel.Reader.TryRead(out var more))
-                {
                     Interlocked.Decrement(ref _queuedCount);
                     Interlocked.Increment(ref _inflightCount);
-                    batch.Add(more);
-                }
 
-                // 处理批量 work
-                foreach (var item in batch)
-                {
                     var workerCts = holder.Current;
                     try
                     {
-                        await ExecuteWorkAsync(item, workerCts, stopToken)
+                        await ExecuteWorkAsync(work, workerCts, stopToken)
                             .ConfigureAwait(false);
                         _completedCount.Increment();
                     }
@@ -170,17 +162,17 @@ public sealed class DomainWorkLane<TWork> : IAsyncDisposable
                     {
                         // 超时（非 stop）：workerCts 被 CancelAfter 触发。
                         _timeoutCount.Increment();
-                        NotifyFailure(item, exception: null, AsyncOperationFailureKind.TimedOut);
+                        NotifyFailure(work, exception: null, AsyncOperationFailureKind.TimedOut);
                     }
                     catch (OperationCanceledException)
                         when (stopToken.IsCancellationRequested)
                     {
-                        NotifyFailure(item, exception: null, AsyncOperationFailureKind.RuntimeStopping);
+                        NotifyFailure(work, exception: null, AsyncOperationFailureKind.RuntimeStopping);
                     }
                     catch (Exception ex)
                     {
                         _failedCount.Increment();
-                        NotifyFailure(item, ex, AsyncOperationFailureKind.Faulted);
+                        NotifyFailure(work, ex, AsyncOperationFailureKind.Faulted);
                     }
                     finally
                     {
@@ -193,8 +185,18 @@ public sealed class DomainWorkLane<TWork> : IAsyncDisposable
                             holder.Replace(new CancellationTokenSource());
                         }
                     }
+
+                    processed++;
                 }
             }
+        }
+        catch (OperationCanceledException) when (stopToken.IsCancellationRequested)
+        {
+            // 正常停机路径：WaitToReadAsync 抛 OCE。
+        }
+        catch (ChannelClosedException)
+        {
+            // Channel 已关闭：正常退出。
         }
         finally
         {
@@ -203,6 +205,12 @@ public sealed class DomainWorkLane<TWork> : IAsyncDisposable
             holder.Current.Dispose();
         }
     }
+
+    /// <summary>
+    /// P0-7：每 Worker 每轮最大处理 Work 数。Channel 自身负责唤醒多个 Reader，
+    /// 不需要单 Worker 批量 drain。burst=8 仅用于减少高频唤醒开销。
+    /// </summary>
+    private const int BurstLimit = 8;
 
     /// <summary>
     /// CTS 持有者：允许 stopToken 回调通过 Volatile.Read 访问最新的 CTS，

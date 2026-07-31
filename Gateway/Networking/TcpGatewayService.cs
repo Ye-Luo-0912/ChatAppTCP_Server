@@ -742,7 +742,9 @@ internal sealed class TcpGatewayService : BackgroundService
             finally
             {
                 // 释放准入跟踪器槽位（已迁移至 TcpListenerHost）。
-                var wasAuthenticated = session.UserId > 0;
+                // P0-4：使用 AdmissionPromoted 而非 UserId>0——Resume Commit 失败时 UserId 已设置
+                // 但 MarkAuthenticated 从未调用，未认证计数未被递减，需在此递减否则泄漏槽位。
+                var wasAuthenticated = session.AdmissionPromoted;
                 _listenerHost.ReleaseAdmission(remoteIp, wasAuthenticated);
                 if (!wasAuthenticated)
                     _metrics.UnauthenticatedConnectionClosed();

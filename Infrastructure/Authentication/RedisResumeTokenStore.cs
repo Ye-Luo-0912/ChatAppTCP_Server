@@ -12,6 +12,12 @@ namespace ChatApp.TcpGateway.Infrastructure.Authentication;
 /// Value 格式：JSON 序列化的 <see cref="ResumeContext"/>
 /// TTL 由 Redis PEXPIRE 自动管理。
 /// <para>
+/// P0-3：实现 Claim/Commit/Release 原子模式替代破坏性 GETDEL。
+/// Claim 使用 Lua 原子脚本：GETDEL 原 Key + SET claim Key（保存上下文与 attemptId）。
+/// Commit 验证 attemptId 后 DEL claim Key；Release 验证 attemptId 后还原原 Key。
+/// Abort 时 Token 可恢复，客户端可重试。
+/// </para>
+/// <para>
 /// 可选注入 <see cref="IRedisCircuitBreaker"/>：Redis 故障期间快速失败返回 null，
 /// 避免跨 Gateway 重连风暴串行触发 Redis 超时。未注入时跳过熔断器逻辑（兼容旧测试）。
 /// </para>
@@ -19,8 +25,54 @@ namespace ChatApp.TcpGateway.Infrastructure.Authentication;
 internal sealed class RedisResumeTokenStore : IResumeTokenStore
 {
     private const string KeyPrefix = "tcp:resume:";
+    private const string ClaimKeyPrefix = "tcp:resume:claim:";
+
+    /// <summary>
+    /// Claim 占用窗口：超过此时间未 Commit/Release，claim Key 过期，Token 不可恢复。
+    /// 取 10s：覆盖 Commit 阶段所有外部调用（TakeOver、Issue、Watermark）+ 网络往返。
+    /// </summary>
+    private static readonly TimeSpan ClaimTtl = TimeSpan.FromSeconds(10);
+
     private readonly RedisConnectionProvider _connectionProvider;
     private readonly IRedisCircuitBreaker? _circuitBreaker;
+
+    // P0-3：Lua 脚本原子 Claim——GETDEL 原 Key + HSET claim Key。
+    // KEYS[1] = tcp:resume:{token}, KEYS[2] = tcp:resume:claim:{token}
+    // ARGV[1] = attemptId, ARGV[2] = claimTtlMs, ARGV[3] = originalTtlMs
+    // 返回原 context bytes（null 表示 Token 无效/已过期）。
+    private const string ClaimLuaScript = @"
+local ctx = redis.call('GETDEL', KEYS[1])
+if not ctx then return false end
+redis.call('HSET', KEYS[2], 'attemptId', ARGV[1], 'context', ctx, 'ttlMs', ARGV[3])
+redis.call('PEXPIRE', KEYS[2], ARGV[2])
+return ctx
+";
+
+    // P0-3：Lua 脚本原子 Commit——验证 attemptId 后 DEL claim Key。
+    // KEYS[2] = tcp:resume:claim:{token}
+    // ARGV[1] = attemptId
+    // 返回 true/false。
+    private const string CommitLuaScript = @"
+local stored = redis.call('HGET', KEYS[1], 'attemptId')
+if not stored or stored ~= ARGV[1] then return false end
+redis.call('DEL', KEYS[1])
+return true
+";
+
+    // P0-3：Lua 脚本原子 Release——验证 attemptId 后还原原 Key。
+    // KEYS[1] = tcp:resume:{token}, KEYS[2] = tcp:resume:claim:{token}
+    // ARGV[1] = attemptId
+    // 返回 true/false。
+    private const string ReleaseLuaScript = @"
+local stored = redis.call('HGET', KEYS[2], 'attemptId')
+if not stored or stored ~= ARGV[1] then return false end
+local ctx = redis.call('HGET', KEYS[2], 'context')
+local ttlMs = redis.call('HGET', KEYS[2], 'ttlMs')
+if not ctx or not ttlMs then return false end
+redis.call('SET', KEYS[1], ctx, 'PX', ttlMs)
+redis.call('DEL', KEYS[2])
+return true
+";
 
     public RedisResumeTokenStore(
         RedisConnectionProvider connectionProvider,
@@ -146,4 +198,176 @@ internal sealed class RedisResumeTokenStore : IResumeTokenStore
             // 不抛——撤销失败仅记日志，依赖 TTL 兜底。
         }
     }
+
+    /// <summary>
+    /// P0-3：原子占用 ResumeToken。
+    /// <para>
+    /// Lua 脚本原子执行：GETDEL 原 Key（防止并发 Claim）+ HSET claim Key（保存上下文与 attemptId）。
+    /// Claim Key TTL 为 <see cref="ClaimTtl"/>（10s），超时未 Commit/Release 则 Token 不可恢复。
+    /// </para>
+    /// </summary>
+    public async Task<ResumeClaimResult?> TryClaimAsync(
+        string resumeToken,
+        CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(resumeToken))
+            return null;
+
+        if (_circuitBreaker is { IsAvailable: false })
+            throw new RedisException("Redis circuit breaker is open");
+
+        var token = resumeToken.Trim();
+        var key = new RedisKey(KeyPrefix + token);
+        var claimKey = new RedisKey(ClaimKeyPrefix + token);
+        var attemptId = Guid.NewGuid().ToString("N");
+
+        // 读取当前 TTL 用于 Release 时还原。PTTL 返回毫秒；-1=无过期，-2=Key 不存在。
+        TimeSpan? originalTtl;
+        try
+        {
+            originalTtl = await _connectionProvider.Database
+                .KeyTimeToLiveAsync(key, CommandFlags.DemandMaster)
+                .ConfigureAwait(false);
+        }
+        catch (RedisException)
+        {
+            _circuitBreaker?.RecordFailure();
+            throw;
+        }
+
+        if (originalTtl is null || originalTtl <= TimeSpan.Zero)
+        {
+            // Key 不存在或已过期（PTTL 返回 -2）→ Token 无效。
+            _circuitBreaker?.RecordSuccess();
+            return null;
+        }
+
+        var originalTtlMs = (long)originalTtl.Value.TotalMilliseconds;
+
+        byte[]? contextBytes;
+        try
+        {
+            var result = (byte[]?)await _connectionProvider.Database
+                .ScriptEvaluateAsync(
+                    ClaimLuaScript,
+                    new RedisKey[] { key, claimKey },
+                    new RedisValue[]
+                    {
+                        attemptId,
+                        (long)ClaimTtl.TotalMilliseconds,
+                        originalTtlMs
+                    },
+                    CommandFlags.DemandMaster)
+                .ConfigureAwait(false);
+            _circuitBreaker?.RecordSuccess();
+            contextBytes = result;
+        }
+        catch (RedisException)
+        {
+            _circuitBreaker?.RecordFailure();
+            throw;
+        }
+
+        if (contextBytes is null || contextBytes.Length is 0)
+            return null;
+
+        ResumeContext? context;
+        try
+        {
+            context = JsonSerializer.Deserialize(
+                contextBytes,
+                GatewayJsonSerializerContext.Default.ResumeContext);
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+
+        if (context is null)
+            return null;
+
+        return new ResumeClaimResult
+        {
+            Context = context,
+            AttemptId = attemptId
+        };
+    }
+
+    /// <summary>
+    /// P0-3：Commit 成功后最终消费已占用的 Token。
+    /// 验证 attemptId 后 DEL claim Key。
+    /// </summary>
+    public async Task<bool> CommitClaimAsync(
+        string resumeToken,
+        string attemptId,
+        CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(resumeToken) || string.IsNullOrEmpty(attemptId))
+            return false;
+
+        if (_circuitBreaker is { IsAvailable: false })
+        {
+            // 熔断器开路：claim Key 依赖 TTL 过期，无法主动消费。
+            return false;
+        }
+
+        var claimKey = new RedisKey(ClaimKeyPrefix + resumeToken.Trim());
+        try
+        {
+            var result = (bool?)await _connectionProvider.Database
+                .ScriptEvaluateAsync(
+                    CommitLuaScript,
+                    new RedisKey[] { claimKey },
+                    new RedisValue[] { attemptId },
+                    CommandFlags.DemandMaster)
+                .ConfigureAwait(false);
+            _circuitBreaker?.RecordSuccess();
+            return result ?? false;
+        }
+        catch (RedisException)
+        {
+            _circuitBreaker?.RecordFailure();
+            // 不抛——Commit 失败时 claim Key 依赖 TTL 过期，不会泄漏 Token 复活。
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// P0-3：Abort 时归还已占用的 Token，允许客户端重试。
+    /// 验证 attemptId 后还原原 Key（保留剩余 TTL）。
+    /// </summary>
+    public async Task ReleaseClaimAsync(
+        string resumeToken,
+        string attemptId,
+        CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(resumeToken) || string.IsNullOrEmpty(attemptId))
+            return;
+
+        if (_circuitBreaker is { IsAvailable: false })
+        {
+            // 熔断器开路：无法归还，Token 依赖 claim Key TTL 过期后不可恢复。
+            return;
+        }
+
+        var key = new RedisKey(KeyPrefix + resumeToken.Trim());
+        var claimKey = new RedisKey(ClaimKeyPrefix + resumeToken.Trim());
+        try
+        {
+            await _connectionProvider.Database
+                .ScriptEvaluateAsync(
+                    ReleaseLuaScript,
+                    new RedisKey[] { key, claimKey },
+                    new RedisValue[] { attemptId },
+                    CommandFlags.DemandMaster)
+                .ConfigureAwait(false);
+            _circuitBreaker?.RecordSuccess();
+        }
+        catch (RedisException)
+        {
+            _circuitBreaker?.RecordFailure();
+            // 不抛——Release 失败时 claim Key 依赖 TTL 过期。
+        }
+    }
 }
+

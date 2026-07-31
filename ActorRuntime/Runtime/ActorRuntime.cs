@@ -114,6 +114,13 @@ public sealed class ActorRuntime<TKey, TState, TMessage> :
     /// 新 Actor 复用预留（不再 TryAcquire），已存在 Actor 立即 Release。
     /// 入队失败（MailboxFull/ShardOverloaded）时释放预留配额。
     /// </para>
+    /// <para>
+    /// P0-8：分离"激活配额"与"邮箱配额"。已存在 Actor 即使 Shard 满也必须收消息——
+    /// 生产侧通过 <see cref="ActorShard{TKey,TState,TMessage}.ContainsActor"/> 探测 Key 是否已激活，
+    /// 仅对"新 Actor 激活"路径检查全局配额与每 Shard 上限；已存在 Actor 跳过激活配额检查，
+    /// 仅受 Mailbox 容量约束（<see cref="ActorShard{TKey,TState,TMessage}.TryEnqueueDurable"/>
+    /// 内部的 admission TryReserve）。消费侧 RouteEnvelope 仍保留二次校验安全网。
+    /// </para>
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public ActorPostStatus TryTellDurable(
@@ -126,10 +133,30 @@ public sealed class ActorRuntime<TKey, TState, TMessage> :
         var shardIndex = GetShardIndex(in key);
         var shard = _shards[shardIndex];
 
-        // 生产侧消耗式预留：TryAcquire 全局配额 + 每 Shard 上限快检。
-        // 快检失败时不消耗全局配额；TryAcquire 失败时直接拒绝。
-        if (shard.ActiveActorCount >= shard.MaxActorsPerShard ||
-            !_globalQuota.TryAcquire())
+        // P0-8：已存在 Actor 投递路径——跳过激活配额检查，仅受 Mailbox 容量约束。
+        // 这修复了"Shard 满后已存在 Actor 无法收消息"的回归。
+        if (shard.ContainsActor(in key))
+        {
+            return shard.TryEnqueueDurable(
+                in key,
+                in message,
+                hasActorQuotaReservation: false);
+        }
+
+        // 新 Actor 激活路径——先检查每 Shard 上限（快速拒绝，避免入队后消费侧静默丢弃）。
+        // 注意：ActiveActorCount 不包含尚在 Ingress Ring 中待 Consumer 处理的新激活请求，
+        // 因此该预检是"最佳努力"——消费侧 RouteEnvelope 的 _cells.Count > _maxActorsPerShard
+        // 仍是权威检查。预检失败直接返回 AdmissionRejected，让调用方尽早重试或降级。
+        if (shard.ActiveActorCount >= shard.MaxActorsPerShard)
+        {
+            return ActorPostStatus.AdmissionRejected;
+        }
+
+        // 新 Actor 激活路径——消耗式预留全局激活配额。
+        // 消费侧 RouteEnvelope 对新 Actor 复用预留（不再 TryAcquire）；
+        // 若消费侧发现 Actor 已被并发创建，会立即 Release 预留配额。
+        // TryAcquire 失败表示全局激活配额已满（系统级反压），返回 AdmissionRejected。
+        if (!_globalQuota.TryAcquire())
         {
             return ActorPostStatus.AdmissionRejected;
         }
