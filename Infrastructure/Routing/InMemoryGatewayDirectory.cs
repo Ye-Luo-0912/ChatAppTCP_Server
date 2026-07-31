@@ -105,6 +105,17 @@ public sealed class InMemoryGatewayDirectory : IGatewayDirectory
             map);
     }
 
+    /// <summary>
+    /// 五-1：账号删除时显式清理该用户的内存路由记录。幂等：清理不存在的用户为无操作。
+    /// </summary>
+    public Task PurgeUserRoutingAsync(
+        long userId,
+        CancellationToken cancellationToken = default)
+    {
+        _store.TryRemove(userId, out _);
+        return Task.CompletedTask;
+    }
+
     private IReadOnlyList<string> GetOnlineGatewaysCore(long userId, long nowMs)
     {
         if (userId <= 0)

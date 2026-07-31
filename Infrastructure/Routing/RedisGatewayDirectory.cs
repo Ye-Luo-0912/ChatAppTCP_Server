@@ -234,6 +234,34 @@ internal sealed class RedisGatewayDirectory(
         }
     }
 
+    /// <summary>
+    /// 五-1：账号删除时显式清理该用户的在线路由 ZSET（presence:{userId}:instances）。
+    /// 失败仅记录日志，不抛异常，不阻塞账号清理 Saga。
+    /// </summary>
+    public async Task PurgeUserRoutingAsync(
+        long userId,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            await connectionProvider.Database
+                .KeyDeleteAsync(Key(userId))
+                .WaitAsync(cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            logger.DependencyOperationFailed(
+                GatewayDependency.Redis,
+                GatewayDependencyOperation.GatewayDirectoryQuery,
+                ex);
+        }
+    }
+
     private static string[] ToStrings(RedisValue[] members)
     {
         if (members.Length == 0)

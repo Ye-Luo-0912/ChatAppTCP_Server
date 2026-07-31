@@ -142,6 +142,17 @@ public sealed class InMemoryWatcherGatewayDirectory : IWatcherGatewayDirectory
     /// </summary>
     public void Clear() => _store.Clear();
 
+    /// <summary>
+    /// 五-1：账号删除时显式清理该用户作为被观察者的全部 watcher 路由。幂等：清理不存在的用户为无操作。
+    /// </summary>
+    public Task PurgeUserRoutingAsync(
+        long watchedUserId,
+        CancellationToken cancellationToken = default)
+    {
+        _store.TryRemove(watchedUserId, out _);
+        return Task.CompletedTask;
+    }
+
     private IReadOnlyList<string> GetWatcherGatewaysCore(long watchedUserId)
     {
         if (watchedUserId <= 0)

@@ -324,6 +324,34 @@ internal sealed class RedisWatcherGatewayDirectory(
         }
     }
 
+    /// <summary>
+    /// 五-1：账号删除时显式清理该用户作为被观察者的全部 watcher 路由 HASH（pw:{watchedUserId}）。
+    /// 失败仅记录日志，不抛异常，不阻塞账号清理 Saga。
+    /// </summary>
+    public async Task PurgeUserRoutingAsync(
+        long watchedUserId,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            await connectionProvider.Database
+                .KeyDeleteAsync(Key(watchedUserId))
+                .WaitAsync(cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            logger.DependencyOperationFailed(
+                GatewayDependency.Redis,
+                GatewayDependencyOperation.WatcherDirectoryQuery,
+                ex);
+        }
+    }
+
     private static RedisKey Key(long watchedUserId) =>
         string.Concat(KeyPrefix, watchedUserId.ToString(CultureInfo.InvariantCulture));
 
