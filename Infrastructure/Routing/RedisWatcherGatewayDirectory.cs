@@ -234,123 +234,84 @@ internal sealed class RedisWatcherGatewayDirectory(
         }
     }
 
-    public async Task<IReadOnlyList<string>> ListActiveShardsAsync(
+    public Task<IReadOnlyList<string>> ListActiveShardsAsync(
         CancellationToken cancellationToken = default)
-    {
-        try
-        {
-            var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-            var db = connectionProvider.Database;
-            var members = await db.SortedSetRangeByScoreAsync(
-                    ActiveShardsKey,
-                    nowMs,
-                    double.PositiveInfinity,
-                    Exclude.Start)
-                .WaitAsync(cancellationToken)
-                .ConfigureAwait(false);
-            if (members.Length == 0)
-                return Array.Empty<string>();
+        => RedisSafeOperation.ExecuteAsync<IReadOnlyList<string>>(
+            async ct =>
+            {
+                var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                var db = connectionProvider.Database;
+                var members = await db.SortedSetRangeByScoreAsync(
+                        ActiveShardsKey,
+                        nowMs,
+                        double.PositiveInfinity,
+                        Exclude.Start)
+                    .WaitAsync(ct)
+                    .ConfigureAwait(false);
+                if (members.Length == 0)
+                    return Array.Empty<string>();
 
-            var result = new string[members.Length];
-            for (var i = 0; i < members.Length; i++)
-                result[i] = members[i].ToString();
-            return result;
-        }
-        catch (OperationCanceledException)
-            when (cancellationToken.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch (Exception ex)
-        {
-            logger.DependencyOperationFailed(
-                GatewayDependency.Redis,
-                GatewayDependencyOperation.WatcherDirectoryQuery,
-                ex);
-            return Array.Empty<string>();
-        }
-    }
+                var result = new string[members.Length];
+                for (var i = 0; i < members.Length; i++)
+                    result[i] = members[i].ToString();
+                return result;
+            },
+            Array.Empty<string>(),
+            logger,
+            GatewayDependencyOperation.WatcherDirectoryQuery,
+            cancellationToken);
 
     // 四-4：Gateway 实例注册自身活跃状态（ZADD ActiveShardsKey，score = 租约到期 Unix 毫秒）。
-    public async Task RegisterGatewayInstanceAsync(
+    public Task RegisterGatewayInstanceAsync(
         string instanceId,
         TimeSpan leaseDuration,
         CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(instanceId);
-        try
-        {
-            var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-            var expiryMs = nowMs + (long)leaseDuration.TotalMilliseconds;
-            await connectionProvider.Database
-                .SortedSetAddAsync(ActiveShardsKey, instanceId, expiryMs)
-                .WaitAsync(cancellationToken).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch (Exception ex)
-        {
-            logger.DependencyOperationFailed(
-                GatewayDependency.Redis,
-                GatewayDependencyOperation.WatcherDirectoryQuery,
-                ex);
-        }
+        return RedisSafeOperation.ExecuteAsync(
+            async ct =>
+            {
+                var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                var expiryMs = nowMs + (long)leaseDuration.TotalMilliseconds;
+                await connectionProvider.Database
+                    .SortedSetAddAsync(ActiveShardsKey, instanceId, expiryMs)
+                    .WaitAsync(ct).ConfigureAwait(false);
+            },
+            logger,
+            GatewayDependencyOperation.WatcherDirectoryQuery,
+            cancellationToken);
     }
 
     // 四-4：Gateway 实例注销自身活跃状态（ZREM ActiveShardsKey）。
-    public async Task UnregisterGatewayInstanceAsync(
+    public Task UnregisterGatewayInstanceAsync(
         string instanceId,
         CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(instanceId);
-        try
-        {
-            await connectionProvider.Database
+        return RedisSafeOperation.ExecuteAsync(
+            async ct => await connectionProvider.Database
                 .SortedSetRemoveAsync(ActiveShardsKey, instanceId)
-                .WaitAsync(cancellationToken).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch (Exception ex)
-        {
-            logger.DependencyOperationFailed(
-                GatewayDependency.Redis,
-                GatewayDependencyOperation.WatcherDirectoryQuery,
-                ex);
-        }
+                .WaitAsync(ct).ConfigureAwait(false),
+            logger,
+            GatewayDependencyOperation.WatcherDirectoryQuery,
+            cancellationToken);
     }
 
     /// <summary>
     /// 五-1：账号删除时显式清理该用户作为被观察者的全部 watcher 路由 HASH（pw:{watchedUserId}）。
     /// 失败仅记录日志，不抛异常，不阻塞账号清理 Saga。
     /// </summary>
-    public async Task PurgeUserRoutingAsync(
+    public Task PurgeUserRoutingAsync(
         long watchedUserId,
         CancellationToken cancellationToken = default)
-    {
-        try
-        {
-            await connectionProvider.Database
+        => RedisSafeOperation.ExecuteAsync(
+            async ct => await connectionProvider.Database
                 .KeyDeleteAsync(Key(watchedUserId))
-                .WaitAsync(cancellationToken)
-                .ConfigureAwait(false);
-        }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch (Exception ex)
-        {
-            logger.DependencyOperationFailed(
-                GatewayDependency.Redis,
-                GatewayDependencyOperation.WatcherDirectoryQuery,
-                ex);
-        }
-    }
+                .WaitAsync(ct)
+                .ConfigureAwait(false),
+            logger,
+            GatewayDependencyOperation.WatcherDirectoryQuery,
+            cancellationToken);
 
     private static RedisKey Key(long watchedUserId) =>
         string.Concat(KeyPrefix, watchedUserId.ToString(CultureInfo.InvariantCulture));
