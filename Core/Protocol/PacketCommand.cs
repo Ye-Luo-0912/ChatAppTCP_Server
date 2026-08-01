@@ -81,6 +81,10 @@ public enum PacketCommand : ushort
     RelationshipListRequest = 163,
     /// <summary>主线四：关系列表查询响应（S2C）。</summary>
     RelationshipListResponse = 164,
+    /// <summary>P0-6：群成员批量加入通知（S2C），替代逐成员 MemberJoined 的聚合事件。</summary>
+    MembersAddedUpdate = 165,
+    /// <summary>P0-6：会话解散通知（S2C），客户端据此明确识别群已解散。</summary>
+    ConversationDissolvedUpdate = 166,
     HeartbeatAcknowledgement = 1000,
     Error = 500
 }

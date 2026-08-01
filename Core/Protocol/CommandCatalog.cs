@@ -360,6 +360,12 @@ internal static class CommandCatalog
         PacketCommand.RelationshipListResponse => new(
             PacketCommand.RelationshipListResponse, CommandDirection.ServerToClient,
             ConnectionPhase.Authenticated, CommandLane.Inline, -1, 1),
+        PacketCommand.MembersAddedUpdate => new(
+            PacketCommand.MembersAddedUpdate, CommandDirection.ServerToClient,
+            ConnectionPhase.Authenticated, CommandLane.Inline, -1, 1),
+        PacketCommand.ConversationDissolvedUpdate => new(
+            PacketCommand.ConversationDissolvedUpdate, CommandDirection.ServerToClient,
+            ConnectionPhase.Authenticated, CommandLane.Inline, -1, 1),
 
         // 离线推送
         PacketCommand.RegisterPushTokenRequest => new(

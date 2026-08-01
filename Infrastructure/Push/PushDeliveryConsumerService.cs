@@ -109,8 +109,11 @@ internal sealed class PushDeliveryConsumerService : BackgroundService
                 var disposition = ClassifyDisposition(result);
                 if (disposition == PushDispatchDisposition.Retryable)
                 {
+                    // P0-4：使用 Provider 返回的最大 RetryAfter（尊重限流建议），
+                    // 无值时回退到固定 DeliveryRetryDelay。
+                    var retryDelay = result.MaxRetryAfter ?? DeliveryRetryDelay;
                     await delivery
-                        .NakAsync(DeliveryRetryDelay, stoppingToken)
+                        .NakAsync(retryDelay, stoppingToken)
                         .ConfigureAwait(false);
                 }
                 else

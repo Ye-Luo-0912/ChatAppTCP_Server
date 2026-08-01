@@ -1,4 +1,4 @@
-﻿using ChatApp.Realtime.Abstractions.Events;
+using ChatApp.Realtime.Abstractions.Events;
 using ChatApp.TcpGateway.Core.Protocol;
 using ChatApp.TcpGateway.Core.Serialization;
 using ChatApp.TcpGateway.Gateway.Networking.Buffers;
@@ -55,6 +55,9 @@ internal sealed class RealtimeEventDeliveryHelper
             if (skipOriginSession && ShouldSkipOrigin(target, realtimeEvent))
                 continue;
 
+            if (ShouldSkipByProtocolVersion(target, realtimeEvent))
+                continue;
+
             if (target.TryQueue(frame))
                 queued++;
         }
@@ -90,6 +93,9 @@ internal sealed class RealtimeEventDeliveryHelper
                 if (skipOriginSession && ShouldSkipOrigin(target, realtimeEvent))
                     continue;
 
+                if (ShouldSkipByProtocolVersion(target, realtimeEvent))
+                    continue;
+
                 if (target.TryQueue(frame))
                     queued++;
             }
@@ -100,6 +106,17 @@ internal sealed class RealtimeEventDeliveryHelper
             totalTargets: targetUserIds.Length,
             queuedRecipients: queued);
         return queued;
+    }
+
+    /// <summary>
+    /// P0-7：协议版本过滤——事件标注的 <see cref="RealtimeEvent.MinProtocolVersion"/>
+    /// 高于目标会话协商版本时跳过投递，避免低版本客户端收到不兼容的事件。
+    /// </summary>
+    private static bool ShouldSkipByProtocolVersion(TcpClientSession target, RealtimeEvent evt)
+    {
+        if (!evt.MinProtocolVersion.HasValue)
+            return false;
+        return target.NegotiatedProtocolVersion < (ushort)evt.MinProtocolVersion.Value;
     }
 
     private static bool ShouldSkipOrigin(TcpClientSession target, RealtimeEvent evt) =>

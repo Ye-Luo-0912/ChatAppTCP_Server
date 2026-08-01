@@ -180,7 +180,9 @@ internal sealed partial class PushDispatcher : IPushDispatcher
             catch (Exception ex)
             {
                 LogProviderException(_logger, ex, record.Platform, command.TargetUserId);
-                providerResult = PushProviderResult.Fail("unknown");
+                // P0-4：未分类异常（timeout/DNS/HTTP client exception）默认归为 provider_unavailable（可重试），
+                // 而非 unknown（被归为永久失败 → ACK → 消息丢失）。
+                providerResult = PushProviderResult.Fail("provider_unavailable");
             }
 
             return new PushDeliveryOutcome

@@ -1,4 +1,6 @@
 using System.Threading.Channels;
+using ChatApp.Realtime.Abstractions.Events;
+using ChatApp.Realtime.Abstractions.Routing;
 using ChatApp.Realtime.Integration;
 using ChatApp.TcpGateway.Gateway.Configuration;
 using ChatApp.TcpGateway.Gateway.Diagnostics;
@@ -207,7 +209,7 @@ internal sealed class RealtimeEventConsumerService : BackgroundService
                                    .ConfigureAwait(false))
                 {
                     var partitionIndex = GetPartitionIndex(
-                        delivery.Event.TargetUserId,
+                        delivery.Event,
                         partitionCount);
                     await partitions[partitionIndex].Writer
                         .WriteAsync(delivery, mainLoopCts.Token)
@@ -359,11 +361,36 @@ internal sealed class RealtimeEventConsumerService : BackgroundService
     /// 模分布均匀。
     /// </para>
     /// </summary>
-    private static int GetPartitionIndex(long targetUserId, int partitionCount)
+    private static int GetPartitionIndex(RealtimeEvent evt, int partitionCount)
     {
-        // 处理负数（理论不应出现，但防御性处理）。
-        var positiveId = targetUserId >= 0 ? targetUserId : -targetUserId;
+        // P0-8：会话级聚合事件按 ConversationId 分区，保证同一会话的
+        // Message/Edit/Reaction/MemberChange 进入同一分区、保持顺序。
+        // 用户级事件按 TargetUserId 分区，保证同一用户的事件顺序。
+        if (evt.AudienceKind == AudienceKind.Conversation
+            && !string.IsNullOrEmpty(evt.ConversationId))
+        {
+            return PartitionByString(evt.ConversationId!, partitionCount);
+        }
+
+        var positiveId = evt.TargetUserId >= 0 ? evt.TargetUserId : -evt.TargetUserId;
         return (int)((ulong)positiveId % (ulong)partitionCount);
+    }
+
+    /// <summary>
+    /// 确定性字符串哈希分区（FNV-1a 64-bit，跨进程稳定，不使用进程随机种子）。
+    /// </summary>
+    private static int PartitionByString(string key, int partitionCount)
+    {
+        unchecked
+        {
+            ulong hash = 14695981039346656037UL; // FNV offset basis
+            foreach (var c in key)
+            {
+                hash ^= (uint)c;
+                hash *= 1099511628211UL; // FNV prime
+            }
+            return (int)(hash % (ulong)partitionCount);
+        }
     }
 
     private async Task TryNakAsync(

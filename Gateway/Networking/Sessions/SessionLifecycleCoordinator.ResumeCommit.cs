@@ -115,6 +115,14 @@ internal sealed partial class SessionLifecycleCoordinator
         var context = claim.Context;
         var attemptId = claim.AttemptId;
 
+        // P0-3 缺口3：构造 prepared 上下文，供后续失败路径调用 ReleaseClaimSafeAsync 归还 Token。
+        var prepared = new PreparedResumeContext
+        {
+            Context = context,
+            AttemptId = attemptId,
+            ResumeToken = resumeToken
+        };
+
         // 代次校验：若待恢复会话携带 DeviceIdHash，查询当前设备租约持有者。
         // 若租约已被另一个 SessionId 接管，说明此 ResumeContext 来自已被替换的旧会话，拒绝恢复。
         //
@@ -154,6 +162,9 @@ internal sealed partial class SessionLifecycleCoordinator
                 else
                 {
                     // FailClosed：依赖不可用时拒绝恢复，要求完整认证。
+                    // P0-3 缺口3：Claim 已成功，失败退出前必须归还 Token，否则卡死至 claim TTL 过期。
+                    await ReleaseClaimSafeAsync(prepared, cancellationToken)
+                        .ConfigureAwait(false);
                     return ResumePrepareResult.Failed(
                         ResumeFailureKind.DependencyUnavailable,
                         ResumeFailureReason.LeaseQueryFailed,
@@ -175,18 +186,16 @@ internal sealed partial class SessionLifecycleCoordinator
                     new InvalidOperationException(
                         "Resume rejected: device lease owned by a newer session."));
                 _metrics.ResumeFailed(ResumeFailureReason.LeaseMismatch);
+                // P0-3 缺口3：Claim 已成功，拒绝恢复前必须归还 Token，允许客户端重试。
+                await ReleaseClaimSafeAsync(prepared, cancellationToken)
+                    .ConfigureAwait(false);
                 return ResumePrepareResult.Failed(
                     ResumeFailureKind.InvalidToken,
                     ResumeFailureReason.LeaseMismatch);
             }
         }
 
-        return ResumePrepareResult.Succeeded(new PreparedResumeContext
-        {
-            Context = context,
-            AttemptId = attemptId,
-            ResumeToken = resumeToken
-        });
+        return ResumePrepareResult.Succeeded(prepared);
     }
 
     /// <summary>
@@ -414,6 +423,11 @@ internal sealed partial class SessionLifecycleCoordinator
 
     /// <summary>
     /// P0-3：安全调用 CommitClaimAsync，吞掉异常（claim Key 依赖 TTL 过期兜底）。
+    /// <para>
+    /// P0-3 缺口4：检查 CommitClaimAsync 返回值，false 时记 Warning 日志。
+    /// Commit Claim 失败（attemptId 不匹配或 claim Key 已过期）不抛异常——
+    /// 原 Token 已被 GETDEL 删除不会复活，claim Key 依赖 TTL 过期兜底。
+    /// </para>
     /// </summary>
     private async Task CommitClaimSafeAsync(
         PreparedResumeContext prepared,
@@ -424,9 +438,19 @@ internal sealed partial class SessionLifecycleCoordinator
 
         try
         {
-            await _resumeTokenStore
+            var committed = await _resumeTokenStore
                 .CommitClaimAsync(prepared.ResumeToken, prepared.AttemptId, cancellationToken)
                 .ConfigureAwait(false);
+            if (!committed)
+            {
+                // P0-3 缺口4：CommitClaim 返回 false 不可观测会导致 claim 残留静默泄漏。
+                // 记 Warning：attemptId 不匹配或 claim Key 已过期（超 10s 窗口）。
+                _logger.DependencyOperationFailed(
+                    GatewayDependency.Redis,
+                    GatewayDependencyOperation.ResumeTokenRevoke,
+                    new InvalidOperationException(
+                        "CommitClaim returned false: attemptId mismatch or claim key expired."));
+            }
         }
         catch (Exception ex)
         {

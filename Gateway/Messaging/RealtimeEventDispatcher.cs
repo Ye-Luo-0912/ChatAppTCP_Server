@@ -58,7 +58,9 @@ internal sealed class RealtimeEventDispatcher
         IPayloadCodec<AttachmentLifecycleUpdate>? attachmentLifecycleCodec = null,
         IResumeTokenStore? resumeTokenStore = null,
         IDirectConversationAuthorizer? directConversationAuthorizer = null,
-        ITypingAuthorizationInvalidator? typingAuthorizationInvalidator = null)
+        ITypingAuthorizationInvalidator? typingAuthorizationInvalidator = null,
+        IPayloadCodec<MembersAddedUpdate>? membersAddedCodec = null,
+        IPayloadCodec<ConversationDissolvedUpdate>? conversationDissolvedCodec = null)
         : this(
             BuildRegistry(
                 userSessions,
@@ -82,7 +84,9 @@ internal sealed class RealtimeEventDispatcher
                 attachmentLifecycleCodec,
                 resumeTokenStore,
                 directConversationAuthorizer,
-                typingAuthorizationInvalidator),
+                typingAuthorizationInvalidator,
+                membersAddedCodec,
+                conversationDissolvedCodec),
             metrics,
             logger)
     {
@@ -144,7 +148,9 @@ internal sealed class RealtimeEventDispatcher
         IPayloadCodec<AttachmentLifecycleUpdate>? attachmentLifecycleCodec,
         IResumeTokenStore? resumeTokenStore,
         IDirectConversationAuthorizer? directConversationAuthorizer,
-        ITypingAuthorizationInvalidator? typingAuthorizationInvalidator)
+        ITypingAuthorizationInvalidator? typingAuthorizationInvalidator,
+        IPayloadCodec<MembersAddedUpdate>? membersAddedCodec,
+        IPayloadCodec<ConversationDissolvedUpdate>? conversationDissolvedCodec)
     {
         var delivery = new RealtimeEventDeliveryHelper(userSessions, metrics);
         // 复用 dispatcher 的 logger：原 RejectEvent 也走该 logger，保持日志类别一致。
@@ -172,6 +178,8 @@ internal sealed class RealtimeEventDispatcher
             attachmentLifecycleCodec, delivery, rejection, metrics);
         IRealtimeEventHandler sessionRevocation = new SessionRevocationHandler(
             userSessions, metrics, rejection, logger, resumeTokenStore);
+        IRealtimeEventHandler conversationAggregate = new ConversationAggregateEventHandler(
+            membersAddedCodec!, conversationDissolvedCodec!, delivery, rejection);
 
         return new RealtimeEventHandlerRegistry(new KeyValuePair<RealtimeEventType, IRealtimeEventHandler>[]
         {
@@ -193,6 +201,8 @@ internal sealed class RealtimeEventDispatcher
             new(RealtimeEventType.BlockedListChanged, relationshipList),
             new(RealtimeEventType.AttachmentLifecycleChanged, attachmentLifecycle),
             new(RealtimeEventType.SessionRevoked, sessionRevocation),
+            new(RealtimeEventType.MembersAdded, conversationAggregate),
+            new(RealtimeEventType.ConversationDissolved, conversationAggregate),
         });
     }
 }

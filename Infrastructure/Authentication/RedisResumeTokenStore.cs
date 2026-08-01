@@ -8,12 +8,12 @@ namespace ChatApp.TcpGateway.Infrastructure.Authentication;
 
 /// <summary>
 /// Redis 实现的 ResumeToken 存储。
-/// Key 格式：tcp:resume:{token}
+/// Key 格式：tcp:resume:{token}（{token} 为 Redis Hash Tag，确保原 Key 与 claim Key 共槽）
 /// Value 格式：JSON 序列化的 <see cref="ResumeContext"/>
 /// TTL 由 Redis PEXPIRE 自动管理。
 /// <para>
 /// P0-3：实现 Claim/Commit/Release 原子模式替代破坏性 GETDEL。
-/// Claim 使用 Lua 原子脚本：GETDEL 原 Key + SET claim Key（保存上下文与 attemptId）。
+/// Claim 使用 Lua 原子脚本：PTTL + GETDEL 原 Key + SET claim Key（保存上下文与 attemptId），单次往返原子。
 /// Commit 验证 attemptId 后 DEL claim Key；Release 验证 attemptId 后还原原 Key。
 /// Abort 时 Token 可恢复，客户端可重试。
 /// </para>
@@ -24,8 +24,11 @@ namespace ChatApp.TcpGateway.Infrastructure.Authentication;
 /// </summary>
 internal sealed class RedisResumeTokenStore : IResumeTokenStore
 {
-    private const string KeyPrefix = "tcp:resume:";
-    private const string ClaimKeyPrefix = "tcp:resume:claim:";
+    // P0-3 缺口1：Hash Tag {token} 确保 tcp:resume:{token} 与 tcp:resume:claim:{token} 共槽，
+    // Redis Cluster 下 Claim/Commit/Release 的多 Key Lua 操作可跨 Key 原子执行。
+    private const string KeyPrefix = "tcp:resume:{";
+    private const string ClaimKeyPrefix = "tcp:resume:claim:{";
+    private const string KeySuffix = "}";
 
     /// <summary>
     /// Claim 占用窗口：超过此时间未 Commit/Release，claim Key 过期，Token 不可恢复。
@@ -36,14 +39,16 @@ internal sealed class RedisResumeTokenStore : IResumeTokenStore
     private readonly RedisConnectionProvider _connectionProvider;
     private readonly IRedisCircuitBreaker? _circuitBreaker;
 
-    // P0-3：Lua 脚本原子 Claim——GETDEL 原 Key + HSET claim Key。
+    // P0-3 缺口2：Lua 脚本原子 Claim——PTTL + GETDEL 原 Key + HSET claim Key（单次 Redis 往返）。
     // KEYS[1] = tcp:resume:{token}, KEYS[2] = tcp:resume:claim:{token}
-    // ARGV[1] = attemptId, ARGV[2] = claimTtlMs, ARGV[3] = originalTtlMs
-    // 返回原 context bytes（null 表示 Token 无效/已过期）。
+    // ARGV[1] = attemptId, ARGV[2] = claimTtlMs
+    // 返回原 context bytes（false 表示 Token 无效/已过期/无 TTL）。
     private const string ClaimLuaScript = @"
+local ttlMs = redis.call('PTTL', KEYS[1])
+if ttlMs < 0 then return false end
 local ctx = redis.call('GETDEL', KEYS[1])
 if not ctx then return false end
-redis.call('HSET', KEYS[2], 'attemptId', ARGV[1], 'context', ctx, 'ttlMs', ARGV[3])
+redis.call('HSET', KEYS[2], 'attemptId', ARGV[1], 'context', ctx, 'ttlMs', ttlMs)
 redis.call('PEXPIRE', KEYS[2], ARGV[2])
 return ctx
 ";
@@ -96,7 +101,7 @@ return true
             throw new RedisException("Redis circuit breaker is open");
 
         var token = Guid.NewGuid().ToString("N");
-        var key = new RedisKey(KeyPrefix + token);
+        var key = new RedisKey(KeyPrefix + token + KeySuffix);
         var value = JsonSerializer.SerializeToUtf8Bytes(
             context,
             GatewayJsonSerializerContext.Default.ResumeContext);
@@ -132,7 +137,7 @@ return true
         // IssueAsync/RevokeAsync 保留各自独立的 IsAvailable 检查，因为它们的调用方
         // （OnAuthenticatedAsync）不在 Resume 路径上，不存在二次获取 Probe 的问题。
 
-        var key = new RedisKey(KeyPrefix + resumeToken.Trim());
+        var key = new RedisKey(KeyPrefix + resumeToken.Trim() + KeySuffix);
 
         // GETDEL：消费式读取，Token 一次性使用。
         // 即使客户端误重放，第二次返回 null。
@@ -182,7 +187,7 @@ return true
             return;
         }
 
-        var key = new RedisKey(KeyPrefix + resumeToken.Trim());
+        var key = new RedisKey(KeyPrefix + resumeToken.Trim() + KeySuffix);
         // DemandMaster：与 IssueAsync 一致，确保主从切换期间撤销操作写入主节点，
         // 避免撤销失效导致旧 Token 在 TTL 窗口内被用于跨 Gateway 恢复。
         try
@@ -217,33 +222,12 @@ return true
             throw new RedisException("Redis circuit breaker is open");
 
         var token = resumeToken.Trim();
-        var key = new RedisKey(KeyPrefix + token);
-        var claimKey = new RedisKey(ClaimKeyPrefix + token);
+        var key = new RedisKey(KeyPrefix + token + KeySuffix);
+        var claimKey = new RedisKey(ClaimKeyPrefix + token + KeySuffix);
         var attemptId = Guid.NewGuid().ToString("N");
 
-        // 读取当前 TTL 用于 Release 时还原。PTTL 返回毫秒；-1=无过期，-2=Key 不存在。
-        TimeSpan? originalTtl;
-        try
-        {
-            originalTtl = await _connectionProvider.Database
-                .KeyTimeToLiveAsync(key, CommandFlags.DemandMaster)
-                .ConfigureAwait(false);
-        }
-        catch (RedisException)
-        {
-            _circuitBreaker?.RecordFailure();
-            throw;
-        }
-
-        if (originalTtl is null || originalTtl <= TimeSpan.Zero)
-        {
-            // Key 不存在或已过期（PTTL 返回 -2）→ Token 无效。
-            _circuitBreaker?.RecordSuccess();
-            return null;
-        }
-
-        var originalTtlMs = (long)originalTtl.Value.TotalMilliseconds;
-
+        // P0-3 缺口2：PTTL 已移入 ClaimLuaScript 内部，避免 PTTL + GETDEL 两次往返的非原子竞态。
+        // Lua 脚本原子执行：PTTL（-2/-1 返回 false）→ GETDEL → HSET claim Key → PEXPIRE。
         byte[]? contextBytes;
         try
         {
@@ -254,8 +238,7 @@ return true
                     new RedisValue[]
                     {
                         attemptId,
-                        (long)ClaimTtl.TotalMilliseconds,
-                        originalTtlMs
+                        (long)ClaimTtl.TotalMilliseconds
                     },
                     CommandFlags.DemandMaster)
                 .ConfigureAwait(false);
@@ -311,7 +294,7 @@ return true
             return false;
         }
 
-        var claimKey = new RedisKey(ClaimKeyPrefix + resumeToken.Trim());
+        var claimKey = new RedisKey(ClaimKeyPrefix + resumeToken.Trim() + KeySuffix);
         try
         {
             var result = (bool?)await _connectionProvider.Database
@@ -350,8 +333,8 @@ return true
             return;
         }
 
-        var key = new RedisKey(KeyPrefix + resumeToken.Trim());
-        var claimKey = new RedisKey(ClaimKeyPrefix + resumeToken.Trim());
+        var key = new RedisKey(KeyPrefix + resumeToken.Trim() + KeySuffix);
+        var claimKey = new RedisKey(ClaimKeyPrefix + resumeToken.Trim() + KeySuffix);
         try
         {
             await _connectionProvider.Database

@@ -49,6 +49,9 @@ internal sealed class ActorShard<TKey, TState, TMessage>
     private readonly int _completionCreditCapacity;
     private int _completionCredits;
     private readonly ActorCellTable<TKey, TState, TMessage> _cells;
+    // P0-1：生产侧线程安全的 Actor 存在性探测表。Consumer 激活/回收时同步维护，
+    // Producer 通过此 ConcurrentDictionary 查询，不再直接读 _cells（普通 Dictionary）。
+    private readonly ConcurrentDictionary<TKey, byte> _activeActorKeys = new();
     private readonly ConcurrentDictionary<TKey, ActorAdmission>? _fifoAdmissions;
     private readonly SingleWaiterSignal _signal;
     private readonly ShardDeadlineWheel<TKey, TState, TMessage> _deadlines;
@@ -161,22 +164,24 @@ internal sealed class ActorShard<TKey, TState, TMessage>
     public int MaxActorsPerShard => _maxActorsPerShard;
 
     /// <summary>
-    /// P0-8：判断指定 Key 的 Actor 是否已存在。
+    /// P0-1：判断指定 Key 的 Actor 是否已存在（生产侧线程安全探测）。
     /// <para>
-    /// <see cref="ActorCellTable{TKey,TState,TMessage}"/> 内部为普通 <see cref="Dictionary{TKey,TValue}"/>，
-    /// .NET 10 的 ref 字典支持并发读 + 单写（Shard Consumer 为唯一写者），因此生产侧可安全调用
-    /// <see cref="ActorCellTable{TKey,TState,TMessage}.TryGetValue"/> 进行存在性探测。
+    /// 通过独立的 <see cref="ConcurrentDictionary{TKey,TValue}"/> 查询，不再直接读
+    /// <see cref="ActorCellTable{TKey,TState,TMessage}"/> 内部的普通
+    /// <see cref="Dictionary{TKey,TValue}"/>（Consumer 单写时并发读不安全）。
+    /// Consumer 在 Actor 激活/回收时同步维护此表。
     /// </para>
     /// <para>
     /// 用途：<see cref="TryEnqueueDurable"/> 在生产侧区分"新 Actor 激活"与"已存在 Actor 投递"——
     /// 仅新 Actor 激活需检查 <see cref="MaxActorsPerShard"/> 上限，已存在 Actor 即使 Shard 满也必须收消息。
-    /// 探测与消费侧 <see cref="RouteEnvelope"/> 之间存在 TOCTOU 竞态：若探测时不存在、消费时已存在
-    /// （或反之），消费侧 RouteEnvelope 仍会按实际状态二次校验，不会破坏不变量。
+    /// 探测与消费侧 <see cref="RouteEnvelope"/> 之间存在 TOCTOU 竞态：若探测时存在、消费时已回收，
+    /// 消费侧 RouteEnvelope 走非预留路径二次校验（TryAcquire 安全网），可能因配额满而 AdmissionRejected。
+    /// 完整修复需引入 ActorRoute 状态机（ActivationState/Generation），见 roadmap-todo.md P0-1。
     /// </para>
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool ContainsActor(in TKey key)
-        => _cells.TryGetValue(in key, out _);
+        => _activeActorKeys.ContainsKey(key);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public ActorPostStatus TryEnqueue(in TKey key, in TMessage message)
@@ -452,6 +457,7 @@ internal sealed class ActorShard<TKey, TState, TMessage>
 
             ClearCurrentCell();
             _cells.Clear();
+            _activeActorKeys.Clear();
         }
 
         ClearReadyQueue();
@@ -614,6 +620,8 @@ internal sealed class ActorShard<TKey, TState, TMessage>
             ClearCurrentCell();
             _activeActorCount++;
             _activationCount++;
+            // P0-1：同步生产侧探测表。Consumer 单线程写入，生产侧多线程读取。
+            _activeActorKeys.TryAdd(envelope.Key, 0);
         }
 
         var actor = cellRef!;
@@ -923,6 +931,8 @@ internal sealed class ActorShard<TKey, TState, TMessage>
         _deactivationCount++;
         _activeActorCount--;
         _globalQuota.Release();
+        // P0-1：同步生产侧探测表。先移除探测标记，再移除 cell。
+        _activeActorKeys.TryRemove(actor.Key, out _);
         _cells.Remove(in actor.Key);
         TryRetireAdmission(in actor.Key);
         // 时间轮中该 Actor 的未触发条目不显式移除：

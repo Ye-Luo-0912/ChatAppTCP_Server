@@ -125,7 +125,21 @@ internal sealed partial class TcpClientSession : IAsyncDisposable
         }
 
         /// <summary>获取可等待的 <see cref="ValueTask"/>。Version 随 Reset 递增，使旧 token 失效。</summary>
-        public ValueTask WaitAsync() => new(this, _core.Version);
+        /// <summary>
+    /// 当前绑定的代次。DisposeAsync 据此判断 op 是否已发布到当前 generation。
+    /// </summary>
+    public int ActiveGeneration => Volatile.Read(ref _activeGeneration);
+
+    /// <summary>
+    /// P0-2：Generation-aware 等待。代次不匹配时同步完成（让调用方重新检查状态），
+    /// 避免读到上一代 op 的已完成 Version 导致 busy-loop 或 InvalidOperationException。
+    /// </summary>
+    public ValueTask WaitAsync(int expectedGeneration)
+    {
+        if (Volatile.Read(ref _activeGeneration) != expectedGeneration)
+            return ValueTask.CompletedTask;
+        return new(this, _core.Version);
+    }
 
         ValueTaskSourceStatus IValueTaskSource.GetStatus(short token) =>
             _core.GetStatus(token);

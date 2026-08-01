@@ -93,13 +93,28 @@ internal sealed partial class TcpClientSession
                     if ((stateGen & DrainStateRunningBit) == 0)
                         break; // Idle：无活跃 drain。
 
+                    var currentGen = (int)(stateGen & 0xFFFFFFFF);
                     var op = Volatile.Read(ref _drainOp);
-                    if (op is null)
-                        break; // 从未启动过 drain。
+
+                    // P0-2：op 尚未发布或属上一代时，SpinWait 等待当前代次 op 发布。
+                    // 修复窗口 A（op==null 提前退出）和窗口 B（上一代 op busy-loop）。
+                    if (op is null || op.ActiveGeneration != currentGen)
+                    {
+                        var spin = new SpinWait();
+                        for (var i = 0; i < 1000; i++)
+                        {
+                            op = Volatile.Read(ref _drainOp);
+                            if (op is not null && op.ActiveGeneration == currentGen)
+                                break;
+                            spin.SpinOnce();
+                        }
+                        if (op is null || op.ActiveGeneration != currentGen)
+                            continue; // 重新检查状态（可能已 Idle 或换代）。
+                    }
 
                     try
                     {
-                        await op.WaitAsync().ConfigureAwait(false);
+                        await op.WaitAsync(currentGen).ConfigureAwait(false);
                     }
                     catch
                     {

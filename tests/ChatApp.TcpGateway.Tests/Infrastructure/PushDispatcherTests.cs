@@ -151,7 +151,7 @@ public sealed class PushDispatcherTests
     }
 
     [Fact]
-    public async Task DispatchAsync_ProviderThrows_ReturnsUnknownError()
+    public async Task DispatchAsync_ProviderThrows_ReturnsProviderUnavailable()
     {
         var ct = TestContext.Current.CancellationToken;
         var tokenStore = new FakePushTokenStore
@@ -175,7 +175,8 @@ public sealed class PushDispatcherTests
 
         Assert.Equal(1, result.AttemptedCount);
         Assert.Equal(0, result.SucceededCount);
-        Assert.Equal(0, result.RetryableFailureCount);
+        // P0-4：Provider 异常默认映射为 provider_unavailable（可重试），而非 unknown（被 ACK 永久丢失）。
+        Assert.Equal(1, result.RetryableFailureCount);
         // 异常不触发注销（不是 invalid_token）
         Assert.Empty(result.InvalidTokenFingerprints);
     }

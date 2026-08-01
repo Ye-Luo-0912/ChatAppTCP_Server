@@ -328,6 +328,12 @@ public static class InfrastructureServiceCollectionExtensions
         services.AddSingleton<IPayloadCodec<RelationshipListResponse>>(
             static _ => new JsonPayloadCodec<RelationshipListResponse>(
                 GatewayJsonSerializerContext.Default.RelationshipListResponse));
+        services.AddSingleton<IPayloadCodec<MembersAddedUpdate>>(
+            static _ => new JsonPayloadCodec<MembersAddedUpdate>(
+                GatewayJsonSerializerContext.Default.MembersAddedUpdate));
+        services.AddSingleton<IPayloadCodec<ConversationDissolvedUpdate>>(
+            static _ => new JsonPayloadCodec<ConversationDissolvedUpdate>(
+                GatewayJsonSerializerContext.Default.ConversationDissolvedUpdate));
 
         return services;
     }

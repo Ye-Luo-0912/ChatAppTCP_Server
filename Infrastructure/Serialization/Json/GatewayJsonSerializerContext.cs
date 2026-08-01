@@ -113,6 +113,8 @@ namespace ChatApp.TcpGateway.Infrastructure.Serialization.Json;
 [JsonSerializable(typeof(RelationshipCommandResponse))]
 [JsonSerializable(typeof(RelationshipListRequest))]
 [JsonSerializable(typeof(RelationshipListResponse))]
+[JsonSerializable(typeof(MembersAddedUpdate))]
+[JsonSerializable(typeof(ConversationDissolvedUpdate))]
 [JsonSerializable(typeof(RelationshipItem))]
 [JsonSerializable(typeof(RelationshipItem[]))]
 [JsonSerializable(typeof(RealtimeAttachmentLifecyclePayload))]
