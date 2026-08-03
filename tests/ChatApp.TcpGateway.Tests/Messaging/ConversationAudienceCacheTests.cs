@@ -1,4 +1,3 @@
-using System.Net;
 using System.Runtime.CompilerServices;
 using ChatApp.Realtime.Abstractions.Attachments;
 using ChatApp.Realtime.Abstractions.Conversations;
@@ -8,114 +7,166 @@ using ChatApp.Realtime.Abstractions.Messaging.History;
 using ChatApp.Realtime.Abstractions.Relationships;
 using ChatApp.Realtime.Abstractions.Sync;
 using ChatApp.Realtime.Integration;
-using ChatApp.Realtime.Integration.Push;
-using ChatApp.Realtime.Integration.Configuration;
 using ChatApp.Realtime.Integration.Ephemeral;
-using ChatApp.TcpGateway.Gateway.Configuration;
-using ChatApp.TcpGateway.Gateway.Diagnostics;
-using ChatApp.TcpGateway.Gateway.Networking.Sessions;
-using ChatApp.TcpGateway.Infrastructure;
-using ChatApp.TcpGateway.Infrastructure.Caching;
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Hosting;
-using Microsoft.Extensions.Logging;
-using EphemeralPresenceTypingConsumerService = ChatApp.TcpGateway.Gateway.Messaging.EphemeralPresenceTypingConsumerService;
-using RealtimeEventDispatcher = ChatApp.TcpGateway.Gateway.Messaging.RealtimeEventDispatcher;
-using TcpGatewayService = ChatApp.TcpGateway.Gateway.Networking.TcpGatewayService;
+using ChatApp.Realtime.Integration.Push;
+using ChatApp.TcpGateway.Gateway.Messaging.Realtime;
+using Xunit;
 
-namespace ChatApp.TcpGateway.Tests.Networking;
+namespace ChatApp.TcpGateway.Tests.Messaging;
 
 /// <summary>
-/// Composition test: gateway DI graph resolves and shares ephemeral registries.
+/// P1-2：会话受众缓存（ConversationAudienceCache）测试。
+/// 验证：冷启动拉取、命中不重复拉取、AudienceVersion 不匹配触发重拉、
+/// 拉取失败 fail-closed 抛异常、TTL 过期触发重拉。
 /// </summary>
-public sealed class TcpGatewayServiceCompositionTests
+public sealed class ConversationAudienceCacheTests
 {
+    private const string ConversationId = "grp:audience-test";
+
     [Fact]
-    public async Task GatewayServiceGraphResolvesAndSharesEphemeralRegistries()
+    public async Task GetOrResolveAsync_OnColdCache_QueriesAndReturnsMembers()
     {
-        var services = new ServiceCollection();
-        services.AddLogging();
+        var bus = new StubMessageBus(version: 7, members: [42, 43, 44]);
 
-        services.AddOptions<TcpGatewayOptions>()
-            .Configure(ConfigureValidGatewayOptions);
-        services.AddOptions<RedisOptions>()
-            .Configure(static o =>
-            {
-                o.ConnectionString = "127.0.0.1:6379";
-                o.StartupTimeout = TimeSpan.FromSeconds(1);
-            });
+        var cache = new ConversationAudienceCache(bus);
 
-        services.AddSingleton(TimeProvider.System);
-        services.AddSingleton<GatewayMetrics>();
-        services.AddSingleton<UserSessionRegistry>();
-        services.AddSingleton<PresenceWatcherRegistry>();
-        services.AddSingleton<TypingFanoutCoordinator>();
-        services.AddSingleton<IGlobalPresenceStore, NoopGlobalPresenceStore>();
-        services.AddSingleton<RealtimeEventDispatcher>();
-        services.AddSingleton(new RealtimeIntegrationOptions { InstanceId = "composition-test" });
-        services.AddSingleton<IRealtimeMessageBus, EmptyMessageBus>();
+        var members = await cache.GetOrResolveAsync(ConversationId, expectedAudienceVersion: 7, CancellationToken.None);
 
-        services.AddGatewayInfrastructure();
-
-        services.AddHostedService<TcpGatewayService>();
-        services.AddHostedService<EphemeralPresenceTypingConsumerService>();
-
-        await using var provider = services.BuildServiceProvider(validateScopes: true);
-
-        Assert.Same(
-            provider.GetRequiredService<PresenceWatcherRegistry>(),
-            provider.GetRequiredService<PresenceWatcherRegistry>());
-        Assert.Same(
-            provider.GetRequiredService<TypingFanoutCoordinator>(),
-            provider.GetRequiredService<TypingFanoutCoordinator>());
-
-        var hosted = provider.GetServices<IHostedService>();
-        Assert.Contains(hosted, static h => h is TcpGatewayService);
-        Assert.Contains(hosted, static h => h is EphemeralPresenceTypingConsumerService);
+        Assert.Equal([42, 43, 44], members);
+        Assert.Equal(1, bus.QueryCount);
     }
 
-    private static void ConfigureValidGatewayOptions(TcpGatewayOptions o)
+    [Fact]
+    public async Task GetOrResolveAsync_CachedAndVersionMatch_DoesNotRequery()
     {
-        o.ListenAddress = IPAddress.Loopback.ToString();
-        o.Port = 8888;
-        o.ListenBacklog = 8;
-        o.MaxConnections = 8;
-        o.ReceiveBufferSize = 1024;
-        o.PipePauseWriterThreshold = 32 * 1024;
-        o.PipeResumeWriterThreshold = 16 * 1024;
-        o.OutboundQueueCapacity = 8;
-        o.MaxOutboundQueuedBytes = 128 * 1024;
-        o.AuthenticationTimeout = TimeSpan.FromSeconds(1);
-        o.IdleTimeout = TimeSpan.FromSeconds(5);
-        o.EnableEphemeralPresenceAndTyping = false;
+        var bus = new StubMessageBus(version: 7, members: [42, 43]);
+
+        var cache = new ConversationAudienceCache(bus);
+
+        var first = await cache.GetOrResolveAsync(ConversationId, expectedAudienceVersion: 7, CancellationToken.None);
+        var second = await cache.GetOrResolveAsync(ConversationId, expectedAudienceVersion: 7, CancellationToken.None);
+
+        Assert.Equal([42, 43], first);
+        Assert.Equal([42, 43], second);
+        // 快速路径命中：仅首次拉取。
+        Assert.Equal(1, bus.QueryCount);
     }
 
-    private sealed class NoopGlobalPresenceStore : IGlobalPresenceStore
+    [Fact]
+    public async Task GetOrResolveAsync_VersionMismatch_Refetches()
     {
-        public Task<PresenceTransition> SetOnlineAsync(long userId, string sessionId, CancellationToken ct = default) =>
-            Task.FromResult(PresenceTransition.None);
+        var bus = new StubMessageBus(version: 7, members: [42, 43]);
 
-        public Task<PresenceTransition> SetOfflineAsync(long userId, string sessionId, CancellationToken ct = default) =>
-            Task.FromResult(PresenceTransition.None);
+        var cache = new ConversationAudienceCache(bus);
 
-        public Task RefreshOnlineAsync(long userId, string sessionId, CancellationToken ct = default) =>
-            Task.CompletedTask;
+        // 首次以匹配版本填充缓存。
+        var first = await cache.GetOrResolveAsync(ConversationId, expectedAudienceVersion: 7, CancellationToken.None);
+        Assert.Equal([42, 43], first);
+        Assert.Equal(1, bus.QueryCount);
 
-        public Task<bool> IsOnlineAsync(long userId, CancellationToken ct = default) =>
-            Task.FromResult(false);
+        // 事件携带版本 5，与缓存版本 7 不一致 → 视为过期，重新拉取。
+        var second = await cache.GetOrResolveAsync(ConversationId, expectedAudienceVersion: 5, CancellationToken.None);
 
-        public Task<IReadOnlyDictionary<long, bool>> GetOnlineManyAsync(
-            IReadOnlyList<long> userIds,
-            CancellationToken ct = default) =>
-            Task.FromResult<IReadOnlyDictionary<long, bool>>(
-                userIds.ToDictionary(static id => id, static _ => false));
-
-        public Task RunMaintenanceAsync(CancellationToken ct = default) =>
-            Task.CompletedTask;
+        Assert.Equal([42, 43], second);
+        Assert.Equal(2, bus.QueryCount);
     }
 
-    internal sealed class EmptyMessageBus : IRealtimeMessageBus
+    [Fact]
+    public async Task GetOrResolveAsync_QueryFailure_ThrowsInvalidOperationException()
     {
+        var bus = new StubMessageBus(version: 7, members: [42])
+        {
+            FailQueries = true
+        };
+
+        var cache = new ConversationAudienceCache(bus);
+
+        // fail-closed：拉取失败向上抛异常，由调用方决定 NAK 重投，绝不投递错误受众。
+        async Task Act() => await cache.GetOrResolveAsync(ConversationId, expectedAudienceVersion: 7, CancellationToken.None);
+        await Assert.ThrowsAsync<InvalidOperationException>(Act);
+    }
+
+    [Fact]
+    public async Task GetOrResolveAsync_TtlExpiry_Refetches()
+    {
+        var bus = new StubMessageBus(version: 7, members: [42, 43]);
+
+        // 用可推进的 TimeProvider 模拟 TTL 过期。
+        var clock = new ManualTimeProvider();
+        var cache = new ConversationAudienceCache(
+            bus,
+            timeProvider: clock,
+            ttl: TimeSpan.FromMinutes(5));
+
+        var first = await cache.GetOrResolveAsync(ConversationId, expectedAudienceVersion: 7, CancellationToken.None);
+        Assert.Equal(1, bus.QueryCount);
+
+        // 时钟前进 6 分钟，超过 TTL → 重新拉取。
+        clock.Advance(TimeSpan.FromMinutes(6));
+        var second = await cache.GetOrResolveAsync(ConversationId, expectedAudienceVersion: 7, CancellationToken.None);
+
+        Assert.Equal([42, 43], second);
+        Assert.Equal(2, bus.QueryCount);
+    }
+
+    [Fact]
+    public async Task GetOrResolveAsync_NonexistentConversation_ReturnsEmptyMembers()
+    {
+        var bus = new StubMessageBus(version: 0, members: []);
+
+        var cache = new ConversationAudienceCache(bus);
+
+        var members = await cache.GetOrResolveAsync(ConversationId, expectedAudienceVersion: null, CancellationToken.None);
+
+        Assert.Empty(members);
+    }
+
+    /// <summary>可推进的 TimeProvider，用于 TTL 过期测试。</summary>
+    private sealed class ManualTimeProvider : TimeProvider
+    {
+        private long _ticks;
+
+        public ManualTimeProvider() => _ticks = DateTimeOffset.UtcNow.UtcTicks;
+
+        public override long TimestampFrequency => TimeSpan.TicksPerSecond;
+
+        public override long GetTimestamp() => _ticks;
+
+        public void Advance(TimeSpan delta) => _ticks += delta.Ticks;
+    }
+
+    /// <summary>
+    /// 可配置的 IRealtimeMessageBus 桩：仅 MutateGroupConversationAsync 返回可控受众结果，
+    /// 其余方法返回默认空值。记录 QueryCount 以验证拉取次数。
+    /// </summary>
+    private sealed class StubMessageBus(
+        long version,
+        IReadOnlyList<long> members) : IRealtimeMessageBus
+    {
+        public bool FailQueries { get; init; }
+
+        public int QueryCount { get; private set; }
+
+        public Task<GroupConversationResult> MutateGroupConversationAsync(
+            GroupConversationCommand command,
+            CancellationToken ct = default)
+        {
+            QueryCount++;
+            if (FailQueries)
+                return Task.FromResult(GroupConversationResult.Failed(command.RequestId, "server_busy", "busy"));
+
+            return Task.FromResult(
+                GroupConversationResult.SuccessAudience(
+                    command.RequestId,
+                    command.ConversationId!,
+                    version,
+                    members));
+        }
+
+        public Task<GroupConversationResult> QueryReadReceiptsAsync(
+            GroupConversationCommand command, CancellationToken ct = default) =>
+            Task.FromResult(GroupConversationResult.Failed(command.RequestId, "x", "x"));
+
         public Task PublishIncomingMessageAsync(IncomingMessageCommand command, CancellationToken ct = default) =>
             Task.CompletedTask;
 
@@ -133,12 +184,6 @@ public sealed class TcpGatewayServiceCompositionTests
 
         public Task<ConversationSetPrefsResult> SetConversationPrefsAsync(ConversationSetPrefsCommand command, CancellationToken ct = default) =>
             Task.FromResult(ConversationSetPrefsResult.Failed(command.RequestId, "x", "x"));
-
-        public Task<GroupConversationResult> MutateGroupConversationAsync(GroupConversationCommand command, CancellationToken ct = default) =>
-            Task.FromResult(GroupConversationResult.Failed(command.RequestId, "x", "x"));
-
-        public Task<GroupConversationResult> QueryReadReceiptsAsync(GroupConversationCommand command, CancellationToken ct = default) =>
-            Task.FromResult(GroupConversationResult.Failed(command.RequestId, "x", "x"));
 
         public Task<AttachmentFinalizeResult> FinalizeAttachmentUploadAsync(AttachmentFinalizeCommand command, CancellationToken ct = default) =>
             Task.FromResult(AttachmentFinalizeResult.Failed(command.RequestId, "x", "x"));
@@ -229,6 +274,6 @@ public sealed class TcpGatewayServiceCompositionTests
         }
 
         public Task<TimeSpan> PingAsync(CancellationToken ct = default) =>
-            Task.FromResult(TimeSpan.Zero);
+            Task.FromResult(TimeSpan.FromMilliseconds(1));
     }
 }

@@ -137,7 +137,8 @@ internal sealed class RealtimeEventConsumerService : BackgroundService
 
             try
             {
-                _dispatcher.Dispatch(delivery.Event);
+                await _dispatcher.DispatchAsync(delivery.Event, stoppingToken)
+                    .ConfigureAwait(false);
                 await delivery.AckAsync(stoppingToken)
                     .ConfigureAwait(false);
             }
@@ -331,7 +332,8 @@ internal sealed class RealtimeEventConsumerService : BackgroundService
 
             try
             {
-                _dispatcher.Dispatch(delivery.Event);
+                await _dispatcher.DispatchAsync(delivery.Event, ct)
+                    .ConfigureAwait(false);
                 await delivery.AckAsync(ct)
                     .ConfigureAwait(false);
             }

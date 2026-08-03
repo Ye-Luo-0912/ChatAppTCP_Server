@@ -36,17 +36,20 @@ internal sealed class MessageLifecycleEventHandler : IRealtimeEventHandler
         _rejection = rejection;
     }
 
-    public void Handle(RealtimeEvent realtimeEvent)
+    public ValueTask HandleAsync(
+        RealtimeEvent realtimeEvent,
+        CancellationToken ct = default)
     {
         switch (realtimeEvent.Type)
         {
             case RealtimeEventType.MessageRecalled:
                 HandleMessageRecalled(realtimeEvent);
-                return;
+                break;
             case RealtimeEventType.MessageEdited:
                 HandleMessageEdited(realtimeEvent);
-                return;
+                break;
         }
+        return ValueTask.CompletedTask;
     }
 
     private void HandleMessageRecalled(RealtimeEvent realtimeEvent)

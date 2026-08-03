@@ -35,12 +35,14 @@ internal sealed class MessageReceiptHandler : IRealtimeEventHandler
         _timestampConverter = timestampConverter;
     }
 
-    public void Handle(RealtimeEvent realtimeEvent)
+    public ValueTask HandleAsync(
+        RealtimeEvent realtimeEvent,
+        CancellationToken ct = default)
     {
         if (string.IsNullOrWhiteSpace(realtimeEvent.PayloadJson))
         {
             _rejection.Reject(realtimeEvent, RealtimeRejectReason.MissingPayload);
-            return;
+            return ValueTask.CompletedTask;
         }
 
         RealtimeMessageReceiptPayload? payload;
@@ -51,7 +53,7 @@ internal sealed class MessageReceiptHandler : IRealtimeEventHandler
         catch (JsonException)
         {
             _rejection.Reject(realtimeEvent, RealtimeRejectReason.InvalidJson);
-            return;
+            return ValueTask.CompletedTask;
         }
 
         if (payload is null
@@ -66,7 +68,7 @@ internal sealed class MessageReceiptHandler : IRealtimeEventHandler
                 StringComparison.Ordinal))
         {
             _rejection.Reject(realtimeEvent, RealtimeRejectReason.InvalidPayload);
-            return;
+            return ValueTask.CompletedTask;
         }
 
         _delivery.Deliver(
@@ -81,5 +83,6 @@ internal sealed class MessageReceiptHandler : IRealtimeEventHandler
                 OccurredUtc = _timestampConverter.ToUtc(payload.OccurredAtMs)
             },
             skipOriginSession: false);
+        return ValueTask.CompletedTask;
     }
 }

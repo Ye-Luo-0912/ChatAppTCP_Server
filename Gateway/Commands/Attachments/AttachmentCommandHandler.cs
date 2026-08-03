@@ -31,6 +31,8 @@ internal sealed class AttachmentCommandHandler : ICommandHandler
     private readonly IAttachmentBackend _backend;
     private readonly IPayloadCodec<AttachmentFinalizeRequest> _requestCodec;
     private readonly IPayloadCodec<AttachmentFinalizeResponse> _responseCodec;
+    private readonly IPayloadCodec<AttachmentDownloadAuthorizeRequest> _downloadAuthorizeRequestCodec;
+    private readonly IPayloadCodec<AttachmentDownloadAuthorizeResponse> _downloadAuthorizeResponseCodec;
     private readonly GatewayMetrics _metrics;
     private readonly ILogger<AttachmentCommandHandler> _logger;
 
@@ -38,12 +40,16 @@ internal sealed class AttachmentCommandHandler : ICommandHandler
         IAttachmentBackend backend,
         IPayloadCodec<AttachmentFinalizeRequest> requestCodec,
         IPayloadCodec<AttachmentFinalizeResponse> responseCodec,
+        IPayloadCodec<AttachmentDownloadAuthorizeRequest> downloadAuthorizeRequestCodec,
+        IPayloadCodec<AttachmentDownloadAuthorizeResponse> downloadAuthorizeResponseCodec,
         GatewayMetrics metrics,
         ILogger<AttachmentCommandHandler> logger)
     {
         _backend = backend;
         _requestCodec = requestCodec;
         _responseCodec = responseCodec;
+        _downloadAuthorizeRequestCodec = downloadAuthorizeRequestCodec;
+        _downloadAuthorizeResponseCodec = downloadAuthorizeResponseCodec;
         _metrics = metrics;
         _logger = logger;
     }
@@ -54,6 +60,8 @@ internal sealed class AttachmentCommandHandler : ICommandHandler
         CancellationToken cancellationToken) => frame.Command switch
     {
         PacketCommand.AttachmentFinalizeRequest => HandleFinalizeAsync(
+            frame.Payload, context.Session, cancellationToken),
+        PacketCommand.AttachmentDownloadAuthorizeRequest => HandleDownloadAuthorizeAsync(
             frame.Payload, context.Session, cancellationToken),
         _ => default
     };
@@ -153,6 +161,104 @@ internal sealed class AttachmentCommandHandler : ICommandHandler
         using var frame = OutboundFrameFactory.Create(
             PacketCommand.AttachmentFinalizeResponse,
             _responseCodec,
+            response);
+        session.TryQueue(frame);
+    }
+
+    private async ValueTask HandleDownloadAuthorizeAsync(
+        ReadOnlySequence<byte> payload,
+        TcpClientSession session,
+        CancellationToken cancellationToken)
+    {
+        var request = _downloadAuthorizeRequestCodec.Deserialize(payload);
+        if (request is null)
+        {
+            _metrics.ProtocolError();
+            session.Close(SessionCloseReason.ProtocolViolation);
+            return;
+        }
+
+        var requestId = string.IsNullOrWhiteSpace(request.RequestId)
+            ? Guid.CreateVersion7().ToString("N")
+            : request.RequestId;
+
+        // 廉价结构校验：RequestId / AttachmentId 长度。
+        if (requestId.Length > MaxRequestIdLength
+            || string.IsNullOrWhiteSpace(request.AttachmentId)
+            || request.AttachmentId.Length > MaxAttachmentIdLength)
+        {
+            SendDownloadAuthorizeResponse(
+                session,
+                new AttachmentDownloadAuthorizeResponse
+                {
+                    RequestId = requestId.Length <= MaxRequestIdLength
+                        ? requestId
+                        : string.Empty,
+                    Succeeded = false,
+                    ErrorCode = "invalid_attachment_request",
+                    ErrorMessage = "附件下载授权请求参数无效。"
+                });
+            return;
+        }
+
+        try
+        {
+            var result = await _backend
+                .AuthorizeDownloadAsync(
+                    requestId,
+                    session.UserId,
+                    request.AttachmentId,
+                    request.ConversationId,
+                    session.SessionId,
+                    cancellationToken)
+                .ConfigureAwait(false);
+
+            SendDownloadAuthorizeResponse(
+                session,
+                new AttachmentDownloadAuthorizeResponse
+                {
+                    RequestId = result.RequestId,
+                    Succeeded = result.Succeeded,
+                    ErrorCode = result.ErrorCode,
+                    ErrorMessage = result.ErrorMessage,
+                    AttachmentId = result.AttachmentId,
+                    DownloadUrl = result.DownloadUrl,
+                    DownloadToken = result.DownloadToken,
+                    ExpiresAtMs = result.ExpiresAtMs
+                });
+        }
+        catch (OperationCanceledException)
+            when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception exception)
+        {
+            _metrics.CommandFailed(PacketCommand.AttachmentDownloadAuthorizeRequest);
+            _logger.CommandFailed(
+                PacketCommand.AttachmentDownloadAuthorizeRequest,
+                session.ConnectionId,
+                requestId,
+                exception);
+            SendDownloadAuthorizeResponse(
+                session,
+                new AttachmentDownloadAuthorizeResponse
+                {
+                    RequestId = requestId,
+                    Succeeded = false,
+                    ErrorCode = "attachment_service_unavailable",
+                    ErrorMessage = "附件下载授权服务暂时不可用。"
+                });
+        }
+    }
+
+    private void SendDownloadAuthorizeResponse(
+        TcpClientSession session,
+        AttachmentDownloadAuthorizeResponse response)
+    {
+        using var frame = OutboundFrameFactory.Create(
+            PacketCommand.AttachmentDownloadAuthorizeResponse,
+            _downloadAuthorizeResponseCodec,
             response);
         session.TryQueue(frame);
     }

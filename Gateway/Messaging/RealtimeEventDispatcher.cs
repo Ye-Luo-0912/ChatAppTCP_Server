@@ -60,7 +60,8 @@ internal sealed class RealtimeEventDispatcher
         ITypingAuthorizationInvalidator? typingAuthorizationInvalidator = null,
         IPayloadCodec<MembersAddedUpdate>? membersAddedCodec = null,
         IPayloadCodec<ConversationDissolvedUpdate>? conversationDissolvedCodec = null,
-        IFrozenUserCache? frozenUserCache = null)
+        IFrozenUserCache? frozenUserCache = null,
+        ConversationAudienceCache? audienceCache = null)
         : this(
             BuildRegistry(
                 userSessions,
@@ -87,7 +88,8 @@ internal sealed class RealtimeEventDispatcher
                 typingAuthorizationInvalidator,
                 membersAddedCodec,
                 conversationDissolvedCodec,
-                frozenUserCache),
+                frozenUserCache,
+                audienceCache),
             metrics,
             logger)
     {
@@ -106,13 +108,16 @@ internal sealed class RealtimeEventDispatcher
         _logger = logger;
     }
 
-    public void Dispatch(RealtimeEvent realtimeEvent)
+    public async ValueTask DispatchAsync(
+        RealtimeEvent realtimeEvent,
+        CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(realtimeEvent);
 
         if (_registry.TryGet(realtimeEvent.Type, out var handler))
         {
-            handler.Handle(realtimeEvent);
+            await handler.HandleAsync(realtimeEvent, cancellationToken)
+                .ConfigureAwait(false);
             return;
         }
 
@@ -152,9 +157,10 @@ internal sealed class RealtimeEventDispatcher
         ITypingAuthorizationInvalidator? typingAuthorizationInvalidator,
         IPayloadCodec<MembersAddedUpdate>? membersAddedCodec,
         IPayloadCodec<ConversationDissolvedUpdate>? conversationDissolvedCodec,
-        IFrozenUserCache? frozenUserCache)
+        IFrozenUserCache? frozenUserCache,
+        ConversationAudienceCache? audienceCache)
     {
-        var delivery = new RealtimeEventDeliveryHelper(userSessions, metrics);
+        var delivery = new RealtimeEventDeliveryHelper(userSessions, metrics, audienceCache);
         // 复用 dispatcher 的 logger：原 RejectEvent 也走该 logger，保持日志类别一致。
         var rejection = new RealtimeEventRejectionSink(metrics, logger);
         var timestamp = new RealtimeTimestampConverter(timeProvider);

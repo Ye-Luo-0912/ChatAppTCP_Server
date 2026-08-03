@@ -16,9 +16,9 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <Compile Remove="Core\**;Infrastructure\**;Observability\**;tests\**;tools\**;ActorRuntime\**;PushWorker\**" />
-    <EmbeddedResource Remove="Core\**;Infrastructure\**;Observability\**;tests\**;tools\**;ActorRuntime\**;PushWorker\**" />
-    <None Remove="Core\**;Infrastructure\**;Observability\**;tests\**;tools\**;ActorRuntime\**;PushWorker\**" />
+    <Compile Remove="Core\**;Infrastructure\**;Observability\**;tests\**;tools\**;ActorRuntime\**;PushWorker\**;scratch\**" />
+    <EmbeddedResource Remove="Core\**;Infrastructure\**;Observability\**;tests\**;tools\**;ActorRuntime\**;PushWorker\**;scratch\**" />
+    <None Remove="Core\**;Infrastructure\**;Observability\**;tests\**;tools\**;ActorRuntime\**;PushWorker\**;scratch\**" />
   </ItemGroup>
 
   <ItemGroup>
@@ -33,7 +33,8 @@
     <ProjectReference Include="Infrastructure\Infrastructure.csproj" />
     <ProjectReference Include="Observability\ChatApp.TcpGateway.Observability.csproj" />
     <ProjectReference Include="ActorRuntime\ChatApp.ActorRuntime.csproj" />
-    <ProjectReference Include="..\ChatApp.RealtimeServices\ChatApp.Realtime.Integration\ChatApp.Realtime.Integration.csproj" />
+    <!-- P1-1：Realtime 集成层改为版本化 NuGet 包（本地 feed packages/）。 -->
+    <PackageReference Include="ChatApp.Realtime.Integration" />
   </ItemGroup>
 
   <ItemGroup>

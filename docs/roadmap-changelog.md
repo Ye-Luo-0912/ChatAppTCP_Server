@@ -3,6 +3,35 @@
 本文件记录已完成的历史变更，按时间倒序排列。当前状态见 `roadmap-current-state.md`，
 未完成工作见 `roadmap-todo.md`。本文件不再保留过期测试数字（当时通过数仅作参考）。
 
+## 2026-08-04
+
+### P1 跨仓库与功能语义问题（5 项全部完成）
+
+完成 P1-1 ~ P1-5 五个跨仓库/功能语义问题的闭环，两个仓库均构建通过、测试全绿：
+
+- **P1-1 版本化 Contract Package**：将 `ChatApp.Realtime.Abstractions` 提取为版本化
+  NuGet 包（本地 feed `ChatApp.Realtime.Contracts` / `ChatApp.Realtime.Integration`），
+  消除 Core 对 sibling 仓库的源码级相对路径引用；`RealtimeContractMetadata` 记录契约元数据；
+  启用 `RestorePackagesWithLockFile` 保证可复现构建；`ContractCompatibilityTests`
+  验证协议版本对齐与序列化往返。
+- **P1-2 AudienceVersion 消费闭环**：Gateway 新增 `ConversationAudienceCache`
+  （striped lock + bounded TTL + LRU 淘汰 + 版本校验）；Realtime 新增
+  `GroupConversationOperation.QueryAudience=8` 专用受众查询契约，Gateway 在版本落后时
+  刷新成员并正确处理 `AudienceKind=Conversation` 且 `TargetUserIds=null` 的事件路由。
+- **P1-3 附件闭环**：Realtime 侧 `AttachmentScanProcessor`（Uploaded→Scanning→
+  Available/Rejected，含对象存储 HEAD 校验）+ `AttachmentSweeper`（未绑定过期清理）+
+  `state_version` 条件更新防旧结果覆盖；Gateway 侧新增 `AttachmentDownloadAuthorizeRequest(167)/
+  Response(168)` 下载授权命令 + wire DTO + `IAttachmentBackend.AuthorizeDownloadAsync` NATS 转发。
+- **P1-4 群已读回执端到端**：Realtime 侧 `GroupConversationOperation.QueryReadReceipts=9` +
+  处理器权限校验（仅消息发送者）+ `IRealtimeMessageBus.QueryReadReceiptsAsync`；Gateway 侧
+  `MessageReadReceiptQueryRequest(169)/Response(170)` 命令 + wire DTO + 端到端 round-trip 测试。
+- **P1-5 Relationship 并发状态机测试**：新增 6 个并发测试（双方同时发请求、接受/拒绝并发、
+  删好友与重发并发、拉黑与接受并发、重复 RequestId 跨 Gateway 幂等、已注销用户拒绝变更）。
+  测试发现并修复 `NpgsqlRelationshipStore` 中 `NpgsqlDataReader` 未释放即 `RollbackAsync`
+  的真实并发 bug（`NpgsqlOperationInProgressException`）。
+
+测试基线：TcpGateway **447/447**，RealtimeServices **278/278**。
+
 ## 2026-08-03
 
 ### 主线四-关系：Relationship 事件发布者核验（已完成，无代码改动）

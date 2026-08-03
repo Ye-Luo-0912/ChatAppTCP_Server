@@ -1,4 +1,4 @@
-﻿using System.Diagnostics.Metrics;
+using System.Diagnostics.Metrics;
 using System.Net.Sockets;
 using System.Text.Json;
 using ChatApp.Realtime.Abstractions.Events;
@@ -47,7 +47,7 @@ public sealed class AttachmentLifecycleDispatcherTests
         using var enqueueCounter = new OutboundEnqueueCounter();
         var baseline = enqueueCounter.PositiveEnqueues;
 
-        dispatcher.Dispatch(
+        await dispatcher.DispatchAsync(
             new RealtimeEvent
             {
                 EventId = "attachment-lifecycle-event",
@@ -55,7 +55,8 @@ public sealed class AttachmentLifecycleDispatcherTests
                 TargetUserId = 42,
                 PayloadJson = payloadJson,
                 OccurredAtMs = 1_700_000_000_000L
-            });
+            },
+            TestContext.Current.CancellationToken);
 
         Assert.True(
             enqueueCounter.PositiveEnqueues > baseline,
@@ -77,7 +78,7 @@ public sealed class AttachmentLifecycleDispatcherTests
         using var enqueueCounter = new OutboundEnqueueCounter();
         var baseline = enqueueCounter.PositiveEnqueues;
 
-        dispatcher.Dispatch(
+        await dispatcher.DispatchAsync(
             new RealtimeEvent
             {
                 EventId = "attachment-lifecycle-event",
@@ -85,7 +86,8 @@ public sealed class AttachmentLifecycleDispatcherTests
                 TargetUserId = 42,
                 PayloadJson = "{\"attachmentId\":\"attach-1\",\"status\":1,\"occurredAtMs\":1700000000000}",
                 OccurredAtMs = 1_700_000_000_000L
-            });
+            },
+            TestContext.Current.CancellationToken);
 
         Assert.Equal(baseline, enqueueCounter.PositiveEnqueues);
     }
@@ -105,7 +107,7 @@ public sealed class AttachmentLifecycleDispatcherTests
         var baseline = enqueueCounter.PositiveEnqueues;
 
         // 缺 AttachmentId：应被 RejectEvent 拦截，不入队。
-        dispatcher.Dispatch(
+        await dispatcher.DispatchAsync(
             new RealtimeEvent
             {
                 EventId = "attachment-lifecycle-event",
@@ -113,7 +115,8 @@ public sealed class AttachmentLifecycleDispatcherTests
                 TargetUserId = 42,
                 PayloadJson = "{\"attachmentId\":\"\",\"status\":1,\"occurredAtMs\":1700000000000}",
                 OccurredAtMs = 1_700_000_000_000L
-            });
+            },
+            TestContext.Current.CancellationToken);
 
         Assert.Equal(baseline, enqueueCounter.PositiveEnqueues);
     }

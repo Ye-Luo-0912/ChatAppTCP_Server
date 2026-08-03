@@ -85,6 +85,14 @@ public enum PacketCommand : ushort
     MembersAddedUpdate = 165,
     /// <summary>P0-6：会话解散通知（S2C），客户端据此明确识别群已解散。</summary>
     ConversationDissolvedUpdate = 166,
+    /// <summary>P1-3：附件下载授权请求（C2S）。客户端请求为附件签发短时有效的签名下载 URL。</summary>
+    AttachmentDownloadAuthorizeRequest = 167,
+    /// <summary>P1-3：附件下载授权响应（S2C）。返回签发的下载 URL / 令牌、过期时间或错误。</summary>
+    AttachmentDownloadAuthorizeResponse = 168,
+    /// <summary>P1-4：群消息已读回执查询请求（C2S）。仅消息发送者可查询。</summary>
+    MessageReadReceiptQueryRequest = 169,
+    /// <summary>P1-4：群消息已读回执查询响应（S2C）。小群返回 reader 列表，大群返回已读人数聚合。</summary>
+    MessageReadReceiptQueryResponse = 170,
     HeartbeatAcknowledgement = 1000,
     Error = 500
 }

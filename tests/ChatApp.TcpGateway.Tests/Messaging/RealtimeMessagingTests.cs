@@ -36,14 +36,15 @@ public sealed class RealtimeMessagingTests
         registry.Add(retained);
 
         var dispatcher = CreateDispatcher(registry, metrics);
-        dispatcher.Dispatch(
+        await dispatcher.DispatchAsync(
             new RealtimeEvent
             {
                 EventId = "session-revoked-event",
                 Type = RealtimeEventType.SessionRevoked,
                 TargetUserId = 42,
                 SessionId = "revoked-session"
-            });
+            },
+            TestContext.Current.CancellationToken);
 
         Assert.False(revoked.IsConnected);
         Assert.Equal(
@@ -219,10 +220,24 @@ public sealed class RealtimeMessagingTests
                     "not_used",
                     "not used"));
 
+        public Task<GroupConversationResult> QueryReadReceiptsAsync(
+            GroupConversationCommand command,
+            CancellationToken ct = default) =>
+            Task.FromResult(
+                GroupConversationResult.Failed(
+                    command.RequestId,
+                    "not_used",
+                    "not used"));
+
         public Task<AttachmentFinalizeResult> FinalizeAttachmentUploadAsync(
             AttachmentFinalizeCommand command,
             CancellationToken ct = default) =>
             Task.FromResult(AttachmentFinalizeResult.Failed(command.RequestId, "not_used", "not used"));
+
+        public Task<AttachmentDownloadAuthorizeResult> AuthorizeAttachmentDownloadAsync(
+            AttachmentDownloadAuthorizeCommand command,
+            CancellationToken ct = default) =>
+            Task.FromResult(AttachmentDownloadAuthorizeResult.Failed(command.RequestId, "not_used", "not used"));
 
         public Task<RelationshipCommandResult> MutateRelationshipAsync(
             RelationshipCommand command,

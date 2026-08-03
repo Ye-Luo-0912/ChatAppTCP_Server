@@ -140,8 +140,14 @@ file sealed class ScriptedEphemeralBus(EphemeralTypingEvent? typing = null) : IR
     public Task<GroupConversationResult> MutateGroupConversationAsync(GroupConversationCommand command, CancellationToken ct = default) =>
         Task.FromResult(GroupConversationResult.Failed(command.RequestId, "x", "x"));
 
+    public Task<GroupConversationResult> QueryReadReceiptsAsync(GroupConversationCommand command, CancellationToken ct = default) =>
+        Task.FromResult(GroupConversationResult.Failed(command.RequestId, "x", "x"));
+
     public Task<AttachmentFinalizeResult> FinalizeAttachmentUploadAsync(AttachmentFinalizeCommand command, CancellationToken ct = default) =>
         Task.FromResult(AttachmentFinalizeResult.Failed(command.RequestId, "x", "x"));
+
+    public Task<AttachmentDownloadAuthorizeResult> AuthorizeAttachmentDownloadAsync(AttachmentDownloadAuthorizeCommand command, CancellationToken ct = default) =>
+        Task.FromResult(AttachmentDownloadAuthorizeResult.Failed(command.RequestId, "x", "x"));
 
     public Task<RelationshipCommandResult> MutateRelationshipAsync(RelationshipCommand command, CancellationToken ct = default) =>
         Task.FromResult(RelationshipCommandResult.Failed(command.RequestId, "x", "x"));

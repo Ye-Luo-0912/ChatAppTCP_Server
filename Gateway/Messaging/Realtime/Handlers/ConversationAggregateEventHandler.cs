@@ -36,17 +36,20 @@ internal sealed class ConversationAggregateEventHandler : IRealtimeEventHandler
         _rejection = rejection;
     }
 
-    public void Handle(RealtimeEvent realtimeEvent)
+    public ValueTask HandleAsync(
+        RealtimeEvent realtimeEvent,
+        CancellationToken ct = default)
     {
         switch (realtimeEvent.Type)
         {
             case RealtimeEventType.MembersAdded:
                 HandleMembersAdded(realtimeEvent);
-                return;
+                break;
             case RealtimeEventType.ConversationDissolved:
                 HandleConversationDissolved(realtimeEvent);
-                return;
+                break;
         }
+        return ValueTask.CompletedTask;
     }
 
     private void HandleMembersAdded(RealtimeEvent realtimeEvent)

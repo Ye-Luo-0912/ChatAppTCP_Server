@@ -42,23 +42,26 @@ internal sealed class ConversationMemberEventHandler : IRealtimeEventHandler
         _rejection = rejection;
     }
 
-    public void Handle(RealtimeEvent realtimeEvent)
+    public ValueTask HandleAsync(
+        RealtimeEvent realtimeEvent,
+        CancellationToken ct = default)
     {
         switch (realtimeEvent.Type)
         {
             case RealtimeEventType.MemberJoined:
                 HandleMemberJoined(realtimeEvent);
-                return;
+                break;
             case RealtimeEventType.MemberLeft:
                 HandleMemberLeft(realtimeEvent);
-                return;
+                break;
             case RealtimeEventType.MemberRemoved:
                 HandleMemberRemoved(realtimeEvent);
-                return;
+                break;
             case RealtimeEventType.RoleChanged:
                 HandleRoleChanged(realtimeEvent);
-                return;
+                break;
         }
+        return ValueTask.CompletedTask;
     }
 
     private void HandleMemberJoined(RealtimeEvent realtimeEvent)

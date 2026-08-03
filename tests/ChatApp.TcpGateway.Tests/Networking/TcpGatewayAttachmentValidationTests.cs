@@ -412,6 +412,10 @@ public sealed class TcpGatewayAttachmentValidationTests
                 GatewayJsonSerializerContext.Default.ListGroupMembersRequest);
             var listGroupMembersResponseCodec = new JsonPayloadCodec<ListGroupMembersResponse>(
                 GatewayJsonSerializerContext.Default.ListGroupMembersResponse);
+            var messageReadReceiptQueryRequestCodec = new JsonPayloadCodec<MessageReadReceiptQueryRequest>(
+                GatewayJsonSerializerContext.Default.MessageReadReceiptQueryRequest);
+            var messageReadReceiptQueryResponseCodec = new JsonPayloadCodec<MessageReadReceiptQueryResponse>(
+                GatewayJsonSerializerContext.Default.MessageReadReceiptQueryResponse);
 
             // Typing / Presence handler 专用 codec
             var typingNotifyCodec = new JsonPayloadCodec<TypingNotify>(
@@ -496,6 +500,8 @@ public sealed class TcpGatewayAttachmentValidationTests
                 changeMemberRoleResponseCodec,
                 listGroupMembersRequestCodec,
                 listGroupMembersResponseCodec,
+                messageReadReceiptQueryRequestCodec,
+                messageReadReceiptQueryResponseCodec,
                 metrics,
                 NullLogger<GroupCommandHandler>.Instance);
             var typingHandler = new TypingCommandHandler(
@@ -524,6 +530,10 @@ public sealed class TcpGatewayAttachmentValidationTests
                     GatewayJsonSerializerContext.Default.AttachmentFinalizeRequest),
                 new JsonPayloadCodec<AttachmentFinalizeResponse>(
                     GatewayJsonSerializerContext.Default.AttachmentFinalizeResponse),
+                new JsonPayloadCodec<AttachmentDownloadAuthorizeRequest>(
+                    GatewayJsonSerializerContext.Default.AttachmentDownloadAuthorizeRequest),
+                new JsonPayloadCodec<AttachmentDownloadAuthorizeResponse>(
+                    GatewayJsonSerializerContext.Default.AttachmentDownloadAuthorizeResponse),
                 metrics,
                 NullLogger<AttachmentCommandHandler>.Instance);
             var relationshipHandler = new RelationshipCommandHandler(
@@ -737,10 +747,24 @@ public sealed class TcpGatewayAttachmentValidationTests
                     "not_used",
                     "not used"));
 
+        public Task<GroupConversationResult> QueryReadReceiptsAsync(
+            GroupConversationCommand command,
+            CancellationToken ct = default) =>
+            Task.FromResult(
+                GroupConversationResult.Failed(
+                    command.RequestId,
+                    "not_used",
+                    "not used"));
+
         public Task<AttachmentFinalizeResult> FinalizeAttachmentUploadAsync(
             AttachmentFinalizeCommand command,
             CancellationToken ct = default) =>
             Task.FromResult(AttachmentFinalizeResult.Failed(command.RequestId, "not_used", "not used"));
+
+        public Task<AttachmentDownloadAuthorizeResult> AuthorizeAttachmentDownloadAsync(
+            AttachmentDownloadAuthorizeCommand command,
+            CancellationToken ct = default) =>
+            Task.FromResult(AttachmentDownloadAuthorizeResult.Failed(command.RequestId, "not_used", "not used"));
 
         public Task<RelationshipCommandResult> MutateRelationshipAsync(
             RelationshipCommand command,

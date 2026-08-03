@@ -24,6 +24,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using EphemeralPresenceTypingConsumerService = ChatApp.TcpGateway.Gateway.Messaging.EphemeralPresenceTypingConsumerService;
+using RealtimeConversationAudienceCache = ChatApp.TcpGateway.Gateway.Messaging.Realtime.ConversationAudienceCache;
 using RealtimeEventConsumerService = ChatApp.TcpGateway.Gateway.Messaging.RealtimeEventConsumerService;
 using RealtimeEventDispatcher = ChatApp.TcpGateway.Gateway.Messaging.RealtimeEventDispatcher;
 using RedisGlobalPresenceStore = ChatApp.TcpGateway.Gateway.Networking.Sessions.RedisGlobalPresenceStore;
@@ -101,6 +102,9 @@ builder.Services.AddSingleton<TypingAuthorizationInvalidatorAccessor>();
 builder.Services.AddSingleton<ITypingAuthorizationInvalidator>(sp =>
     sp.GetRequiredService<TypingAuthorizationInvalidatorAccessor>());
 builder.Services.AddSingleton<RealtimeEventDispatcher>();
+// P1-2：会话受众缓存。经 IRealtimeMessageBus 查询成员 + audience_version，
+// 供会话级广播事件（AudienceKind=Conversation）解析成员并校验 AudienceVersion。
+builder.Services.AddSingleton<RealtimeConversationAudienceCache>();
 builder.Services.AddGatewayInfrastructure();
 builder.Services.AddChatAppRealtimeIntegration(
     realtimeIntegrationOptions);

@@ -52,6 +52,8 @@ internal sealed partial class GroupCommandHandler : ICommandHandler
     private readonly IPayloadCodec<ChangeMemberRoleResponse> _changeMemberRoleResponseCodec;
     private readonly IPayloadCodec<ListGroupMembersRequest> _listGroupMembersRequestCodec;
     private readonly IPayloadCodec<ListGroupMembersResponse> _listGroupMembersResponseCodec;
+    private readonly IPayloadCodec<MessageReadReceiptQueryRequest> _messageReadReceiptQueryRequestCodec;
+    private readonly IPayloadCodec<MessageReadReceiptQueryResponse> _messageReadReceiptQueryResponseCodec;
     private readonly GatewayMetrics _metrics;
     private readonly ILogger<GroupCommandHandler> _logger;
     private readonly IGroupIdempotencyStore? _idempotencyCache;
@@ -70,6 +72,8 @@ internal sealed partial class GroupCommandHandler : ICommandHandler
         IPayloadCodec<ChangeMemberRoleResponse> changeMemberRoleResponseCodec,
         IPayloadCodec<ListGroupMembersRequest> listGroupMembersRequestCodec,
         IPayloadCodec<ListGroupMembersResponse> listGroupMembersResponseCodec,
+        IPayloadCodec<MessageReadReceiptQueryRequest> messageReadReceiptQueryRequestCodec,
+        IPayloadCodec<MessageReadReceiptQueryResponse> messageReadReceiptQueryResponseCodec,
         GatewayMetrics metrics,
         ILogger<GroupCommandHandler> logger,
         IGroupIdempotencyStore? idempotencyCache = null)
@@ -87,6 +91,8 @@ internal sealed partial class GroupCommandHandler : ICommandHandler
         _changeMemberRoleResponseCodec = changeMemberRoleResponseCodec;
         _listGroupMembersRequestCodec = listGroupMembersRequestCodec;
         _listGroupMembersResponseCodec = listGroupMembersResponseCodec;
+        _messageReadReceiptQueryRequestCodec = messageReadReceiptQueryRequestCodec;
+        _messageReadReceiptQueryResponseCodec = messageReadReceiptQueryResponseCodec;
         _metrics = metrics;
         _logger = logger;
         _idempotencyCache = idempotencyCache;
@@ -108,6 +114,8 @@ internal sealed partial class GroupCommandHandler : ICommandHandler
         PacketCommand.ChangeMemberRoleRequest => HandleChangeMemberRoleRequestAsync(
             frame.Payload, context.Session, cancellationToken),
         PacketCommand.ListGroupMembersRequest => HandleListGroupMembersRequestAsync(
+            frame.Payload, context.Session, cancellationToken),
+        PacketCommand.MessageReadReceiptQueryRequest => HandleMessageReadReceiptQueryRequestAsync(
             frame.Payload, context.Session, cancellationToken),
         _ => default
     };

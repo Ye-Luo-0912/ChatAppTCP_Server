@@ -51,6 +51,7 @@ public sealed class CommandHandlerCoverageTests
         PacketCommand.LeaveGroupRequest,
         PacketCommand.ChangeMemberRoleRequest,
         PacketCommand.ListGroupMembersRequest,
+        PacketCommand.MessageReadReceiptQueryRequest,
         // Typing
         PacketCommand.TypingNotify,
         // Presence
@@ -58,6 +59,7 @@ public sealed class CommandHandlerCoverageTests
         PacketCommand.PresenceUnwatch,
         // 主线四：附件与关系命令
         PacketCommand.AttachmentFinalizeRequest,
+        PacketCommand.AttachmentDownloadAuthorizeRequest,
         PacketCommand.RelationshipCommandRequest,
         PacketCommand.RelationshipListRequest,
     };

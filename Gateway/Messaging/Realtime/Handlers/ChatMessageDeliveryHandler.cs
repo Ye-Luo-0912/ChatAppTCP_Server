@@ -2,6 +2,7 @@ using System.Text.Json;
 using ChatApp.Realtime.Abstractions.Conversations;
 using ChatApp.Realtime.Abstractions.Events;
 using ChatApp.Realtime.Abstractions.Messaging;
+using ChatApp.Realtime.Abstractions.Routing;
 using ChatApp.Realtime.Integration.Serialization;
 using ChatApp.TcpGateway.Core.Messaging;
 using ChatApp.TcpGateway.Core.Protocol;
@@ -43,7 +44,9 @@ internal sealed class ChatMessageDeliveryHandler : IRealtimeEventHandler
         _timestampConverter = timestampConverter;
     }
 
-    public void Handle(RealtimeEvent realtimeEvent)
+    public async ValueTask HandleAsync(
+        RealtimeEvent realtimeEvent,
+        CancellationToken ct = default)
     {
         if (string.IsNullOrWhiteSpace(realtimeEvent.PayloadJson))
         {
@@ -80,18 +83,25 @@ internal sealed class ChatMessageDeliveryHandler : IRealtimeEventHandler
             return;
         }
 
-        var isReceiverTarget = payload.ReceiverUserId == realtimeEvent.TargetUserId;
-        var isSenderEcho = payload.SenderUserId == realtimeEvent.TargetUserId;
-        if (!isGroup && !isReceiverTarget && !isSenderEcho)
+        // P1-2：会话级广播（AudienceKind=Conversation）时 TargetUserId 可为 0，
+        // 成员集合由 ConversationAudienceCache 解析，跳过按 TargetUserId 的语义校验。
+        var isConversationAudience = realtimeEvent.AudienceKind == AudienceKind.Conversation;
+        var isSenderEcho = false;
+        if (!isConversationAudience)
         {
-            _rejection.Reject(realtimeEvent, RealtimeRejectReason.InvalidPayload);
-            return;
-        }
+            var isReceiverTarget = payload.ReceiverUserId == realtimeEvent.TargetUserId;
+            isSenderEcho = payload.SenderUserId == realtimeEvent.TargetUserId;
+            if (!isGroup && !isReceiverTarget && !isSenderEcho)
+            {
+                _rejection.Reject(realtimeEvent, RealtimeRejectReason.InvalidPayload);
+                return;
+            }
 
-        if (isGroup && realtimeEvent.TargetUserId <= 0)
-        {
-            _rejection.Reject(realtimeEvent, RealtimeRejectReason.InvalidPayload);
-            return;
+            if (isGroup && realtimeEvent.TargetUserId <= 0)
+            {
+                _rejection.Reject(realtimeEvent, RealtimeRejectReason.InvalidPayload);
+                return;
+            }
         }
 
         var message = new ChatMessage
@@ -114,6 +124,20 @@ internal sealed class ChatMessageDeliveryHandler : IRealtimeEventHandler
         };
 
         var skipOriginSession = isSenderEcho || isGroup;
+
+        // P1-2：会话级广播优先走 audience 解析投递。
+        if (isConversationAudience)
+        {
+            await _delivery.DeliverToConversationAudienceAsync(
+                realtimeEvent,
+                PacketCommand.ChatMessage,
+                _chatMessageCodec,
+                message,
+                skipOriginSession,
+                ct)
+                .ConfigureAwait(false);
+            return;
+        }
 
         // 聚合群聊事件优先：envelope.TargetUserIds 非空时走多目标 fanout。
         if (realtimeEvent.TargetUserIds is { Length: > 0 })

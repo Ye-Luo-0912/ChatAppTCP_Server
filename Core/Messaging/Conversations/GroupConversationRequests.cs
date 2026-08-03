@@ -110,3 +110,49 @@ public sealed class ListGroupMembersResponse
     /// <summary>是否还有更多成员可分页获取。</summary>
     public bool HasMore { get; init; }
 }
+
+public sealed class MessageReadReceiptQueryRequest
+{
+    public required string RequestId { get; init; }
+    public required string ConversationId { get; init; }
+    public required string MessageId { get; init; }
+
+    /// <summary>分页游标（上一页最后一条已读者的 user_id）。null 表示第一页。</summary>
+    public long? Cursor { get; init; }
+
+    /// <summary>每页大小。0 或省略表示 Realtime 侧默认值。</summary>
+    public int PageSize { get; init; }
+}
+
+public sealed class MessageReadReceiptItem
+{
+    public required long UserId { get; init; }
+    public required long ReadAtMs { get; init; }
+}
+
+public sealed class MessageReadReceiptQueryResponse
+{
+    public required string RequestId { get; init; }
+    public required bool Succeeded { get; init; }
+    public string? ErrorCode { get; init; }
+    public string? ErrorMessage { get; init; }
+    public string? ConversationId { get; init; }
+
+    /// <summary>已读人数。</summary>
+    public int ReadCount { get; init; }
+
+    /// <summary>总成员人数（不含已离群成员）。</summary>
+    public int TotalMemberCount { get; init; }
+
+    /// <summary>是否为小群（返回完整 reader 列表而非仅 count）。</summary>
+    public bool IsSmallGroup { get; init; }
+
+    /// <summary>已读者列表（小群）。</summary>
+    public IReadOnlyList<MessageReadReceiptItem>? Readers { get; init; }
+
+    /// <summary>下一页游标。null 表示无更多数据。</summary>
+    public long? NextCursor { get; init; }
+
+    /// <summary>是否还有更多已读者可分页获取。</summary>
+    public bool HasMore { get; init; }
+}

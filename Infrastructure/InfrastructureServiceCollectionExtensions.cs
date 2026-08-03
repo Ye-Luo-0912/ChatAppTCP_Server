@@ -265,6 +265,12 @@ public static class InfrastructureServiceCollectionExtensions
         services.AddSingleton<IPayloadCodec<ListGroupMembersResponse>>(
             static _ => new JsonPayloadCodec<ListGroupMembersResponse>(
                 GatewayJsonSerializerContext.Default.ListGroupMembersResponse));
+        services.AddSingleton<IPayloadCodec<MessageReadReceiptQueryRequest>>(
+            static _ => new JsonPayloadCodec<MessageReadReceiptQueryRequest>(
+                GatewayJsonSerializerContext.Default.MessageReadReceiptQueryRequest));
+        services.AddSingleton<IPayloadCodec<MessageReadReceiptQueryResponse>>(
+            static _ => new JsonPayloadCodec<MessageReadReceiptQueryResponse>(
+                GatewayJsonSerializerContext.Default.MessageReadReceiptQueryResponse));
 
         // Typing / Presence（TypingCommandHandler / PresenceCommandHandler 使用）
         services.AddSingleton<IPayloadCodec<TypingNotify>>(
@@ -319,6 +325,14 @@ public static class InfrastructureServiceCollectionExtensions
         services.AddSingleton<IPayloadCodec<AttachmentFinalizeResponse>>(
             static _ => new JsonPayloadCodec<AttachmentFinalizeResponse>(
                 GatewayJsonSerializerContext.Default.AttachmentFinalizeResponse));
+
+        // P1-3：附件下载授权协议
+        services.AddSingleton<IPayloadCodec<AttachmentDownloadAuthorizeRequest>>(
+            static _ => new JsonPayloadCodec<AttachmentDownloadAuthorizeRequest>(
+                GatewayJsonSerializerContext.Default.AttachmentDownloadAuthorizeRequest));
+        services.AddSingleton<IPayloadCodec<AttachmentDownloadAuthorizeResponse>>(
+            static _ => new JsonPayloadCodec<AttachmentDownloadAuthorizeResponse>(
+                GatewayJsonSerializerContext.Default.AttachmentDownloadAuthorizeResponse));
 
         // 主线四：关系命令协议
         services.AddSingleton<IPayloadCodec<RelationshipCommandRequest>>(

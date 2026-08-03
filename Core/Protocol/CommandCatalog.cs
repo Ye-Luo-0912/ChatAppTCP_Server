@@ -321,6 +321,15 @@ internal static class CommandCatalog
         PacketCommand.ListGroupMembersResponse => new(
             PacketCommand.ListGroupMembersResponse, CommandDirection.ServerToClient,
             ConnectionPhase.Authenticated, CommandLane.Inline, -1, 1),
+        PacketCommand.MessageReadReceiptQueryRequest => new(
+            PacketCommand.MessageReadReceiptQueryRequest, CommandDirection.ClientToServer,
+            ConnectionPhase.Authenticated, CommandLane.Query, 4 * 1024, 4)
+        {
+            RequiredFeature = GatewayFeature.GroupManagement
+        },
+        PacketCommand.MessageReadReceiptQueryResponse => new(
+            PacketCommand.MessageReadReceiptQueryResponse, CommandDirection.ServerToClient,
+            ConnectionPhase.Authenticated, CommandLane.Inline, -1, 1),
         PacketCommand.MemberJoined => new(
             PacketCommand.MemberJoined, CommandDirection.ServerToClient,
             ConnectionPhase.Authenticated, CommandLane.Inline, -1, 1),
@@ -347,6 +356,12 @@ internal static class CommandCatalog
             ConnectionPhase.Authenticated, CommandLane.OrderedWrite, 4096, 2),
         PacketCommand.AttachmentFinalizeResponse => new(
             PacketCommand.AttachmentFinalizeResponse, CommandDirection.ServerToClient,
+            ConnectionPhase.Authenticated, CommandLane.Inline, -1, 1),
+        PacketCommand.AttachmentDownloadAuthorizeRequest => new(
+            PacketCommand.AttachmentDownloadAuthorizeRequest, CommandDirection.ClientToServer,
+            ConnectionPhase.Authenticated, CommandLane.OrderedWrite, 4096, 2),
+        PacketCommand.AttachmentDownloadAuthorizeResponse => new(
+            PacketCommand.AttachmentDownloadAuthorizeResponse, CommandDirection.ServerToClient,
             ConnectionPhase.Authenticated, CommandLane.Inline, -1, 1),
         PacketCommand.RelationshipCommandRequest => new(
             PacketCommand.RelationshipCommandRequest, CommandDirection.ClientToServer,

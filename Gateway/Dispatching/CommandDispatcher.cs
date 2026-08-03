@@ -104,7 +104,8 @@ internal sealed class CommandDispatcher
         or PacketCommand.RemoveGroupMemberRequest
         or PacketCommand.LeaveGroupRequest
         or PacketCommand.ChangeMemberRoleRequest
-        or PacketCommand.ListGroupMembersRequest =>
+        or PacketCommand.ListGroupMembersRequest
+        or PacketCommand.MessageReadReceiptQueryRequest =>
             InvokeAsync(_groupHandler, frame, context, cancellationToken),
 
         // Typing
@@ -116,8 +117,9 @@ internal sealed class CommandDispatcher
         or PacketCommand.PresenceUnwatch =>
             InvokeAsync(_presenceHandler, frame, context, cancellationToken),
 
-        // Attachments (主线四)
-        PacketCommand.AttachmentFinalizeRequest =>
+        // Attachments (主线四 / P1-3)
+        PacketCommand.AttachmentFinalizeRequest
+        or PacketCommand.AttachmentDownloadAuthorizeRequest =>
             InvokeAsync(_attachmentHandler, frame, context, cancellationToken),
 
         // Relationships (主线四)

@@ -36,18 +36,20 @@ internal sealed class AttachmentLifecycleHandler : IRealtimeEventHandler
         _metrics = metrics;
     }
 
-    public void Handle(RealtimeEvent realtimeEvent)
+    public ValueTask HandleAsync(
+        RealtimeEvent realtimeEvent,
+        CancellationToken ct = default)
     {
         if (_attachmentLifecycleCodec is null)
         {
             _metrics.RealtimeEventHandled(queuedDeliveries: 0);
-            return;
+            return ValueTask.CompletedTask;
         }
 
         if (string.IsNullOrWhiteSpace(realtimeEvent.PayloadJson))
         {
             _rejection.Reject(realtimeEvent, RealtimeRejectReason.MissingPayload);
-            return;
+            return ValueTask.CompletedTask;
         }
 
         RealtimeAttachmentLifecyclePayload? payload;
@@ -60,7 +62,7 @@ internal sealed class AttachmentLifecycleHandler : IRealtimeEventHandler
         catch (JsonException)
         {
             _rejection.Reject(realtimeEvent, RealtimeRejectReason.InvalidJson);
-            return;
+            return ValueTask.CompletedTask;
         }
 
         if (payload is null
@@ -68,7 +70,7 @@ internal sealed class AttachmentLifecycleHandler : IRealtimeEventHandler
             || realtimeEvent.TargetUserId <= 0)
         {
             _rejection.Reject(realtimeEvent, RealtimeRejectReason.InvalidPayload);
-            return;
+            return ValueTask.CompletedTask;
         }
 
         _delivery.Deliver(
@@ -85,5 +87,6 @@ internal sealed class AttachmentLifecycleHandler : IRealtimeEventHandler
                 DownloadToken = payload.DownloadToken
             },
             skipOriginSession: false);
+        return ValueTask.CompletedTask;
     }
 }

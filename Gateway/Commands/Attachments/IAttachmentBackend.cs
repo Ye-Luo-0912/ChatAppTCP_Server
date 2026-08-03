@@ -27,6 +27,17 @@ internal interface IAttachmentBackend
         string? contentHash,
         string? actorSessionId,
         CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// 为附件签发短时有效的签名下载 URL / 令牌。
+    /// </summary>
+    Task<AttachmentDownloadAuthorizeBackendResult> AuthorizeDownloadAsync(
+        string requestId,
+        long actorUserId,
+        string attachmentId,
+        string? conversationId,
+        string? actorSessionId,
+        CancellationToken cancellationToken = default);
 }
 
 /// <summary>
@@ -48,6 +59,32 @@ internal sealed record AttachmentFinalizeBackendResult(
     public static AttachmentFinalizeBackendResult Failed(
         string requestId, string errorCode, string errorMessage) =>
         new(requestId, false, errorCode, errorMessage, null, null);
+}
+
+/// <summary>
+/// 附件下载授权后端结果。
+/// </summary>
+internal sealed record AttachmentDownloadAuthorizeBackendResult(
+    string RequestId,
+    bool Succeeded,
+    string? ErrorCode,
+    string? ErrorMessage,
+    string? AttachmentId,
+    string? DownloadUrl,
+    string? DownloadToken,
+    long? ExpiresAtMs)
+{
+    public static AttachmentDownloadAuthorizeBackendResult Success(
+        string requestId,
+        string attachmentId,
+        string downloadUrl,
+        string? downloadToken,
+        long? expiresAtMs) =>
+        new(requestId, true, null, null, attachmentId, downloadUrl, downloadToken, expiresAtMs);
+
+    public static AttachmentDownloadAuthorizeBackendResult Failed(
+        string requestId, string errorCode, string errorMessage) =>
+        new(requestId, false, errorCode, errorMessage, null, null, null, null);
 }
 
 /// <summary>
@@ -78,6 +115,21 @@ internal sealed class StubAttachmentBackend : IAttachmentBackend
             requestId,
             "attachment_service_unavailable",
             "附件上传确认服务暂未配置。"));
+    }
+
+    public Task<AttachmentDownloadAuthorizeBackendResult> AuthorizeDownloadAsync(
+        string requestId,
+        long actorUserId,
+        string attachmentId,
+        string? conversationId,
+        string? actorSessionId,
+        CancellationToken cancellationToken = default)
+    {
+        _logger.AttachmentBackendUnavailable(requestId, attachmentId, actorUserId);
+        return Task.FromResult(AttachmentDownloadAuthorizeBackendResult.Failed(
+            requestId,
+            "attachment_service_unavailable",
+            "附件下载授权服务暂未配置。"));
     }
 }
 
@@ -130,5 +182,37 @@ internal sealed class RealtimeAttachmentBackend : IAttachmentBackend
             result.ErrorMessage,
             result.AttachmentId,
             result.Status);
+    }
+
+    public async Task<AttachmentDownloadAuthorizeBackendResult> AuthorizeDownloadAsync(
+        string requestId,
+        long actorUserId,
+        string attachmentId,
+        string? conversationId,
+        string? actorSessionId,
+        CancellationToken cancellationToken = default)
+    {
+        var command = new AttachmentDownloadAuthorizeCommand
+        {
+            RequestId = requestId,
+            ActorUserId = actorUserId,
+            AttachmentId = attachmentId,
+            ConversationId = conversationId,
+            ActorSessionId = actorSessionId,
+        };
+
+        var result = await _messageBus
+            .AuthorizeAttachmentDownloadAsync(command, cancellationToken)
+            .ConfigureAwait(false);
+
+        return new AttachmentDownloadAuthorizeBackendResult(
+            result.RequestId,
+            result.Succeeded,
+            result.ErrorCode,
+            result.ErrorMessage,
+            result.AttachmentId,
+            result.DownloadUrl,
+            result.DownloadToken,
+            result.ExpiresAtMs);
     }
 }

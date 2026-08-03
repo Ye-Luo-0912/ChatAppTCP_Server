@@ -19,13 +19,16 @@ internal sealed class RealtimeEventDeliveryHelper
 {
     private readonly UserSessionRegistry _userSessions;
     private readonly GatewayMetrics _metrics;
+    private readonly ConversationAudienceCache? _audienceCache;
 
     public RealtimeEventDeliveryHelper(
         UserSessionRegistry userSessions,
-        GatewayMetrics metrics)
+        GatewayMetrics metrics,
+        ConversationAudienceCache? audienceCache = null)
     {
         _userSessions = userSessions;
         _metrics = metrics;
+        _audienceCache = audienceCache;
     }
 
     /// <summary>
@@ -104,6 +107,88 @@ internal sealed class RealtimeEventDeliveryHelper
         _metrics.RealtimeEventHandled(queued);
         _metrics.RealtimeAggregatedDispatch(
             totalTargets: targetUserIds.Length,
+            queuedRecipients: queued);
+        return queued;
+    }
+
+    /// <summary>
+    /// P1-2：会话级广播 fanout（AudienceKind=Conversation、TargetUserIds=null）。
+    /// 经 <see cref="ConversationAudienceCache"/> 解析会话成员集合，投递到本机会话，
+    /// 并跳过 <see cref="RealtimeEvent.ExcludeUserId"/>（如群 MarkRead 的读者本人）。
+    /// <para>
+    /// 受众解析失败（NATS 超时 / 熔断）时 fail-closed：不投递（返回 0），
+    /// 由事件消费者 NAK 重投，绝不投递给错误的受众集合。
+    /// </para>
+    /// </summary>
+    /// <returns>实际入队接收者数。</returns>
+    public async ValueTask<int> DeliverToConversationAudienceAsync<TUpdate>(
+        RealtimeEvent realtimeEvent,
+        PacketCommand command,
+        IPayloadCodec<TUpdate> codec,
+        TUpdate update,
+        bool skipOriginSession,
+        CancellationToken ct)
+    {
+        if (_audienceCache is null
+            || string.IsNullOrWhiteSpace(realtimeEvent.ConversationId))
+        {
+            _metrics.RealtimeEventHandled(queuedDeliveries: 0);
+            return 0;
+        }
+
+        long[] memberUserIds;
+        try
+        {
+            memberUserIds = await _audienceCache
+                .GetOrResolveAsync(
+                    realtimeEvent.ConversationId,
+                    realtimeEvent.AudienceVersion,
+                    ct)
+                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception)
+        {
+            // fail-closed：解析失败不投递，交由消费者 NAK 重投。
+            _metrics.RealtimeEventHandled(queuedDeliveries: 0);
+            return 0;
+        }
+
+        if (memberUserIds.Length == 0)
+        {
+            _metrics.RealtimeEventHandled(queuedDeliveries: 0);
+            return 0;
+        }
+
+        using var frame = OutboundFrameFactory.Create(command, codec, update);
+        var queued = 0;
+        var exclude = realtimeEvent.ExcludeUserId;
+        foreach (var userId in memberUserIds)
+        {
+            if (exclude.HasValue && userId == exclude.Value)
+                continue;
+
+            var userTargets = _userSessions.GetSnapshot(userId);
+            for (var i = 0; i < userTargets.Length; i++)
+            {
+                var target = userTargets[i];
+                if (skipOriginSession && ShouldSkipOrigin(target, realtimeEvent))
+                    continue;
+
+                if (ShouldSkipByProtocolVersion(target, realtimeEvent))
+                    continue;
+
+                if (target.TryQueue(frame))
+                    queued++;
+            }
+        }
+
+        _metrics.RealtimeEventHandled(queued);
+        _metrics.RealtimeAggregatedDispatch(
+            totalTargets: memberUserIds.Length,
             queuedRecipients: queued);
         return queued;
     }

@@ -12,8 +12,8 @@
   StackExchange.Redis 等依赖仍存在 trim/AOT 警告，未重新启用。
 - **JSON 序列化**：协议/存储 JSON 全部走源生成 `GatewayJsonSerializerContext`，
   不使用反射 `JsonSerializerOptions`，为未来重新启用 AOT 保留可能。
-- **构建/测试**：`dotnet build` 0 警告 0 错误；`dotnet test` **440/440** 通过
-  （`tests/ChatApp.TcpGateway.Tests`）；RealtimeServices **259/259** 通过
+- 构建/测试：`dotnet build` 0 警告 0 错误；`dotnet test` **447/447** 通过
+  （`tests/ChatApp.TcpGateway.Tests`）；RealtimeServices **278/278** 通过
   （`ChatApp.Realtime.Tests`）。
 
 ## 架构边界

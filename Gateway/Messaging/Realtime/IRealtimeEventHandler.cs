@@ -9,5 +9,5 @@ namespace ChatApp.TcpGateway.Gateway.Messaging.Realtime;
 internal interface IRealtimeEventHandler
 {
     /// <summary>处理单个事件。实现不得抛出异常；校验失败应走 Reject 路径并返回。</summary>
-    void Handle(RealtimeEvent realtimeEvent);
+    ValueTask HandleAsync(RealtimeEvent realtimeEvent, CancellationToken ct = default);
 }

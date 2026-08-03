@@ -35,17 +35,20 @@ internal sealed class ReactionEventHandler : IRealtimeEventHandler
         _rejection = rejection;
     }
 
-    public void Handle(RealtimeEvent realtimeEvent)
+    public ValueTask HandleAsync(
+        RealtimeEvent realtimeEvent,
+        CancellationToken ct = default)
     {
         switch (realtimeEvent.Type)
         {
             case RealtimeEventType.ReactionAdded:
                 HandleReactionAdded(realtimeEvent);
-                return;
+                break;
             case RealtimeEventType.ReactionRemoved:
                 HandleReactionRemoved(realtimeEvent);
-                return;
+                break;
         }
+        return ValueTask.CompletedTask;
     }
 
     private void HandleReactionAdded(RealtimeEvent realtimeEvent)

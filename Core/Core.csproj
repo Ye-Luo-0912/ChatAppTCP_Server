@@ -5,10 +5,11 @@
   </PropertyGroup>
   <ItemGroup>
     <!--
+      P1-1：Realtime 契约层改为版本化 NuGet 包 ChatApp.Realtime.Contracts（本地 feed packages/）。
       Realtime.Abstractions 是 BCL-only 共享契约层（无任何外部依赖），
       Core 引用它是为了共享 PushPlatform / PushTokenLimits 等跨仓库契约类型。
-      这不违反 "Core: BCL only" 约束——Realtime.Abstractions 本身不依赖 Logging/Redis/Hosting 等。
+      这不违反 "Core: BCL only" 约束——该契约包本身不依赖 Logging/Redis/Hosting 等。
     -->
-    <ProjectReference Include="..\..\ChatApp.RealtimeServices\ChatApp.Realtime.Abstractions\ChatApp.Realtime.Abstractions.csproj" />
+    <PackageReference Include="ChatApp.Realtime.Contracts" />
   </ItemGroup>
 </Project>

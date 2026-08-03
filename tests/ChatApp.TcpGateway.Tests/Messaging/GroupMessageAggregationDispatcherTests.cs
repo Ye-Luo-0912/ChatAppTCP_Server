@@ -1,4 +1,4 @@
-﻿using System.Diagnostics.Metrics;
+using System.Diagnostics.Metrics;
 using System.Net.Sockets;
 using ChatApp.Realtime.Abstractions.Events;
 using ChatApp.TcpGateway.Core.Messaging;
@@ -43,10 +43,10 @@ public sealed class GroupMessageAggregationDispatcherTests
         using var enqueueCounter = new OutboundEnqueueCounter();
         var baseline = enqueueCounter.PositiveEnqueues;
 
-        dispatcher.Dispatch(BuildAggregatedGroupEvent(
+        await dispatcher.DispatchAsync(BuildAggregatedGroupEvent(
             senderUserId: 7,
             senderSessionId: "sender-session",
-            targetUserIds: [7, 42, 43]));
+            targetUserIds: [7, 42, 43]), TestContext.Current.CancellationToken);
 
         // 三个目标中，senderSession 会被 SessionId 跳过；recipient1 + recipient2 各入队一帧。
         var enqueued = enqueueCounter.PositiveEnqueues - baseline;
@@ -73,10 +73,11 @@ public sealed class GroupMessageAggregationDispatcherTests
         using var enqueueCounter = new OutboundEnqueueCounter();
         var baseline = enqueueCounter.PositiveEnqueues;
 
-        dispatcher.Dispatch(BuildAggregatedGroupEvent(
+        await dispatcher.DispatchAsync(BuildAggregatedGroupEvent(
             senderUserId: 7,
             senderSessionId: "origin-session",
-            targetUserIds: [7]));
+            targetUserIds: [7]),
+            TestContext.Current.CancellationToken);
 
         // origin session 应被跳过；同用户的另一设备会话应收到一帧（多设备回声）。
         var enqueued = enqueueCounter.PositiveEnqueues - baseline;
@@ -100,10 +101,11 @@ public sealed class GroupMessageAggregationDispatcherTests
         using var enqueueCounter = new OutboundEnqueueCounter();
         var baseline = enqueueCounter.PositiveEnqueues;
 
-        dispatcher.Dispatch(BuildAggregatedGroupEvent(
+        await dispatcher.DispatchAsync(BuildAggregatedGroupEvent(
             senderUserId: 7,
             senderSessionId: "sender-session",
-            targetUserIds: [7, 99, 100]));
+            targetUserIds: [7, 99, 100]),
+            TestContext.Current.CancellationToken);
 
         Assert.Equal(baseline, enqueueCounter.PositiveEnqueues);
     }
@@ -123,10 +125,11 @@ public sealed class GroupMessageAggregationDispatcherTests
         var baseline = enqueueCounter.PositiveEnqueues;
 
         // TargetUserIds 为空：走单目标路径，按 TargetUserId=42 投递。
-        dispatcher.Dispatch(BuildSingleTargetGroupEvent(
+        await dispatcher.DispatchAsync(BuildSingleTargetGroupEvent(
             senderUserId: 7,
             senderSessionId: "sender-session",
-            targetUserId: 42));
+            targetUserId: 42),
+            TestContext.Current.CancellationToken);
 
         var enqueued = enqueueCounter.PositiveEnqueues - baseline;
         Assert.True(
@@ -156,10 +159,10 @@ public sealed class GroupMessageAggregationDispatcherTests
         var baselineLocal = aggregatedCounter.LocalRecipientsSum;
         var baselineTargets = aggregatedCounter.TotalTargetsSum;
 
-        dispatcher.Dispatch(BuildAggregatedGroupEvent(
+        await dispatcher.DispatchAsync(BuildAggregatedGroupEvent(
             senderUserId: 7,
             senderSessionId: "sender-session",
-            targetUserIds: [7, 42, 43]));
+            targetUserIds: [7, 42, 43]), TestContext.Current.CancellationToken);
 
         // 计数器应增加 1；local_recipients_sum 应增加 >=2（recipient1 + recipient2）；
         // total_targets_sum 应增加 3（TargetUserIds 长度）。

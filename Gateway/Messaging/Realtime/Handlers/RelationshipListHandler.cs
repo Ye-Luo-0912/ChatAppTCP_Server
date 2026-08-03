@@ -57,18 +57,20 @@ internal sealed class RelationshipListHandler : IRealtimeEventHandler
             ?? new NullTypingAuthorizationInvalidator();
     }
 
-    public void Handle(RealtimeEvent realtimeEvent)
+    public ValueTask HandleAsync(
+        RealtimeEvent realtimeEvent,
+        CancellationToken ct = default)
     {
         if (_relationshipListCodec is null)
         {
             _metrics.RealtimeEventHandled(queuedDeliveries: 0);
-            return;
+            return ValueTask.CompletedTask;
         }
 
         if (string.IsNullOrWhiteSpace(realtimeEvent.PayloadJson))
         {
             _rejection.Reject(realtimeEvent, RealtimeRejectReason.MissingPayload);
-            return;
+            return ValueTask.CompletedTask;
         }
 
         RealtimeDomainNotificationPayload? payload;
@@ -81,7 +83,7 @@ internal sealed class RelationshipListHandler : IRealtimeEventHandler
         catch (JsonException)
         {
             _rejection.Reject(realtimeEvent, RealtimeRejectReason.InvalidJson);
-            return;
+            return ValueTask.CompletedTask;
         }
 
         if (payload is null
@@ -90,7 +92,7 @@ internal sealed class RelationshipListHandler : IRealtimeEventHandler
             || realtimeEvent.TargetUserId <= 0)
         {
             _rejection.Reject(realtimeEvent, RealtimeRejectReason.InvalidPayload);
-            return;
+            return ValueTask.CompletedTask;
         }
 
         // 主动失效 Typing/Presence 授权缓存。
@@ -136,6 +138,7 @@ internal sealed class RelationshipListHandler : IRealtimeEventHandler
                 OccurredAtMs = realtimeEvent.OccurredAtMs
             },
             skipOriginSession: false);
+        return ValueTask.CompletedTask;
     }
 
     /// <summary>

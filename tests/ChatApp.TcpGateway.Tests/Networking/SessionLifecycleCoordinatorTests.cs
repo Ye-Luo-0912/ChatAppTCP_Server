@@ -914,10 +914,21 @@ public sealed class SessionLifecycleCoordinatorTests
             Task.FromResult(GroupConversationResult.Failed(
                 command.RequestId, "not_used", "not used"));
 
+        public Task<GroupConversationResult> QueryReadReceiptsAsync(
+            GroupConversationCommand command,
+            CancellationToken ct = default) =>
+            Task.FromResult(GroupConversationResult.Failed(
+                command.RequestId, "not_used", "not used"));
+
         public Task<AttachmentFinalizeResult> FinalizeAttachmentUploadAsync(
             AttachmentFinalizeCommand command,
             CancellationToken ct = default) =>
             Task.FromResult(AttachmentFinalizeResult.Failed(command.RequestId, "not_used", "not used"));
+
+        public Task<AttachmentDownloadAuthorizeResult> AuthorizeAttachmentDownloadAsync(
+            AttachmentDownloadAuthorizeCommand command,
+            CancellationToken ct = default) =>
+            Task.FromResult(AttachmentDownloadAuthorizeResult.Failed(command.RequestId, "not_used", "not used"));
 
         public Task<RelationshipCommandResult> MutateRelationshipAsync(
             RelationshipCommand command,

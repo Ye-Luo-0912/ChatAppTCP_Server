@@ -2,7 +2,6 @@ using System.Buffers;
 using System.Buffers.Binary;
 using System.Net;
 using System.Net.Sockets;
-using System.Runtime.CompilerServices;
 using ChatApp.Realtime.Abstractions.Attachments;
 using ChatApp.Realtime.Abstractions.Conversations;
 using ChatApp.Realtime.Abstractions.Events;
@@ -11,7 +10,6 @@ using ChatApp.Realtime.Abstractions.Messaging.History;
 using ChatApp.Realtime.Abstractions.Push;
 using ChatApp.Realtime.Abstractions.Relationships;
 using ChatApp.Realtime.Abstractions.Routing;
-using ChatApp.Realtime.Abstractions.Stores;
 using ChatApp.Realtime.Abstractions.Sync;
 using ChatApp.Realtime.Integration;
 using ChatApp.Realtime.Integration.Push;
@@ -49,13 +47,14 @@ using TcpGatewayService = ChatApp.TcpGateway.Gateway.Networking.TcpGatewayServic
 namespace ChatApp.TcpGateway.Tests.Networking;
 
 /// <summary>
-/// 验证 CommandDispatcher 路径：Push / Reaction 命令通过 handler 处理，
-/// 而非 TcpGatewayService 内联 switch。通过 TCP 端到端验证响应正确。
+/// P1-3：附件下载授权命令端到端验证。客户端发送 AttachmentDownloadAuthorizeRequest，
+/// 经 CommandDispatcher → AttachmentCommandHandler → 后端（成功桩）签发下载 URL，
+/// 返回 AttachmentDownloadAuthorizeResponse 验证序列化 + handler + backend 全链路。
 /// </summary>
-public sealed class CommandDispatcherIntegrationTests
+public sealed class AttachmentDownloadAuthorizeTests
 {
     [Fact(Timeout = 15_000)]
-    public async Task PushTokenAndReactionCommandsAreHandledByDispatcher()
+    public async Task DownloadAuthorizeCommand_RoundTrips()
     {
         var port = ReserveLoopbackPort();
         var options = new TcpGatewayOptions
@@ -81,8 +80,7 @@ public sealed class CommandDispatcherIntegrationTests
 
         var metrics = new GatewayMetrics();
         var userSessions = new UserSessionRegistry();
-        var messageBus = new ReactionCapturingMessageBus();
-        var pushStore = new InMemoryPushTokenStore();
+        var messageBus = new NoopRealtimeMessageBus();
 
         var authenticationRequestCodec = new JsonPayloadCodec<AuthenticationRequest>(
             GatewayJsonSerializerContext.Default.AuthenticationRequest);
@@ -129,7 +127,12 @@ public sealed class CommandDispatcherIntegrationTests
         var syncBootstrapResponseCodec = new JsonPayloadCodec<SyncBootstrapResponse>(
             GatewayJsonSerializerContext.Default.SyncBootstrapResponse);
 
-        // Handler 专用 codec（与 service 内联 codec 分开，证明 handler 自带 codec 不依赖 service 字段）
+        var integrationOptions = new RealtimeIntegrationOptions { InstanceId = "download-authorize-test" };
+        var globalPresence = new NoopGlobalPresenceStore();
+        var presenceWatchers = new PresenceWatcherRegistry();
+        var typingFanout = new TypingFanoutCoordinator(TimeProvider.System);
+        var pushStore = new InMemoryPushTokenStore();
+
         var registerPushRequestCodec = new JsonPayloadCodec<RegisterPushTokenRequest>(
             GatewayJsonSerializerContext.Default.RegisterPushTokenRequest);
         var registerPushResponseCodec = new JsonPayloadCodec<RegisterPushTokenResponse>(
@@ -164,9 +167,6 @@ public sealed class CommandDispatcherIntegrationTests
             metrics,
             TimeProvider.System,
             NullLogger<ReactionCommandHandler>.Instance);
-
-        // 其余 6 个 handler：复用已有 codec 与依赖。本测试只断言 Push/Reaction 路径，
-        // 但 CommandDispatcher 构造函数要求全部 8 个 handler 实例。
         var messagingHandler = new MessagingCommandHandler(
             messageBus,
             chatMessageCodec,
@@ -251,7 +251,6 @@ public sealed class CommandDispatcherIntegrationTests
 
         var typingNotifyCodec = new JsonPayloadCodec<TypingNotify>(
             GatewayJsonSerializerContext.Default.TypingNotify);
-        var typingFanout = new TypingFanoutCoordinator(TimeProvider.System);
         var typingHandler = new TypingCommandHandler(
             typingNotifyCodec,
             typingFanout,
@@ -265,16 +264,10 @@ public sealed class CommandDispatcherIntegrationTests
             GatewayJsonSerializerContext.Default.PresenceUnwatchRequest);
         var presenceSnapshotResponseCodec = new JsonPayloadCodec<PresenceSnapshotResponse>(
             GatewayJsonSerializerContext.Default.PresenceSnapshotResponse);
-
-        // TcpGatewayService 直接消费的 codec（DI 注入路径在此测试中以手工构造替代）
         var typingUpdateCodec = new JsonPayloadCodec<TypingUpdate>(
             GatewayJsonSerializerContext.Default.TypingUpdate);
         var presenceChangedCodec = new JsonPayloadCodec<PresenceChanged>(
             GatewayJsonSerializerContext.Default.PresenceChanged);
-
-        var integrationOptions = new RealtimeIntegrationOptions { InstanceId = "dispatcher-test" };
-        var globalPresence = new NoopGlobalPresenceStore();
-        var presenceWatchers = new PresenceWatcherRegistry();
         var presenceHandler = new PresenceCommandHandler(
             Options.Create(options),
             messageBus,
@@ -289,16 +282,18 @@ public sealed class CommandDispatcherIntegrationTests
             metrics,
             NullLogger<PresenceCommandHandler>.Instance);
 
+        var downloadAuthorizeRequestCodec = new JsonPayloadCodec<AttachmentDownloadAuthorizeRequest>(
+            GatewayJsonSerializerContext.Default.AttachmentDownloadAuthorizeRequest);
+        var downloadAuthorizeResponseCodec = new JsonPayloadCodec<AttachmentDownloadAuthorizeResponse>(
+            GatewayJsonSerializerContext.Default.AttachmentDownloadAuthorizeResponse);
         var attachmentHandler = new AttachmentCommandHandler(
-            new StubAttachmentBackend(NullLogger<StubAttachmentBackend>.Instance),
+            new SuccessAttachmentBackend(),
             new JsonPayloadCodec<AttachmentFinalizeRequest>(
                 GatewayJsonSerializerContext.Default.AttachmentFinalizeRequest),
             new JsonPayloadCodec<AttachmentFinalizeResponse>(
                 GatewayJsonSerializerContext.Default.AttachmentFinalizeResponse),
-            new JsonPayloadCodec<AttachmentDownloadAuthorizeRequest>(
-                GatewayJsonSerializerContext.Default.AttachmentDownloadAuthorizeRequest),
-            new JsonPayloadCodec<AttachmentDownloadAuthorizeResponse>(
-                GatewayJsonSerializerContext.Default.AttachmentDownloadAuthorizeResponse),
+            downloadAuthorizeRequestCodec,
+            downloadAuthorizeResponseCodec,
             metrics,
             NullLogger<AttachmentCommandHandler>.Instance);
         var relationshipHandler = new RelationshipCommandHandler(
@@ -357,98 +352,31 @@ public sealed class CommandDispatcherIntegrationTests
 
             await AuthenticateAsync(stream, authenticationRequestCodec, authenticationResponseCodec, timeout.Token);
 
-            // Push: 注册推送令牌。认证会话 DeviceIdHash=7，应成功。
-            var registerRequestId = Guid.CreateVersion7().ToString("N");
+            var requestId = Guid.CreateVersion7().ToString("N");
             await WriteFrameAsync(
                 stream,
-                PacketCommand.RegisterPushTokenRequest,
-                registerPushRequestCodec,
-                new RegisterPushTokenRequest
+                PacketCommand.AttachmentDownloadAuthorizeRequest,
+                downloadAuthorizeRequestCodec,
+                new AttachmentDownloadAuthorizeRequest
                 {
-                    RequestId = registerRequestId,
-                    Platform = PushPlatform.Fcm,
-                    Token = "fcm-dispatcher-test-token"
+                    RequestId = requestId,
+                    AttachmentId = "attach-download-1",
+                    ConversationId = "conv-1"
                 },
                 timeout.Token);
 
-            var registerFrame = await ReadFrameAsync(stream, timeout.Token);
-            Assert.Equal(PacketCommand.RegisterPushTokenResponse, registerFrame.Command);
-            var registerResponse = registerPushResponseCodec.Deserialize(
-                new ReadOnlySequence<byte>(registerFrame.Payload));
-            Assert.NotNull(registerResponse);
-            Assert.True(registerResponse.Succeeded);
-            Assert.Equal(registerRequestId, registerResponse.RequestId);
-            Assert.Equal(1, registerResponse.ActiveTokenCount);
-
-            // 验证 store 状态确实被 handler 写入
-            var tokens = await pushStore.ListAsync(42, timeout.Token);
-            var token = Assert.Single(tokens);
-            Assert.Equal("fcm-dispatcher-test-token", token.Token);
-
-            // Reaction: 添加反应。fake bus 返回 Failed，验证 handler 仍正常返回 ack。
-            var reactionRequestId = Guid.CreateVersion7().ToString("N");
-            await WriteFrameAsync(
-                stream,
-                PacketCommand.AddReactionRequest,
-                addReactionRequestCodec,
-                new AddReactionRequest
-                {
-                    RequestId = reactionRequestId,
-                    MessageId = "msg-dispatcher-test",
-                    Emoji = "👍"
-                },
-                timeout.Token);
-
-            var reactionFrame = await ReadFrameAsync(stream, timeout.Token);
-            Assert.Equal(PacketCommand.AddReactionAck, reactionFrame.Command);
-            var reactionAck = addReactionAckCodec.Deserialize(
-                new ReadOnlySequence<byte>(reactionFrame.Payload));
-            Assert.NotNull(reactionAck);
-            Assert.Equal(reactionRequestId, reactionAck.RequestId);
-            // CapturingMessageBus 返回 Failed，handler 应原样透传
-            Assert.False(reactionAck.Succeeded);
-            Assert.NotNull(messageBus.LastReactionCommand);
-            Assert.Equal("msg-dispatcher-test", messageBus.LastReactionCommand!.MessageId);
-            Assert.Equal("👍", messageBus.LastReactionCommand.Emoji);
-
-            // 群已读回执：查询已读回执。fake bus 返回成功（小群 + 2 位 reader），验证 handler 映射。
-            var receiptRequestId = Guid.CreateVersion7().ToString("N");
-            await WriteFrameAsync(
-                stream,
-                PacketCommand.MessageReadReceiptQueryRequest,
-                messageReadReceiptQueryRequestCodec,
-                new MessageReadReceiptQueryRequest
-                {
-                    RequestId = receiptRequestId,
-                    ConversationId = "grp-dispatcher-test",
-                    MessageId = "msg-read-receipt-1",
-                    PageSize = 20
-                },
-                timeout.Token);
-
-            var receiptFrame = await ReadFrameAsync(stream, timeout.Token);
-            Assert.Equal(PacketCommand.MessageReadReceiptQueryResponse, receiptFrame.Command);
-            var receiptResponse = messageReadReceiptQueryResponseCodec.Deserialize(
-                new ReadOnlySequence<byte>(receiptFrame.Payload));
-            Assert.NotNull(receiptResponse);
-            Assert.True(receiptResponse.Succeeded);
-            Assert.Equal(receiptRequestId, receiptResponse.RequestId);
-            Assert.Equal("grp-dispatcher-test", receiptResponse.ConversationId);
-            Assert.True(receiptResponse.IsSmallGroup);
-            Assert.Equal(2, receiptResponse.ReadCount);
-            Assert.Equal(10, receiptResponse.TotalMemberCount);
-            Assert.NotNull(receiptResponse.Readers);
-            Assert.Equal(2, receiptResponse.Readers!.Count);
-            Assert.Equal(100, receiptResponse.Readers[0].UserId);
-            Assert.Equal(200, receiptResponse.Readers[1].UserId);
-            Assert.Equal(200L, receiptResponse.NextCursor);
-            Assert.False(receiptResponse.HasMore);
-            // 验证 handler 正确透传请求参数到 Realtime bus
-            Assert.NotNull(messageBus.LastReadReceiptCommand);
-            Assert.Equal("grp-dispatcher-test", messageBus.LastReadReceiptCommand!.ConversationId);
-            Assert.Equal("msg-read-receipt-1", messageBus.LastReadReceiptCommand!.MessageId);
-            Assert.Equal(42, messageBus.LastReadReceiptCommand!.ActorUserId);
-            Assert.Equal(20, messageBus.LastReadReceiptCommand!.PageSize);
+            var frame = await ReadFrameAsync(stream, timeout.Token);
+            Assert.Equal(PacketCommand.AttachmentDownloadAuthorizeResponse, frame.Command);
+            var response = downloadAuthorizeResponseCodec.Deserialize(
+                new ReadOnlySequence<byte>(frame.Payload));
+            Assert.NotNull(response);
+            Assert.True(response.Succeeded);
+            Assert.Equal(requestId, response.RequestId);
+            Assert.Equal("attach-download-1", response.AttachmentId);
+            Assert.Equal("https://cdn.example.com/attachments/attach-download-1?signature=abc", response.DownloadUrl);
+            Assert.Equal("token-abc", response.DownloadToken);
+            Assert.NotNull(response.ExpiresAtMs);
+            Assert.Null(response.ErrorCode);
         }
         finally
         {
@@ -537,6 +465,34 @@ public sealed class CommandDispatcherIntegrationTests
 
     private sealed record ReceivedFrame(PacketCommand Command, byte[] Payload);
 
+    /// <summary>成功签发下载 URL 的附件后端桩。</summary>
+    private sealed class SuccessAttachmentBackend : IAttachmentBackend
+    {
+        public Task<AttachmentFinalizeBackendResult> FinalizeUploadAsync(
+            string requestId,
+            long actorUserId,
+            string attachmentId,
+            long sizeBytes,
+            string? contentHash,
+            string? actorSessionId,
+            CancellationToken cancellationToken = default) =>
+            Task.FromResult(AttachmentFinalizeBackendResult.Success(requestId, attachmentId, 4));
+
+        public Task<AttachmentDownloadAuthorizeBackendResult> AuthorizeDownloadAsync(
+            string requestId,
+            long actorUserId,
+            string attachmentId,
+            string? conversationId,
+            string? actorSessionId,
+            CancellationToken cancellationToken = default) =>
+            Task.FromResult(AttachmentDownloadAuthorizeBackendResult.Success(
+                requestId,
+                attachmentId,
+                "https://cdn.example.com/attachments/" + attachmentId + "?signature=abc",
+                "token-abc",
+                expiresAtMs: 1_800_000_000_000L));
+    }
+
     private sealed class FakeAuthenticator : IRealtimeAuthenticator
     {
         public ValueTask<RealtimeAuthenticationResult> AuthenticateAsync(
@@ -546,7 +502,7 @@ public sealed class CommandDispatcherIntegrationTests
             ValueTask.FromResult(
                 RealtimeAuthenticationResult.Success(
                     userId: 42,
-                    sessionId: "dispatcher-test",
+                    sessionId: "download-authorize-test",
                     userName: "test-user",
                     deviceIdHash,
                     roles: []));
@@ -586,10 +542,8 @@ public sealed class CommandDispatcherIntegrationTests
             ValueTask.FromResult<string?>(null);
     }
 
-    private sealed class ReactionCapturingMessageBus : IRealtimeMessageBus
+    private sealed class NoopRealtimeMessageBus : IRealtimeMessageBus
     {
-        public MessageReactionCommand? LastReactionCommand { get; private set; }
-
         public Task PublishIncomingMessageAsync(
             IncomingMessageCommand command, CancellationToken ct = default) =>
             Task.CompletedTask;
@@ -618,26 +572,9 @@ public sealed class CommandDispatcherIntegrationTests
             GroupConversationCommand command, CancellationToken ct = default) =>
             Task.FromResult(GroupConversationResult.Failed(command.RequestId, "x", "x"));
 
-        public GroupConversationCommand? LastReadReceiptCommand { get; private set; }
-
         public Task<GroupConversationResult> QueryReadReceiptsAsync(
-            GroupConversationCommand command, CancellationToken ct = default)
-        {
-            LastReadReceiptCommand = command;
-            return Task.FromResult(GroupConversationResult.SuccessReadReceipt(
-                command.RequestId,
-                command.ConversationId!,
-                readCount: 2,
-                totalMemberCount: 10,
-                isSmallGroup: true,
-                readers: new[]
-                {
-                    new MessageReader { UserId = 100, ReadAtMs = 1700000000000L },
-                    new MessageReader { UserId = 200, ReadAtMs = 1700000000001L }
-                },
-                nextCursor: 200,
-                hasMore: false));
-        }
+            GroupConversationCommand command, CancellationToken ct = default) =>
+            Task.FromResult(GroupConversationResult.Failed(command.RequestId, "x", "x"));
 
         public Task<AttachmentFinalizeResult> FinalizeAttachmentUploadAsync(
             AttachmentFinalizeCommand command, CancellationToken ct = default) =>
@@ -664,11 +601,8 @@ public sealed class CommandDispatcherIntegrationTests
             Task.FromResult(MessageEditResult.Failed(command.RequestId, "x", "x"));
 
         public Task<MessageReactionResult> ReactToMessageAsync(
-            MessageReactionCommand command, CancellationToken ct = default)
-        {
-            LastReactionCommand = command;
-            return Task.FromResult(MessageReactionResult.Failed(command.RequestId, "not_used", "not used"));
-        }
+            MessageReactionCommand command, CancellationToken ct = default) =>
+            Task.FromResult(MessageReactionResult.Failed(command.RequestId, "x", "x"));
 
         public Task<SyncBootstrapPage> QuerySyncBootstrapAsync(
             SyncBootstrapQuery query, CancellationToken ct = default) =>
@@ -682,7 +616,7 @@ public sealed class CommandDispatcherIntegrationTests
             Task.CompletedTask;
 
         public async IAsyncEnumerable<RealtimeEventDelivery> ConsumeEventsAsync(
-            [EnumeratorCancellation] CancellationToken ct = default)
+            [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
         {
             ct.ThrowIfCancellationRequested();
             await Task.CompletedTask;
@@ -690,7 +624,7 @@ public sealed class CommandDispatcherIntegrationTests
         }
 
         public async IAsyncEnumerable<RealtimeEventDelivery> ConsumeAccountCleanupEventsAsync(
-            [EnumeratorCancellation] CancellationToken ct = default)
+            [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
         {
             ct.ThrowIfCancellationRequested();
             await Task.CompletedTask;
@@ -704,7 +638,7 @@ public sealed class CommandDispatcherIntegrationTests
             Task.CompletedTask;
 
         public async IAsyncEnumerable<EphemeralTypingEvent> ConsumeEphemeralTypingAsync(
-            [EnumeratorCancellation] CancellationToken ct = default)
+            [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
         {
             ct.ThrowIfCancellationRequested();
             await Task.CompletedTask;
@@ -712,7 +646,7 @@ public sealed class CommandDispatcherIntegrationTests
         }
 
         public async IAsyncEnumerable<EphemeralPresenceEvent> ConsumeEphemeralPresenceAsync(
-            [EnumeratorCancellation] CancellationToken ct = default)
+            [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
         {
             ct.ThrowIfCancellationRequested();
             await Task.CompletedTask;
@@ -732,7 +666,7 @@ public sealed class CommandDispatcherIntegrationTests
             Task.CompletedTask;
 
         public async IAsyncEnumerable<PushDelivery> ConsumePushDeliveriesAsync(
-            [EnumeratorCancellation] CancellationToken ct = default)
+            [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
         {
             ct.ThrowIfCancellationRequested();
             await Task.CompletedTask;

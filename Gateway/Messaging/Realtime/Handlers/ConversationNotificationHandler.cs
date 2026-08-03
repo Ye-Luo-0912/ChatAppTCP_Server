@@ -1,6 +1,7 @@
 using System.Text.Json;
 using ChatApp.Realtime.Abstractions.Conversations;
 using ChatApp.Realtime.Abstractions.Events;
+using ChatApp.Realtime.Abstractions.Routing;
 using ChatApp.Realtime.Integration.Serialization;
 using ChatApp.TcpGateway.Core.Messaging.Conversations;
 using ChatApp.TcpGateway.Core.Protocol;
@@ -39,7 +40,9 @@ internal sealed class ConversationNotificationHandler : IRealtimeEventHandler
         _rejection = rejection;
     }
 
-    public void Handle(RealtimeEvent realtimeEvent)
+    public async ValueTask HandleAsync(
+        RealtimeEvent realtimeEvent,
+        CancellationToken ct = default)
     {
         switch (realtimeEvent.Type)
         {
@@ -50,7 +53,7 @@ internal sealed class ConversationNotificationHandler : IRealtimeEventHandler
                 HandleUnreadCountChanged(realtimeEvent);
                 return;
             case RealtimeEventType.ConversationRead:
-                HandleConversationRead(realtimeEvent);
+                await HandleConversationReadAsync(realtimeEvent, ct).ConfigureAwait(false);
                 return;
         }
     }
@@ -144,7 +147,9 @@ internal sealed class ConversationNotificationHandler : IRealtimeEventHandler
             skipOriginSession: false);
     }
 
-    private void HandleConversationRead(RealtimeEvent realtimeEvent)
+    private async ValueTask HandleConversationReadAsync(
+        RealtimeEvent realtimeEvent,
+        CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(realtimeEvent.PayloadJson))
         {
@@ -167,8 +172,36 @@ internal sealed class ConversationNotificationHandler : IRealtimeEventHandler
             || string.IsNullOrWhiteSpace(payload.ConversationId)
             || string.IsNullOrWhiteSpace(payload.LastReadMessageId)
             || payload.ReaderUserId <= 0
-            || payload.LastReadAtMs <= 0
-            || realtimeEvent.TargetUserId <= 0)
+            || payload.LastReadAtMs <= 0)
+        {
+            _rejection.Reject(realtimeEvent, RealtimeRejectReason.InvalidPayload);
+            return;
+        }
+
+        var conversationRead = new ConversationReadUpdate
+        {
+            ConversationId = payload.ConversationId,
+            ReaderUserId = payload.ReaderUserId,
+            LastReadMessageId = payload.LastReadMessageId,
+            LastReadAtMs = payload.LastReadAtMs
+        };
+
+        // P1-2：群已读回执走会话级广播（AudienceKind=Conversation），成员集合由
+        // ConversationAudienceCache 解析，并跳过 ExcludeUserId（读者本人）。
+        if (realtimeEvent.AudienceKind == AudienceKind.Conversation)
+        {
+            await _delivery.DeliverToConversationAudienceAsync(
+                realtimeEvent,
+                PacketCommand.ConversationRead,
+                _conversationReadCodec,
+                conversationRead,
+                skipOriginSession: false,
+                ct)
+                .ConfigureAwait(false);
+            return;
+        }
+
+        if (realtimeEvent.TargetUserId <= 0)
         {
             _rejection.Reject(realtimeEvent, RealtimeRejectReason.InvalidPayload);
             return;
@@ -178,13 +211,7 @@ internal sealed class ConversationNotificationHandler : IRealtimeEventHandler
             realtimeEvent,
             PacketCommand.ConversationRead,
             _conversationReadCodec,
-            new ConversationReadUpdate
-            {
-                ConversationId = payload.ConversationId,
-                ReaderUserId = payload.ReaderUserId,
-                LastReadMessageId = payload.LastReadMessageId,
-                LastReadAtMs = payload.LastReadAtMs
-            },
+            conversationRead,
             skipOriginSession: false);
     }
 }

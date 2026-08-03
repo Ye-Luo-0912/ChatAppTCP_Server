@@ -41,12 +41,14 @@ internal sealed class SessionRevocationHandler : IRealtimeEventHandler
         _resumeTokenStore = resumeTokenStore;
     }
 
-    public void Handle(RealtimeEvent realtimeEvent)
+    public ValueTask HandleAsync(
+        RealtimeEvent realtimeEvent,
+        CancellationToken ct = default)
     {
         if (string.IsNullOrWhiteSpace(realtimeEvent.SessionId))
         {
             _rejection.Reject(realtimeEvent, RealtimeRejectReason.MissingSessionId);
-            return;
+            return ValueTask.CompletedTask;
         }
 
         // P0-7：优先按 ConnectionLeaseId 精确匹配（PayloadJson 携带旧连接的 lease id），
@@ -102,6 +104,7 @@ internal sealed class SessionRevocationHandler : IRealtimeEventHandler
         }
 
         _metrics.RealtimeEventHandled(closedSessions);
+        return ValueTask.CompletedTask;
     }
 
     private static string? TryParseTransportId(string json)

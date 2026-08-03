@@ -43,18 +43,20 @@ internal sealed partial class UserLifecycleChangedHandler : IRealtimeEventHandle
         _logger = logger;
     }
 
-    public void Handle(RealtimeEvent realtimeEvent)
+    public ValueTask HandleAsync(
+        RealtimeEvent realtimeEvent,
+        CancellationToken ct = default)
     {
         if (realtimeEvent.TargetUserId <= 0)
         {
             _rejection.Reject(realtimeEvent, RealtimeRejectReason.InvalidPayload);
-            return;
+            return ValueTask.CompletedTask;
         }
 
         if (string.IsNullOrWhiteSpace(realtimeEvent.PayloadJson))
         {
             _rejection.Reject(realtimeEvent, RealtimeRejectReason.MissingPayload);
-            return;
+            return ValueTask.CompletedTask;
         }
 
         RealtimeUserLifecycleChangedPayload? payload;
@@ -67,13 +69,13 @@ internal sealed partial class UserLifecycleChangedHandler : IRealtimeEventHandle
         catch (JsonException)
         {
             _rejection.Reject(realtimeEvent, RealtimeRejectReason.InvalidJson);
-            return;
+            return ValueTask.CompletedTask;
         }
 
         if (payload is null)
         {
             _rejection.Reject(realtimeEvent, RealtimeRejectReason.InvalidPayload);
-            return;
+            return ValueTask.CompletedTask;
         }
 
         var userId = realtimeEvent.TargetUserId;
@@ -106,6 +108,8 @@ internal sealed partial class UserLifecycleChangedHandler : IRealtimeEventHandle
             // Deleting / Deleted 等其他状态：不更新缓存（由 tombstone 路径处理）。
             _metrics.RealtimeEventHandled(queuedDeliveries: 0);
         }
+
+        return ValueTask.CompletedTask;
     }
 
     [LoggerMessage(
