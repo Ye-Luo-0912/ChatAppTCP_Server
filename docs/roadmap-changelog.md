@@ -5,6 +5,55 @@
 
 ## 2026-08-03
 
+### 主线四-关系：Relationship 增量同步水位与 SyncBootstrap 集成（已完成）
+
+在 SyncBootstrap 内引入 Relationship 维度的水位/增量同步能力，与既有会话维度水位解耦并行：
+
+- **RealtimeServices 侧**（sibling 仓库）：
+  - `IRelationshipStore.List*` 三方法新增 `afterChangedAtMs` 服务端水位过滤参数：
+    - `ListFriendsAsync` / `ListFriendRequestsAsync` 在 SQL 中按 `created_at_ms > @after` 过滤；
+    - `ListBlockedUsersAsync` 底层 `T_BlockRecords` 表无变更时间戳，参数保留接口对称但服务端不过滤
+      （由客户端按本地缓存 diff，`NewAfterChangedAtMs` 始终为 0）。
+  - `NpgsqlRelationshipStore` 三 list 实现 `afterChangedAtMs` 服务端过滤。
+  - 新增 `IRelationshipSyncCursorStore` 设备级游标存储接口
+    （`Load/UpsertManyAsync 单调推进/Delete/DeleteByUser/DeleteInactive`），
+    与 `IRealtimeDeviceSyncCursorStore` 平行但以 list_type 为维度。
+  - `NpgsqlRelationshipSyncCursorStore`：`ON CONFLICT DO UPDATE WHERE 旧水位 < 新水位` 单调推进。
+  - `NoopRelationshipSyncCursorStore` 占位实现。
+  - `Migration053_RelationshipSyncCursors`：`relationship_sync_cursors` 表
+    （PK `user_id+device_id_hash+list_type`）。
+  - `SyncBootstrapQuery` 新增 `RelationshipWatermarks` / `RelationshipListLimit`。
+  - `SyncBootstrapPage` 新增 `RelationshipCatchUps` 字段。
+  - 新增 `RelationshipSyncWatermark` / `RelationshipCatchUp` 抽象类型。
+  - `DefaultSyncBootstrapQueryProcessor` 集成：
+    - `BuildRelationshipCatchUpsAsync`：水位来源优先级 client watermarks > 设备持久化游标。
+    - `EnforceByteBudget` 阶段 2.5/2.6：关系条目纳入字节预算硬约束
+      （优先级低于会话 catch-up，高于会话列表项）。
+    - `BuildRelationshipCursorsToPersist`：仅推进非 reset 且实际返回条目的水位
+      （BlockedUsers 的 `NewAfterChangedAtMs=0` 天然被过滤）。
+    - 关系列表查询失败降级为空 catch-up，不影响会话同步。
+  - `RealtimeJsonSerializerContext` 注册 `RelationshipSyncCursor` / `List<RelationshipSyncCursor>`。
+  - 三处 DI 注册同步（Core/Postgres/Host）。
+  - `DefaultRelationshipListQueryProcessor` 调用签名同步。
+  - 修复 `RealtimeDatabaseSchema` 预存在的 `schema_migration_checkpoints` 未终止字符串 bug。
+- **Gateway 侧**（本仓库）：
+  - 新增 wire 类型 `Core/Messaging/Sync/RelationshipSyncWatermark`
+    （`ListType + AfterChangedAtMs`）与 `Core/Messaging/Sync/RelationshipCatchUp`
+    （`Items/HasMore/NextCursor/NewAfterChangedAtMs/ResetRequired/ResetReason`）。
+  - `SyncBootstrapRequest` 新增 `RelationshipWatermarks` / `RelationshipListLimit`。
+  - `SyncBootstrapResponse` 新增 `RelationshipCatchUps`（空时序列化为 null 向后兼容）。
+  - `GatewayJsonSerializerContext` 注册 4 个新类型
+    （`RelationshipSyncWatermark` / `List<>` / `RelationshipCatchUp` / `List<>`）。
+  - `HistoryQueryCommandHandler.SyncBootstrap`：
+    - 校验 `RelationshipWatermarks` 列表大小、ListType 范围（1..3）、水位非负；
+    - 校验 `RelationshipListLimit` 范围；
+    - 映射 wire `RelationshipSyncWatermark` → Realtime 抽象类型；
+    - 映射 Realtime `RelationshipCatchUp` → wire 类型（含 `RelationshipItem` 字段映射）。
+- 构建：TcpGateway.sln 0 警告 0 错误；RealtimeServices 0 警告 0 错误。
+- 测试：RealtimeServices 259/259 通过；TcpGateway 439/440 通过
+  （1 个无关的 `LazySegmentedOutboundQueue.ConcurrentProducer_Consumer_Pipeline`
+  30s 并发计时测试在批量负载下抖动，单独运行通过）。
+
 ### 主线四-关系：Relationship 域 RealtimeServices 业务逻辑闭环（已完成）
 
 RealtimeServices 侧 Relationship 域业务逻辑全部实现，从 Gateway 到 DB 端到端打通：

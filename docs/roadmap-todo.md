@@ -111,11 +111,20 @@ Gateway 侧协议命令、DTO、Handler、端口 + Stub 已全部实现。
      三个事件类型（`FriendRequestListChanged=1` / `FriendListChanged=2` / `BlockedListChanged=3`）
      已在枚举预留但无发布者（待增量同步需求驱动）。
 
-2. **Relationship Watermark**
-   - `ConversationSyncWatermark` 仅限会话维度，需扩展为 Relationship 级别版本/水位用于增量同步。
+2. ~~**Relationship Watermark**~~
+   - ~~`ConversationSyncWatermark` 仅限会话维度，需扩展为 Relationship 级别版本/水位用于增量同步。~~
+     **已完成（2026-08-03）**：`RelationshipSyncWatermark` / `RelationshipCatchUp` 抽象类型
+     + `IRelationshipSyncCursorStore` 设备级游标存储 + `NpgsqlRelationshipSyncCursorStore`
+     + `Migration053`。详见 `roadmap-changelog.md` 2026-08-03 条目。
 
-3. **增量同步**
-   - 好友列表分页、好友请求列表、接受/拒绝流程的客户端增量同步。
+3. ~~**增量同步**~~
+   - ~~好友列表分页、好友请求列表、接受/拒绝流程的客户端增量同步。~~
+     **已完成（2026-08-03）**：`DefaultSyncBootstrapQueryProcessor` 集成
+     `BuildRelationshipCatchUpsAsync`（水位优先级 client > 设备游标），
+     `EnforceByteBudget` 阶段 2.5/2.6 关系条目纳入字节预算，
+     `BuildRelationshipCursorsToPersist` 仅推进非 reset 水位。
+     Gateway wire 类型 `RelationshipSyncWatermark` / `RelationshipCatchUp` 已注册。
+     详见 `roadmap-changelog.md` 2026-08-03 条目。
 
 ## 其他待办（非主线，按优先级评估）
 

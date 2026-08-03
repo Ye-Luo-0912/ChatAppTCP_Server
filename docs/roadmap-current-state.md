@@ -12,8 +12,9 @@
   StackExchange.Redis 等依赖仍存在 trim/AOT 警告，未重新启用。
 - **JSON 序列化**：协议/存储 JSON 全部走源生成 `GatewayJsonSerializerContext`，
   不使用反射 `JsonSerializerOptions`，为未来重新启用 AOT 保留可能。
-- **构建/测试**：`dotnet build` 0 警告 0 错误；`dotnet test` **366/366** 通过
-  （`tests/ChatApp.TcpGateway.Tests`）。
+- **构建/测试**：`dotnet build` 0 警告 0 错误；`dotnet test` **440/440** 通过
+  （`tests/ChatApp.TcpGateway.Tests`）；RealtimeServices **259/259** 通过
+  （`ChatApp.Realtime.Tests`）。
 
 ## 架构边界
 
@@ -150,17 +151,30 @@ Infrastructure 和 Gateway 共享。跨进程消息使用同级仓库 `../ChatAp
 - 权限矩阵/群主转让/最后 Owner 退群/审计事件仍由 RealtimeServices 承担。
 - **仍待补**：稳定指纹强化、DB keyset pagination、不可变 Cursor，见 `roadmap-todo.md` 主线三。
 
-### Relationship（Gateway 侧协议层已完成，跨仓库待补）
+### Relationship（Gateway 侧协议层 + Realtime 后端 + 增量同步已完成）
 
 - `RelationshipListChanged=153`（S2C）+ `RelationshipListHandler`：消费
   `FriendRequestListChanged` / `FriendListChanged` / `BlockedListChanged` 事件。
 - `IDirectConversationAuthorizer` 缓存主动失效：friendship/blocked-user 变更双向失效。
-- **Gateway 协议层已完成**：`RelationshipCommandHandler` + `IRelationshipBackend` 端口就绪
-  （当前 Stub 返回 `relationship_service_unavailable`），C2S 命令路由已接入 `CommandDispatcher`。
-- **跨仓库待补**：`IRealtimeMessageBus` 新增 `MutateRelationshipAsync` /
-  `QueryRelationshipListAsync`；RealtimeServices 侧域（Store/QueryProcessor/CommandProcessor/
-  Postgres migration/NATS consumer）；Relationship Watermark；增量同步，
-  见 `roadmap-todo.md` 主线四。
+- **Gateway 协议层已完成**：`RelationshipCommandHandler` + `IRelationshipBackend` 端口
+  （`RealtimeRelationshipBackend` 生产实现，`StubRelationshipBackend` 保留供单测注入），
+  C2S 命令路由已接入 `CommandDispatcher`。
+- **跨仓库业务逻辑已完成（2026-08-03）**：RealtimeServices 侧域
+  （`IRelationshipStore` / `NpgsqlRelationshipStore` / Migration052 /
+  `DefaultRelationshipCommandProcessor` / `DefaultRelationshipListQueryProcessor` /
+  NATS consumer）。详见 `roadmap-changelog.md` 2026-08-03 条目。
+- **增量同步已完成（2026-08-03）**：
+  - `IRelationshipStore.List*` 支持 `afterChangedAtMs` 服务端水位过滤。
+  - `IRelationshipSyncCursorStore` + `NpgsqlRelationshipSyncCursorStore` +
+    `Migration053` 设备级游标存储（单调推进）。
+  - `SyncBootstrapQuery.RelationshipWatermarks` / `RelationshipListLimit` +
+    `SyncBootstrapPage.RelationshipCatchUps` 字段。
+  - `DefaultSyncBootstrapQueryProcessor.BuildRelationshipCatchUpsAsync`：
+    水位优先级 client > 设备游标；查询失败降级为空 catch-up。
+  - `EnforceByteBudget` 阶段 2.5/2.6 关系条目纳入字节预算硬约束。
+  - Gateway wire 类型 `RelationshipSyncWatermark` / `RelationshipCatchUp` 已注册。
+  - 详见 `roadmap-changelog.md` 2026-08-03 条目。
+
 ### 附件（Gateway 侧协议层 + Finalize 后端已完成，跨仓库部分待补）
 
 - `InboundPayloadEarlyValidator`：ChatMessage 入站前廉价结构校验（附件数 ≤32、ID 长度 1..64）。
