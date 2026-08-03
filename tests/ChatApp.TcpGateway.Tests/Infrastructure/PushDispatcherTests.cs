@@ -1,6 +1,5 @@
+using ChatApp.Realtime.Abstractions.Push;
 using ChatApp.Realtime.Integration.Push;
-using ChatApp.TcpGateway.Core.Messaging.Push;
-using ChatApp.TcpGateway.Core.Push;
 using ChatApp.TcpGateway.Gateway.Configuration;
 using ChatApp.TcpGateway.Infrastructure.Push;
 using Microsoft.Extensions.Logging;

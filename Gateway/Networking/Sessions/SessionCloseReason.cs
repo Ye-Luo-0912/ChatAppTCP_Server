@@ -13,6 +13,8 @@ internal enum SessionCloseReason : byte
     OutboundQueueFull,
     SendTimedOut,
     SessionRevoked,
+    /// <summary>三-3：账号被冻结，活跃会话由 UserLifecycleChangedHandler 关闭。</summary>
+    AccountSuspended,
     TransportError,
     /// <summary>全局入站缓冲预算耗尽。</summary>
     InboundBudgetExceeded,

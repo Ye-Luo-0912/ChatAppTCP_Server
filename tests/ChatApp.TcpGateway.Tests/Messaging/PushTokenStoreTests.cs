@@ -1,4 +1,4 @@
-using ChatApp.TcpGateway.Core.Messaging.Push;
+using ChatApp.Realtime.Abstractions.Push;
 using ChatApp.TcpGateway.Infrastructure.Push;
 
 namespace ChatApp.TcpGateway.Tests.Messaging;

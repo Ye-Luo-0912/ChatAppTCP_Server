@@ -1,5 +1,5 @@
+using ChatApp.Realtime.Abstractions.Push;
 using ChatApp.Realtime.Integration.Push;
-using ChatApp.TcpGateway.Core.Push;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -31,11 +31,11 @@ namespace ChatApp.TcpGateway.Infrastructure.Push;
 internal sealed partial class PushDispatcher : IPushDispatcher
 {
     private readonly IPushTokenStore _tokenStore;
-    private readonly Dictionary<Core.Messaging.Push.PushPlatform, IPushProvider> _providersByPlatform;
+    private readonly Dictionary<PushPlatform, IPushProvider> _providersByPlatform;
     private readonly PushOptions _options;
     private readonly ILogger<PushDispatcher> _logger;
     // 主线一7：per-Provider 并发限制器。按 Platform 索引，0 表示不限制。
-    private readonly Dictionary<Core.Messaging.Push.PushPlatform, SemaphoreSlim> _concurrencyGates;
+    private readonly Dictionary<PushPlatform, SemaphoreSlim> _concurrencyGates;
 
     public PushDispatcher(
         IPushTokenStore tokenStore,
@@ -50,7 +50,7 @@ internal sealed partial class PushDispatcher : IPushDispatcher
 
         // 主线一7：为每个 Provider 创建并发限制器。
         var maxConcurrent = Math.Max(0, _options.MaxConcurrentSendsPerProvider);
-        _concurrencyGates = new Dictionary<Core.Messaging.Push.PushPlatform, SemaphoreSlim>();
+        _concurrencyGates = new Dictionary<PushPlatform, SemaphoreSlim>();
         foreach (var platform in _providersByPlatform.Keys)
         {
             _concurrencyGates[platform] = maxConcurrent > 0
@@ -274,7 +274,7 @@ internal sealed partial class PushDispatcher : IPushDispatcher
         LogLevel.Error,
         "Push provider {Platform} threw exception: userId={UserId}")]
     static partial void LogProviderException(
-        ILogger logger, Exception ex, Core.Messaging.Push.PushPlatform platform, long userId);
+        ILogger logger, Exception ex, PushPlatform platform, long userId);
 
     [LoggerMessage(
         LogLevel.Error,

@@ -1,3 +1,4 @@
+using ChatApp.Realtime.Abstractions.Push;
 using ChatApp.Realtime.Abstractions.Routing;
 using ChatApp.Realtime.Integration.Push;
 using ChatApp.TcpGateway.Core.Authentication;
@@ -8,7 +9,6 @@ using ChatApp.TcpGateway.Core.Messaging.History;
 using ChatApp.TcpGateway.Core.Messaging.Push;
 using ChatApp.TcpGateway.Core.Messaging.Relationships;
 using ChatApp.TcpGateway.Core.Messaging.Sync;
-using ChatApp.TcpGateway.Core.Push;
 using ChatApp.TcpGateway.Core.Serialization;
 using ChatApp.TcpGateway.Core.Server;
 using ChatApp.TcpGateway.Infrastructure.Authentication;
@@ -73,6 +73,11 @@ public static class InfrastructureServiceCollectionExtensions
         });
         services.AddSingleton<IGatewayDirectory, RedisGatewayDirectory>();
         services.AddSingleton<IWatcherGatewayDirectory, RedisWatcherGatewayDirectory>();
+
+        // 三-3：冻结用户缓存（fail-open + 后台刷新）。由 UserLifecycleChanged 事件驱动更新，
+        // 供 SessionLifecycleCoordinator 认证/Resume 路径快速拒绝冻结用户。
+        // 实现 IDisposable（清理定时器），DI 容器在停机时自动 Dispose。
+        services.AddSingleton<IFrozenUserCache, FrozenUserCache>();
 
         // 群组命令幂等 L2（Redis）存储。具体类型注册——Composite 在 Program.cs 中组装。
         // P0-1：离线推送 Provider 与 IPushDispatcher 不在此处无条件注册。

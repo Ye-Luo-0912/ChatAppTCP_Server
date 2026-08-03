@@ -1,3 +1,5 @@
+using ChatApp.Realtime.Abstractions.Attachments;
+using ChatApp.Realtime.Integration;
 using ChatApp.TcpGateway.Observability.Logging;
 using Microsoft.Extensions.Logging;
 
@@ -6,10 +8,10 @@ namespace ChatApp.TcpGateway.Gateway.Commands.Attachments;
 /// <summary>
 /// 附件后端端口：抽象 RealtimeServices 侧附件生命周期操作。
 /// <para>
-/// 主线四：当前为 stub 实现（<see cref="StubAttachmentBackend"/>），
-/// 返回 <c>attachment_service_unavailable</c>。待 sibling 仓库
-/// <c>IRealtimeMessageBus</c> 新增 <c>FinalizeAttachmentUploadAsync</c> 后，
-/// 替换为调用 bus 的适配实现即可。
+/// 主线四：生产路径由 <see cref="RealtimeAttachmentBackend"/> 实现，经
+/// <c>IRealtimeMessageBus.FinalizeAttachmentUploadAsync</c> 转发到 Realtime 侧
+/// 触发 Ticketed→Uploaded 状态转换。<see cref="StubAttachmentBackend"/> 仅保留供
+/// 单测注入（不依赖 NATS 总线）。
 /// </para>
 /// </summary>
 internal interface IAttachmentBackend
@@ -51,6 +53,7 @@ internal sealed record AttachmentFinalizeBackendResult(
 /// <summary>
 /// 占位实现：RealtimeServices 侧附件 finalize 后端尚未接入。
 /// 返回 <c>attachment_service_unavailable</c>，客户端可稍后重试。
+/// <para>仅用于单测注入；生产路径注册 <see cref="RealtimeAttachmentBackend"/>。</para>
 /// </summary>
 internal sealed class StubAttachmentBackend : IAttachmentBackend
 {
@@ -75,5 +78,57 @@ internal sealed class StubAttachmentBackend : IAttachmentBackend
             requestId,
             "attachment_service_unavailable",
             "附件上传确认服务暂未配置。"));
+    }
+}
+
+/// <summary>
+/// 生产适配实现：经 <see cref="IRealtimeMessageBus.FinalizeAttachmentUploadAsync"/>
+/// 将附件确认命令转发到 RealtimeServices，触发 Ticketed→Uploaded 状态转换。
+/// <para>
+/// 总线异常（含 <see cref="RealtimeServerBusyException"/>、NATS 超时等）不做吞咽，
+/// 直接向 <see cref="AttachmentCommandHandler"/> 抛出，由其 catch-all 统一映射为
+/// <c>attachment_service_unavailable</c> 响应。这与其他 Realtime 命令处理器
+/// （<see cref="GroupCommandHandler"/> / <c>MessagingCommandHandler</c>）的异常约定一致。
+/// </para>
+/// </summary>
+internal sealed class RealtimeAttachmentBackend : IAttachmentBackend
+{
+    private readonly IRealtimeMessageBus _messageBus;
+
+    public RealtimeAttachmentBackend(IRealtimeMessageBus messageBus)
+    {
+        _messageBus = messageBus;
+    }
+
+    public async Task<AttachmentFinalizeBackendResult> FinalizeUploadAsync(
+        string requestId,
+        long actorUserId,
+        string attachmentId,
+        long sizeBytes,
+        string? contentHash,
+        string? actorSessionId,
+        CancellationToken cancellationToken = default)
+    {
+        var command = new AttachmentFinalizeCommand
+        {
+            RequestId = requestId,
+            ActorUserId = actorUserId,
+            AttachmentId = attachmentId,
+            SizeBytes = sizeBytes,
+            ContentHash = contentHash,
+            ActorSessionId = actorSessionId,
+        };
+
+        var result = await _messageBus
+            .FinalizeAttachmentUploadAsync(command, cancellationToken)
+            .ConfigureAwait(false);
+
+        return new AttachmentFinalizeBackendResult(
+            result.RequestId,
+            result.Succeeded,
+            result.ErrorCode,
+            result.ErrorMessage,
+            result.AttachmentId,
+            result.Status);
     }
 }

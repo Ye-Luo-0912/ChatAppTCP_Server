@@ -5,5 +5,8 @@ public enum AuthenticationFailureKind : byte
     None,
     InvalidCredentials,
     DeviceMismatch,
-    DependencyUnavailable
+    DependencyUnavailable,
+
+    /// <summary>三-3：账号已被冻结，认证拒绝。</summary>
+    UserFrozen
 }

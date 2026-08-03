@@ -1,4 +1,4 @@
-using ChatApp.TcpGateway.Core.Messaging.Push;
+using ChatApp.Realtime.Abstractions.Push;
 using ChatApp.TcpGateway.Infrastructure.Push;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;

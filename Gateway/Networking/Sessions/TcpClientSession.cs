@@ -1,5 +1,4 @@
 using System.Net.Sockets;
-using System.Threading.Channels;
 using System.Threading.Tasks.Sources;
 using ChatApp.TcpGateway.Core.Authentication;
 using ChatApp.TcpGateway.Core.Protocol;
@@ -23,7 +22,7 @@ namespace ChatApp.TcpGateway.Gateway.Networking.Sessions;
 internal sealed partial class TcpClientSession : IAsyncDisposable
 {
     private readonly Socket _socket;
-    private readonly Channel<OutboundWrite> _outbound;
+    private readonly LazySegmentedOutboundQueue _outbound;
     private readonly OutboundQueueBudget _outboundBudget;
     private readonly GlobalOutboundBudget? _globalOutboundBudget;
     private readonly CancellationTokenSource _lifetime = new();
@@ -256,14 +255,10 @@ internal sealed partial class TcpClientSession : IAsyncDisposable
         // Token Bucket 初始化时间戳，首次调用时补充满桶。
         _lastRefillTimestamp = _connectedTimestamp;
 
-        _outbound = Channel.CreateBounded<OutboundWrite>(
-            new BoundedChannelOptions(outboundQueueCapacity)
-            {
-                SingleReader = true,
-                SingleWriter = false,
-                AllowSynchronousContinuations = false,
-                FullMode = BoundedChannelFullMode.Wait
-            });
+        // 五-3：Lazy Segmented MPSC 出站队列。空闲连接零段分配（首次 TryWrite 才分配 16 槽段），
+        // 较 Channel.CreateBounded 节省约 87% 每连接出站队列内存（见 OutboundChannel.Benchmarks）。
+        // 多生产者 CAS 保留槽位 + 位掩码发布；单消费者按 _tail 顺序读取。
+        _outbound = new LazySegmentedOutboundQueue(outboundQueueCapacity);
 
         // 鉴权超时：通过全局 DeadlineWheel 注册一次性 deadline，认证成功后取消。
         // deadlineWheel=null 时（测试场景）退化为不启用 deadline，由 HeartbeatCoordinator 兜底扫描。

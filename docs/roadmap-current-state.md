@@ -161,18 +161,20 @@ Infrastructure 和 Gateway 共享。跨进程消息使用同级仓库 `../ChatAp
   `QueryRelationshipListAsync`；RealtimeServices 侧域（Store/QueryProcessor/CommandProcessor/
   Postgres migration/NATS consumer）；Relationship Watermark；增量同步，
   见 `roadmap-todo.md` 主线四。
-### 附件（Gateway 侧协议层已完成，跨仓库待补）
+### 附件（Gateway 侧协议层 + Finalize 后端已完成，跨仓库部分待补）
 
 - `InboundPayloadEarlyValidator`：ChatMessage 入站前廉价结构校验（附件数 ≤32、ID 长度 1..64）。
 - `AttachmentLifecycleHandler`：消费 `AttachmentLifecycleChanged` 事件，推送 `AttachmentLifecycleUpdate`。
 - `AttachmentWireMapper` + `AttachmentRef` wire DTO：6 状态枚举 + DownloadApiHint/DownloadToken。
-- **Gateway 协议层已完成**：`AttachmentCommandHandler` + `IAttachmentBackend` 端口就绪
-  （当前 Stub 返回 `attachment_service_unavailable`），Initiate/Finalize C2S 命令路由已接入
-  `CommandDispatcher`。Gateway `AttachmentWireStatus` 6 状态 vs Realtime Abstractions 2 状态
+- **Gateway 协议层已完成**：`AttachmentCommandHandler` + `IAttachmentBackend` 端口就绪，
+  Initiate/Finalize C2S 命令路由已接入 `CommandDispatcher`。
+  `RealtimeAttachmentBackend`（生产）经 `IRealtimeMessageBus.FinalizeAttachmentUploadAsync`
+  转发到 Realtime 侧完成 Ticketed→Uploaded 转换；`StubAttachmentBackend` 保留供单测注入。
+  Gateway `AttachmentWireStatus` 6 状态 vs Realtime Abstractions 2 状态
   前 2 值已对齐，扩展状态（UploadConfirmed/Rejected/Expired/ThumbnailUpdated）仅由
   `AttachmentLifecycleHandler` 下游推送使用，不参与 `AttachmentWireMapper` 映射。
-- **跨仓库待补**：Attachment Finalize 后端（`FinalizeAttachmentUploadAsync`）、所有权校验、
-  扫描/审核、过期清理（sweep worker）、下载授权、Migration012 约束放宽，
+- **Finalize 后端已完成（2026-08-03）**：详见 `roadmap-changelog.md`。
+- **跨仓库待补**：所有权校验、扫描/审核、过期清理（sweep worker）、下载授权，
   见 `roadmap-todo.md` 主线四。
 ### 可观测性
 

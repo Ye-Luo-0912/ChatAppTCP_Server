@@ -28,5 +28,10 @@ public enum ResumeFailureKind : byte
     /// 客户端可按 <see cref="ResumeResponse.RetryAfterMs"/> 退避后重试 Resume，
     /// 或回退到完整认证（完整认证路径同样可能受依赖故障影响）。
     /// </summary>
-    DependencyUnavailable = 2
+    DependencyUnavailable = 2,
+
+    /// <summary>
+    /// 三-3：账号已被冻结，Resume 拒绝。客户端应走完整认证（同样会被拒绝）。
+    /// </summary>
+    UserFrozen = 3
 }

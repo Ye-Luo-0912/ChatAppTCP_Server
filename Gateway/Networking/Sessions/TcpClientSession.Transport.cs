@@ -27,7 +27,7 @@ internal sealed partial class TcpClientSession
         }
 
         Volatile.Write(ref _closeReason, (int)reason);
-        _outbound.Writer.TryComplete();
+        _outbound.TryComplete();
         _lifetime.Cancel();
 
         // 取消未触发的 Auth/Idle deadline，避免 close 后回调误执行。

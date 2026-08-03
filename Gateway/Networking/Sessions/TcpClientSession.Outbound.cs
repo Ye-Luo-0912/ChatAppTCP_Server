@@ -1,5 +1,4 @@
 using System.Net.Sockets;
-using System.Threading.Channels;
 using ChatApp.TcpGateway.Gateway.Diagnostics;
 using ChatApp.TcpGateway.Gateway.Networking.Buffers;
 using ChatApp.TcpGateway.Gateway.Networking.Executor;
@@ -61,7 +60,7 @@ internal sealed partial class TcpClientSession
             return false;
         }
 
-        if (_outbound.Writer.TryWrite(
+        if (_outbound.TryWrite(
                 new OutboundWrite(
                     frame,
                     byteCount,
@@ -149,7 +148,7 @@ internal sealed partial class TcpClientSession
         if (!_ephemeralFlushPending)
         {
             _ephemeralFlushPending = true;
-            if (!_outbound.Writer.TryWrite(new OutboundWrite(null, 0, null)))
+            if (!_outbound.TryWrite(new OutboundWrite(null, 0, null)))
             {
                 // TryWrite 失败：队列已关闭（连接正在关闭）或队列满。
                 // 重置 flag 允许后续 TryQueueEphemeral 重试 sentinel。
@@ -179,7 +178,7 @@ internal sealed partial class TcpClientSession
             {
                 // 等待有数据可读——此期间不在 Tracker 中（空闲连接不参与超时扫描）。
                 // WaitToReadAsync 在 Channel 完成时返回 false，在取消时抛 OperationCanceledException。
-                if (!await _outbound.Reader.WaitToReadAsync(
+                if (!await _outbound.WaitToReadAsync(
                         _lifetime.Token).ConfigureAwait(false))
                 {
                     break; // Channel completed
@@ -194,7 +193,7 @@ internal sealed partial class TcpClientSession
                 }
 
                 // 持续消费 burst：处理所有当前可读帧，直到 TryRead 返回 false（队列空）。
-                while (_outbound.Reader.TryRead(out var write))
+                while (_outbound.TryRead(out var write))
                 {
                     if (write.Frame is null)
                     {
@@ -359,7 +358,7 @@ internal sealed partial class TcpClientSession
         {
             while (IsConnected)
             {
-                if (!_outbound.Reader.TryRead(out var write))
+                if (!_outbound.TryRead(out var write))
                 {
                     // FIFO 空：检查 ephemeral mailbox（机会式排空，处理 sentinel TryWrite 失败的丢失唤醒）。
                     if (HasEphemeralEntries)
@@ -504,7 +503,7 @@ internal sealed partial class TcpClientSession
             var processed = 0;
             while (processed < maxBurst && IsConnected)
             {
-                if (!_outbound.Reader.TryRead(out var write))
+                if (!_outbound.TryRead(out var write))
                     break; // FIFO 空：让出 worker
 
                 if (write.Frame is null)
@@ -623,7 +622,7 @@ internal sealed partial class TcpClientSession
     /// 用于 pump 结束时的 re-check，判断是否需要重新调度。
     /// </summary>
     private bool HasPendingWork() =>
-        _outbound.Reader.TryPeek(out _) || HasEphemeralEntries;
+        _outbound.TryPeek(out _) || HasEphemeralEntries;
 
     /// <summary>
     /// 排空出站 FIFO 与 ephemeral mailbox 中残留的帧，释放预算与帧引用。
@@ -634,7 +633,7 @@ internal sealed partial class TcpClientSession
     private void DrainOutboundOnClose()
     {
         // 排空 FIFO 中残留的 writes（含 sentinel，Frame 可能为 null）。
-        while (_outbound.Reader.TryRead(out var pending))
+        while (_outbound.TryRead(out var pending))
         {
             ReleaseQueuedWrite(pending.ByteCount);
             pending.Frame?.Dispose();

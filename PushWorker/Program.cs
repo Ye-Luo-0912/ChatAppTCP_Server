@@ -1,3 +1,4 @@
+using ChatApp.PushWorker.Providers;
 using ChatApp.Realtime.Integration.Configuration;
 using ChatApp.Realtime.Integration.DependencyInjection;
 using ChatApp.TcpGateway.Infrastructure;
@@ -63,6 +64,19 @@ var realtimeIntegrationOptions = builder.Configuration
 builder.Services.AddSingleton<GatewayMetrics>();
 builder.Services.AddGatewayInfrastructure();
 builder.Services.AddChatAppRealtimeIntegration(realtimeIntegrationOptions);
+
+// Production 模式：注册真实 FCM/APNs/WebPush Provider（须在 AddPushServices 之前，
+// 以便 PushProviderStartupValidator 校验通过）。
+// TestNoop 模式：由 AddPushServices 自动注册 NoopPushProvider。
+var pushOptions = builder.Configuration
+    .GetSection(PushOptions.SectionName)
+    .Get<PushOptions>() ?? new PushOptions();
+if (pushOptions.Enabled
+    && pushOptions.ProviderMode == PushProviderMode.Production)
+{
+    builder.Services.AddRealPushProviders(builder.Configuration);
+}
+
 builder.Services.AddPushServices(builder.Configuration);
 
 await builder.Build().RunAsync();

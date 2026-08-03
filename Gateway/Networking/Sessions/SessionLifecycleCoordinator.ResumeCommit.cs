@@ -123,6 +123,20 @@ internal sealed partial class SessionLifecycleCoordinator
             ResumeToken = resumeToken
         };
 
+        // 三-3：冻结用户拒绝 Resume。fail-open 缓存未命中时放行——
+        // 认证路径权威性由 AccessTokenStore 保证，Resume 路径在缓存预热后秒级拦截；
+        // UserLifecycleChanged 事件到达后会关闭已恢复的活跃会话（AccountSuspended）。
+        if (_frozenUserCache is not null && _frozenUserCache.IsFrozen(context.UserId))
+        {
+            _metrics.ResumeFailed(ResumeFailureReason.UserFrozen);
+            // 归还 Claim：不留 dangling claim Key，依赖 TTL 兜底。
+            await ReleaseClaimSafeAsync(prepared, cancellationToken)
+                .ConfigureAwait(false);
+            return ResumePrepareResult.Failed(
+                ResumeFailureKind.UserFrozen,
+                ResumeFailureReason.UserFrozen);
+        }
+
         // 代次校验：若待恢复会话携带 DeviceIdHash，查询当前设备租约持有者。
         // 若租约已被另一个 SessionId 接管，说明此 ResumeContext 来自已被替换的旧会话，拒绝恢复。
         //

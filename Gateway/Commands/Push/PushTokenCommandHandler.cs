@@ -1,8 +1,8 @@
 using ChatApp.TcpGateway.Gateway.Networking.Sessions;
 using System.Buffers;
+using ChatApp.Realtime.Abstractions.Push;
 using ChatApp.TcpGateway.Core.Messaging.Push;
 using ChatApp.TcpGateway.Core.Protocol;
-using ChatApp.TcpGateway.Core.Push;
 using ChatApp.TcpGateway.Core.Serialization;
 using ChatApp.TcpGateway.Gateway.Dispatching;
 using ChatApp.TcpGateway.Gateway.Networking.Buffers;

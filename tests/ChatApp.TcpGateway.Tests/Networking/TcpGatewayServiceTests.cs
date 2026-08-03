@@ -3,9 +3,12 @@ using System.Buffers.Binary;
 using System.Net;
 using System.Net.Sockets;
 using System.Runtime.CompilerServices;
+using ChatApp.Realtime.Abstractions.Attachments;
 using ChatApp.Realtime.Abstractions.Conversations;
 using ChatApp.Realtime.Abstractions.Events;
 using ChatApp.Realtime.Abstractions.Messaging;
+using ChatApp.Realtime.Abstractions.Push;
+using ChatApp.Realtime.Abstractions.Relationships;
 using ChatApp.Realtime.Abstractions.Routing;
 using ChatApp.Realtime.Abstractions.Sync;
 using ChatApp.Realtime.Integration;
@@ -1006,6 +1009,21 @@ public sealed class TcpGatewayServiceTests
                     command.RequestId,
                     "not_used",
                     "not used"));
+
+        public Task<AttachmentFinalizeResult> FinalizeAttachmentUploadAsync(
+            AttachmentFinalizeCommand command,
+            CancellationToken ct = default) =>
+            Task.FromResult(AttachmentFinalizeResult.Failed(command.RequestId, "not_used", "not used"));
+
+        public Task<RelationshipCommandResult> MutateRelationshipAsync(
+            RelationshipCommand command,
+            CancellationToken ct = default) =>
+            Task.FromResult(RelationshipCommandResult.Failed(command.RequestId, "x", "x"));
+
+        public Task<RelationshipListResult> QueryRelationshipListAsync(
+            RelationshipListQuery query,
+            CancellationToken ct = default) =>
+            Task.FromResult(RelationshipListResult.Failed(query.RequestId, "x", "x"));
 
         public Task<MessageRecallResult> RecallMessageAsync(
             MessageRecallCommand command,

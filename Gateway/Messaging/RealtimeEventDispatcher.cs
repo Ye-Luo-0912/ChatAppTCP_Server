@@ -13,7 +13,6 @@ using ChatApp.TcpGateway.Gateway.Networking.Sessions;
 using ChatApp.TcpGateway.Observability.Logging;
 using ChatApp.TcpGateway.Observability.Metrics;
 using Microsoft.Extensions.Logging;
-
 namespace ChatApp.TcpGateway.Gateway.Messaging;
 
 /// <summary>
@@ -60,7 +59,8 @@ internal sealed class RealtimeEventDispatcher
         IDirectConversationAuthorizer? directConversationAuthorizer = null,
         ITypingAuthorizationInvalidator? typingAuthorizationInvalidator = null,
         IPayloadCodec<MembersAddedUpdate>? membersAddedCodec = null,
-        IPayloadCodec<ConversationDissolvedUpdate>? conversationDissolvedCodec = null)
+        IPayloadCodec<ConversationDissolvedUpdate>? conversationDissolvedCodec = null,
+        IFrozenUserCache? frozenUserCache = null)
         : this(
             BuildRegistry(
                 userSessions,
@@ -86,7 +86,8 @@ internal sealed class RealtimeEventDispatcher
                 directConversationAuthorizer,
                 typingAuthorizationInvalidator,
                 membersAddedCodec,
-                conversationDissolvedCodec),
+                conversationDissolvedCodec,
+                frozenUserCache),
             metrics,
             logger)
     {
@@ -150,7 +151,8 @@ internal sealed class RealtimeEventDispatcher
         IDirectConversationAuthorizer? directConversationAuthorizer,
         ITypingAuthorizationInvalidator? typingAuthorizationInvalidator,
         IPayloadCodec<MembersAddedUpdate>? membersAddedCodec,
-        IPayloadCodec<ConversationDissolvedUpdate>? conversationDissolvedCodec)
+        IPayloadCodec<ConversationDissolvedUpdate>? conversationDissolvedCodec,
+        IFrozenUserCache? frozenUserCache)
     {
         var delivery = new RealtimeEventDeliveryHelper(userSessions, metrics);
         // 复用 dispatcher 的 logger：原 RejectEvent 也走该 logger，保持日志类别一致。
@@ -180,8 +182,13 @@ internal sealed class RealtimeEventDispatcher
             userSessions, metrics, rejection, logger, resumeTokenStore);
         IRealtimeEventHandler conversationAggregate = new ConversationAggregateEventHandler(
             membersAddedCodec!, conversationDissolvedCodec!, delivery, rejection);
+        // 三-3：UserLifecycleChanged 处理器。frozenUserCache 未注入（测试场景）时跳过注册，
+        // 事件到达时由 Dispatch 兜底走 unsupported 日志路径。
+        IRealtimeEventHandler? userLifecycle = frozenUserCache is not null
+            ? new UserLifecycleChangedHandler(frozenUserCache, userSessions, metrics, rejection, logger)
+            : null;
 
-        return new RealtimeEventHandlerRegistry(new KeyValuePair<RealtimeEventType, IRealtimeEventHandler>[]
+        var registrations = new List<KeyValuePair<RealtimeEventType, IRealtimeEventHandler>>
         {
             new(RealtimeEventType.MessageReceived, chatMessage),
             new(RealtimeEventType.MessageReceiptUpdated, messageReceipt),
@@ -203,6 +210,10 @@ internal sealed class RealtimeEventDispatcher
             new(RealtimeEventType.SessionRevoked, sessionRevocation),
             new(RealtimeEventType.MembersAdded, conversationAggregate),
             new(RealtimeEventType.ConversationDissolved, conversationAggregate),
-        });
+        };
+        if (userLifecycle is not null)
+            registrations.Add(new(RealtimeEventType.UserLifecycleChanged, userLifecycle));
+
+        return new RealtimeEventHandlerRegistry(registrations.ToArray());
     }
 }

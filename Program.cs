@@ -24,7 +24,6 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using EphemeralPresenceTypingConsumerService = ChatApp.TcpGateway.Gateway.Messaging.EphemeralPresenceTypingConsumerService;
-using PushDispatcher = ChatApp.TcpGateway.Infrastructure.Push.PushDispatcher;
 using RealtimeEventConsumerService = ChatApp.TcpGateway.Gateway.Messaging.RealtimeEventConsumerService;
 using RealtimeEventDispatcher = ChatApp.TcpGateway.Gateway.Messaging.RealtimeEventDispatcher;
 using RedisGlobalPresenceStore = ChatApp.TcpGateway.Gateway.Networking.Sessions.RedisGlobalPresenceStore;
@@ -123,16 +122,20 @@ builder.Services.AddSingleton<IGroupIdempotencyStore>(static provider =>
 builder.Services.AddSingleton<GroupCommandHandler>();
 builder.Services.AddSingleton<TypingCommandHandler>();
 builder.Services.AddSingleton<PresenceCommandHandler>();
-// 主线四：附件与关系后端端口（当前 stub，待 sibling 仓库 IRealtimeMessageBus 接入后替换）。
-builder.Services.AddSingleton<IAttachmentBackend, StubAttachmentBackend>();
-builder.Services.AddSingleton<IRelationshipBackend, StubRelationshipBackend>();
+// 主线四：附件 / 关系后端已接入 RealtimeServices
+// （FinalizeAttachmentUploadAsync / MutateRelationshipAsync / QueryRelationshipListAsync）。
+builder.Services.AddSingleton<IAttachmentBackend, RealtimeAttachmentBackend>();
+builder.Services.AddSingleton<IRelationshipBackend, RealtimeRelationshipBackend>();
 builder.Services.AddSingleton<AttachmentCommandHandler>();
 builder.Services.AddSingleton<RelationshipCommandHandler>();
 builder.Services.AddSingleton<CommandDispatcher>();
 builder.Services.AddHostedService<RealtimeEventConsumerService>();
 
-// 主线一9：Push 注册抽取到 AddPushServices 扩展方法，Gateway 与独立 PushWorker 共用。
-builder.Services.AddPushServices(builder.Configuration);
+// 五-5：Push 消费已移出 TCP Gateway。PushDeliveryConsumerService / PushDispatcher / IPushProvider
+// 仅在独立 PushWorker 进程注册（见 PushWorker/Program.cs）。
+// Gateway 仅保留 PushTokenCommandHandler（依赖 IPushTokenStore，已在 AddGatewayInfrastructure 注册），
+// 负责 Token 注册/注销协议命令。真实 FCM/APNs/WebPush 的 HTTP/2 连接、限流、重试不再与 10k TCP 连接竞争资源。
+// PushOptions 仍在此验证配置（早失败），但不注册任何 Push 消费服务。
 
 builder.Services.AddHostedService<EphemeralPresenceTypingConsumerService>();
 builder.Services.AddHostedService<TcpGatewayService>();

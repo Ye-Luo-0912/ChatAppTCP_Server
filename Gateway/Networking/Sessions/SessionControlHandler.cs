@@ -196,13 +196,22 @@ internal sealed class SessionControlHandler
 
         if (!authResult.Success)
         {
-            // FailClosed：依赖不可用，拒绝认证。客户端可按 RetryAfterMs 退避后重试。
-            SendAuthenticationFailure(
-                session,
-                authResult.FailureKind == AuthFailureKind.DependencyUnavailable
-                    ? "authentication dependency unavailable, retry after backoff"
-                    : "authentication failed",
-                AuthenticationFailureKind.DependencyUnavailable);
+            // 三-3：区分冻结与依赖不可用。冻结不可重试；依赖不可用可退避后重试。
+            if (authResult.FailureKind == AuthFailureKind.UserFrozen)
+            {
+                SendAuthenticationFailure(
+                    session,
+                    "account suspended",
+                    AuthenticationFailureKind.UserFrozen);
+            }
+            else
+            {
+                // FailClosed：依赖不可用，拒绝认证。客户端可按 RetryAfterMs 退避后重试。
+                SendAuthenticationFailure(
+                    session,
+                    "authentication dependency unavailable, retry after backoff",
+                    AuthenticationFailureKind.DependencyUnavailable);
+            }
             return;
         }
 
@@ -365,12 +374,18 @@ internal sealed class SessionControlHandler
                 // P1-B：恢复失败——按 FailureKind 区分错误码。
                 // InvalidToken → ResumeFailed（客户端必须完整认证）
                 // DependencyUnavailable → DependencyUnavailable（客户端可退避后重试 Resume）
+                // UserFrozen → AccountSuspended（账号冻结，不可重试）
                 _listenerHost.RecordAuthenticationFailure(remoteIp);
                 var failureKind = resumeAttempt.FailureKind;
                 var errorCode = failureKind.ToErrorCode();
-                var errorMessage = failureKind == ResumeFailureKind.DependencyUnavailable
-                    ? "resume dependency unavailable, retry after backoff"
-                    : "resume token invalid or expired";
+                var errorMessage = failureKind switch
+                {
+                    ResumeFailureKind.DependencyUnavailable
+                        => "resume dependency unavailable, retry after backoff",
+                    ResumeFailureKind.UserFrozen
+                        => "account suspended",
+                    _ => "resume token invalid or expired"
+                };
                 SendProtocolError(
                     session,
                     errorCode,

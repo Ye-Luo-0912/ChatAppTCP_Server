@@ -3,6 +3,142 @@
 本文件记录已完成的历史变更，按时间倒序排列。当前状态见 `roadmap-current-state.md`，
 未完成工作见 `roadmap-todo.md`。本文件不再保留过期测试数字（当时通过数仅作参考）。
 
+## 2026-08-03
+
+### 主线四-关系：Relationship 域 RealtimeServices 业务逻辑闭环（已完成）
+
+RealtimeServices 侧 Relationship 域业务逻辑全部实现，从 Gateway 到 DB 端到端打通：
+
+- **Abstractions 层**（`ChatApp.Realtime.Abstractions`）：
+  - `IRelationshipStore`（`Stores/IRelationshipStore.cs`）：9 方法接口（6 变更 + 3 列表查询）+
+    `RelationshipMutatePersistResult` 结果结构体（Ok/Fail 工厂）。
+- **Infrastructure.Core 层**：
+  - `NoopRelationshipStore`（`Stores/`）：默认占位实现。
+  - `DefaultRelationshipCommandProcessor`（`Relationships/`）：校验 tombstone → 按 Operation
+    分发到 store → 映射结果。遵循 `DefaultGroupConversationProcessor` 模式。
+  - `DefaultRelationshipListQueryProcessor`（`Relationships/`）：按 ListType 分发到 store，
+    计算 `hasMore` + `nextCursor`（base64 编码 offset）。
+- **Infrastructure.Postgres 层**：
+  - `Migration052_Relationships`：`friend_requests`（PK request_id，status 0=Pending/1=Accepted/
+    2=Declined）+ `friendships`（canonical `user_id_low/user_id_high`，UNIQUE 约束）+
+    `relationship_mutation_requests`（幂等账本，PK actor_user_id+request_id）三表 + 索引。
+  - `NpgsqlRelationshipStore`（`Stores/`）：完整 DB 实现，含：
+    - 幂等去重：`TryReadIdempotencyAsync` + `RecordIdempotencyAsync`（事务内）。
+    - 好友请求：双向 pending 检查、FOR UPDATE 行锁、状态机转换。
+    - 友谊：`CanonicalPair`（Math.Min/Max）规范化存储，UNIQUE 约束防重复。
+    - 黑名单：复用 `public."T_BlockRecords"`（与 `NpgsqlBlockListStore` 共享），
+      `ON CONFLICT DO NOTHING` 幂等写入。
+    - 列表查询：OFFSET-based 游标分页（base64 编码 int32 offset）。
+  - `RealtimeDatabaseSchema`：新增 `FriendRequestsTableSql` / `FriendshipsTableSql` /
+    `RelationshipMutationRequestsTableSql` 属性。
+- **DI 注册**（三处 + NATS）：
+  - `RealtimeCoreRegistration`：`NoopRelationshipStore` + `DefaultRelationshipCommandProcessor` +
+    `DefaultRelationshipListQueryProcessor` + Noop consumers（默认注册）。
+  - `RealtimePostgresRegistration`：`NpgsqlRelationshipStore`（RemoveAll + AddSingleton 覆盖）。
+  - `RealtimeServicesRegistration`：`RelationshipCommandWorker` + `RelationshipListQueryWorker`。
+  - `RealtimeNatsRegistration`：`NatsRelationshipCommandConsumer` +
+    `NatsRelationshipListQueryConsumer`（覆盖 Noop 默认）。
+- **附带修复**：`CapturingAttachmentStore`（RealtimeTests）补充 `FinalizeUploadAsync` 方法
+  （预存在的测试 mock 缺失，非本次引入）。
+- 构建：RealtimeServices.slnx 0 警告 0 错误；TcpGateway.sln 0 警告 0 错误。
+- 测试：TcpGateway 440/440 通过无回归。
+
+### 主线四-关系：Relationship 后端 Gateway 适配闭环（已完成）
+
+Gateway 侧 `IRelationshipBackend` 端口已从 stub 替换为真实 RealtimeServices 适配实现，
+关系变更命令（`RelationshipCommandRequest`）与列表查询（`RelationshipListRequest`）
+端到端打通：
+
+- **RealtimeServices 侧**（sibling 仓库）：
+  - `RelationshipCommand` / `RelationshipCommandResult` / `RelationshipListQuery` /
+    `RelationshipListResult` / `RelationshipListItem` / `RelationshipOperation` /
+    `RelationshipListType` 定义于 `ChatApp.Realtime.Abstractions.Relationships`。
+  - `NatsRelationshipCommandConsumer` + `NatsRelationshipListQueryConsumer`
+    （`Infrastructure.Nats`）消费 Core NATS request/reply。
+  - `RelationshipCommandWorker` + `RelationshipListQueryWorker`
+    （`ChatApp.RealtimeServices`）并发处理命令/查询，含过载保护与 metrics。
+  - `NoopRelationshipCommandConsumer`（`Infrastructure.Core`）供测试注入。
+  - `IRealtimeMessageBus.MutateRelationshipAsync` / `QueryRelationshipListAsync` +
+    `NatsRealtimeMessageBus` / `RealtimeRequestClient` 实现 +
+    `RealtimeJsonSerializerContext` 注册 6 个 Relationship DTO 类型。
+- **Gateway 侧**（本仓库）：
+  - `RealtimeRelationshipBackend`（`Gateway/Commands/Relationships/IRelationshipBackend.cs`）
+    注入 `IRealtimeMessageBus`，构造 `RelationshipCommand` / `RelationshipListQuery` 转发
+    并映射 `RelationshipCommandResult` / `RelationshipListResult` →
+    `RelationshipCommandBackendResult` / `RelationshipListBackendResult`。
+    使用 `Realtime*` using 别名解决 Core / Realtime 枚举命名冲突
+    （`RelationshipOperation` / `RelationshipListType`）。
+    总线异常不吞咽，由 `RelationshipCommandHandler` catch-all 统一映射为
+    `relationship_service_unavailable`。
+  - `Program.cs` 注册 `RealtimeRelationshipBackend` 替换 `StubRelationshipBackend`
+    （stub 保留供单测注入）。
+- 测试：440/440 通过无回归；8 个 `IRealtimeMessageBus` 测试替身补充
+  `MutateRelationshipAsync` / `QueryRelationshipListAsync` stub 实现。
+
+### 主线四-附件：Attachment Finalize 后端闭环（已完成）
+
+Gateway 侧 `IAttachmentBackend` 端口已从 stub 替换为真实 RealtimeServices 适配实现，
+附件上传确认命令（`AttachmentFinalizeRequest`）端到端打通：
+
+- **RealtimeServices 侧**（sibling 仓库）：
+  - `AttachmentFinalizeCommand` / `AttachmentFinalizeResult` /
+    `IAttachmentFinalizeProcessor` 定义于 `ChatApp.Realtime.Abstractions.Attachments`。
+  - `DefaultAttachmentFinalizeProcessor`（`Infrastructure.Core`）执行校验 +
+    `IRealtimeAttachmentStore.FinalizeUploadAsync`（Ticketed→Uploaded 原子 UPDATE）。
+  - `NatsAttachmentFinalizeConsumer` + `AttachmentFinalizeWorker`（`Infrastructure.Nats`/
+    `ChatApp.RealtimeServices`）消费 Core NATS request/reply。
+  - `Migration051` 放宽 `attachments.status` CHECK 至 `0..6`（Uploaded=4/Scanning=5/Rejected=6）。
+  - `IRealtimeMessageBus.FinalizeAttachmentUploadAsync` + `NatsRealtimeMessageBus`/
+    `RealtimeRequestClient` 实现 + `RealtimeJsonSerializerContext`/`RealtimeWireSerializer` 注册。
+- **Gateway 侧**（本仓库）：
+  - `RealtimeAttachmentBackend`（`Gateway/Commands/Attachments/IAttachmentBackend.cs`）注入
+    `IRealtimeMessageBus`，构造 `AttachmentFinalizeCommand` 转发并映射 `AttachmentFinalizeResult`
+    → `AttachmentFinalizeBackendResult`。总线异常（含 `RealtimeServerBusyException`、NATS 超时）
+    不吞咽，由 `AttachmentCommandHandler` catch-all 统一映射为 `attachment_service_unavailable`，
+    与 `GroupCommandHandler` 等其他 Realtime 命令处理器异常约定一致。
+  - `Program.cs` 注册 `RealtimeAttachmentBackend` 替换 `StubAttachmentBackend`
+    （stub 保留供单测注入，不依赖 NATS 总线）。
+- 测试：381/381 通过无回归；8 个 `IRealtimeMessageBus` 测试替身补充
+  `FinalizeAttachmentUploadAsync` stub 实现。
+
+### 主线三：Group 后端分页和稳定指纹（已完成）
+
+经核验 RealtimeServices 仓库，跨仓库待补项均已实现（非 stub）：
+
+- **`NpgsqlRealtimeGroupStore`**（`ChatApp.Realtime.Infrastructure.Postgres/Stores/`，约 2000 行）
+  完整实现 `IRealtimeGroupStore` 全部方法：
+  - 权限矩阵：AddMembers/RemoveMember 仅 Owner/Admin，ChangeRole/Dissolve 仅 Owner。
+  - 群主转让：不能转让给自己；Owner 不能自降级（须先转让）。
+  - 最后 Owner 退群：拒绝（"Owner 退群前须先转让所有权"）。
+  - 审计 Outbox：事务内 `IGroupOperationAuditStore.RecordInTransactionAsync`，失败回滚。
+  - 幂等账本：`group_mutation_requests`（Migration024，`FOR UPDATE` 串行化）。
+  - 软删除：`left_at_ms`/`dissolved_at_ms`（Migration029），重新加群复活原行。
+  - membership periods（Migration035/038）、`audience_version` 递增（Migration049）、
+    用户生命周期 advisory lock。
+- **`NpgsqlGroupOperationAuditStore`** 双路径：`RecordAsync`（事务外 best-effort）+
+  `RecordInTransactionAsync`（事务内 Outbox，复用调用方连接/事务）。
+  审计表 `group_operation_audit`（Migration028）。
+- **keyset 分页**：设计决策为 Realtime 返回全量成员（`role, joined_at_ms, user_id` 升序），
+  Gateway 本地 `PaginateMembers` 切片，cursor 编码 `(role, joined_at_ms, user_id)` base64，
+  避免改动 RealtimeServices 协议；幂等缓存全量结果，翻页命中同一缓存。
+
+### 主线一-c：真实 FCM/APNs/WebPush Provider 骨架（已完成）
+
+PushWorker 侧三个真实 Provider client + payload builder 已实现（构建通过，381/381 测试无回归）：
+
+- **FcmPushProvider**：OAuth2 Service Account JWT（RS256 签名，1h 有效 5min 提前刷新）换取
+  access token；HTTP v1 API `POST /v1/projects/{projectId}/messages:send`；`FcmPayloadBuilder`
+  构造含 `notification` / `data` / `android.collapse_key` / `apns.headers[apns-collapse-id]` 的请求体。
+- **ApnsPushProvider**：Provider JWT（p8 私钥 ES256 签名，1h 有效 5min 提前刷新）；
+  `POST /3/device/{token}` HTTP/2；`apns-push-type`/`apns-priority`/`apns-collapse-id` 头；
+  `ApnsPayloadBuilder` 构造 `aps.alert` + `[JsonExtensionData]` 自定义字段。
+- **WebPushPushProvider**：RFC 8291 AES128GCM 加密（`WebPushEncryptor`）+ VAPID JWT（ES256）认证；
+  订阅 JSON 解析（`WebPushSubscription.Parse`）；`Topic` 头实现折叠；`TTL` 2419200。
+- **DI 注册**：`PushProviderRegistrationExtensions.AddRealPushProviders` 仅在 Production 模式下注册
+  三个 typed `HttpClient`（HTTP/2）+ `IPushProvider`；`PushProviderOptions` 统一配置平台凭证与超时。
+- **错误映射**：HTTP 429 → `rate_limited`，5xx → `provider_unavailable`，410/Unregistered →
+  `invalid_token`，400 → `payload_too_large`/`invalid_token`，403 → 清缓存 + `provider_unavailable`。
+
 ## 2026-08-01
 
 ### 主线二：Resume 真正事务化（已完成）

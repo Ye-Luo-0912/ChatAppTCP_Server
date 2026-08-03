@@ -64,8 +64,12 @@ internal sealed partial class SessionRuntime
     /// Pipelines 与 DirectSocket 的统一帧处理入口。ownedPayloadBuffer 非空时，
     /// Payload 及其全局预算已由 DirectSocket 跨缓冲读取路径持有；成功入队后
     /// 所有权转移给 SessionCommand，其余路径在 finally 归还。
+    /// <para>
+    /// 标记为 internal 供 <see cref="SessionRuntimeTests"/> 直接驱动验证 lane 路由、
+    /// 限流、能力门控、负载体积上限与资源所有权转移；其余不参与协议数据面的代码不调用此方法。
+    /// </para>
     /// </summary>
-    private async ValueTask<bool> DispatchFrameAsync(
+    internal async ValueTask<bool> DispatchFrameAsync(
         PacketFrame frame,
         TcpClientSession session,
         string remoteIp,

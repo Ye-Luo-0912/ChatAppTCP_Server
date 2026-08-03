@@ -47,6 +47,13 @@ public enum ProtocolErrorCode : ushort
     /// </summary>
     DependencyUnavailable = 14,
 
+    /// <summary>
+    /// 三-3：账号已被冻结（管理员操作）。认证与 Resume 均拒绝。
+    /// 客户端应提示用户账号已被冻结，不可重试认证。
+    /// 与 <see cref="AuthRejected"/> 区分：后者是凭据无效，本码表示账号状态被管理员冻结。
+    /// </summary>
+    AccountSuspended = 15,
+
     /// <summary>请求频率超限。客户端应按 <c>RetryAfterMs</c> 退避后重试。</summary>
     RateLimited = 20,
 

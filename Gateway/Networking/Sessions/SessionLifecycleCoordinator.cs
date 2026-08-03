@@ -53,6 +53,8 @@ internal sealed partial class SessionLifecycleCoordinator
     // 可选 Redis 熔断器：仅用于 TryResumeAsync 入口快速失败判定与 CircuitOpen 失败归因。
     // 实际 Redis 调用由 IResumeTokenStore / IDeviceSessionLeaseStore 内部再次检查。
     private readonly IRedisCircuitBreaker? _circuitBreaker;
+    // 三-3：冻结用户缓存。fail-open + 后台刷新，供认证/Resume 路径快速拒绝冻结用户。
+    private readonly IFrozenUserCache? _frozenUserCache;
 
     public SessionLifecycleCoordinator(
         IDeviceSessionLeaseStore deviceSessionLeaseStore,
@@ -67,7 +69,8 @@ internal sealed partial class SessionLifecycleCoordinator
         TimeProvider timeProvider,
         ILogger logger,
         IPayloadCodec<PresenceChanged> presenceChangedCodec,
-        IRedisCircuitBreaker? circuitBreaker = null)
+        IRedisCircuitBreaker? circuitBreaker = null,
+        IFrozenUserCache? frozenUserCache = null)
     {
         _deviceSessionLeaseStore = deviceSessionLeaseStore;
         _globalPresence = globalPresence;
@@ -82,6 +85,7 @@ internal sealed partial class SessionLifecycleCoordinator
         _logger = logger;
         _presenceChangedCodec = presenceChangedCodec;
         _circuitBreaker = circuitBreaker;
+        _frozenUserCache = frozenUserCache;
     }
 
     /// <summary>
@@ -108,6 +112,15 @@ internal sealed partial class SessionLifecycleCoordinator
         RealtimeAuthenticationResult result,
         CancellationToken cancellationToken)
     {
+        // 三-3：冻结用户拒绝认证。fail-open 缓存未命中时放行——
+        // 认证路径权威性由 AccessTokenStore 保证（冻结时 Server 撤销 access token），
+        // 此处为快速拦截已预热缓存的冻结用户，避免无谓的 Registry/Presence/TakeOver 副作用。
+        // 失败 metric 由 SessionControlHandler.SendAuthenticationFailure 记录，此处不重复计数。
+        if (_frozenUserCache is not null && _frozenUserCache.IsFrozen(result.UserId))
+        {
+            return AuthLifecycleResult.Failed(AuthFailureKind.UserFrozen);
+        }
+
         session.Authenticate(
             result.UserId,
             result.SessionId,
@@ -555,7 +568,10 @@ internal enum AuthFailureKind : byte
     /// 依赖不可用（Redis 异常、熔断器开路、TakeOver 不可用）。
     /// 客户端可按 <see cref="AuthLifecycleResult.RetryAfterMs"/> 退避后重新认证。
     /// </summary>
-    DependencyUnavailable = 1
+    DependencyUnavailable = 1,
+
+    /// <summary>三-3：账号已被冻结，认证拒绝。不可重试。</summary>
+    UserFrozen = 2
 }
 
 /// <summary>
@@ -579,6 +595,7 @@ internal static class ResumeFailureReasonExtensions
         ResumeFailureReason.CircuitOpen => ResumeFailureKind.DependencyUnavailable,
         ResumeFailureReason.LeaseQueryFailed => ResumeFailureKind.DependencyUnavailable,
         ResumeFailureReason.TakeOverUnavailable => ResumeFailureKind.DependencyUnavailable,
+        ResumeFailureReason.UserFrozen => ResumeFailureKind.UserFrozen,
         _ => ResumeFailureKind.InvalidToken
     };
 
@@ -587,6 +604,7 @@ internal static class ResumeFailureReasonExtensions
     {
         ResumeFailureKind.InvalidToken => ProtocolErrorCode.ResumeFailed,
         ResumeFailureKind.DependencyUnavailable => ProtocolErrorCode.DependencyUnavailable,
+        ResumeFailureKind.UserFrozen => ProtocolErrorCode.AccountSuspended,
         _ => ProtocolErrorCode.ResumeFailed
     };
 }

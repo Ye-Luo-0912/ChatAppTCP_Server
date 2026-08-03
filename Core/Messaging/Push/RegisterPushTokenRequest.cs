@@ -1,3 +1,5 @@
+using ChatApp.Realtime.Abstractions.Push;
+
 namespace ChatApp.TcpGateway.Core.Messaging.Push;
 
 /// <summary>

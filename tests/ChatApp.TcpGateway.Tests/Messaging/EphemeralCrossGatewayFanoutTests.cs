@@ -1,10 +1,12 @@
 using System.Diagnostics.Metrics;
 using System.Net.Sockets;
 using System.Runtime.CompilerServices;
+using ChatApp.Realtime.Abstractions.Attachments;
 using ChatApp.Realtime.Abstractions.Conversations;
 using ChatApp.Realtime.Abstractions.Events;
 using ChatApp.Realtime.Abstractions.Messaging;
 using ChatApp.Realtime.Abstractions.Messaging.History;
+using ChatApp.Realtime.Abstractions.Relationships;
 using ChatApp.Realtime.Abstractions.Sync;
 using ChatApp.Realtime.Integration;
 using ChatApp.Realtime.Integration.Push;
@@ -137,6 +139,15 @@ file sealed class ScriptedEphemeralBus(EphemeralTypingEvent? typing = null) : IR
 
     public Task<GroupConversationResult> MutateGroupConversationAsync(GroupConversationCommand command, CancellationToken ct = default) =>
         Task.FromResult(GroupConversationResult.Failed(command.RequestId, "x", "x"));
+
+    public Task<AttachmentFinalizeResult> FinalizeAttachmentUploadAsync(AttachmentFinalizeCommand command, CancellationToken ct = default) =>
+        Task.FromResult(AttachmentFinalizeResult.Failed(command.RequestId, "x", "x"));
+
+    public Task<RelationshipCommandResult> MutateRelationshipAsync(RelationshipCommand command, CancellationToken ct = default) =>
+        Task.FromResult(RelationshipCommandResult.Failed(command.RequestId, "x", "x"));
+
+    public Task<RelationshipListResult> QueryRelationshipListAsync(RelationshipListQuery query, CancellationToken ct = default) =>
+        Task.FromResult(RelationshipListResult.Failed(query.RequestId, "x", "x"));
 
     public Task<MessageRecallResult> RecallMessageAsync(MessageRecallCommand command, CancellationToken ct = default) =>
         Task.FromResult(MessageRecallResult.Failed(command.RequestId, "x", "x"));

@@ -10,10 +10,15 @@ Provider 并发限制、无效 Token 注销、PushWorker 拆出、AES-GCM Token 
 以下为跨仓库待补项：
 
 2. **真实 FCM/APNs/WebPush Provider**
-   - 跨仓库实现 Provider client 与 payload builder。
-   - `IPushTokenStore` / `PushTokenRecord` 当前位于 `ChatApp.TcpGateway.Core.Push`，
+   - ~~跨仓库实现 Provider client 与 payload builder。~~
+     **已完成（2026-08-03）**：`FcmPushProvider` / `ApnsPushProvider` / `WebPushPushProvider`
+     + payload builder + `PushProviderOptions` + DI 注册（`AddRealPushProviders`）已实现于
+     `PushWorker/Providers/`，构建通过、381/381 测试无回归。详见 `roadmap-changelog.md` 2026-08-03 条目。
+   - ~~`IPushTokenStore` / `PushTokenRecord` 当前位于 `ChatApp.TcpGateway.Core.Push`，
      RealtimeServices 无法引用——需提取到 `ChatApp.Realtime.Abstractions` 或发布独立 NuGet 包
-     （见 `AGENTS.md` "Long-term: publish shared Realtime contracts as a versioned package"）。
+     （见 `AGENTS.md` "Long-term: publish shared Realtime contracts as a versioned package"）。~~
+     **已完成（2026-08-03）**：`PushPlatform` / `PushTokenLimits` / `PushTokenRecord` / `IPushTokenStore`
+     已提取到 `ChatApp.Realtime.Abstractions.Push`，Core.csproj 引用 Realtime.Abstractions（BCL-only 契约层）。
    - Publisher 侧 Push 触发：`GetOnlineGatewaysWithStatusAsync` 返回 `UserOffline` 时入队 Push 任务。
 
 ## 主线二：Resume 真正事务化（已完成）
@@ -22,22 +27,22 @@ Provider 并发限制、无效 Token 注销、PushWorker 拆出、AES-GCM Token 
 DependencyUnavailable 可重试、同设备 fencing、旧 Socket 关闭验证、SessionRevokedPayload 结构化。
 见 `roadmap-changelog.md` 2026-08-01 条目。
 
-## 主线三：Group 后端分页和稳定指纹（Gateway 侧已完成，跨仓库待补）
+## 主线三：Group 后端分页和稳定指纹（已完成）
 
-Gateway 侧 SHA-256 稳定指纹、Redis 条件 Lua 写、keyset 分页均已实现。
-以下为跨仓库待补项：
+经核验，跨仓库待补项均已实现，详见 `roadmap-changelog.md` 2026-08-03 条目：
 
-3. **Realtime DB Ledger 作为唯一权威**
-   - Gateway 不重复实现权限矩阵（Owner/Admin/Member）、群主转让、最后 Owner 退群、审计事件。
-
-4. **DB keyset pagination**
-   - Member 列表分页需跨仓库扩展 `GroupConversationCommand`（当前无分页字段）。
-
-5. **不可变 Cursor 顺序**
-   - 分页 cursor 顺序稳定，不遗漏/不重复。
-
-6. **权限和审计继续由 RealtimeServices 承担**
-   - 禁止移除自己/群主等业务规则在 Realtime 侧判定。
+- **Realtime DB Ledger 作为唯一权威**：`NpgsqlRealtimeGroupStore`（约 2000 行）承担全部
+  权限矩阵（Owner/Admin/Member）、群主转让（仅 Owner 可变更角色、不能转让给自己、
+  Owner 不能自降级）、最后 Owner 退群拒绝（"Owner 退群前须先转让所有权"）、审计 Outbox
+  （事务内 `RecordInTransactionAsync`）、幂等账本（`group_mutation_requests`）、
+  软删除（`left_at_ms`/`dissolved_at_ms`）、membership periods、audience_version 递增。
+- **DB keyset pagination**：设计决策为 Realtime 侧返回全量成员（按 role/joined_at_ms/user_id 升序），
+  Gateway 本地执行 keyset 分页（`PaginateMembers`），避免改动 RealtimeServices 协议；
+  幂等缓存保存全量结果，不同分页参数命中同一缓存后各自切片。
+- **不可变 Cursor 顺序**：cursor 编码 `(role, joined_at_ms, user_id)` 元组（base64），
+  Realtime 排序保证 keyset 稳定，不遗漏/不重复；cursor 非法时退化为首页。
+- **权限和审计由 RealtimeServices 承担**：`NpgsqlGroupOperationAuditStore` 双路径
+  （事务外 best-effort + 事务内 Outbox），`group_operation_audit` 表（Migration028）已就绪。
 
 ## 主线四：附件和 Relationship（Gateway 侧协议层已完成，跨仓库待补）
 
@@ -47,9 +52,12 @@ Gateway 侧协议命令、DTO、Handler、端口 + Stub 已全部实现。
 ### 附件
 
 1. **Attachment Finalize 后端**
-   - Gateway `AttachmentCommandHandler` + `IAttachmentBackend` 端口已就绪（当前 Stub）。
-   - Realtime 侧需实现 `FinalizeUploadAsync`（Ticketed→Uploaded 转换）并接入
-     `IRealtimeMessageBus`（新增 `FinalizeAttachmentUploadAsync` 方法）。
+   - ~~Gateway `AttachmentCommandHandler` + `IAttachmentBackend` 端口已就绪（当前 Stub）。~~
+     ~~Realtime 侧需实现 `FinalizeUploadAsync`（Ticketed→Uploaded 转换）并接入
+     `IRealtimeMessageBus`（新增 `FinalizeAttachmentUploadAsync` 方法）。~~
+     **已完成（2026-08-03）**：`RealtimeAttachmentBackend` 替换 stub，端到端打通
+     `AttachmentFinalizeRequest` → `IRealtimeMessageBus.FinalizeAttachmentUploadAsync` →
+     Realtime 侧 `FinalizeUploadAsync`（Ticketed→Uploaded）。详见 `roadmap-changelog.md`。
 
 2. **所有权校验**
    - `MessagingCommandHandler` 当前不校验 `AttachmentIds` 归属，由 Realtime `BindToMessageAsync` 拒绝。
@@ -76,12 +84,32 @@ Gateway 侧协议命令、DTO、Handler、端口 + Stub 已全部实现。
 ### Relationship
 
 1. **Relationship 后端**
-   - Gateway `RelationshipCommandHandler` + `IRelationshipBackend` 端口已就绪（当前 Stub）。
-   - `IRealtimeMessageBus` 需新增 `MutateRelationshipAsync` / `QueryRelationshipListAsync` 方法。
-   - RealtimeServices 侧域：无 `IRelationshipStore` / `IRelationshipQueryProcessor` /
-     `IRelationshipCommandProcessor` / Postgres migration / NATS consumer。
+   - ~~Gateway `RelationshipCommandHandler` + `IRelationshipBackend` 端口已就绪（当前 Stub）。~~
+     ~~`IRealtimeMessageBus` 需新增 `MutateRelationshipAsync` / `QueryRelationshipListAsync` 方法。~~
+     **已完成（2026-08-03）**：`RealtimeRelationshipBackend` 替换 stub，端到端打通
+     `RelationshipCommandRequest` / `RelationshipListRequest` →
+     `IRealtimeMessageBus.MutateRelationshipAsync` / `QueryRelationshipListAsync` →
+     Realtime 侧 `NatsRelationshipCommandConsumer` / `NatsRelationshipListQueryConsumer` →
+     `RelationshipCommandWorker` / `RelationshipListQueryWorker` →
+     `DefaultRelationshipCommandProcessor` / `DefaultRelationshipListQueryProcessor` →
+     `NpgsqlRelationshipStore`（好友请求/友谊/黑名单 DB 操作）。
+     Gateway 与 Realtime 两侧 byte 枚举（`RelationshipOperation` / `RelationshipListType`）
+     数值一一对应，通过强制转换映射。440/440 测试无回归。
+   - ~~RealtimeServices 侧域业务逻辑仍待补：`IRelationshipStore` / Postgres migration /
+     `IRelationshipCommandProcessor` / `IRelationshipListQueryProcessor` 真实实现。~~
+     **已完成（2026-08-03）**：
+     - `IRelationshipStore` 接口 + `NoopRelationshipStore` 默认实现。
+     - `NpgsqlRelationshipStore`：好友请求状态机（Pending/Accepted/Declined）、
+       友谊规范化存储（`user_id_low/user_id_high`）、黑名单复用 `T_BlockRecords`、
+       幂等账本（`relationship_mutation_requests`）、游标分页。
+     - `Migration052_Relationships`：`friend_requests` + `friendships` +
+       `relationship_mutation_requests` 三表 + 索引。
+     - `DefaultRelationshipCommandProcessor` / `DefaultRelationshipListQueryProcessor`。
+     - 三处 DI 注册（Core/Postgres/Host）+ NATS consumer 注册。
+     - 修复预存在的 `CapturingAttachmentStore` 缺少 `FinalizeUploadAsync` 测试问题。
+     - RealtimeServices.slnx 构建 0 错误；TcpGateway 440/440 测试通过。
      三个事件类型（`FriendRequestListChanged=1` / `FriendListChanged=2` / `BlockedListChanged=3`）
-     已在枚举预留但无发布者。
+     已在枚举预留但无发布者（待增量同步需求驱动）。
 
 2. **Relationship Watermark**
    - `ConversationSyncWatermark` 仅限会话维度，需扩展为 Relationship 级别版本/水位用于增量同步。

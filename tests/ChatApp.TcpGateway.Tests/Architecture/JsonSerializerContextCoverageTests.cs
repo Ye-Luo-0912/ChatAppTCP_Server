@@ -8,7 +8,7 @@ using ChatApp.TcpGateway.Core.Messaging.History;
 using ChatApp.TcpGateway.Core.Messaging.Push;
 using ChatApp.TcpGateway.Core.Messaging.Relationships;
 using ChatApp.TcpGateway.Core.Messaging.Sync;
-using ChatApp.TcpGateway.Core.Push;
+using ChatApp.Realtime.Abstractions.Push;
 using ChatApp.TcpGateway.Infrastructure.Serialization.Json;
 using Xunit;
 

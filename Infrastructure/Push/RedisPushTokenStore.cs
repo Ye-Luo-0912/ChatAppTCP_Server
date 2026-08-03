@@ -1,8 +1,7 @@
 using System.Globalization;
 using System.Security.Cryptography;
 using System.Text.Json;
-using ChatApp.TcpGateway.Core.Messaging.Push;
-using ChatApp.TcpGateway.Core.Push;
+using ChatApp.Realtime.Abstractions.Push;
 using ChatApp.TcpGateway.Infrastructure.Caching;
 using ChatApp.TcpGateway.Infrastructure.Serialization.Json;
 using ChatApp.TcpGateway.Observability.Logging;
