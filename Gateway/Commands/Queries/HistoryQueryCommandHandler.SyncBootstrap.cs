@@ -2,6 +2,7 @@ using System.Buffers;
 using ChatApp.Realtime.Integration;
 using ChatApp.TcpGateway.Core.Messaging.Conversations;
 using ChatApp.TcpGateway.Core.Messaging.History;
+using ChatApp.TcpGateway.Core.Messaging.Relationships;
 using ChatApp.TcpGateway.Core.Messaging.Sync;
 using ChatApp.TcpGateway.Core.Protocol;
 using ChatApp.TcpGateway.Core.Serialization;
@@ -15,6 +16,10 @@ using RealtimeSyncBootstrapQuery =
     ChatApp.Realtime.Abstractions.Sync.SyncBootstrapQuery;
 using RealtimeConversationSyncWatermark =
     ChatApp.Realtime.Abstractions.Sync.ConversationSyncWatermark;
+using RealtimeRelationshipSyncWatermark =
+    ChatApp.Realtime.Abstractions.Sync.RelationshipSyncWatermark;
+using RealtimeRelationshipListType =
+    ChatApp.Realtime.Abstractions.Relationships.RelationshipListType;
 
 namespace ChatApp.TcpGateway.Gateway.Commands.Queries;
 
@@ -53,7 +58,13 @@ internal sealed partial class HistoryQueryCommandHandler
                 || watermark.ConversationId.Length > 64
                 || string.IsNullOrWhiteSpace(watermark.AfterMessageId)
                 || watermark.AfterMessageId.Length > 64
-                || watermark.AfterReceivedAtMs <= 0) == true)
+                || watermark.AfterReceivedAtMs <= 0) == true
+            || request.RelationshipWatermarks?.Count > PacketProtocol.SyncMaxWatermarks
+            || request.RelationshipWatermarks?.Any(static watermark =>
+                (byte)watermark.ListType < 1
+                || (byte)watermark.ListType > 3
+                || watermark.AfterChangedAtMs < 0) == true
+            || request.RelationshipListLimit is int rll and (< 0 or > PacketProtocol.ConversationListMaxItems))
         {
             _metrics.HistoryQueryFailed();
             SendSyncBootstrapResponse(
@@ -87,7 +98,15 @@ internal sealed partial class HistoryQueryCommandHandler
                     AfterChangedAtMs = watermark.AfterReceivedAtMs,
                     AfterMessageId = watermark.AfterMessageId
                 })
-                .ToArray()
+                .ToArray(),
+            RelationshipWatermarks = request.RelationshipWatermarks?
+                .Select(static watermark => new RealtimeRelationshipSyncWatermark
+                {
+                    ListType = (RealtimeRelationshipListType)(byte)watermark.ListType,
+                    AfterChangedAtMs = watermark.AfterChangedAtMs
+                })
+                .ToArray(),
+            RelationshipListLimit = request.RelationshipListLimit
         };
 
         try
@@ -323,7 +342,30 @@ internal sealed partial class HistoryQueryCommandHandler
                 ConversationsNextCursor = conversationsCursor,
                 ConversationsHasMore = conversationsHasMore,
                 CatchUps = truncatedCatchUps,
-                ResetsRequired = mappedResets
+                ResetsRequired = mappedResets,
+                RelationshipCatchUps = page.RelationshipCatchUps is null || page.RelationshipCatchUps.Count == 0
+                    ? null
+                    : page.RelationshipCatchUps
+                        .Select(static catchUp => new RelationshipCatchUp
+                        {
+                            ListType = (RelationshipListType)(byte)catchUp.ListType,
+                            Items = catchUp.Items
+                                .Select(static item => new RelationshipItem
+                                {
+                                    UserId = item.UserId,
+                                    ResourceId = item.ResourceId,
+                                    Status = item.Status,
+                                    Message = item.Message,
+                                    CreatedAtMs = item.CreatedAtMs
+                                })
+                                .ToArray(),
+                            HasMore = catchUp.HasMore,
+                            NextCursor = catchUp.NextCursor,
+                            NewAfterChangedAtMs = catchUp.NewAfterChangedAtMs,
+                            ResetRequired = catchUp.ResetRequired,
+                            ResetReason = catchUp.ResetReason
+                        })
+                        .ToArray()
             };
 
             var totalSize = ResponseByteBudget.MeasurePayload(

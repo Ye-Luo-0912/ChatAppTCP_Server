@@ -21,4 +21,9 @@ public sealed record SyncBootstrapResponse
     /// </summary>
     public IReadOnlyList<SyncCursorResetRequired> ResetsRequired { get; init; } =
         Array.Empty<SyncCursorResetRequired>();
+
+    /// <summary>
+    /// 关系列表增量同步结果。null 或空表示未请求关系同步。
+    /// </summary>
+    public IReadOnlyList<RelationshipCatchUp>? RelationshipCatchUps { get; init; }
 }
