@@ -112,10 +112,10 @@ $scenarioDefs = [ordered]@{
     }
 }
 
-$scenariosToRun = if ($Scenario -eq 'all') {
-    @($scenarioDefs.Keys)
+if ($Scenario -eq 'all') {
+    $scenariosToRun = @($scenarioDefs.Keys)
 } else {
-    @($Scenario)
+    $scenariosToRun = @($Scenario)
 }
 
 $inboundModes = @('Pipelines', 'DirectSocket')
@@ -127,7 +127,7 @@ $totalRuns = $scenariosToRun.Count * $inboundModes.Count * $outboundModes.Count
 
 foreach ($scn in $scenariosToRun) {
     $def = $scenarioDefs[$scn]
-    $scnDuration = if ($def.DurationOverride -gt 0) { $def.DurationOverride } else { $DurationSeconds }
+    $scnDuration = if ($def.ContainsKey('DurationOverride') -and $def.DurationOverride -gt 0) { $def.DurationOverride } else { $DurationSeconds }
 
     foreach ($inbound in $inboundModes) {
         foreach ($outbound in $outboundModes) {
@@ -135,6 +135,13 @@ foreach ($scn in $scenariosToRun) {
             $comboName = "${inbound}+${outbound}"
             $runLabel = "${scn}/${comboName}"
             Write-Host "`n[$runIndex/$totalRuns] Running $runLabel ..." -ForegroundColor Cyan
+
+            # Clean up stale capacity containers from previous runs
+            $staleContainers = @(& docker ps -a --filter 'name=codex-chatapp-capacity-' --format '{{.Names}}' 2>$null)
+            if ($staleContainers.Count -gt 0) {
+                Write-Host "  Cleaning up $($staleContainers.Count) stale container(s)..." -ForegroundColor DarkGray
+                & docker rm -f @staleContainers 2>$null | Out-Null
+            }
 
             $runDirectory = Join-Path $matrixDirectory "$scn/$comboName"
             [IO.Directory]::CreateDirectory($runDirectory) | Out-Null
@@ -152,7 +159,7 @@ foreach ($scn in $scenariosToRun) {
                 ReportDirectory = $runDirectory
                 NoPipeline = $true
             }
-            if ($def.SlowReaders -gt 0) {
+            if ($def.ContainsKey('SlowReaders') -and $def.SlowReaders -gt 0) {
                 $arguments.TcpSlowReaders = $def.SlowReaders
             }
             if ($SkipBuild -or $runIndex -gt 1) {
@@ -240,15 +247,15 @@ foreach ($scn in $scenariosToRun) {
 
 # 汇总报告
 $completedAt = [DateTimeOffset]::UtcNow
-$allPassed = ($results | Where-Object { -not $_.Passed }).Count -eq 0
+$allPassed = @($results | Where-Object { -not $_.Passed }).Count -eq 0
 
 $summary = [pscustomobject]@{
     StartedAtUtc = $startedAt
     CompletedAtUtc = $completedAt
     Passed = $allPassed
-    TotalRuns = $results.Count
-    PassedRuns = ($results | Where-Object { $_.Passed }).Count
-    FailedRuns = ($results | Where-Object { -not $_.Passed }).Count
+    TotalRuns = @($results).Count
+    PassedRuns = @($results | Where-Object { $_.Passed }).Count
+    FailedRuns = @($results | Where-Object { -not $_.Passed }).Count
     Scenarios = $scenariosToRun
     Results = $results
 }
@@ -280,7 +287,7 @@ foreach ($scn in $scenariosToRun) {
             $r.Combo, $r.Passed, $r.SuccessfulConnections, $r.FailedConnections,
             $r.ThroughputPerSecond, $r.P95Milliseconds, $r.P99Milliseconds,
             $r.GatewayAverageCpuPercent, $r.GatewayMaximumWorkingSetBytes / 1MB,
-            $r.BytesPerConn, $r.Gen2Collections))
+            $r.BytesPerConnection, $r.Gen2Collections))
     }
     $lines.Add('')
 }
