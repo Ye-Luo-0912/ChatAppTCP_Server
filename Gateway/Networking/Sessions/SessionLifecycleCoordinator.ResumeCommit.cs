@@ -1,3 +1,5 @@
+using ChatApp.Realtime.Abstractions.Stores;
+using ChatApp.Realtime.Integration.Ephemeral;
 using ChatApp.TcpGateway.Core.Authentication;
 using ChatApp.TcpGateway.Core.Messaging;
 using ChatApp.TcpGateway.Core.Protocol;
@@ -123,9 +125,13 @@ internal sealed partial class SessionLifecycleCoordinator
             ResumeToken = resumeToken
         };
 
-        // 三-3：冻结用户拒绝 Resume。fail-open 缓存未命中时放行——
-        // 认证路径权威性由 AccessTokenStore 保证，Resume 路径在缓存预热后秒级拦截；
-        // UserLifecycleChanged 事件到达后会关闭已恢复的活跃会话（AccountSuspended）。
+        // P0-3：冻结用户拒绝 Resume —— 权威生命周期校验（fail-closed）。
+        // 1) 快速路径：缓存命中冻结 → 立即拒绝，避免不必要的 NATS 往返。
+        // 2) 权威校验：查询 Server 获取用户当前生命周期状态。
+        //    - 查询返回 Frozen → 拒绝（UserFrozen）。
+        //    - 查询失败（依赖不可用）→ fail-closed 拒绝 Resume，避免
+        //      "缓存未命中 + 后台刷新" 的 fail-open 窗口被冻结用户滥用。
+        //    仅在缓存未标记冻结且权威查询成功且返回 Active 时才放行。
         if (_frozenUserCache is not null && _frozenUserCache.IsFrozen(context.UserId))
         {
             _metrics.ResumeFailed(ResumeFailureReason.UserFrozen);
@@ -135,6 +141,29 @@ internal sealed partial class SessionLifecycleCoordinator
             return ResumePrepareResult.Failed(
                 ResumeFailureKind.UserFrozen,
                 ResumeFailureReason.UserFrozen);
+        }
+
+        var lifecycleDecision = await AuthoritativeLifecycleCheckAsync(
+                context.UserId, cancellationToken)
+            .ConfigureAwait(false);
+        if (lifecycleDecision != ResumeLifecycleDecision.Allow)
+        {
+            // 归还 Claim：拒绝 Resume 前必须释放 Token，允许客户端走完整认证或重试。
+            await ReleaseClaimSafeAsync(prepared, cancellationToken)
+                .ConfigureAwait(false);
+            if (lifecycleDecision == ResumeLifecycleDecision.Frozen)
+            {
+                _metrics.ResumeFailed(ResumeFailureReason.UserFrozen);
+                return ResumePrepareResult.Failed(
+                    ResumeFailureKind.UserFrozen,
+                    ResumeFailureReason.UserFrozen);
+            }
+            // 依赖不可用：fail-closed 拒绝 Resume，客户端退避后重试或走完整认证。
+            _metrics.ResumeFailed(ResumeFailureReason.LifecycleUnavailable);
+            return ResumePrepareResult.Failed(
+                ResumeFailureKind.DependencyUnavailable,
+                ResumeFailureReason.LifecycleUnavailable,
+                RetryAfterMsForDependency);
         }
 
         // 代次校验：若待恢复会话携带 DeviceIdHash，查询当前设备租约持有者。
@@ -501,6 +530,51 @@ internal sealed partial class SessionLifecycleCoordinator
     }
 
     /// <summary>
+    /// P0-3：权威生命周期校验。查询 Server 获取用户当前生命周期状态，fail-closed。
+    /// <para>
+    /// 返回 <see cref="ResumeLifecycleDecision.Allow"/> 仅当查询成功且用户未被冻结。
+    /// 查询失败（NATS 依赖不可用）返回 <see cref="ResumeLifecycleDecision.Unavailable"/>，
+    /// 由调用方 fail-closed 拒绝 Resume，杜绝"缓存未命中即放行"的 fail-open 窗口。
+    /// </para>
+    /// </summary>
+    private async Task<ResumeLifecycleDecision> AuthoritativeLifecycleCheckAsync(
+        long userId,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            var response = await _messageBus
+                .QueryUserLifecycleAsync(
+                    new UserLifecycleQuery { UserId = userId },
+                    cancellationToken)
+                .ConfigureAwait(false);
+
+            if (response.State == UserLifecycleState.Frozen)
+            {
+                // 权威确认冻结：同步预热缓存，避免后续请求重复走 NATS 往返。
+                _frozenUserCache?.MarkFrozen(
+                    userId,
+                    _timeProvider.GetUtcNow().ToUnixTimeMilliseconds());
+                return ResumeLifecycleDecision.Frozen;
+            }
+
+            return ResumeLifecycleDecision.Allow;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.DependencyOperationFailed(
+                GatewayDependency.RealtimeService,
+                GatewayDependencyOperation.ResumeTokenLookup,
+                ex);
+            return ResumeLifecycleDecision.Unavailable;
+        }
+    }
+
+    /// <summary>
     /// P1-D：Abort 阶段——回滚 Commit 阶段已完成的部分本地状态。
     /// <para>
     /// Auth 路径（<see cref="OnAuthenticatedAsync"/>）与 Resume 路径（<see cref="CommitResumeAsync"/>）
@@ -612,4 +686,22 @@ internal sealed class PreparedResumeContext
     /// P0-3：客户端提交的原始 ResumeToken，用于 Commit/Release 调用。
     /// </summary>
     public string ResumeToken { get; init; } = string.Empty;
+}
+
+/// <summary>
+/// P0-3：权威生命周期校验的决策结果。
+/// </summary>
+internal enum ResumeLifecycleDecision
+{
+    /// <summary>未尝试/不适用（仅占位）。</summary>
+    None = 0,
+
+    /// <summary>查询成功且用户未被冻结，允许 Resume。</summary>
+    Allow = 1,
+
+    /// <summary>权威查询确认用户已冻结，拒绝 Resume。</summary>
+    Frozen = 2,
+
+    /// <summary>权威查询依赖不可用（NATS 到 Server 失败），fail-closed 拒绝 Resume。</summary>
+    Unavailable = 3,
 }

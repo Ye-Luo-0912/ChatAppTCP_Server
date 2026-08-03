@@ -69,6 +69,17 @@ public sealed class TcpGatewayOptions
     public long PipeResumeWriterThreshold { get; set; } = 80 * 1024;
     public int OutboundQueueCapacity { get; set; } = 256;
     public long MaxOutboundQueuedBytes { get; set; } = 256 * 1024;
+
+    /// <summary>
+    /// P0-5：出站队列实现模式。
+    /// <para>
+    /// 默认 <see cref="OutboundQueueMode.BoundedChannel"/>（成熟实现，生产默认）。
+    /// 切换为 <see cref="OutboundQueueMode.LazySegmented"/> 后使用自定义 MPSC 队列
+    /// （空闲连接零段分配），仅供 A/B 对照；在完整 Transport Matrix 通过前不应作为生产默认。
+    /// </para>
+    /// </summary>
+    public OutboundQueueMode OutboundQueueMode { get; set; } =
+        OutboundQueueMode.BoundedChannel;
     public TimeSpan AuthenticationTimeout { get; set; } = TimeSpan.FromSeconds(10);
     public TimeSpan IdleTimeout { get; set; } = TimeSpan.FromSeconds(90);
     public TimeSpan HeartbeatScanInterval { get; set; } = TimeSpan.FromSeconds(30);

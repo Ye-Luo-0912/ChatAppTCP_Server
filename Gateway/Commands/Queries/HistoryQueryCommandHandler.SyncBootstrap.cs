@@ -63,7 +63,7 @@ internal sealed partial class HistoryQueryCommandHandler
             || request.RelationshipWatermarks?.Any(static watermark =>
                 (byte)watermark.ListType < 1
                 || (byte)watermark.ListType > 3
-                || watermark.AfterChangedAtMs < 0) == true
+                || watermark.AfterSequence < 0) == true
             || request.RelationshipListLimit is int rll and (< 0 or > PacketProtocol.ConversationListMaxItems))
         {
             _metrics.HistoryQueryFailed();
@@ -103,7 +103,7 @@ internal sealed partial class HistoryQueryCommandHandler
                 .Select(static watermark => new RealtimeRelationshipSyncWatermark
                 {
                     ListType = (RealtimeRelationshipListType)(byte)watermark.ListType,
-                    AfterChangedAtMs = watermark.AfterChangedAtMs
+                    AfterSequence = watermark.AfterSequence
                 })
                 .ToArray(),
             RelationshipListLimit = request.RelationshipListLimit
@@ -349,19 +349,24 @@ internal sealed partial class HistoryQueryCommandHandler
                         .Select(static catchUp => new RelationshipCatchUp
                         {
                             ListType = (RelationshipListType)(byte)catchUp.ListType,
-                            Items = catchUp.Items
-                                .Select(static item => new RelationshipItem
+                            Changes = catchUp.Changes
+                                .Select(static change => new RelationshipChangeLogEntry
                                 {
-                                    UserId = item.UserId,
-                                    ResourceId = item.ResourceId,
-                                    Status = item.Status,
-                                    Message = item.Message,
-                                    CreatedAtMs = item.CreatedAtMs
+                                    ChangeSequence = change.ChangeSequence,
+                                    Operation = (RelationshipChangeOperation)(byte)change.Operation,
+                                    ResourceId = change.ResourceId,
+                                    UserId = change.UserId,
+                                    Status = change.Status,
+                                    Message = change.Message,
+                                    CreatedAtMs = change.CreatedAtMs,
+                                    OccurredAtMs = change.OccurredAtMs,
+                                    RequestId = change.RequestId
                                 })
                                 .ToArray(),
                             HasMore = catchUp.HasMore,
                             NextCursor = catchUp.NextCursor,
-                            NewAfterChangedAtMs = catchUp.NewAfterChangedAtMs,
+                            NextSequence = catchUp.NextSequence,
+                            RetentionFloorSequence = catchUp.RetentionFloorSequence,
                             ResetRequired = catchUp.ResetRequired,
                             ResetReason = catchUp.ResetReason
                         })

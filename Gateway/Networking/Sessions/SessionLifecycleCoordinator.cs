@@ -595,6 +595,7 @@ internal static class ResumeFailureReasonExtensions
         ResumeFailureReason.CircuitOpen => ResumeFailureKind.DependencyUnavailable,
         ResumeFailureReason.LeaseQueryFailed => ResumeFailureKind.DependencyUnavailable,
         ResumeFailureReason.TakeOverUnavailable => ResumeFailureKind.DependencyUnavailable,
+        ResumeFailureReason.LifecycleUnavailable => ResumeFailureKind.DependencyUnavailable,
         ResumeFailureReason.UserFrozen => ResumeFailureKind.UserFrozen,
         _ => ResumeFailureKind.InvalidToken
     };

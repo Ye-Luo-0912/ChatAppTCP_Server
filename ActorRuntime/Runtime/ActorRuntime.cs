@@ -106,20 +106,11 @@ public sealed class ActorRuntime<TKey, TState, TMessage> :
         => TryTell(in key, in message);
 
     /// <summary>
-    /// 持久消息入队：在生产侧消耗式预留 Actor 数量配额（TryAcquire）。
-    /// 若配额已满，返回 AdmissionRejected 且不入队，避免持久消息被静默丢弃。
+    /// 持久消息入队：在生产侧消耗式预留 Actor 激活配额（<see cref="ActorRoute"/> 状态机）。
+    /// 若全局配额已满或每 Shard 上限已满，返回 AdmissionRejected 且不入队，避免持久消息被静默丢弃。
     /// <para>
-    /// P1-7：返回 Accepted 时保证 Actor 配额 + Mailbox credit 均已预留。
-    /// 配额通过 envelope.HasActorQuotaReservation 传递到消费侧：
-    /// 新 Actor 复用预留（不再 TryAcquire），已存在 Actor 立即 Release。
-    /// 入队失败（MailboxFull/ShardOverloaded）时释放预留配额。
-    /// </para>
-    /// <para>
-    /// P0-8：分离"激活配额"与"邮箱配额"。已存在 Actor 即使 Shard 满也必须收消息——
-    /// 生产侧通过 <see cref="ActorShard{TKey,TState,TMessage}.ContainsActor"/> 探测 Key 是否已激活，
-    /// 仅对"新 Actor 激活"路径检查全局配额与每 Shard 上限；已存在 Actor 跳过激活配额检查，
-    /// 仅受 Mailbox 容量约束（<see cref="ActorShard{TKey,TState,TMessage}.TryEnqueueDurable"/>
-    /// 内部的 admission TryReserve）。消费侧 RouteEnvelope 仍保留二次校验安全网。
+    /// P0-2：通过 <see cref="ActorRoute"/> 状态机原子地预留激活配额 + 邮件配额，消除
+    /// "探测 Actor 存在 → 消费时已回收"的 TOCTOU 竞态。不再使用 ContainsActor 快照探测。
     /// </para>
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -133,44 +124,7 @@ public sealed class ActorRuntime<TKey, TState, TMessage> :
         var shardIndex = GetShardIndex(in key);
         var shard = _shards[shardIndex];
 
-        // P0-8：已存在 Actor 投递路径——跳过激活配额检查，仅受 Mailbox 容量约束。
-        // 这修复了"Shard 满后已存在 Actor 无法收消息"的回归。
-        if (shard.ContainsActor(in key))
-        {
-            return shard.TryEnqueueDurable(
-                in key,
-                in message,
-                hasActorQuotaReservation: false);
-        }
-
-        // 新 Actor 激活路径——先检查每 Shard 上限（快速拒绝，避免入队后消费侧静默丢弃）。
-        // 注意：ActiveActorCount 不包含尚在 Ingress Ring 中待 Consumer 处理的新激活请求，
-        // 因此该预检是"最佳努力"——消费侧 RouteEnvelope 的 _cells.Count > _maxActorsPerShard
-        // 仍是权威检查。预检失败直接返回 AdmissionRejected，让调用方尽早重试或降级。
-        if (shard.ActiveActorCount >= shard.MaxActorsPerShard)
-        {
-            return ActorPostStatus.AdmissionRejected;
-        }
-
-        // 新 Actor 激活路径——消耗式预留全局激活配额。
-        // 消费侧 RouteEnvelope 对新 Actor 复用预留（不再 TryAcquire）；
-        // 若消费侧发现 Actor 已被并发创建，会立即 Release 预留配额。
-        // TryAcquire 失败表示全局激活配额已满（系统级反压），返回 AdmissionRejected。
-        if (!_globalQuota.TryAcquire())
-        {
-            return ActorPostStatus.AdmissionRejected;
-        }
-
-        // 配额已预留，入队并标记。入队失败时释放预留。
-        var status = shard.TryEnqueueDurable(
-            in key,
-            in message,
-            hasActorQuotaReservation: true);
-        if (status != ActorPostStatus.Accepted)
-        {
-            _globalQuota.Release();
-        }
-        return status;
+        return shard.TryEnqueueDurable(in key, in message);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]

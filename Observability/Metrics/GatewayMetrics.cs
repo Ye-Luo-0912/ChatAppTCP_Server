@@ -338,6 +338,7 @@ public sealed partial class GatewayMetrics : IDisposable
             ResumeFailureReason.LeaseQueryFailed => "lease_query_failed",
             ResumeFailureReason.TakeOverUnavailable => "takeover_unavailable",
             ResumeFailureReason.UserFrozen => "user_frozen",
+            ResumeFailureReason.LifecycleUnavailable => "lifecycle_unavailable",
             _ => "unknown"
         };
 
@@ -604,5 +605,8 @@ public enum ResumeFailureReason
     TakeOverUnavailable,
 
     /// <summary>三-3：账号已被冻结，Resume 拒绝。</summary>
-    UserFrozen
+    UserFrozen,
+
+    /// <summary>P0-3：权威生命周期查询依赖不可用（NATS 到 Server 失败），fail-closed 拒绝 Resume。</summary>
+    LifecycleUnavailable
 }

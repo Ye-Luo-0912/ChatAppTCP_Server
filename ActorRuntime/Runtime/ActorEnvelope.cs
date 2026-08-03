@@ -11,9 +11,10 @@ namespace ChatApp.ActorRuntime.Runtime;
 /// Deadline 触发不经过 Ingress——由 Shard 单线程 DeadlineWheel 在 Consumer Loop 内直接投递控制通道。
 /// </para>
 /// <para>
-/// P1-7：<see cref="HasActorQuotaReservation"/> 标记生产侧（TryTellDurable）已消耗式预留全局 Actor 配额。
-/// 消费侧 RouteEnvelope 据此决定：新 Actor 复用预留（不再 TryAcquire），已存在 Actor 立即 Release。
-/// 这使 TryTellDurable 返回 Accepted 时保证 Actor 配额 + Mailbox credit 均已预留，消除"生产侧接受、消费侧静默丢弃"竞态。
+/// P0-2：<see cref="Route"/> 为每个 Actor Key 的线程安全路由对象（<see cref="ActorRoute"/>），
+/// 承担生产侧准入决策（邮件配额 + 激活配额 + 状态机）。生产侧（TryTellDurable）在入队前
+/// 通过 Route 原子地预留激活配额，消除"探测 Actor 存在 → 消费时已回收"的 TOCTOU 竞态。
+/// 消费侧据此判断是否已持有配额（复用/Commit）或需 TryAcquire 安全网。
 /// </para>
 /// </summary>
 internal readonly struct ActorEnvelope<TKey, TMessage>
@@ -22,29 +23,25 @@ internal readonly struct ActorEnvelope<TKey, TMessage>
 {
     public readonly TKey Key;
     public readonly TMessage Message;
-    public readonly ActorAdmission? Admission;
+    public readonly ActorRoute? Route;
     public readonly ActivationId Activation;
     public readonly ActorDeactivateReason DeactivateReason;
     public readonly ActorEnvelopeKind Kind;
-    // P1-7：生产侧 TryTellDurable 已 TryAcquire 全局配额。仅对 Durable 消息为 true。
-    public readonly bool HasActorQuotaReservation;
 
     public ActorEnvelope(
         in TKey key,
         in TMessage message,
-        ActorAdmission? admission,
+        ActorRoute? route,
         ActivationId activation,
         ActorEnvelopeKind kind,
-        ActorDeactivateReason deactivateReason = default,
-        bool hasActorQuotaReservation = false)
+        ActorDeactivateReason deactivateReason = default)
     {
         Key = key;
         Message = message;
-        Admission = admission;
+        Route = route;
         Activation = activation;
         Kind = kind;
         DeactivateReason = deactivateReason;
-        HasActorQuotaReservation = hasActorQuotaReservation;
     }
 }
 
@@ -72,11 +69,11 @@ internal readonly struct ActorMailboxItem<TMessage>
     where TMessage : struct
 {
     public readonly TMessage Message;
-    public readonly ActorAdmission? Admission;
+    public readonly ActorRoute? Route;
 
-    public ActorMailboxItem(in TMessage message, ActorAdmission? admission)
+    public ActorMailboxItem(in TMessage message, ActorRoute? route)
     {
         Message = message;
-        Admission = admission;
+        Route = route;
     }
 }

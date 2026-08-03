@@ -26,7 +26,7 @@ namespace ChatApp.TcpGateway.Gateway.Networking.Sessions;
 /// （保留 slot 2 的生产者先于 slot 1 完成写入时，消费者不会读到未发布的 slot 1）。
 /// </para>
 /// </summary>
-internal sealed class LazySegmentedOutboundQueue : IValueTaskSource<bool>
+internal sealed class LazySegmentedOutboundQueue : IOutboundQueue, IValueTaskSource<bool>
 {
     /// <summary>每段槽位数。16 槽：兼顾首段内存成本（~0.5 KiB）与段分配频率。</summary>
     private const int SegmentSize = 16;

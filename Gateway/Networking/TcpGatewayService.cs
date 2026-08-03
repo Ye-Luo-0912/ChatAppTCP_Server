@@ -679,7 +679,8 @@ internal sealed partial class TcpGatewayService : BackgroundService
                 outboundPump: _outboundPump,
                 sendTimeoutTracker: _sendTimeoutTracker,
                 frameAssemblyTracker: _frameAssemblyTracker,
-                usePerSessionDrain: _usePerSessionDrain);
+                usePerSessionDrain: _usePerSessionDrain,
+                outboundQueueMode: _options.OutboundQueueMode);
 
             // 注册连接到全局执行器（OrderedWrite/Query/Ephemeral 共享 worker 池）。
             // 未认证会话 UserId=0，认证成功后执行器不依赖此字段重新路由（按 connectionId 串行）。

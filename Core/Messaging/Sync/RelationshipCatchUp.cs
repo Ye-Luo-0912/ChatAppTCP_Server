@@ -6,8 +6,8 @@ namespace ChatApp.TcpGateway.Core.Messaging.Sync;
 /// 关系列表增量同步结果（S2C）。
 /// <para>
 /// 与 <see cref="ConversationHistoryCatchUp"/> 平行，但以 list_type 为维度。
-/// BlockedUsers 因底层表无变更时间戳，<see cref="NewAfterChangedAtMs"/> 始终为 0
-/// （客户端需全量 diff）。
+/// 变更以 <see cref="RelationshipChangeLogEntry"/> 表达（含删除 tombstone），
+/// 客户端按 <see cref="NextSequence"/> 推进本地水位。
 /// </para>
 /// </summary>
 public sealed record RelationshipCatchUp
@@ -15,9 +15,9 @@ public sealed record RelationshipCatchUp
     /// <summary>关系列表类型。</summary>
     public required RelationshipListType ListType { get; init; }
 
-    /// <summary>当前列表项（全量或增量）。</summary>
-    public IReadOnlyList<RelationshipItem> Items { get; init; } =
-        Array.Empty<RelationshipItem>();
+    /// <summary>增量变更日志条目（含删除 tombstone）。</summary>
+    public IReadOnlyList<RelationshipChangeLogEntry> Changes { get; init; } =
+        Array.Empty<RelationshipChangeLogEntry>();
 
     /// <summary>是否还有更多数据（分页）。</summary>
     public bool HasMore { get; init; }
@@ -25,11 +25,11 @@ public sealed record RelationshipCatchUp
     /// <summary>下一页游标（opaque）。null 表示无更多数据。</summary>
     public string? NextCursor { get; init; }
 
-    /// <summary>
-    /// 服务端推进后的新水位。客户端应持久化此值作为下次同步的 AfterChangedAtMs。
-    /// BlockedUsers 始终为 0。
-    /// </summary>
-    public long NewAfterChangedAtMs { get; init; }
+    /// <summary>服务端推进后的新水位。客户端应持久化此值作为下次同步的 AfterSequence。</summary>
+    public long NextSequence { get; init; }
+
+    /// <summary>服务端仍保留的最低变更序号。若客户端水位低于此值，必须重置。</summary>
+    public long RetentionFloorSequence { get; init; }
 
     /// <summary>该列表类型是否需要客户端本地全量重置（水位无效时）。</summary>
     public bool ResetRequired { get; init; }

@@ -49,10 +49,9 @@ internal sealed class ActorShard<TKey, TState, TMessage>
     private readonly int _completionCreditCapacity;
     private int _completionCredits;
     private readonly ActorCellTable<TKey, TState, TMessage> _cells;
-    // P0-1：生产侧线程安全的 Actor 存在性探测表。Consumer 激活/回收时同步维护，
-    // Producer 通过此 ConcurrentDictionary 查询，不再直接读 _cells（普通 Dictionary）。
-    private readonly ConcurrentDictionary<TKey, byte> _activeActorKeys = new();
-    private readonly ConcurrentDictionary<TKey, ActorAdmission>? _fifoAdmissions;
+    // P0-2：每个 Actor Key 的线程安全路由对象。承担生产侧准入决策（邮件配额 + 激活配额 + 状态机），
+    // 消除"探测 Actor 存在 → 消费时已回收"的 TOCTOU 竞态。替代旧的 _activeActorKeys + _fifoAdmissions。
+    private readonly ConcurrentDictionary<TKey, ActorRoute> _routes = new();
     private readonly SingleWaiterSignal _signal;
     private readonly ShardDeadlineWheel<TKey, TState, TMessage> _deadlines;
     private readonly AsyncOperationExecutor _asyncExecutor;
@@ -135,9 +134,6 @@ internal sealed class ActorShard<TKey, TState, TMessage>
             new BoundedMpscRing<ActorEnvelope<TKey, TMessage>>(
                 completionCreditCapacity);
         _cells = new ActorCellTable<TKey, TState, TMessage>(initialCapacity: 64);
-        _fifoAdmissions = mailboxMode == ActorMailboxMode.Fifo
-            ? new ConcurrentDictionary<TKey, ActorAdmission>()
-            : null;
         _signal = new SingleWaiterSignal();
         _deadlines = new ShardDeadlineWheel<TKey, TState, TMessage>(
             timeProvider,
@@ -164,24 +160,50 @@ internal sealed class ActorShard<TKey, TState, TMessage>
     public int MaxActorsPerShard => _maxActorsPerShard;
 
     /// <summary>
-    /// P0-1：判断指定 Key 的 Actor 是否已存在（生产侧线程安全探测）。
-    /// <para>
-    /// 通过独立的 <see cref="ConcurrentDictionary{TKey,TValue}"/> 查询，不再直接读
-    /// <see cref="ActorCellTable{TKey,TState,TMessage}"/> 内部的普通
-    /// <see cref="Dictionary{TKey,TValue}"/>（Consumer 单写时并发读不安全）。
-    /// Consumer 在 Actor 激活/回收时同步维护此表。
-    /// </para>
-    /// <para>
-    /// 用途：<see cref="TryEnqueueDurable"/> 在生产侧区分"新 Actor 激活"与"已存在 Actor 投递"——
-    /// 仅新 Actor 激活需检查 <see cref="MaxActorsPerShard"/> 上限，已存在 Actor 即使 Shard 满也必须收消息。
-    /// 探测与消费侧 <see cref="RouteEnvelope"/> 之间存在 TOCTOU 竞态：若探测时存在、消费时已回收，
-    /// 消费侧 RouteEnvelope 走非预留路径二次校验（TryAcquire 安全网），可能因配额满而 AdmissionRejected。
-    /// 完整修复需引入 ActorRoute 状态机（ActivationState/Generation），见 roadmap-todo.md P0-1。
-    /// </para>
+    /// 获取（或创建）指定 Key 的路由对象。生产侧准入决策的唯一入口。
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public bool ContainsActor(in TKey key)
-        => _activeActorKeys.ContainsKey(key);
+    private ActorRoute GetOrCreateRoute(in TKey key)
+        => _routes.GetOrAdd(key, static _ => new ActorRoute());
+
+    /// <summary>
+    /// FIFO 模式下的邮件配额预留。成功返回 true（route 已计入在途消息）。
+    /// 失败且 route 已退休时返回 false，调用方应重取路由。
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private bool TryReserveMailboxCapacity(in TKey key, ActorRoute route)
+    {
+        if (_mailboxMode != ActorMailboxMode.Fifo)
+            return true;
+
+        while (true)
+        {
+            if (route.TryReserveMailbox(_mailboxCapacity))
+                return true;
+
+            if (!route.IsRetired)
+            {
+                Interlocked.Increment(ref _mailboxFullCount);
+                return false;
+            }
+
+            RemoveRouteIfSame(in key, route);
+            route = GetOrCreateRoute(in key);
+        }
+    }
+
+    /// <summary>
+    /// 释放一条消息的邮件配额（仅 FIFO 模式；Latest 模式在 <see cref="TryReserveMailboxCapacity"/>
+    /// 中不预留配额，故此处为 no-op，避免 _pending 越界为负触发 "released more than once"）。
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void ReleaseMailboxCapacity(ActorRoute? route)
+    {
+        if (_mailboxMode != ActorMailboxMode.Fifo)
+            return;
+
+        route?.ReleaseMailbox();
+    }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public ActorPostStatus TryEnqueue(in TKey key, in TMessage message)
@@ -189,36 +211,19 @@ internal sealed class ActorShard<TKey, TState, TMessage>
         if (_stopping)
             return ActorPostStatus.RuntimeStopping;
 
-        ActorAdmission? admission = null;
-        if (_fifoAdmissions is not null)
-        {
-            while (true)
-            {
-                admission = _fifoAdmissions.GetOrAdd(
-                    key,
-                    static _ => new ActorAdmission());
-                if (admission.TryReserve(_mailboxCapacity))
-                    break;
-
-                if (!admission.IsRetired)
-                {
-                    Interlocked.Increment(ref _mailboxFullCount);
-                    return ActorPostStatus.MailboxFull;
-                }
-
-                RemoveAdmissionIfSame(in key, admission);
-            }
-        }
+        var route = GetOrCreateRoute(in key);
+        if (!TryReserveMailboxCapacity(in key, route))
+            return ActorPostStatus.MailboxFull;
 
         var envelope = new ActorEnvelope<TKey, TMessage>(
             in key,
             in message,
-            admission,
+            route,
             ActivationId.None,
             ActorEnvelopeKind.Message);
         if (!_ingress.TryEnqueue(in envelope))
         {
-            admission?.Release();
+            ReleaseMailboxCapacity(route);
             Interlocked.Increment(ref _shardOverloadedCount);
             return ActorPostStatus.ShardOverloaded;
         }
@@ -228,52 +233,55 @@ internal sealed class ActorShard<TKey, TState, TMessage>
     }
 
     /// <summary>
-    /// P1-7：Durable 消息入队。与 <see cref="TryEnqueue"/> 相同的 FIFO admission 流程，
-    /// 但在 envelope 中标记 <paramref name="hasActorQuotaReservation"/>。
-    /// 调用方（ActorRuntime.TryTellDurable）已在生产侧消耗式 TryAcquire 全局配额，
-    /// 消费侧 RouteEnvelope 据此标记决定复用预留或释放。
+    /// P0-2：Durable 消息入队。在 Route 状态机上原子地预留激活配额 + 邮件配额，
+    /// 消除"探测 Actor 存在 → 消费时已回收"的 TOCTOU 竞态：
+    /// <list type="bullet">
+    /// <item>Inactive → Activating：预留全局激活配额 + 每 Shard 预检；</item>
+    /// <item>Activating / Active：激活已在进行或已存在，仅预留邮件配额；</item>
+    /// <item>Retiring：接管（Retiring → Activating），转移配额，建立下一代激活。</item>
+    /// </list>
+    /// 返回 Accepted 时保证激活配额 + 邮件配额均已预留；入队失败时释放。
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public ActorPostStatus TryEnqueueDurable(
         in TKey key,
-        in TMessage message,
-        bool hasActorQuotaReservation)
+        in TMessage message)
     {
         if (_stopping)
             return ActorPostStatus.RuntimeStopping;
 
-        ActorAdmission? admission = null;
-        if (_fifoAdmissions is not null)
+        var route = GetOrCreateRoute(in key);
+        if (!TryReserveMailboxCapacity(in key, route))
+            return ActorPostStatus.MailboxFull;
+
+        // 在 Route 状态机上原子地预留激活配额。
+        if (!route.TryBeginActivation(_globalQuota, out var quotaReserved))
         {
-            while (true)
-            {
-                admission = _fifoAdmissions.GetOrAdd(
-                    key,
-                    static _ => new ActorAdmission());
-                if (admission.TryReserve(_mailboxCapacity))
-                    break;
+            ReleaseMailboxCapacity(route);
+            return ActorPostStatus.AdmissionRejected;
+        }
 
-                if (!admission.IsRetired)
-                {
-                    Interlocked.Increment(ref _mailboxFullCount);
-                    return ActorPostStatus.MailboxFull;
-                }
-
-                RemoveAdmissionIfSame(in key, admission);
-            }
+        // 新激活槽（quotaReserved=true）需预检每 Shard 上限，避免入队后消费侧静默丢弃。
+        // 预检是"最佳努力"——消费侧 _cells.Count 仍是权威检查。
+        if (quotaReserved && Volatile.Read(ref _activeActorCount) >= _maxActorsPerShard)
+        {
+            ReleaseMailboxCapacity(route);
+            if (route.TryRollbackActivation())
+                _globalQuota.Release();
+            return ActorPostStatus.AdmissionRejected;
         }
 
         var envelope = new ActorEnvelope<TKey, TMessage>(
             in key,
             in message,
-            admission,
+            route,
             ActivationId.None,
-            ActorEnvelopeKind.Message,
-            deactivateReason: default,
-            hasActorQuotaReservation: hasActorQuotaReservation);
+            ActorEnvelopeKind.Message);
         if (!_ingress.TryEnqueue(in envelope))
         {
-            admission?.Release();
+            ReleaseMailboxCapacity(route);
+            if (quotaReserved && route.TryRollbackActivation())
+                _globalQuota.Release();
             Interlocked.Increment(ref _shardOverloadedCount);
             return ActorPostStatus.ShardOverloaded;
         }
@@ -294,7 +302,7 @@ internal sealed class ActorShard<TKey, TState, TMessage>
         var envelope = new ActorEnvelope<TKey, TMessage>(
             in key,
             in message,
-            admission: null,
+            route: null,
             activation,
             ActorEnvelopeKind.Completion);
         Interlocked.Increment(ref _pendingCompletionIngress);
@@ -326,7 +334,7 @@ internal sealed class ActorShard<TKey, TState, TMessage>
         var envelope = new ActorEnvelope<TKey, TMessage>(
             in key,
             message: default,
-            admission: null,
+            route: null,
             activation,
             ActorEnvelopeKind.Deactivate,
             reason);
@@ -352,7 +360,7 @@ internal sealed class ActorShard<TKey, TState, TMessage>
         var envelope = new ActorEnvelope<TKey, TMessage>(
             in key,
             in message,
-            admission: null,
+            route: null,
             ActivationId.None,
             ActorEnvelopeKind.Invalidation);
         if (!_ingress.TryEnqueue(in envelope))
@@ -457,11 +465,11 @@ internal sealed class ActorShard<TKey, TState, TMessage>
 
             ClearCurrentCell();
             _cells.Clear();
-            _activeActorKeys.Clear();
+            _routes.Clear();
         }
 
         ClearReadyQueue();
-        _fifoAdmissions?.Clear();
+        _routes.Clear();
         Volatile.Write(ref _activeActorCount, 0);
         Volatile.Write(ref _busyActorCount, 0);
         Volatile.Write(ref _pendingMailboxCount, 0);
@@ -531,45 +539,32 @@ internal sealed class ActorShard<TKey, TState, TMessage>
 
     private void RouteEnvelope(in ActorEnvelope<TKey, TMessage> envelope)
     {
+        var route = envelope.Route;
         ref var cellRef = ref _cells.GetOrAddRef(in envelope.Key);
-        // P1-7：已存在 Actor 时，生产侧预留的全局配额用不上，立即释放。
-        // 新 Actor 创建路径（cellRef is null）复用预留配额，不释放。
-        if (cellRef is not null && envelope.HasActorQuotaReservation)
-        {
-            _globalQuota.Release();
-        }
 
         if (cellRef is null)
         {
-            // 新 Actor 准入。
-            // P1-7：预留路径（TryTellDurable）已在生产侧消耗式 TryAcquire 全局配额，
-            // 此处复用预留，不再 TryAcquire；仅检查每 Shard 上限。
-            // 非预留路径（TryTell/TryTellEphemeral）仍走消费侧 TryAcquire 安全网。
-            if (envelope.HasActorQuotaReservation)
-            {
-                // _cells.Count 已包含 GetOrAddRef 刚插入的占位条目，
-                // 因此"已存在 Actor 数 == Count - 1"。允许创建当且仅当
-                // (Count - 1) + 1 <= MaxActorsPerShard，即 Count <= MaxActorsPerShard，
-                // 拒绝条件为 Count > MaxActorsPerShard。
-                if (_cells.Count > _maxActorsPerShard)
-                {
-                    _cells.Remove(in envelope.Key);
-                    Interlocked.Increment(ref _admissionRejectedCount);
-                    // 释放生产侧预留的配额（用不上）。
-                    _globalQuota.Release();
-                    DropEnvelope(in envelope, ActorMessageDropReason.AdmissionRejected);
-                    TryRetireAdmission(in envelope.Key);
-                    return;
-                }
-                // 配额已预留，继续创建 Actor。
-            }
-            else if (_cells.Count > _maxActorsPerShard ||
-                     !_globalQuota.TryAcquire())
+            // 新 Actor 准入。Route 状态机是权威来源：
+            // 已持有配额（非 Inactive）→ 复用预留并 Commit；未持有 → TryAcquire 安全网。
+            var hasReservation = route?.HasReservation ?? false;
+
+            if (_cells.Count > _maxActorsPerShard)
             {
                 _cells.Remove(in envelope.Key);
                 Interlocked.Increment(ref _admissionRejectedCount);
                 DropEnvelope(in envelope, ActorMessageDropReason.AdmissionRejected);
-                TryRetireAdmission(in envelope.Key);
+                if (route is not null && hasReservation && route.TryRollbackActivation())
+                    _globalQuota.Release();
+                TryRetireRoute(in envelope.Key);
+                return;
+            }
+
+            if (!hasReservation && !_globalQuota.TryAcquire())
+            {
+                _cells.Remove(in envelope.Key);
+                Interlocked.Increment(ref _admissionRejectedCount);
+                DropEnvelope(in envelope, ActorMessageDropReason.AdmissionRejected);
+                TryRetireRoute(in envelope.Key);
                 return;
             }
 
@@ -609,25 +604,30 @@ internal sealed class ActorShard<TKey, TState, TMessage>
                 }
 
                 _deactivationCount++;
-                _globalQuota.Release();
+                // 激活失败：释放本路径持有的配额。若已预留（非 Inactive），
+                // 仅在无其他在途消息时回滚并释放；否则保留以供后续消息重新激活。
+                if (!hasReservation)
+                    _globalQuota.Release();
+                else if (route is not null && route.TryRollbackActivation())
+                    _globalQuota.Release();
                 ClearCurrentCell();
                 _cells.Remove(in envelope.Key);
-                DropEnvelope(in envelope, ActorMessageDropReason.ActivationFailed);
-                TryRetireAdmission(in envelope.Key);
+                DropEnvelope(in envelope, ActorMessageDropReason.BehaviorFaulted);
+                TryRetireRoute(in envelope.Key);
                 return;
             }
 
             ClearCurrentCell();
             _activeActorCount++;
             _activationCount++;
-            // P0-1：同步生产侧探测表。Consumer 单线程写入，生产侧多线程读取。
-            _activeActorKeys.TryAdd(envelope.Key, 0);
+            // P0-2：提交 Route 为 Active。配额由活跃 Actor 持有，直到退休时释放。
+            route?.CommitActive();
         }
 
         var actor = cellRef!;
         var item = new ActorMailboxItem<TMessage>(
             in envelope.Message,
-            envelope.Admission);
+            envelope.Route);
         var status = actor.TryEnqueueMessage(
             in item,
             _mailboxCapacity,
@@ -637,7 +637,7 @@ internal sealed class ActorShard<TKey, TState, TMessage>
 
         if (status is ActorPostStatus.MailboxFull or ActorPostStatus.ActorClosed)
         {
-            ReleaseAdmission(item.Admission);
+            ReleaseMailboxCapacity(item.Route);
             DropMessage(
                 in item.Message,
                 status == ActorPostStatus.MailboxFull
@@ -645,7 +645,7 @@ internal sealed class ActorShard<TKey, TState, TMessage>
                     : ActorMessageDropReason.ActorClosed);
             if (status == ActorPostStatus.MailboxFull)
                 Interlocked.Increment(ref _mailboxFullCount);
-            TryRetireAdmission(in actor.Key);
+            TryRetireRoute(in actor.Key);
             return;
         }
 
@@ -678,7 +678,7 @@ internal sealed class ActorShard<TKey, TState, TMessage>
 
         var item = new ActorMailboxItem<TMessage>(
             in envelope.Message,
-            admission: null);
+            route: null);
         var status = actor.TryEnqueueCompletion(
             in item,
             out _,
@@ -715,7 +715,7 @@ internal sealed class ActorShard<TKey, TState, TMessage>
 
         var item = new ActorMailboxItem<TMessage>(
             in envelope.Message,
-            admission: null);
+            route: null);
         if (actor.TryEnqueueInvalidation(in item))
             _pendingMailboxCount++;
         ScheduleReady(actor);
@@ -780,7 +780,7 @@ internal sealed class ActorShard<TKey, TState, TMessage>
                 }
 
                 _pendingMailboxCount--;
-                ReleaseAdmission(item.Admission);
+                ReleaseMailboxCapacity(item.Route);
 
                 if (cancellationToken.IsCancellationRequested)
                 {
@@ -930,13 +930,34 @@ internal sealed class ActorShard<TKey, TState, TMessage>
         actor.ReleaseStorage();
         _deactivationCount++;
         _activeActorCount--;
-        _globalQuota.Release();
-        // P0-1：同步生产侧探测表。先移除探测标记，再移除 cell。
-        _activeActorKeys.TryRemove(actor.Key, out _);
+        ReleaseRouteQuota(in actor.Key);
         _cells.Remove(in actor.Key);
-        TryRetireAdmission(in actor.Key);
+        TryRetireRoute(in actor.Key);
         // 时间轮中该 Actor 的未触发条目不显式移除：
         // 触发时 Activation 匹配失败被识别为过期丢弃（惰性取消）。
+    }
+
+    /// <summary>
+    /// 退休时协调 ActorRoute 的配额释放。Active → Retiring → Inactive（无在途消息）时释放全局配额；
+    /// 存在在途消息（<see cref="ActorRoute.Pending"/> &gt; 0）或已被生产侧接管（Retiring → Activating）时，
+    /// 保留配额供后续消息重新激活。Route 非 Active（如已接管）但不持有配额时也释放。
+    /// </summary>
+    private void ReleaseRouteQuota(in TKey key)
+    {
+        if (!_routes.TryGetValue(key, out var route))
+            return;
+
+        if (route.TryBeginRetirement())
+        {
+            // 本次退休由本路径完成：无在途消息才真正释放配额。
+            if (route.TryCompleteRetirement())
+                _globalQuota.Release();
+        }
+        else if (!route.HasReservation)
+        {
+            // Route 非 Active 且未持有配额（已接管时 HasReservation=true，配额由新一代持有）。
+            _globalQuota.Release();
+        }
     }
 
     private void DrainCellMessages(
@@ -1265,7 +1286,7 @@ internal sealed class ActorShard<TKey, TState, TMessage>
             actor.LastDeadlineBucketIndex = -1;
         var item = new ActorMailboxItem<TMessage>(
             in message,
-            admission: null);
+            route: null);
         if (!actor.TryEnqueueDeadline(in item))
         {
             // 调度侧不变量保证控制 FIFO 必有槽。
@@ -1284,37 +1305,30 @@ internal sealed class ActorShard<TKey, TState, TMessage>
         => DropMessage(in message, ActorMessageDropReason.RuntimeStopping);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static void ReleaseAdmission(ActorAdmission? admission)
-        => admission?.Release();
-
-    private void TryRetireAdmission(in TKey key)
+    private void TryRetireRoute(in TKey key)
     {
-        if (_fifoAdmissions is null ||
-            !_fifoAdmissions.TryGetValue(key, out var admission) ||
-            !admission.TryRetireIfIdle())
-        {
+        if (!_routes.TryGetValue(key, out var route))
             return;
-        }
 
-        RemoveAdmissionIfSame(in key, admission);
+        if (!route.TryRetireIfIdle())
+            return;
+
+        RemoveRouteIfSame(in key, route);
     }
 
-    private void RemoveAdmissionIfSame(
+    private void RemoveRouteIfSame(
         in TKey key,
-        ActorAdmission admission)
+        ActorRoute route)
     {
-        if (_fifoAdmissions is null)
-            return;
-
-        ((ICollection<KeyValuePair<TKey, ActorAdmission>>)_fifoAdmissions)
-            .Remove(new KeyValuePair<TKey, ActorAdmission>(key, admission));
+        ((ICollection<KeyValuePair<TKey, ActorRoute>>)_routes)
+            .Remove(new KeyValuePair<TKey, ActorRoute>(key, route));
     }
 
     private void DropEnvelope(
         in ActorEnvelope<TKey, TMessage> envelope,
         ActorMessageDropReason reason)
     {
-        ReleaseAdmission(envelope.Admission);
+        ReleaseMailboxCapacity(envelope.Route);
         DropMessage(in envelope.Message, reason);
     }
 
@@ -1322,7 +1336,7 @@ internal sealed class ActorShard<TKey, TState, TMessage>
         in ActorMailboxItem<TMessage> item,
         ActorMessageDropReason reason)
     {
-        ReleaseAdmission(item.Admission);
+        ReleaseMailboxCapacity(item.Route);
         DropMessage(in item.Message, reason);
     }
 

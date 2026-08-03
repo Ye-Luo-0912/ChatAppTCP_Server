@@ -2,6 +2,7 @@ using System.Net.Sockets;
 using System.Threading.Tasks.Sources;
 using ChatApp.TcpGateway.Core.Authentication;
 using ChatApp.TcpGateway.Core.Protocol;
+using ChatApp.TcpGateway.Gateway.Configuration;
 using ChatApp.TcpGateway.Gateway.Networking.Buffers;
 using ChatApp.TcpGateway.Gateway.Networking.Executor;
 using ChatApp.TcpGateway.Observability.Metrics;
@@ -22,7 +23,7 @@ namespace ChatApp.TcpGateway.Gateway.Networking.Sessions;
 internal sealed partial class TcpClientSession : IAsyncDisposable
 {
     private readonly Socket _socket;
-    private readonly LazySegmentedOutboundQueue _outbound;
+    private readonly IOutboundQueue _outbound;
     private readonly OutboundQueueBudget _outboundBudget;
     private readonly GlobalOutboundBudget? _globalOutboundBudget;
     private readonly CancellationTokenSource _lifetime = new();
@@ -232,7 +233,8 @@ internal sealed partial class TcpClientSession : IAsyncDisposable
         OutboundPumpCoordinator? outboundPump = null,
         SendTimeoutTracker? sendTimeoutTracker = null,
         FrameAssemblyTimeoutTracker? frameAssemblyTracker = null,
-        bool usePerSessionDrain = false)
+        bool usePerSessionDrain = false,
+        OutboundQueueMode outboundQueueMode = OutboundQueueMode.BoundedChannel)
     {
         _socket = socket;
         ConnectionId = connectionId;
@@ -255,10 +257,12 @@ internal sealed partial class TcpClientSession : IAsyncDisposable
         // Token Bucket 初始化时间戳，首次调用时补充满桶。
         _lastRefillTimestamp = _connectedTimestamp;
 
-        // 五-3：Lazy Segmented MPSC 出站队列。空闲连接零段分配（首次 TryWrite 才分配 16 槽段），
-        // 较 Channel.CreateBounded 节省约 87% 每连接出站队列内存（见 OutboundChannel.Benchmarks）。
+        // 五-3 / P0-5：出站队列实现按模式选择。
+        // - BoundedChannel（默认，成熟实现）：Channel.CreateBounded，行为与历史版本一致。
+        // - LazySegmented：自定义 MPSC 队列，空闲连接零段分配（首次 TryWrite 才分配 16 槽段），
+        //   较 Channel 节省约 87% 每连接出站队列内存（见 OutboundChannel.Benchmarks）。
         // 多生产者 CAS 保留槽位 + 位掩码发布；单消费者按 _tail 顺序读取。
-        _outbound = new LazySegmentedOutboundQueue(outboundQueueCapacity);
+        _outbound = CreateOutboundQueue(outboundQueueCapacity, outboundQueueMode);
 
         // 鉴权超时：通过全局 DeadlineWheel 注册一次性 deadline，认证成功后取消。
         // deadlineWheel=null 时（测试场景）退化为不启用 deadline，由 HeartbeatCoordinator 兜底扫描。
@@ -293,6 +297,17 @@ internal sealed partial class TcpClientSession : IAsyncDisposable
     }
 
     public uint ConnectionId { get; }
+
+    /// <summary>
+    /// P0-5：按 <see cref="OutboundQueueMode"/> 创建出站队列。
+    /// </summary>
+    private static IOutboundQueue CreateOutboundQueue(
+        int capacity, OutboundQueueMode mode) =>
+        mode switch
+        {
+            OutboundQueueMode.LazySegmented => new LazySegmentedOutboundQueue(capacity),
+            _ => new BoundedChannelOutboundQueue(capacity)
+        };
 
     /// <summary>
     /// 每次 TCP 连接生成的公开路由标识（GUID），用于：
