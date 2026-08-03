@@ -109,7 +109,9 @@ Gateway 侧协议命令、DTO、Handler、端口 + Stub 已全部实现。
      - 修复预存在的 `CapturingAttachmentStore` 缺少 `FinalizeUploadAsync` 测试问题。
      - RealtimeServices.slnx 构建 0 错误；TcpGateway 440/440 测试通过。
      三个事件类型（`FriendRequestListChanged=1` / `FriendListChanged=2` / `BlockedListChanged=3`）
-     已在枚举预留但无发布者（待增量同步需求驱动）。
+     已由 `NpgsqlRelationshipStore` 在 6 个 mutation 操作中发布（经 `OutboxInsertHelper`
+     写入 outbox → `OutboxPublisherWorker` 走 NATS/JetStream），Gateway `RelationshipListHandler`
+     消费并失效 Typing/Presence 授权缓存 + 推送 `RelationshipListChanged`。
 
 2. ~~**Relationship Watermark**~~
    - ~~`ConversationSyncWatermark` 仅限会话维度，需扩展为 Relationship 级别版本/水位用于增量同步。~~

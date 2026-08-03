@@ -155,6 +155,10 @@ Infrastructure 和 Gateway 共享。跨进程消息使用同级仓库 `../ChatAp
 
 - `RelationshipListChanged=153`（S2C）+ `RelationshipListHandler`：消费
   `FriendRequestListChanged` / `FriendListChanged` / `BlockedListChanged` 事件。
+- **事件发布者已闭环**：`NpgsqlRelationshipStore` 6 个 mutation 操作（Send/Accept/Decline
+  FriendRequest、RemoveFriend、Block/Unblock）经 `OutboxInsertHelper` 写入 outbox →
+  `OutboxPublisherWorker` 走 NATS/JetStream；`RelationshipListHandler` 消费后失效
+  Typing/Presence 授权缓存并推送 `RelationshipListChanged`。
 - `IDirectConversationAuthorizer` 缓存主动失效：friendship/blocked-user 变更双向失效。
 - **Gateway 协议层已完成**：`RelationshipCommandHandler` + `IRelationshipBackend` 端口
   （`RealtimeRelationshipBackend` 生产实现，`StubRelationshipBackend` 保留供单测注入），

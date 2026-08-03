@@ -5,6 +5,24 @@
 
 ## 2026-08-03
 
+### 主线四-关系：Relationship 事件发布者核验（已完成，无代码改动）
+
+核验三个关系事件类型（`FriendRequestListChanged` / `FriendListChanged` / `BlockedListChanged`）
+的发布链路，确认发布者已随 Relationship 后端闭环一并实现，roadmap 中"无发布者"描述过时：
+
+- **RealtimeServices 发布者**：`NpgsqlRelationshipStore` 6 个 mutation 操作
+  （SendFriendRequest / AcceptFriendRequest / DeclineFriendRequest / RemoveFriend /
+  BlockUser / UnblockUser）每次成功变更在同一事务内经 `OutboxInsertHelper.InsertManyAsync`
+  写入 outbox 表，由 `OutboxPublisherWorker` 异步发布到 NATS/JetStream。
+  `RealtimeEvent.PayloadJson` 使用 `RealtimeDomainNotificationPayload`
+  （Resource / Action / ResourceId / Message）。
+- **Gateway 消费端**：`RealtimeEventDispatcher` 已注册 3 个事件类型 →
+  `RelationshipListHandler` 通过 `GatewayJsonSerializerContext` 解析 payload，
+  friendship/blocked-user 变更双向失效 `IDirectConversationAuthorizer` 缓存 +
+  Specialized TypingActor 授权，并推送 `RelationshipListChanged`。
+- 文档更新：`roadmap-todo.md` / `roadmap-current-state.md` 修正"无发布者"描述。
+- 无代码改动，构建/测试基线不变（TcpGateway 440/440，RealtimeServices 259/259）。
+
 ### 主线四-关系：Relationship 增量同步水位与 SyncBootstrap 集成（已完成）
 
 在 SyncBootstrap 内引入 Relationship 维度的水位/增量同步能力，与既有会话维度水位解耦并行：
