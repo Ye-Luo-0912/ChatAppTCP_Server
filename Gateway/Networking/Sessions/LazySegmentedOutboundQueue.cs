@@ -210,9 +210,13 @@ internal sealed class LazySegmentedOutboundQueue : IValueTaskSource<bool>
         if (Volatile.Read(ref _completed) != 0)
             return new ValueTask<bool>(false);
 
-        // 注册等待方：先标记 _hasWaiter=1 再 Reset 信号，确保 SignalWaiter 的 Exchange 能命中。
-        Volatile.Write(ref _hasWaiter, 1);
+        // 注册等待方：先 Reset 信号再标记 _hasWaiter=1。SignalWaiter 的 SetResult 仅在
+        // Exchange(_hasWaiter,0)==1（即 _hasWaiter==1）时发生，故 SetResult 一定晚于 Reset，
+        // 避免生产者在 _signal 仍处于 Complete 状态时 SetResult 抛 InvalidOperationException。
+        // Reset 与 _hasWaiter=1 之间生产者的 SignalWaiter 因 Exchange 不命中而跳过 SetResult，
+        // 由下方注册后重检（TryPeek / _completed）兜底，不丢失唤醒。
         _signal.Reset();
+        Volatile.Write(ref _hasWaiter, 1);
 
         // 注册后重检：catch 生产者在 fast-path 与 _hasWaiter=1 之间的入队（丢失唤醒修复）。
         if (TryPeek(out _))
