@@ -1,3 +1,6 @@
+using System.Diagnostics;
+using System.Security.Cryptography;
+using System.Text;
 using ChatApp.Realtime.Abstractions.Push;
 using ChatApp.Realtime.Integration.Push;
 using Microsoft.Extensions.Logging;
@@ -14,18 +17,16 @@ namespace ChatApp.TcpGateway.Infrastructure.Push;
 /// <item>用户无令牌时立即返回 <see cref="PushDeliveryResult.NoTokensRegistered"/>（跳过指标）。</item>
 /// <item>按平台分组，并行调用对应 <see cref="IPushProvider"/>（每令牌一个 Task）。</item>
 /// <item>主线一4/6：对 rate_limited / provider_unavailable 的 token 按指数退避内部重试。</item>
-/// <item>收集结果：成功计数、可重试失败计数、无效令牌指纹列表。</item>
-/// <item>主线一8：对 invalid_token 令牌调用 <see cref="IPushTokenStore.UnregisterByTokenAsync"/>
-///   可靠注销（带重试，await 完成不 fire-and-forget）。</item>
+/// <item>门禁1：Token 级幂等——投递前检查 <see cref="IPushIdempotencyStore.IsSentAsync"/>，
+///   已成功投递的 token 跳过，避免 JetStream NAK 重投整条命令时重复推送。</item>
+/// <item>门禁5：永久失败（invalid_token / payload_too_large）记录到 <see cref="IPushDlqStore"/>。</item>
+/// <item>门禁4：对 invalid_token 令牌入队 <see cref="PushInvalidTokenCleanupQueue"/>，
+///   由后台 worker 可靠注销（不阻塞请求生命周期，非 fire-and-forget）。</item>
 /// </list>
 /// </para>
 /// <para>
 /// 主线一7：每 Provider 并发由 <see cref="PushOptions.MaxConcurrentSendsPerProvider"/> 限制，
 /// 避免突发流量打爆 Provider API。
-/// </para>
-/// <para>
-/// 不含幂等去重（本轮聚焦投递；去重由调用方或后续 Redis 去重层实现）。
-/// 令牌指纹：令牌字符串的 SHA256 前 8 字节 hex（用于日志/指标/无效注销匹配，不泄露完整令牌）。
 /// </para>
 /// </summary>
 internal sealed partial class PushDispatcher : IPushDispatcher
@@ -33,6 +34,10 @@ internal sealed partial class PushDispatcher : IPushDispatcher
     private readonly IPushTokenStore _tokenStore;
     private readonly Dictionary<PushPlatform, IPushProvider> _providersByPlatform;
     private readonly PushOptions _options;
+    private readonly IPushIdempotencyStore _idempotencyStore;
+    private readonly IPushDlqStore _dlqStore;
+    private readonly PushInvalidTokenCleanupQueue _cleanupQueue;
+    private readonly TimeProvider _timeProvider;
     private readonly ILogger<PushDispatcher> _logger;
     // 主线一7：per-Provider 并发限制器。按 Platform 索引，0 表示不限制。
     private readonly Dictionary<PushPlatform, SemaphoreSlim> _concurrencyGates;
@@ -41,11 +46,19 @@ internal sealed partial class PushDispatcher : IPushDispatcher
         IPushTokenStore tokenStore,
         IEnumerable<IPushProvider> providers,
         IOptions<PushOptions> options,
+        IPushIdempotencyStore idempotencyStore,
+        IPushDlqStore dlqStore,
+        PushInvalidTokenCleanupQueue cleanupQueue,
+        TimeProvider timeProvider,
         ILogger<PushDispatcher> logger)
     {
         _tokenStore = tokenStore;
         _providersByPlatform = providers.ToDictionary(p => p.Platform);
         _options = options.Value;
+        _idempotencyStore = idempotencyStore;
+        _dlqStore = dlqStore;
+        _cleanupQueue = cleanupQueue;
+        _timeProvider = timeProvider;
         _logger = logger;
 
         // 主线一7：为每个 Provider 创建并发限制器。
@@ -69,26 +82,28 @@ internal sealed partial class PushDispatcher : IPushDispatcher
             return PushDeliveryResult.Skipped(command.TargetUserId);
         }
 
+        // 门禁1：稳定 deliveryId（JetStream 重投整条命令时保持相同，用于幂等去重）。
+        var deliveryId = BuildDeliveryId(command);
+
         var tasks = new Task<PushDeliveryOutcome>[tokens.Count];
         for (var i = 0; i < tokens.Count; i++)
         {
             var record = tokens[i];
-            tasks[i] = DispatchWithRetryAsync(command, record, cancellationToken);
+            tasks[i] = DispatchWithRetryAsync(command, record, deliveryId, cancellationToken);
         }
 
         var completed = await Task.WhenAll(tasks).ConfigureAwait(false);
         var outcomes = new List<PushDeliveryOutcome>(completed);
         var result = PushDeliveryResult.FromOutcomes(command.TargetUserId, outcomes);
 
-        // 主线一8：可靠注销无效令牌（await + 重试，非 fire-and-forget）。
+        // 门禁4：无效令牌入队可靠清理（后台 worker 消费注销，非请求生命周期 fire-and-forget）。
         if (result.InvalidTokenFingerprints.Count > 0)
         {
-            await UnregisterInvalidTokensReliableAsync(
-                command.TargetUserId,
-                tokens,
-                result.InvalidTokenFingerprints,
-                cancellationToken).ConfigureAwait(false);
+            EnqueueInvalidTokens(command.TargetUserId, tokens, result.InvalidTokenFingerprints);
         }
+
+        // 门禁5：永久失败（invalid_token / payload_too_large）记录 DLQ，供人工排查与重放。
+        await RecordDlqAsync(command, deliveryId, outcomes, cancellationToken).ConfigureAwait(false);
 
         if (result.SucceededCount == 0 && result.AttemptedCount > 0)
         {
@@ -99,14 +114,30 @@ internal sealed partial class PushDispatcher : IPushDispatcher
     }
 
     /// <summary>
-    /// 主线一4/6/7：带并发限制和 Token 粒度重试的投递。
+    /// 主线一4/6/7 + 门禁1：带并发限制、Token 粒度重试与幂等去重的投递。
     /// </summary>
     private async Task<PushDeliveryOutcome> DispatchWithRetryAsync(
         PushDeliveryCommand command,
         PushTokenRecord record,
+        string deliveryId,
         CancellationToken cancellationToken)
     {
+        var fingerprint = FingerprintToken(record.Token);
+
+        // 门禁1：已成功投递的 token 直接跳过（幂等重放），避免重复推送。
+        if (await IsAlreadySentAsync(deliveryId, fingerprint, cancellationToken).ConfigureAwait(false))
+        {
+            return new PushDeliveryOutcome
+            {
+                TokenFingerprint = fingerprint,
+                Platform = (byte)record.Platform,
+                Succeeded = true
+            };
+        }
+
         var outcome = await DispatchToOneAsync(command, record, cancellationToken).ConfigureAwait(false);
+        if (outcome.Succeeded)
+            await MarkSentAsync(deliveryId, fingerprint, cancellationToken).ConfigureAwait(false);
 
         // 主线一4/6：对可重试失败按指数退避重试。
         var retryCount = Math.Max(0, _options.TokenRetryCount);
@@ -130,9 +161,44 @@ internal sealed partial class PushDispatcher : IPushDispatcher
             }
 
             outcome = await DispatchToOneAsync(command, record, cancellationToken).ConfigureAwait(false);
+            if (outcome.Succeeded)
+                await MarkSentAsync(deliveryId, fingerprint, cancellationToken).ConfigureAwait(false);
         }
 
         return outcome;
+    }
+
+    /// <summary>
+    /// 门禁1：幂等检查（fail-open）。若存储异常则允许发送（重复推送比丢失安全）。
+    /// </summary>
+    private async ValueTask<bool> IsAlreadySentAsync(
+        string deliveryId, string fingerprint, CancellationToken ct)
+    {
+        try
+        {
+            return await _idempotencyStore.IsSentAsync(deliveryId, fingerprint, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            LogIdempotencyCheckFailed(_logger, ex, deliveryId);
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// 门禁1：记录成功投递（best-effort，失败不阻断返回）。
+    /// </summary>
+    private async ValueTask MarkSentAsync(
+        string deliveryId, string fingerprint, CancellationToken ct)
+    {
+        try
+        {
+            await _idempotencyStore.MarkSentAsync(deliveryId, fingerprint, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            LogIdempotencyMarkFailed(_logger, ex, deliveryId);
+        }
     }
 
     /// <summary>
@@ -201,66 +267,95 @@ internal sealed partial class PushDispatcher : IPushDispatcher
     }
 
     /// <summary>
-    /// 主线一8：可靠注销无效令牌（await + 重试，非 fire-and-forget）。
-    /// <para>
-    /// 注销失败不阻塞投递返回，但会在后台重试 <see cref="PushOptions.InvalidTokenUnregisterRetryCount"/> 次，
-    /// 避免无效 Token 残留导致后续推送继续尝试已失效的令牌。
-    /// </para>
+    /// 门禁4：将无效令牌入队，交给后台 <see cref="PushInvalidTokenCleanupWorker"/> 可靠注销。
     /// </summary>
-    private async Task UnregisterInvalidTokensReliableAsync(
+    private void EnqueueInvalidTokens(
         long userId,
         IReadOnlyList<PushTokenRecord> allTokens,
-        IReadOnlyList<string> invalidFingerprints,
-        CancellationToken cancellationToken)
+        IReadOnlyList<string> invalidFingerprints)
     {
         var fingerprintSet = new HashSet<string>(invalidFingerprints, StringComparer.Ordinal);
-        var maxRetry = Math.Max(0, _options.InvalidTokenUnregisterRetryCount);
-
         foreach (var token in allTokens)
         {
-            if (!fingerprintSet.Contains(FingerprintToken(token.Token)))
-                continue;
-
-            for (var attempt = 0; attempt <= maxRetry; attempt++)
-            {
-                try
-                {
-                    await _tokenStore.UnregisterByTokenAsync(userId, token.Token, cancellationToken)
-                        .ConfigureAwait(false);
-                    break; // 注销成功，跳出重试。
-                }
-                catch (OperationCanceledException)
-                {
-                    throw;
-                }
-                catch (Exception ex)
-                {
-                    LogUnregisterFailed(_logger, ex, userId, attempt, maxRetry);
-                    if (attempt >= maxRetry)
-                        break;
-
-                    // 指数退避：100ms * 2^attempt。
-                    var delay = TimeSpan.FromMilliseconds(100 * (1 << attempt));
-                    try
-                    {
-                        await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
-                    }
-                    catch (OperationCanceledException)
-                    {
-                        throw;
-                    }
-                }
-            }
+            if (fingerprintSet.Contains(FingerprintToken(token.Token)))
+                _cleanupQueue.Enqueue(userId, token.Token);
         }
     }
+
+    /// <summary>
+    /// 门禁5：将永久失败（invalid_token / payload_too_large）的 token 记录到 DLQ。
+    /// <para>
+    /// 携带 DeliveryId、失败 Token 子集（Provider/ErrorCode/RetryAfter）、原始 Trace Context 与记录时间。
+    /// </para>
+    /// </summary>
+    private async Task RecordDlqAsync(
+        PushDeliveryCommand command,
+        string deliveryId,
+        IReadOnlyList<PushDeliveryOutcome> outcomes,
+        CancellationToken cancellationToken)
+    {
+        var permanentFailures = new List<PushDlqFailedToken>();
+        foreach (var o in outcomes)
+        {
+            if (!o.Succeeded && o.ErrorCode is "invalid_token" or "payload_too_large")
+            {
+                permanentFailures.Add(new PushDlqFailedToken
+                {
+                    TokenFingerprint = o.TokenFingerprint,
+                    Platform = o.Platform,
+                    ErrorCode = o.ErrorCode!,
+                    RetryAfter = o.RetryAfter
+                });
+            }
+        }
+
+        if (permanentFailures.Count == 0)
+            return;
+
+        var activity = Activity.Current;
+        var entry = new PushDlqEntry
+        {
+            DeliveryId = deliveryId,
+            TargetUserId = command.TargetUserId,
+            FailedTokens = permanentFailures,
+            TraceParent = activity is not null ? BuildTraceParent(activity) : null,
+            TraceState = activity?.TraceStateString,
+            RecordedAtMs = _timeProvider.GetUtcNow().ToUnixTimeMilliseconds()
+        };
+
+        try
+        {
+            await _dlqStore.RecordAsync(entry, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            LogDlqRecordFailed(_logger, ex, deliveryId, permanentFailures.Count);
+        }
+    }
+
+    /// <summary>
+    /// 门禁1：稳定 deliveryId。优先使用 MessageId；缺失时退化为命令内容哈希，
+    /// 保证 JetStream 重投同一条命令时 deliveryId 稳定。
+    /// </summary>
+    private static string BuildDeliveryId(PushDeliveryCommand command)
+    {
+        if (!string.IsNullOrWhiteSpace(command.MessageId))
+            return $"{command.TargetUserId}:{command.MessageId}";
+
+        var hash = SHA256.HashData(Encoding.UTF8.GetBytes(
+            $"{command.TargetUserId}|{command.Title}|{command.Body}|{command.ConversationId}|{command.OccurredAtMs}"));
+        return $"{command.TargetUserId}:{Convert.ToHexString(hash, 0, 8).ToLowerInvariant()}";
+    }
+
+    private static string BuildTraceParent(Activity activity) =>
+        $"00-{activity.TraceId}-{activity.SpanId}-01";
 
     /// <summary>
     /// 令牌指纹：SHA256 前 8 字节 hex（16 字符）。用于日志/指标/无效令牌匹配，不泄露完整令牌。
     /// </summary>
     internal static string FingerprintToken(string token)
     {
-        var hash = System.Security.Cryptography.SHA256.HashData(
-            System.Text.Encoding.UTF8.GetBytes(token));
+        var hash = SHA256.HashData(Encoding.UTF8.GetBytes(token));
         return Convert.ToHexString(hash, 0, 8).ToLowerInvariant();
     }
 
@@ -277,8 +372,17 @@ internal sealed partial class PushDispatcher : IPushDispatcher
         ILogger logger, Exception ex, PushPlatform platform, long userId);
 
     [LoggerMessage(
+        LogLevel.Warning,
+        "Push idempotency check failed for deliveryId={DeliveryId}; proceeding to send (fail-open).")]
+    static partial void LogIdempotencyCheckFailed(ILogger logger, Exception ex, string deliveryId);
+
+    [LoggerMessage(
+        LogLevel.Warning,
+        "Push idempotency mark failed for deliveryId={DeliveryId} (best-effort).")]
+    static partial void LogIdempotencyMarkFailed(ILogger logger, Exception ex, string deliveryId);
+
+    [LoggerMessage(
         LogLevel.Error,
-        "Failed to unregister invalid push token: userId={UserId} attempt={Attempt}/{MaxRetry}")]
-    static partial void LogUnregisterFailed(
-        ILogger logger, Exception ex, long userId, int attempt, int maxRetry);
+        "Failed to record push DLQ entry for deliveryId={DeliveryId} failedTokens={FailedTokens}.")]
+    static partial void LogDlqRecordFailed(ILogger logger, Exception ex, string deliveryId, int failedTokens);
 }

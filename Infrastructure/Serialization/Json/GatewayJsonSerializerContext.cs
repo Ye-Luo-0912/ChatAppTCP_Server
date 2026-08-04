@@ -10,6 +10,7 @@ using ChatApp.TcpGateway.Core.Messaging.Sync;
 using ChatApp.Realtime.Abstractions.Events;
 using ChatApp.Realtime.Abstractions.Push;
 using ChatApp.TcpGateway.Infrastructure.Authentication.Models;
+using ChatApp.TcpGateway.Infrastructure.Push;
 
 namespace ChatApp.TcpGateway.Infrastructure.Serialization.Json;
 
@@ -138,6 +139,9 @@ namespace ChatApp.TcpGateway.Infrastructure.Serialization.Json;
 [JsonSerializable(typeof(UnregisterPushTokenRequest))]
 [JsonSerializable(typeof(UnregisterPushTokenResponse))]
 [JsonSerializable(typeof(PushTokenRecord))]
+[JsonSerializable(typeof(PushDlqEntry))]
+[JsonSerializable(typeof(PushDlqFailedToken))]
+[JsonSerializable(typeof(PushDlqFailedToken[]))]
 [JsonSerializable(typeof(ResumeContext))]
 [JsonSerializable(typeof(ChatApp.Realtime.Abstractions.Conversations.GroupConversationResult), TypeInfoPropertyName = "RealtimeGroupConversationResult")]
 [JsonSerializable(typeof(ChatApp.Realtime.Abstractions.Conversations.ConversationMemberItem), TypeInfoPropertyName = "RealtimeConversationMemberItem")]

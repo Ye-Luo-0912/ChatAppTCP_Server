@@ -61,12 +61,34 @@ public static class InfrastructureServiceCollectionExtensions
         services.AddSingleton<IServerIdentity, ServerIdentity>();
         services.AddSingleton<IDirectConversationAuthorizer, CachedDirectConversationAuthorizer>();
         services.AddSingleton<IPushTokenStore, RedisPushTokenStore>();
-        // 主线一10：Push Token 加密保护器。配置 TokenEncryptionKey 时使用 AES-GCM，否则明文（向后兼容）。
+        // 主线一10 + 门禁3：Push Token 加密保护器。
+        // 优先级：密钥环（TokenEncryptionKeys，支持旧 Key 读取 + 当前 Key 写入 + 渐进重加密）
+        //   → 单密钥（TokenEncryptionKey，AES-GCM）→ 明文（NullPushTokenProtector，向后兼容）。
         services.AddSingleton<IPushTokenProtector>(static provider =>
         {
             var options = provider
                 .GetRequiredService<Microsoft.Extensions.Options.IOptions<PushOptions>>()
                 .Value;
+
+            // 门禁3：密钥环配置优先。KeyId 解析为 uint，写入使用 KeyId 最大的密钥（当前 Key）。
+            if (options.TokenEncryptionKeys is { Count: > 0 })
+            {
+                var keyRing = new Dictionary<uint, byte[]>();
+                foreach (var config in options.TokenEncryptionKeys)
+                {
+                    if (string.IsNullOrEmpty(config.Key) ||
+                        !uint.TryParse(config.KeyId, out var keyId))
+                        continue;
+                    keyRing[keyId] = Convert.FromBase64String(config.Key);
+                }
+
+                if (keyRing.Count > 0)
+                {
+                    var currentKeyId = keyRing.Keys.Max();
+                    return new RotatingPushTokenProtector(keyRing, currentKeyId);
+                }
+            }
+
             if (!string.IsNullOrEmpty(options.TokenEncryptionKey))
                 return new AesGcmPushTokenProtector(options.TokenEncryptionKey);
             return new NullPushTokenProtector();
@@ -399,6 +421,18 @@ public static class InfrastructureServiceCollectionExtensions
 
         services.AddSingleton<IPushDispatcher, PushDispatcher>();
         services.AddSingleton<IPushIdempotencyStore, RedisPushIdempotencyStore>();
+        services.AddSingleton<IPushDlqStore, RedisPushDlqStore>();
+
+        // 门禁4：无效 Token 可靠清理——有界队列 + 后台 worker（指数退避重试注销），
+        // 与请求生命周期解耦，非 fire-and-forget。
+        services.AddSingleton<PushInvalidTokenCleanupQueue>();
+        services.AddHostedService<PushInvalidTokenCleanupWorker>();
+
+        // 门禁3：密钥轮换启用时（配置了密钥环），启动后台渐进式重加密 worker。
+        if (pushOptions.TokenEncryptionKeys is { Count: > 0 })
+        {
+            services.AddHostedService<PushTokenReencryptionWorker>();
+        }
 
         if (pushOptions.ProviderMode == PushProviderMode.TestNoop)
         {

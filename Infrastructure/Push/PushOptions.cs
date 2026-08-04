@@ -54,6 +54,32 @@ public sealed class PushOptions
     public int InvalidTokenUnregisterRetryCount { get; set; } = 3;
 
     /// <summary>
+    /// 门禁4：无效 Token 清理工作队列容量。默认 1024。
+    /// 队列满时丢弃最旧项（DropOldest），不阻塞投递热路径。
+    /// </summary>
+    public int InvalidTokenCleanupQueueCapacity { get; set; } = 1024;
+
+    /// <summary>
+    /// 门禁3：Push Token 加密密钥环（支持旧 Key 读取 + 当前 Key 写入）。
+    /// <para>
+    /// 每项为 <see cref="TokenEncryptionKeyConfig"/>：<c>KeyId</c>（默认 "1"）+ <c>Key</c>
+    /// （Base64 编码的 32 字节 AES-256 密钥）。写入使用 KeyId 最大的密钥（当前 Key），
+    /// 读取按密文头部 key_id 从密钥环查找对应密钥，支持旧 Key 解密。
+    /// </para>
+    /// <para>
+    /// 未配置密钥环时：若设置了 <see cref="TokenEncryptionKey"/>，则当作单密钥（KeyId="1"）；
+    /// 都未配置则使用 <c>NullPushTokenProtector</c>（明文存储，向后兼容）。
+    /// </para>
+    /// </summary>
+    public List<TokenEncryptionKeyConfig> TokenEncryptionKeys { get; set; } = [];
+
+    /// <summary>
+    /// 门禁3：后台渐进式重加密调度间隔。默认 1 小时。
+    /// 密钥轮换后，旧 Key 加密的历史令牌由 <c>PushTokenReencryptionWorker</c> 逐步重加密。
+    /// </summary>
+    public TimeSpan TokenReencryptionInterval { get; set; } = TimeSpan.FromHours(1);
+
+    /// <summary>
     /// 主线一10：Push Token 加密密钥（Base64 编码的 32 字节 AES-256 密钥）。
     /// <para>
     /// 配置后，Redis 中存储的 PushTokenRecord JSON 将被 AES-GCM 加密，
@@ -71,6 +97,18 @@ public sealed class PushOptions
     public string? TokenEncryptionKey { get; set; }
 
     public bool IsValid() => Enum.IsDefined(ProviderMode);
+}
+
+/// <summary>
+/// 门禁3：单条 Push Token 加密密钥配置。
+/// </summary>
+public sealed class TokenEncryptionKeyConfig
+{
+    /// <summary>密钥 Id（默认 "1"）。写入用当前 Key，读取按此 Id 定位。</summary>
+    public string KeyId { get; set; } = "1";
+
+    /// <summary>Base64 编码的 32 字节 AES-256 密钥。</summary>
+    public string Key { get; set; } = "";
 }
 
 public enum PushProviderMode

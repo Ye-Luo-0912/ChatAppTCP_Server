@@ -19,6 +19,21 @@ public sealed class RedisConnectionProvider(
         Volatile.Read(ref _connection)?.GetDatabase()
         ?? throw new InvalidOperationException("Redis connection has not been started.");
 
+    /// <summary>
+    /// 获取第一个 server endpoint 用于 SCAN/KEYS 等 server 级操作（渐进式维护任务用）。
+    /// 未连接或连接已关闭时返回 null。
+    /// </summary>
+    public IServer? GetServer()
+    {
+        var connection = Volatile.Read(ref _connection);
+        if (connection is null)
+            return null;
+        var endpoints = connection.GetEndPoints();
+        if (endpoints.Length == 0)
+            return null;
+        return connection.GetServer(endpoints[0]);
+    }
+
     public async Task StartAsync(CancellationToken cancellationToken)
     {
         var connectTask = ConnectionMultiplexer.ConnectAsync(_options.ConnectionString);

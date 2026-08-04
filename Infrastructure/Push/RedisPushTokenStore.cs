@@ -370,4 +370,61 @@ return remaining
         var zsetKey = new RedisKey(KeyPrefix + "{" + userSegment + "}" + ZsetKeySuffix);
         return (hashKey, zsetKey);
     }
+
+    /// <summary>
+    /// 门禁3：渐进式重加密。逐条扫描 <c>push:tokens:*:h</c>，对仍使用旧 Key 加密
+    /// （或旧明文）的令牌用当前 Key 重新加密覆盖。
+    /// <para>
+    /// 仅当 <see cref="ITokenKeyRing"/> 存在（即配置了密钥轮换）时执行；
+    /// 使用 SCAN 分页遍历，避免一次性 KEYS 阻塞 Redis。
+    /// </para>
+    /// </summary>
+    public async Task<int> ReencryptOldTokensAsync(CancellationToken cancellationToken)
+    {
+        if (tokenProtector is not ITokenKeyRing keyRing)
+            return 0;
+
+        var server = connectionProvider.GetServer();
+        if (server is null)
+            return 0;
+
+        var db = connectionProvider.Database;
+        var reencrypted = 0;
+
+        await foreach (var key in server
+                           .KeysAsync(pattern: KeyPrefix + "*" + HashKeySuffix, pageSize: 500)
+                           .WithCancellation(cancellationToken)
+                           .ConfigureAwait(false))
+        {
+            var entries = await db.HashGetAllAsync(key)
+                .WaitAsync(cancellationToken)
+                .ConfigureAwait(false);
+
+            foreach (var entry in entries)
+            {
+                var value = (string?)entry.Value;
+                if (string.IsNullOrEmpty(value) || !keyRing.NeedsReencryption(value))
+                    continue;
+
+                try
+                {
+                    var plaintext = tokenProtector.Unprotect(value);
+                    var reprotected = tokenProtector.Protect(plaintext);
+                    await db.HashSetAsync(key, entry.Name, reprotected)
+                        .WaitAsync(cancellationToken)
+                        .ConfigureAwait(false);
+                    reencrypted++;
+                }
+                catch (Exception ex)
+                {
+                    logger.DependencyOperationFailed(
+                        GatewayDependency.Redis,
+                        GatewayDependencyOperation.PushTokenReencrypt,
+                        ex);
+                }
+            }
+        }
+
+        return reencrypted;
+    }
 }

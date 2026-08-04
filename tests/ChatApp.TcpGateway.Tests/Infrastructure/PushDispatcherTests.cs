@@ -3,6 +3,7 @@ using ChatApp.Realtime.Integration.Push;
 using ChatApp.TcpGateway.Gateway.Configuration;
 using ChatApp.TcpGateway.Infrastructure.Push;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 
 namespace ChatApp.TcpGateway.Tests.Infrastructure;
@@ -30,12 +31,32 @@ public sealed class PushDispatcherTests
             InvalidTokenUnregisterRetryCount = 0
         });
 
+    /// <summary>
+    /// 构造可注入幂等 / DLQ / 清理队列依赖的 <see cref="PushDispatcher"/>。
+    /// 门禁1/4/5 依赖此后台组件，测试中显式注入内存实现。
+    /// </summary>
+    private static PushDispatcher CreateDispatcher(
+        IPushTokenStore tokenStore,
+        IEnumerable<IPushProvider> providers,
+        PushInvalidTokenCleanupQueue? cleanupQueue = null)
+    {
+        cleanupQueue ??= new PushInvalidTokenCleanupQueue(
+            DefaultOptions, NullLogger<PushInvalidTokenCleanupQueue>.Instance);
+        return new PushDispatcher(
+            tokenStore, providers, DefaultOptions,
+            new InMemoryPushIdempotencyStore(),
+            new InMemoryPushDlqStore(),
+            cleanupQueue,
+            TimeProvider.System,
+            Logger);
+    }
+
     [Fact]
     public async Task DispatchAsync_NoTokens_ReturnsSkipped()
     {
         var ct = TestContext.Current.CancellationToken;
         var tokenStore = new FakePushTokenStore();
-        var dispatcher = new PushDispatcher(tokenStore, Array.Empty<IPushProvider>(), DefaultOptions, Logger);
+        var dispatcher = CreateDispatcher(tokenStore, Array.Empty<IPushProvider>());
 
         var result = await dispatcher.DispatchAsync(
             new PushDeliveryCommand
@@ -61,7 +82,7 @@ public sealed class PushDispatcherTests
             ]
         };
         var provider = new FakePushProvider(PushPlatform.Fcm);
-        var dispatcher = new PushDispatcher(tokenStore, new[] { provider }, DefaultOptions, Logger);
+        var dispatcher = CreateDispatcher(tokenStore, new[] { provider });
 
         var result = await dispatcher.DispatchAsync(
             new PushDeliveryCommand
@@ -96,8 +117,8 @@ public sealed class PushDispatcherTests
         var fcmProvider = new FakePushProvider(PushPlatform.Fcm);
         var apnsProvider = new FakePushProvider(PushPlatform.Apns);
         var webProvider = new FakePushProvider(PushPlatform.WebPush);
-        var dispatcher = new PushDispatcher(
-            tokenStore, new[] { fcmProvider, apnsProvider, webProvider }, DefaultOptions, Logger);
+        var dispatcher = CreateDispatcher(
+            tokenStore, new[] { fcmProvider, apnsProvider, webProvider });
 
         var result = await dispatcher.DispatchAsync(
             new PushDeliveryCommand
@@ -129,7 +150,9 @@ public sealed class PushDispatcherTests
         // Provider 对 bad-token 返回 invalid_token，对 good-token 返回成功
         var provider = new FakePushProvider(PushPlatform.Fcm);
         provider.FailTokens["bad-token"] = ("invalid_token", null);
-        var dispatcher = new PushDispatcher(tokenStore, new[] { provider }, DefaultOptions, Logger);
+        var cleanupQueue = new PushInvalidTokenCleanupQueue(
+            DefaultOptions, NullLogger<PushInvalidTokenCleanupQueue>.Instance);
+        var dispatcher = CreateDispatcher(tokenStore, new[] { provider }, cleanupQueue);
 
         var result = await dispatcher.DispatchAsync(
             new PushDeliveryCommand
@@ -143,10 +166,9 @@ public sealed class PushDispatcherTests
         Assert.Equal(1, result.SucceededCount);
         Assert.Single(result.InvalidTokenFingerprints);
 
-        // 等待异步注销完成
-        await Task.Delay(100, ct);
-        Assert.Single(tokenStore.UnregisteredTokens);
-        Assert.Equal("bad-token", tokenStore.UnregisteredTokens[0]);
+        // 门禁4：无效 Token 进入可靠清理队列（由后台 worker 消费注销，非 fire-and-forget）。
+        Assert.True(cleanupQueue.Reader.TryRead(out var item));
+        Assert.Equal("bad-token", item.Token);
     }
 
     [Fact]
@@ -162,7 +184,7 @@ public sealed class PushDispatcherTests
         };
         var provider = new FakePushProvider(PushPlatform.Fcm);
         provider.ThrowOnToken = "throw-token";
-        var dispatcher = new PushDispatcher(tokenStore, new[] { provider }, DefaultOptions, Logger);
+        var dispatcher = CreateDispatcher(tokenStore, new[] { provider });
 
         var result = await dispatcher.DispatchAsync(
             new PushDeliveryCommand
@@ -192,7 +214,7 @@ public sealed class PushDispatcherTests
             ]
         };
         // 不注册 Fcm Provider
-        var dispatcher = new PushDispatcher(tokenStore, Array.Empty<IPushProvider>(), DefaultOptions, Logger);
+        var dispatcher = CreateDispatcher(tokenStore, Array.Empty<IPushProvider>());
 
         var result = await dispatcher.DispatchAsync(
             new PushDeliveryCommand

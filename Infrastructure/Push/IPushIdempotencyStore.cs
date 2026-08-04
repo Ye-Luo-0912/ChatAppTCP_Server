@@ -1,28 +1,45 @@
 namespace ChatApp.TcpGateway.Infrastructure.Push;
 
 /// <summary>
-/// 主线一5：Push 投递幂等存储。防止 JetStream NAK 重投导致重复推送。
+/// Push 投递幂等存储（Token 级）。
 /// <para>
-/// 幂等键 = (TargetUserId, MessageId)。仅当 MessageId 非空时检查。
+/// 幂等键 = <c>deliveryId + ":" + tokenFingerprint</c>。其中 <c>deliveryId</c> 是本次投递的稳定标识
+/// （目标用户 + 消息 Id），tokenFingerprint 是令牌指纹（SHA256 前 8 字节 hex）。
+/// </para>
+/// <para>
+/// 目的：JetStream NAK 重投整条命令时，已成功投递的 token 不应重复推送。
+/// 投递前先 <see cref="IsSentAsync"/> 判断，已成功则跳过；成功后 <see cref="MarkSentAsync"/> 记录。
 /// TTL 有限（默认 5 分钟），覆盖 JetStream 重投窗口即可。
 /// </para>
 /// </summary>
 public interface IPushIdempotencyStore
 {
     /// <summary>
-    /// 尝试标记幂等键为已处理。返回 true 表示首次标记（应执行投递）；
-    /// false 表示已处理过（应 ACK 跳过，避免重复推送）。
+    /// 判断 (deliveryId, tokenFingerprint) 是否已成功投递过。
+    /// 返回 true 表示已投递（应跳过，避免重复推送）；false 表示未投递（应发送）。
+    /// Redis 故障时 fail-open（返回 false，允许发送），避免幂等检查阻断推送。
     /// </summary>
-    ValueTask<bool> TryMarkProcessedAsync(long targetUserId, string messageId, CancellationToken cancellationToken = default);
+    ValueTask<bool> IsSentAsync(
+        string deliveryId,
+        string tokenFingerprint,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// 记录 (deliveryId, tokenFingerprint) 已成功投递。
+    /// </summary>
+    ValueTask MarkSentAsync(
+        string deliveryId,
+        string tokenFingerprint,
+        CancellationToken cancellationToken = default);
 }
 
 /// <summary>
-/// 测试用内存幂等存储。生产环境使用 Redis 实现。
+/// 测试用内存幂等存储。
 /// </summary>
 internal sealed class InMemoryPushIdempotencyStore : IPushIdempotencyStore
 {
     private readonly TimeSpan _ttl;
-    private readonly Dictionary<string, DateTime> _processed = new();
+    private readonly Dictionary<string, DateTime> _sent = new();
     private readonly object _lock = new();
 
     public InMemoryPushIdempotencyStore(TimeSpan? ttl = null)
@@ -30,28 +47,35 @@ internal sealed class InMemoryPushIdempotencyStore : IPushIdempotencyStore
         _ttl = ttl ?? TimeSpan.FromMinutes(5);
     }
 
-    public ValueTask<bool> TryMarkProcessedAsync(
-        long targetUserId,
-        string messageId,
+    public ValueTask<bool> IsSentAsync(
+        string deliveryId,
+        string tokenFingerprint,
         CancellationToken cancellationToken = default)
     {
-        if (string.IsNullOrEmpty(messageId))
-            return ValueTask.FromResult(true); // 无 MessageId 时不做幂等，允许投递。
-
-        var key = $"{targetUserId}:{messageId}";
+        var key = $"{deliveryId}:{tokenFingerprint}";
         var now = DateTime.UtcNow;
         lock (_lock)
         {
-            // 清理过期条目（简易扫描，仅测试用）。
-            var expired = _processed.Where(kv => now - kv.Value > _ttl).ToList();
-            foreach (var kv in expired)
-                _processed.Remove(kv.Key);
-
-            if (_processed.TryGetValue(key, out var processedAt) && now - processedAt <= _ttl)
-                return ValueTask.FromResult(false); // 已处理。
-
-            _processed[key] = now;
-            return ValueTask.FromResult(true);
+            if (_sent.TryGetValue(key, out var sentAt) && now - sentAt <= _ttl)
+                return ValueTask.FromResult(true);
+            return ValueTask.FromResult(false);
         }
+    }
+
+    public ValueTask MarkSentAsync(
+        string deliveryId,
+        string tokenFingerprint,
+        CancellationToken cancellationToken = default)
+    {
+        var key = $"{deliveryId}:{tokenFingerprint}";
+        lock (_lock)
+        {
+            _sent[key] = DateTime.UtcNow;
+            // 简易清理过期条目（仅测试用）。
+            var expired = _sent.Where(kv => DateTime.UtcNow - kv.Value > _ttl).ToList();
+            foreach (var kv in expired)
+                _sent.Remove(kv.Key);
+        }
+        return ValueTask.CompletedTask;
     }
 }
