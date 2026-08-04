@@ -463,31 +463,42 @@ Console.WriteLine("Starting RealtimeServices...");
                 Environment.GetEnvironmentVariable(options.GarnetEnvironmentVariable);
         }
 
+        var arguments = new List<string>
+        {
+            assemblyPath,
+            "--TcpGateway:ListenAddress=127.0.0.1",
+            $"--TcpGateway:Port={options.GatewayBasePort + index}",
+            // 本机负载全部来自 loopback。显式放宽基准专用 admission，
+            // 避免默认单 IP 上限把连接规模误判为传输性能回退。
+            $"--TcpGateway:MaxConnections={benchmarkAdmissionLimit}",
+            $"--TcpGateway:MaxConnectionsPerIp={benchmarkAdmissionLimit}",
+            $"--TcpGateway:MaxUnauthenticatedConnections={benchmarkAdmissionLimit}",
+            $"--TcpGateway:InboundTransportMode={options.InboundTransportMode}",
+            // 出站发送模式 A/B：注入 OutboundSendMode 与 OnDemandSendPump 相关参数。
+            // PersistentSendLoop 模式下 OnDemandSendWorkerCount/BurstLimit 被忽略，不影响行为。
+            $"--TcpGateway:OutboundSendMode={options.OutboundSendMode}",
+            // 出站队列模式 A/B：LazySegmented 为自定义 MPSC 队列，仅作对照，默认 BoundedChannel。
+            $"--TcpGateway:OutboundQueueMode={options.OutboundQueueMode}",
+            $"--TcpGateway:OnDemandSendWorkerCount={options.OnDemandSendWorkerCount}",
+            $"--TcpGateway:OnDemandSendBurstLimit={options.OnDemandSendBurstLimit}",
+            // 负载生成器直接发 AuthenticationRequest，不做 ClientHello 握手；
+            // 关闭 RequireClientHello 以避免握手前置导致的 ProtocolViolation 关闭连接。
+            "--TcpGateway:RequireClientHello=false",
+            "--Observability:OtlpEnabled=false",
+            "--Logging:LogLevel:Default=Warning"
+        };
+        // Inbound 预算耗尽场景：收窄全局入站缓冲字节预算，验证 GlobalInboundBudget
+        // 能在超限时对连接背压/关闭，避免配置上限形同虚设。
+        if (options.TcpInboundBudgetBytes is long inboundBudget)
+        {
+            arguments.Add($"--TcpGateway:GlobalMaxInboundBufferedBytes={inboundBudget}");
+        }
+
         return ManagedProcess.Start(
             $"gateway-{index + 1}",
             "gateway",
             "dotnet",
-            [
-                assemblyPath,
-                "--TcpGateway:ListenAddress=127.0.0.1",
-                $"--TcpGateway:Port={options.GatewayBasePort + index}",
-                // 本机负载全部来自 loopback。显式放宽基准专用 admission，
-                // 避免默认单 IP 上限把连接规模误判为传输性能回退。
-                $"--TcpGateway:MaxConnections={benchmarkAdmissionLimit}",
-                $"--TcpGateway:MaxConnectionsPerIp={benchmarkAdmissionLimit}",
-                $"--TcpGateway:MaxUnauthenticatedConnections={benchmarkAdmissionLimit}",
-                $"--TcpGateway:InboundTransportMode={options.InboundTransportMode}",
-                // 出站发送模式 A/B：注入 OutboundSendMode 与 OnDemandSendPump 相关参数。
-                // PersistentSendLoop 模式下 OnDemandSendWorkerCount/BurstLimit 被忽略，不影响行为。
-                $"--TcpGateway:OutboundSendMode={options.OutboundSendMode}",
-                $"--TcpGateway:OnDemandSendWorkerCount={options.OnDemandSendWorkerCount}",
-                $"--TcpGateway:OnDemandSendBurstLimit={options.OnDemandSendBurstLimit}",
-                // 负载生成器直接发 AuthenticationRequest，不做 ClientHello 握手；
-                // 关闭 RequireClientHello 以避免握手前置导致的 ProtocolViolation 关闭连接。
-                "--TcpGateway:RequireClientHello=false",
-                "--Observability:OtlpEnabled=false",
-                "--Logging:LogLevel:Default=Warning"
-            ],
+            arguments,
             options.RepositoryRoot,
             logDirectory,
             environment);
@@ -544,6 +555,13 @@ Console.WriteLine("Starting RealtimeServices...");
             "--slow-readers", slowReaders.ToString(System.Globalization.CultureInfo.InvariantCulture),
             "--report-directory", Path.Combine(sessionDirectory, $"tcp-gateway-{gatewayIndex + 1}")
         };
+        if (options.TcpSlowlorisPhase is not null)
+        {
+            arguments.Add("--slowloris-phase");
+            arguments.Add(options.TcpSlowlorisPhase);
+            arguments.Add("--slowloris-delay-ms");
+            arguments.Add(options.TcpSlowlorisDelayMs.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        }
         if (tcpTokenFilePath is not null)
         {
             arguments.Add("--token-file");

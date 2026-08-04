@@ -1,4 +1,4 @@
-param(
+﻿param(
     [ValidateSet('concurrent-replay', 'redis-failover', 'circuit-breaker',
         'takeover-competition', 'reconnect-storm', 'recovery-convergence')]
     [string[]] $Scenarios = @(

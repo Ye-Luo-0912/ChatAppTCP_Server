@@ -1,4 +1,4 @@
-param(
+﻿param(
     [ValidateSet('Nats', 'Postgres', 'Garnet')]
     [string[]] $Targets = @('Nats', 'Postgres', 'Garnet'),
     [ValidateRange(1, 3600)] [int] $FaultAfterSeconds = 20,

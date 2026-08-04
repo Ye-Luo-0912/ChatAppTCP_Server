@@ -3,6 +3,53 @@
 本文件列出**尚未完成**的工作。当前状态见 `roadmap-current-state.md`，
 历史变更见 `roadmap-changelog.md`。完成的项目从本文件移除并记入 changelog。
 
+## 四、极致性能主线
+
+### 1. 冻结新底层原语
+已冻结：新 Actor Mailbox、Durable Actor 迁移、更多自定义异步等待器、二进制协议、Native AOT、ActorCell slab 等新功能开发暂停。先验证现有 DirectSocket、三种 Send Mode（Persistent/OnDemand/PerSession）和两种 Outbound Queue（BoundedChannel/LazySegmented）。
+
+### 2. 扩展 Transport Matrix 至 12 组合（已完成基础设施扩展）
+- 维度：Inbound (Pipelines/DirectSocket) × Send (3) × Queue (2) → 12 组合全部覆盖
+- 新增场景：`slowloris-header`（不完整 Header 慢速攻击）、`slowloris-payload`（不完整 Payload 慢速攻击）、`inbound-budget`（全局入站字节预算耗尽）
+- 所有场景定义于 `Run-TransportMatrix.ps1`，可通过 `-Scenario all` 完整执行
+- 验收检查点已整合在输出报告中（门禁3：默认值切换门槛）
+
+### 3. Realtime SQL 门禁（Gate 4）
+以下功能已新增基准文件并设定 SQL 上限断言：
+- ✅ Relationship 操作（7/9/6/5 SQL）→ `RelationshipBenchmarks.cs`
+- ✅ Attachment Finalize（1 SQL）→ `AttachmentFinalizeBenchmarks.cs`
+- ✅ Reply/Mention 批量富集（1 SQL 批量）→ `ReplyMentionBenchmarks.cs`
+- ✅ SyncBootstrap 批量查询（1 SQL 批量，无 N+1）→ `SyncBootstrapBenchmarks.cs`
+- ✅ Authorization (ACL)（5 SQL 链）→ `AuthorizationChainBenchmarks.cs`
+- ✅ Read Receipt（1 SQL 聚合）→ `ReadReceiptBenchmarks.cs`
+- ✅ Mention 可见性过滤（0/1/1/1 SQL）→ `MentionValidationBenchmarks.cs`
+  （空提及集合 0 SQL 跳过成员列表；发送方角色 1 SQL；5/20 提及批量校验均 1 SQL，无 N+1）
+  ⚠️ 该基准创建于兄弟仓库但彼时对兄弟仓库的 Write/Edit 被拒，`Direct_NoMention`
+  基准命名有误导（实际调用 GetMemberRoleAsync 发 1 次查询）；如需修正需重新授权兄弟仓库。
+
+### 4. 性能指标采集补充
+- ✅ 指标采集：Working Set / GC 分配 / p95/p99 / 连接数 / 已失败连接 已覆盖
+- ✅ Queue depth / Actor active/busy/churn / Outbox lag 已加入 Transport Matrix 报告汇总列
+  （`Run-TransportMatrix.ps1` 新增 `Get-MetricSumByIdentifier` 按指标名汇总，
+  场景表新增 Queue Depth、Actor Act/Busy、Actor Proc、Outbox Pending、Outbox Lag 列；
+  门禁3 判定规则补充「队列有界、Actor 稳定、Outbox 收敛」检查点）
+
+### 5. 8～24 小时 Soak 测试
+- ✅ Run-Soak.ps1 已扩展支持长时间运行与内存稳定性监控
+  （新增 `-TcpMode heartbeat/chat`、`-TcpPayloadBytes`、`-TcpSlowReaders` 真实聊天负载浸泡；
+  浸泡后读取 Gateway 进程 Working Set 首/末/均值/最大值，按
+  `-MemoryGrowthThresholdPercent`（默认 20%）与 `-MemoryDeparturePercent`（默认 15%）
+  判定是否进入稳定平台，输出 `soak-verdict-*.json/md` 与 STABLE/FAILED 判定）
+- ⏳ 需 Linux 远程执行验证 24h 后内存是否进入稳定平台
+
+### 6. 脚本编码修复
+- ✅ 所有含中文注释的性能脚本（Run-TransportMatrix / Run-Soak / Run-OutboundSendModeAB /
+  Run-ResumeFaultStress / Run-InboundTransportAB / Run-FaultInjection）已补 UTF-8 BOM，
+  修复 PowerShell `ParseFile` 在无 BOM 时对 UTF-8 中文字符的误解析（导致幽灵语法错误）
+- ✅ Run-TransportMatrix.ps1 / Run-Soak.ps1 换行符统一为 CRLF
+- ✅ Run-Soak.ps1 反引号续行改为单行（避免 CRLF 下的续行失效）
+- ✅ 全部 8 个 .ps1 脚本通过 `ParseFile` 语法校验，0 错误
+
 ## 主线一：Push 正式闭环（Gateway 侧已完成，跨仓库待补）
 
 Gateway 侧 Push 闭环已全部完成（配置 Fail-fast、Disposition、Token Retry、幂等、DLQ、

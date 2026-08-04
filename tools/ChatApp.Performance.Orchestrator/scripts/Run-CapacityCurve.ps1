@@ -9,6 +9,9 @@ param(
     [ValidateRange(1, 100000)] [int] $TcpMessagesPerSecond = 10,
     [ValidateRange(1, 1048576)] [int] $TcpPayloadBytes = 128,
     [int] $TcpSlowReaders = 0,
+    [ValidateSet('header','payload')] [string] $TcpSlowlorisPhase = '',
+    [ValidateRange(1, 60000)] [int] $TcpSlowlorisDelayMs = 1000,
+    [ValidateRange(1, 1099511627776)] [long] $TcpInboundBudgetBytes = 0,
     [int] $GatewayBasePort = 18888,
     [int] $RealtimePort = 18080,
     [int] $NatsPort = 4222,
@@ -20,6 +23,7 @@ param(
     [string] $GarnetImage = 'ghcr.io/microsoft/garnet:1.0.84',
     [ValidateSet('Pipelines','DirectSocket')] [string] $InboundTransportMode = 'DirectSocket',
     [ValidateSet('PersistentSendLoop','OnDemandSendPump','PerSessionDrain')] [string] $OutboundSendMode = 'PersistentSendLoop',
+    [ValidateSet('BoundedChannel','LazySegmented')] [string] $OutboundQueueMode = 'BoundedChannel',
     [int] $OnDemandSendWorkerCount = 0,
     [int] $OnDemandSendBurstLimit = 16,
     [string] $ReportDirectory,
@@ -144,6 +148,7 @@ try {
                 '--pipeline-payload-bytes',"$PipelinePayloadBytes",
                 '--inbound-transport-mode',"$InboundTransportMode",
                 '--outbound-send-mode',"$OutboundSendMode",
+                '--outbound-queue-mode',"$OutboundQueueMode",
                 '--on-demand-send-worker-count',"$OnDemandSendWorkerCount",
                 '--on-demand-send-burst-limit',"$OnDemandSendBurstLimit",
                 '--realtime-database-environment',$dbEnvName,
@@ -152,8 +157,15 @@ try {
                 '--docker-container',$postgres,
                 '--docker-container',$garnet,
                 '--report-directory',$rateDirectory)
-            if ($TcpMode -ne 'connection') {
+            if ($TcpMode -in @('heartbeat','chat')) {
                 $orchestratorArgs += '--tcp-bootstrap-auth'
+            }
+            if ($TcpSlowlorisPhase) {
+                $orchestratorArgs += @('--tcp-slowloris-phase',"$TcpSlowlorisPhase",
+                    '--tcp-slowloris-delay-ms',"$TcpSlowlorisDelayMs")
+            }
+            if ($TcpInboundBudgetBytes -gt 0) {
+                $orchestratorArgs += @('--tcp-inbound-budget-bytes',"$TcpInboundBudgetBytes")
             }
             if ($NoPipeline) {
                 $orchestratorArgs += '--no-pipeline'

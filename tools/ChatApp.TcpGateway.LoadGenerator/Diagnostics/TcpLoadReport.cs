@@ -43,7 +43,9 @@ internal sealed class TcpLoadReport
                 TargetUserId = options.TargetUserId,
                 MessagesPerSecond = options.MessagesPerSecond,
                 PayloadBytes = options.PayloadBytes,
-                SlowReaders = options.SlowReaders
+                SlowReaders = options.SlowReaders,
+                SlowlorisPhase = options.SlowlorisPhase?.ToString(),
+                SlowlorisDelayMs = options.SlowlorisDelayMs
             },
             ElapsedSeconds = elapsedSeconds,
             SuccessfulConnections = successfulConnections,
@@ -72,6 +74,8 @@ internal sealed class TcpLoadConfiguration
     public int MessagesPerSecond { get; init; }
     public int PayloadBytes { get; init; }
     public int SlowReaders { get; init; }
+    public string? SlowlorisPhase { get; init; }
+    public int SlowlorisDelayMs { get; init; }
 }
 
 internal sealed class TcpLatencySnapshot

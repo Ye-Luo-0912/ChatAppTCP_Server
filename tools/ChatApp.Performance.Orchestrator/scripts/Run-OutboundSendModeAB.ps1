@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     三出站发送模式 A/B 对比：PersistentSendLoop / OnDemandSendPump / PerSessionDrain。
     复用 Run-CapacityCurve.ps1 执行单速率基准，对比吞吐/p95/p99/WorkingSet/GC。

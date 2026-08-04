@@ -176,6 +176,57 @@ internal sealed class ProtocolClient : IAsyncDisposable
         return ValueTask.CompletedTask;
     }
 
+    /// <summary>
+    /// Slowloris 攻击：发送不完整帧（Header 或 Payload 阶段），随后仅等待 Gateway
+    /// 关闭连接。返回 true 表示 Gateway 在装配 deadline 内主动关闭了连接（防御生效）；
+    /// false 表示连接在调用方取消前仍保持打开（未执行 deadline 强制）。
+    /// </summary>
+    /// <param name="phase">Header：只发送部分 Header 字节；Payload：完整 Header + 极小 Payload 切片。</param>
+    /// <param name="delayMs">分段发送之间的间隔（模拟逐字节慢速攻击）。</param>
+    /// <param name="cancellationToken">取消令牌；取消后立即返回 false，不视为已被 Gateway 关闭。</param>
+    public async ValueTask<bool> SendSlowlorisAndWaitForCloseAsync(
+        SlowlorisPhase phase,
+        int delayMs,
+        CancellationToken cancellationToken)
+    {
+        var stream = GetStream();
+        if (phase == SlowlorisPhase.Header)
+        {
+            // 只发送 10 字节 Header 的前 6 字节（magic + 部分 command），随后停下。
+            // Gateway 的 Header 装配 deadline 应在超时后关闭该连接。
+            var partial = new byte[6];
+            BinaryPrimitives.WriteUInt32LittleEndian(
+                partial,
+                PacketProtocol.MagicNumber);
+            await stream.WriteAsync(partial, cancellationToken)
+                .ConfigureAwait(false);
+            await Task.Delay(delayMs, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        else
+        {
+            // 发送完整 Header，声明一段 4 KiB Payload，但只发送 1 字节，
+            // 制造不完整 Payload，触发 Gateway 的 Payload 装配 deadline。
+            var header = new byte[PacketProtocol.HeaderSize];
+            PacketParser.WriteHeader(
+                header,
+                PacketCommand.AuthenticationRequest,
+                payloadLength: 4096);
+            await stream.WriteAsync(header, cancellationToken)
+                .ConfigureAwait(false);
+            await stream.WriteAsync(new byte[1], cancellationToken)
+                .ConfigureAwait(false);
+            await Task.Delay(delayMs, cancellationToken)
+                .ConfigureAwait(false);
+        }
+
+        // 等待 Gateway 关闭连接（read 返回 0）。若取消先触发，视为未强制执行。
+        var probe = new byte[1];
+        var read = await stream.ReadAsync(probe, cancellationToken)
+            .ConfigureAwait(false);
+        return read == 0;
+    }
+
     private async ValueTask SendAsync<T>(
         PacketCommand command,
         JsonPayloadCodec<T> codec,

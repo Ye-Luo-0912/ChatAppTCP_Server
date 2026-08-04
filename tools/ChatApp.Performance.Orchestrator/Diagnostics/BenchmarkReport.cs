@@ -53,6 +53,7 @@ internal sealed class BenchmarkConfiguration
     public long PipelineBaseUserId { get; init; }
     public required string InboundTransportMode { get; init; }
     public required string OutboundSendMode { get; init; }
+    public required string OutboundQueueMode { get; init; }
     public int OnDemandSendWorkerCount { get; init; }
     public int OnDemandSendBurstLimit { get; init; }
     public required IReadOnlyList<string> DockerContainers { get; init; }
@@ -87,6 +88,7 @@ internal sealed class BenchmarkConfiguration
         PipelineBaseUserId = options.PipelineBaseUserId,
         InboundTransportMode = options.InboundTransportMode,
         OutboundSendMode = options.OutboundSendMode,
+        OutboundQueueMode = options.OutboundQueueMode,
         OnDemandSendWorkerCount = options.OnDemandSendWorkerCount,
         OnDemandSendBurstLimit = options.OnDemandSendBurstLimit,
         DockerContainers = options.DockerContainers

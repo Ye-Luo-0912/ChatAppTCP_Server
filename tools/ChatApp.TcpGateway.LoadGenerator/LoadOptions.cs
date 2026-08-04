@@ -8,7 +8,19 @@ internal enum LoadMode
     Connection,
     Heartbeat,
     Chat,
-    InvalidPacket
+    InvalidPacket,
+    Slowloris
+}
+
+/// <summary>
+/// Slowloris 攻击阶段：只发送不完整 Header（Header 装配 deadline），
+/// 或发送完整 Header 后分段缓慢发送 Payload（Payload 装配 deadline）。
+/// 用于验证 Gateway 的帧装配 deadline 能及时关闭慢速攻击连接。
+/// </summary>
+internal enum SlowlorisPhase
+{
+    Header,
+    Payload
 }
 
 internal sealed record LoadOptions(
@@ -23,6 +35,8 @@ internal sealed record LoadOptions(
     int MessagesPerSecond,
     int PayloadBytes,
     int SlowReaders,
+    SlowlorisPhase? SlowlorisPhase,
+    int SlowlorisDelayMs,
     string? ReportDirectory)
 {
     public static LoadOptions Parse(string[] args)
@@ -38,6 +52,8 @@ internal sealed record LoadOptions(
         var messagesPerSecond = 10;
         var payloadBytes = 128;
         var slowReaders = 0;
+        SlowlorisPhase? slowlorisPhase = null;
+        var slowlorisDelayMs = 1_000;
         string? reportDirectory = null;
 
         for (var index = 0; index < args.Length; index++)
@@ -88,6 +104,12 @@ internal sealed record LoadOptions(
                     break;
                 case "--slow-readers":
                     slowReaders = ParseInt(value, "slow-readers");
+                    break;
+                case "--slowloris-phase":
+                    slowlorisPhase = ParseSlowlorisPhase(value);
+                    break;
+                case "--slowloris-delay-ms":
+                    slowlorisDelayMs = ParseInt(value, "slowloris-delay-ms");
                     break;
                 case "--report-directory":
                     reportDirectory = string.IsNullOrWhiteSpace(value)
@@ -153,6 +175,20 @@ internal sealed record LoadOptions(
                 "--slow-readers is only valid in chat mode.");
         }
 
+        if (selectedMode == LoadMode.Slowloris && slowlorisPhase is null)
+        {
+            throw new ArgumentException(
+                "--slowloris-phase is required in slowloris mode.");
+        }
+
+        if (selectedMode != LoadMode.Slowloris && slowlorisPhase is not null)
+        {
+            throw new ArgumentException(
+                "--slowloris-phase is only valid in slowloris mode.");
+        }
+
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(slowlorisDelayMs);
+
         return new LoadOptions(
             host,
             port,
@@ -165,8 +201,19 @@ internal sealed record LoadOptions(
             messagesPerSecond,
             payloadBytes,
             slowReaders,
+            slowlorisPhase,
+            slowlorisDelayMs,
             reportDirectory);
     }
+
+    private static SlowlorisPhase ParseSlowlorisPhase(string value) =>
+        value.ToLowerInvariant() switch
+        {
+            "header" => global::ChatApp.TcpGateway.LoadGenerator.SlowlorisPhase.Header,
+            "payload" => global::ChatApp.TcpGateway.LoadGenerator.SlowlorisPhase.Payload,
+            _ => throw new ArgumentException(
+                $"Unknown slowloris phase: {value}")
+        };
 
     private static LoadMode ParseMode(string value) =>
         value.ToLowerInvariant() switch
@@ -175,6 +222,7 @@ internal sealed record LoadOptions(
             "heartbeat" => LoadMode.Heartbeat,
             "chat" => LoadMode.Chat,
             "invalid-packet" => LoadMode.InvalidPacket,
+            "slowloris" => LoadMode.Slowloris,
             _ => throw new ArgumentException(
                 $"Unknown load mode: {value}")
         };

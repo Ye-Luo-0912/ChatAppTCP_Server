@@ -24,6 +24,9 @@ internal sealed record BenchmarkOptions(
     int TcpMessagesPerSecond,
     int TcpPayloadBytes,
     int TcpSlowReaders,
+    string? TcpSlowlorisPhase,
+    int TcpSlowlorisDelayMs,
+    long? TcpInboundBudgetBytes,
     IReadOnlyList<string> TcpTokens,
     bool TcpBootstrapAuthentication,
     long TcpBootstrapUserId,
@@ -36,6 +39,7 @@ internal sealed record BenchmarkOptions(
     long PipelineBaseUserId,
     string InboundTransportMode,
     string OutboundSendMode,
+    string OutboundQueueMode,
     int OnDemandSendWorkerCount,
     int OnDemandSendBurstLimit,
     string ReportDirectory,
@@ -51,13 +55,16 @@ internal sealed record BenchmarkOptions(
         "[--warmup-seconds 10] [--duration-seconds 30] [--sample-interval-ms 1000] " +
         "[--tcp-mode connection|heartbeat|chat] [--tcp-connections 100] " +
         "[--tcp-messages-per-second 10] [--tcp-payload-bytes 128] " +
-        "[--tcp-slow-readers 0] [--tcp-token TOKEN] [--tcp-bootstrap-auth] " +
+        "[--tcp-slow-readers 0] [--tcp-slowloris-phase header|payload] " +
+        "[--tcp-slowloris-delay-ms 1000] [--tcp-inbound-budget-bytes N] " +
+        "[--tcp-token TOKEN] [--tcp-bootstrap-auth] " +
         "[--tcp-bootstrap-user-id 9300000000] [--tcp-target-user-id ID] " +
         "[--no-pipeline] [--pipeline-concurrency 4] [--pipeline-operations-per-second 0] " +
         "[--pipeline-payload-bytes 128] [--pipeline-operation-timeout-seconds 15] " +
         "[--pipeline-base-user-id 9200000000] " +
         "[--inbound-transport-mode Pipelines|DirectSocket] " +
         "[--outbound-send-mode PersistentSendLoop|OnDemandSendPump|PerSessionDrain] " +
+        "[--outbound-queue-mode BoundedChannel|LazySegmented] " +
         "[--on-demand-send-worker-count 0] [--on-demand-send-burst-limit 16] " +
         "[--docker-container NAME] " +
         "[--report-directory .artifacts/performance]";
@@ -85,6 +92,9 @@ internal sealed record BenchmarkOptions(
         var tcpMessagesPerSecond = 10;
         var tcpPayloadBytes = 128;
         var tcpSlowReaders = 0;
+        string? tcpSlowlorisPhase = null;
+        var tcpSlowlorisDelayMs = 1000;
+        long? tcpInboundBudgetBytes = null;
         var tcpTokens = new List<string>();
         var tcpBootstrapAuthentication = false;
         long tcpBootstrapUserId = 9_300_000_000;
@@ -99,6 +109,7 @@ internal sealed record BenchmarkOptions(
         // 出站发送模式 A/B：默认 PersistentSendLoop（与历史基线一致），
         // 切换为 OnDemandSendPump 时编排器会注入额外 TcpGateway 配置覆盖项。
         var outboundSendMode = "PersistentSendLoop";
+        var outboundQueueMode = "BoundedChannel";
         var onDemandSendWorkerCount = 0;
         var onDemandSendBurstLimit = 16;
         string? reportDirectory = null;
@@ -185,6 +196,15 @@ internal sealed record BenchmarkOptions(
                 case "--tcp-slow-readers":
                     tcpSlowReaders = ParseInt(value, option);
                     break;
+                case "--tcp-slowloris-phase":
+                    tcpSlowlorisPhase = value;
+                    break;
+                case "--tcp-slowloris-delay-ms":
+                    tcpSlowlorisDelayMs = ParseInt(value, option);
+                    break;
+                case "--tcp-inbound-budget-bytes":
+                    tcpInboundBudgetBytes = ParseLong(value, option);
+                    break;
                 case "--tcp-token":
                     tcpTokens.Add(value);
                     break;
@@ -214,6 +234,9 @@ internal sealed record BenchmarkOptions(
                     break;
                 case "--outbound-send-mode":
                     outboundSendMode = value;
+                    break;
+                case "--outbound-queue-mode":
+                    outboundQueueMode = value;
                     break;
                 case "--on-demand-send-worker-count":
                     onDemandSendWorkerCount = ParseInt(value, option);
@@ -262,8 +285,9 @@ internal sealed record BenchmarkOptions(
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(durationSeconds);
         if (sampleIntervalMs is < 250 or > 60_000)
             throw new ArgumentOutOfRangeException(nameof(args), "Sample interval must be between 250 and 60000 ms.");
-        if (tcpMode is not ("connection" or "heartbeat" or "chat"))
-            throw new ArgumentException("TCP mode must be connection, heartbeat, or chat.");
+        if (tcpMode is not ("connection" or "heartbeat" or "chat" or "slowloris"))
+            throw new ArgumentException(
+                "TCP mode must be connection, heartbeat, chat, or slowloris.");
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(tcpConnections);
         if (tcpConnections < gatewayCount)
             throw new ArgumentException("TCP connections cannot be fewer than Gateway instances.");
@@ -272,6 +296,17 @@ internal sealed record BenchmarkOptions(
         ArgumentOutOfRangeException.ThrowIfNegative(tcpSlowReaders);
         if (tcpSlowReaders > tcpConnections)
             throw new ArgumentException("TCP slow readers cannot exceed TCP connections.");
+        if (tcpSlowlorisPhase is not null &&
+            tcpSlowlorisPhase is not ("header" or "payload"))
+            throw new ArgumentException(
+                "--tcp-slowloris-phase must be header or payload.");
+        if (tcpSlowlorisPhase is not null && tcpMode != "slowloris")
+            throw new ArgumentException(
+                "--tcp-slowloris-phase requires --tcp-mode slowloris.");
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(tcpSlowlorisDelayMs);
+        if (tcpInboundBudgetBytes is <= 0)
+            throw new ArgumentException(
+                "--tcp-inbound-budget-bytes must be positive.");
         if (tcpBootstrapAuthentication && tcpMode is not ("heartbeat" or "chat"))
             throw new ArgumentException("--tcp-bootstrap-auth requires TCP heartbeat or chat mode.");
         if (tcpBootstrapAuthentication && tcpTokens.Count != 0)
@@ -294,6 +329,9 @@ internal sealed record BenchmarkOptions(
         if (outboundSendMode is not ("PersistentSendLoop" or "OnDemandSendPump" or "PerSessionDrain"))
             throw new ArgumentException(
                 "--outbound-send-mode must be PersistentSendLoop, OnDemandSendPump, or PerSessionDrain.");
+        if (outboundQueueMode is not ("BoundedChannel" or "LazySegmented"))
+            throw new ArgumentException(
+                "--outbound-queue-mode must be BoundedChannel or LazySegmented.");
         ArgumentOutOfRangeException.ThrowIfNegative(onDemandSendWorkerCount);
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(onDemandSendBurstLimit, 0);
 
@@ -319,6 +357,9 @@ internal sealed record BenchmarkOptions(
             tcpMessagesPerSecond,
             tcpPayloadBytes,
             tcpSlowReaders,
+            tcpSlowlorisPhase,
+            tcpSlowlorisDelayMs,
+            tcpInboundBudgetBytes,
             tcpTokens,
             tcpBootstrapAuthentication,
             tcpBootstrapUserId,
@@ -331,6 +372,7 @@ internal sealed record BenchmarkOptions(
             pipelineBaseUserId,
             inboundTransportMode,
             outboundSendMode,
+            outboundQueueMode,
             onDemandSendWorkerCount,
             onDemandSendBurstLimit,
             reportDirectory,

@@ -1,4 +1,4 @@
-param(
+﻿param(
     [ValidateRange(15, 3600)] [int] $DurationSeconds = 60,
     [ValidateRange(0, 3600)] [int] $WarmupSeconds = 10,
     [ValidateRange(1, 100000)] [int] $TcpConnections = 1000,

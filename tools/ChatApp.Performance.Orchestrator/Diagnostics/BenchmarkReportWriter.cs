@@ -52,6 +52,8 @@ internal static class BenchmarkReportWriter
         text.AppendLine(FormattableString.Invariant(
             $"| Outbound send | {report.Configuration.OutboundSendMode} |"));
         text.AppendLine(FormattableString.Invariant(
+            $"| Outbound queue | {report.Configuration.OutboundQueueMode} |"));
+        text.AppendLine(FormattableString.Invariant(
             $"| Pipeline enabled | {report.Configuration.PipelineEnabled} |"));
         text.AppendLine(FormattableString.Invariant(
             $"| Pipeline concurrency | {report.Configuration.PipelineConcurrency} |"));

@@ -14,11 +14,12 @@ catch (Exception exception)
 {
     Console.Error.WriteLine(exception.Message);
     Console.Error.WriteLine(
-        "Usage: --mode connection|heartbeat|chat|invalid-packet " +
+        "Usage: --mode connection|heartbeat|chat|invalid-packet|slowloris " +
         "--host 127.0.0.1 --port 8888 --connections 100 " +
         "--duration-seconds 10 [--token TOKEN] [--target-user-id ID] " +
         "[--messages-per-second 10] [--payload-bytes 128] " +
-        "[--slow-readers 0] [--report-directory PATH]");
+        "[--slow-readers 0] [--slowloris-phase header|payload] " +
+        "[--slowloris-delay-ms 1000] [--report-directory PATH]");
     return 2;
 }
 
@@ -167,6 +168,17 @@ static async Task<ClientResult> RunClientAsync(
             return result;
         }
 
+        if (options.Mode == LoadMode.Slowloris)
+        {
+            await RunSlowlorisAsync(
+                    client,
+                    options,
+                    result,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            return result;
+        }
+
         var token = options.AccessTokens[
             clientIndex % options.AccessTokens.Count];
         var identity = await client.AuthenticateAsync(
@@ -251,6 +263,37 @@ static async Task RunHeartbeatAsync(
             break;
         }
     }
+}
+
+static async Task RunSlowlorisAsync(
+    ProtocolClient client,
+    LoadOptions options,
+    ClientResult result,
+    CancellationToken cancellationToken)
+{
+    // 发送不完整帧，等待 Gateway 在装配 deadline 内关闭连接。
+    // 若 Gateway 主动关闭（防御生效）→ 计入 Acknowledged；
+    // 若超时仍未关闭（未执行 deadline 强制）→ 记为失败（保持连接打开属资源泄漏风险）。
+    try
+    {
+        var closedByGateway = await client.SendSlowlorisAndWaitForCloseAsync(
+                options.SlowlorisPhase!.Value,
+                options.SlowlorisDelayMs,
+                cancellationToken)
+            .ConfigureAwait(false);
+        if (closedByGateway)
+        {
+            result.Acknowledged++;
+            return;
+        }
+    }
+    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+    {
+        // 运行时长耗尽仍未关闭 → 防御未在预期时间内生效。
+    }
+
+    result.Error = "Gateway did not close the slowloris connection within the deadline.";
+    result.Connected = false;
 }
 
 static async Task RunChatSenderAsync(
