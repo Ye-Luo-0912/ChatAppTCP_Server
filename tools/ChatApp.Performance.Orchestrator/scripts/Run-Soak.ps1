@@ -206,6 +206,9 @@ $arguments = @{
     OnDemandSendBurstLimit = $OnDemandSendBurstLimit
     ReportDirectory = $ReportDirectory
     NoPipeline = $true
+    # Soak 的 TcpMessagesPerSecond 是“每个 active sender 的速率”；Rates 仅是单点标签。
+    # 显式保留该语义，避免容量曲线的 aggregate Rates 模型把正式 soak 误降为 1 msg/s。
+    UseTcpMessagesPerSecond = $true
 }
 if ($TcpMode -eq 'chat') {
     # 正式 chat soak 默认验证跨 Gateway sender/receiver 配对，覆盖 Sharded Routing 的真实边界。

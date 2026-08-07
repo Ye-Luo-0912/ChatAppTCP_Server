@@ -164,3 +164,15 @@ consumer 的 delivered/ACK floor 均为 9,804；三者 pending、ack-pending、r
 - Verdict：[soak-verdict-20260806-022238Z.json](../.artifacts/remote-reports/soak-8h-formal-v2/soak-verdict-20260806-022238Z.json)
 - Benchmark：[benchmark-report.json](../.artifacts/remote-reports/soak-8h-formal-v2/capacity-curve-20260805-181649Z/rate-1/benchmark-20260805-181655Z/benchmark-report.json)
 - 资源时间线：[process-resource-timeline.csv](../.artifacts/remote-reports/soak-8h-formal-v2/capacity-curve-20260805-181649Z/rate-1/benchmark-20260805-181655Z/process-resource-timeline.csv)
+
+## 7. 2026-08-07 优化复测说明
+
+本报告的 `605.6 GB / 262,842 B/msg`、每消息两个 Outbox 事件和同 Gateway peer-ring
+均是 2026-08-06 冻结源码的历史结果，不应继续当作当前实现现状。后续已完成聚合授权、
+单条多目标 Outbox、跨 Gateway 固定速率容量曲线，以及 SQL/Outbox allocation 热点优化。
+
+最新可审计结果见 [TCP / Realtime 性能优化与跨 Gateway 容量复测](perf-optimization-rerun-20260807.md)
+和 [版本化容量摘要](performance-baselines/2026-08-07-linux-cross-gateway-capacity.json)。
+同负载 A/B 的 Realtime allocation 由 `127,756.48` 降至 `99,122.23 B/msg`，下降
+`22.41%`；80/160/320/640 msg/s 四档跨 Gateway 曲线均通过，当前环境的持续建议值为
+320 msg/s。最终提交快照仍需以新的正式 8 小时跨 Gateway soak 验证长期内存稳定性。

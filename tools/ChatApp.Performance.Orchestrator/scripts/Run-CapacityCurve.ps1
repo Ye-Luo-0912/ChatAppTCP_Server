@@ -43,6 +43,7 @@ param(
     [string] $ReportDirectory,
     [string] $InvocationManifestPath,
     [switch] $NoPipeline,
+    [switch] $UseTcpMessagesPerSecond,
     [switch] $SkipBuild
 )
 
@@ -87,6 +88,9 @@ if ($TcpMode -in @('heartbeat','chat') -and $effectiveTcpActiveSenders -le 0) {
 if ($TcpCrossGateway -and $TcpMode -ne 'chat') {
     throw 'TcpCrossGateway requires TcpMode=chat.'
 }
+$tcpRateDrivenByRates = $NoPipeline `
+    -and $TcpMode -in @('heartbeat','chat') `
+    -and -not $UseTcpMessagesPerSecond
 
 $repositoryRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..\..'))
 $realtimeRoot = [IO.Path]::GetFullPath((Join-Path $repositoryRoot '..\ChatApp.RealtimeServices'))
@@ -153,6 +157,7 @@ function Write-CapacityManifest {
             TcpCrossGateway = [bool]$TcpCrossGateway
             TcpConnectionsPerSecond = $TcpConnectionsPerSecond
             TcpMessagesPerSecond = $TcpMessagesPerSecond
+            TcpRateDrivenByRates = [bool]$tcpRateDrivenByRates
             TcpDeliveryDrainSeconds = $TcpDeliveryDrainSeconds
             TcpInactiveHeartbeatSeconds = $TcpInactiveHeartbeatSeconds
             RealtimeProcessingConcurrency = $RealtimeProcessingConcurrency
@@ -315,6 +320,15 @@ function Get-MetricSum($Metrics, [string] $Prefix) {
 
 try {
     foreach ($rate in $Rates) {
+        # In TCP-only heartbeat/chat curves, Rates is the aggregate message target.
+        # Distribute it evenly across active senders so every curve point changes
+        # the offered TCP load instead of repeating TcpMessagesPerSecond unchanged.
+        $rateTcpMessagesPerSecond = if ($tcpRateDrivenByRates) {
+            [double]$rate / [double]$effectiveTcpActiveSenders
+        }
+        else {
+            $TcpMessagesPerSecond
+        }
         $tag = "$($stamp.Replace('-','').ToLowerInvariant())-$rate"
         $nats = "codex-chatapp-capacity-nats-$tag"
         $postgres = "codex-chatapp-capacity-postgres-$tag"
@@ -370,7 +384,7 @@ try {
                 '--tcp-mode',"$TcpMode",
                 '--tcp-connections',"$TcpConnections",
                 '--tcp-active-senders',"$TcpActiveSenders",
-                '--tcp-messages-per-second',$TcpMessagesPerSecond.ToString('G17', [Globalization.CultureInfo]::InvariantCulture),
+                '--tcp-messages-per-second',$rateTcpMessagesPerSecond.ToString('G17', [Globalization.CultureInfo]::InvariantCulture),
                 '--tcp-delivery-drain-seconds',"$TcpDeliveryDrainSeconds",
                 '--tcp-inactive-heartbeat-seconds',"$TcpInactiveHeartbeatSeconds",
                 '--tcp-min-ack-ratio',($MinimumAcknowledgementPercent / 100.0).ToString('G17', [Globalization.CultureInfo]::InvariantCulture),
@@ -593,7 +607,7 @@ try {
 
                 if ($TcpMode -eq 'chat') {
                     $messageTotal = $messagesSent
-                    $targetPerSecond = [double]$effectiveTcpActiveSenders * $TcpMessagesPerSecond
+                    $targetPerSecond = [double]$effectiveTcpActiveSenders * $rateTcpMessagesPerSecond
                     $achievedPerSecond = if ($measurementWindowSeconds -gt 0) {
                         $messageTotal / $measurementWindowSeconds
                     } else { 0.0 }
@@ -624,7 +638,7 @@ try {
                 }
                 elseif ($TcpMode -eq 'heartbeat') {
                     $messageTotal = $latencySampleTotal
-                    $targetPerSecond = [double]$effectiveTcpActiveSenders * $TcpMessagesPerSecond
+                    $targetPerSecond = [double]$effectiveTcpActiveSenders * $rateTcpMessagesPerSecond
                     $achievedPerSecond = if ($measurementWindowSeconds -gt 0) {
                         $messageTotal / $measurementWindowSeconds
                     } else { 0.0 }
@@ -817,6 +831,7 @@ try {
                 ConnectionSuccessPercent = $connectionSuccessPercent
                 PeakConnectionPercent = $peakConnectionPercent
                 ActiveSenders = $activeSenders
+                MessagesPerSecondPerActiveSender = $rateTcpMessagesPerSecond
                 AcknowledgementPercent = $acknowledgementPercent
                 DeliveryPercent = $deliveryPercent
                 DeadLetters = $deadLetters
@@ -899,12 +914,17 @@ $summary = [pscustomobject]@{
         TcpCrossGateway = [bool]$TcpCrossGateway
         TcpMode = $TcpMode
         TcpMessagesPerSecond = $TcpMessagesPerSecond
+        TcpRateDrivenByRates = [bool]$tcpRateDrivenByRates
         TcpDeliveryDrainSeconds = $TcpDeliveryDrainSeconds
         TcpInactiveHeartbeatSeconds = $TcpInactiveHeartbeatSeconds
         TcpPayloadBytes = $TcpPayloadBytes
         TcpConnectionsPerSecond = $TcpConnectionsPerSecond
         NoPipeline = [bool]$NoPipeline
-        RateModel = 'bounded closed-loop pacing'
+        RateModel = if ($tcpRateDrivenByRates) {
+            'aggregate Rates target distributed across active TCP senders; bounded periodic pacing'
+        } else {
+            'bounded closed-loop pacing'
+        }
         InboundTransportMode = $InboundTransportMode
         OutboundSendMode = $OutboundSendMode
         OnDemandSendWorkerCount = $OnDemandSendWorkerCount
@@ -940,7 +960,12 @@ $lines.Add('')
 $lines.Add("Run validity: **$(if ($runValid) { 'VALID' } else { 'INVALID' })**")
 $lines.Add('')
 $peerRouting = if ($TcpCrossGateway) { 'cross-gateway' } else { 'same-gateway' }
-$lines.Add("Rate model: bounded closed-loop pacing; concurrency=$PipelineConcurrency; stabilization=$($WarmupSeconds)s; requested measurement=$($DurationSeconds)s; TCP connection ramp=$TcpConnectionsPerSecond/s; active senders=$effectiveTcpActiveSenders/$TcpConnections; peer routing=$peerRouting.")
+$rateModelText = if ($tcpRateDrivenByRates) {
+    'aggregate Rates target distributed across active TCP senders; bounded periodic pacing'
+} else {
+    'bounded closed-loop pacing'
+}
+$lines.Add("Rate model: $rateModelText; concurrency=$PipelineConcurrency; stabilization=$($WarmupSeconds)s; requested measurement=$($DurationSeconds)s; TCP connection ramp=$TcpConnectionsPerSecond/s; active senders=$effectiveTcpActiveSenders/$TcpConnections; peer routing=$peerRouting.")
 $lines.Add('')
 $lines.Add('| Target | Unit | Achieved | Attainment | Conn success | Peak conns | Ack | Delivery | DLQ | Samples | Valid |')
 $lines.Add('|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---|')

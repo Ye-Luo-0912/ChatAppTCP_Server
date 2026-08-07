@@ -1,0 +1,103 @@
+{
+  "schemaVersion": 1,
+  "capturedAtUtc": "2026-08-07T13:26:00Z",
+  "environment": "remote-linux-isolated-dependencies",
+  "remoteRunRoot": "/home/yeluo/chatapp-perf/runs/codex-tcp-opt-post-20260807T125816Z",
+  "sourceSnapshots": {
+    "tcpSha256": "380df302b8ee4146090de6e810ab330eb6badea10b923d92665601c49f70c08a",
+    "realtimeSha256": "0a9eec4509c6de4f474a77efb7668e3cab1660cf2b112fc9b163b12bb7fcdf9d",
+    "dotnetSdkVersion": "10.0.301",
+    "dotnetSha256": "763bfd4dbb1bb3a3b5257c6800eef77bb4abe2127e6ff9c33e2a56e2e814aedf"
+  },
+  "configuration": {
+    "tcpConnections": 10000,
+    "activeSenders": 1000,
+    "payloadBytes": 512,
+    "crossGateway": true,
+    "warmupSeconds": 30,
+    "measurementSeconds": 300,
+    "deliveryDrainSeconds": 60,
+    "realtimeProcessingConcurrency": 16,
+    "minimumAcknowledgementPercent": 99.9,
+    "minimumDeliveryPercent": 99.9,
+    "minimumProcessSampleCoveragePercent": 90
+  },
+  "allocationAB": {
+    "aggregateTargetMessagesPerSecond": 80,
+    "beforeBytesPerMessage": 127756.48,
+    "afterBytesPerMessage": 99122.23,
+    "changePercent": -22.41,
+    "beforeRealtimeAverageCpuPercent": 4.563,
+    "afterRealtimeAverageCpuPercent": 3.963,
+    "beforeGcPauseSeconds": 0.880852,
+    "afterGcPauseSeconds": 0.726756
+  },
+  "capacityCurve": [
+    {
+      "targetMessagesPerSecond": 80,
+      "achievedMessagesPerSecond": 79.98,
+      "messagesSent": 23998,
+      "acknowledgementPercent": 100.0,
+      "deliveryPercent": 100.0,
+      "ackP99Milliseconds": 1.728,
+      "realtimeAverageCpuPercent": 4.29,
+      "realtimeAllocatedBytesPerMessage": 103281,
+      "databaseOperationsPerMessage": 10.85,
+      "postgresAverageCpuPercent": 37.42,
+      "postgresMaximumCpuPercent": 77.08,
+      "valid": true
+    },
+    {
+      "targetMessagesPerSecond": 160,
+      "achievedMessagesPerSecond": 159.96,
+      "messagesSent": 47992,
+      "acknowledgementPercent": 100.0,
+      "deliveryPercent": 100.0,
+      "ackP99Milliseconds": 2.048,
+      "realtimeAverageCpuPercent": 6.23,
+      "realtimeAllocatedBytesPerMessage": 88968,
+      "databaseOperationsPerMessage": 8.96,
+      "postgresAverageCpuPercent": 51.76,
+      "postgresMaximumCpuPercent": 108.93,
+      "valid": true
+    },
+    {
+      "targetMessagesPerSecond": 320,
+      "achievedMessagesPerSecond": 319.92,
+      "messagesSent": 95984,
+      "acknowledgementPercent": 100.0,
+      "deliveryPercent": 100.0,
+      "ackP99Milliseconds": 3.328,
+      "realtimeAverageCpuPercent": 8.60,
+      "realtimeAllocatedBytesPerMessage": 85391,
+      "databaseOperationsPerMessage": 8.44,
+      "postgresAverageCpuPercent": 73.80,
+      "postgresMaximumCpuPercent": 116.81,
+      "valid": true
+    },
+    {
+      "targetMessagesPerSecond": 640,
+      "achievedMessagesPerSecond": 640.14,
+      "messagesSent": 192058,
+      "acknowledgementPercent": 100.0,
+      "deliveryPercent": 100.0,
+      "ackP99Milliseconds": 3.968,
+      "realtimeAverageCpuPercent": 9.99,
+      "realtimeAllocatedBytesPerMessage": 61542,
+      "databaseOperationsPerMessage": 8.21,
+      "postgresAverageCpuPercent": 91.84,
+      "postgresMaximumCpuPercent": 143.84,
+      "valid": true
+    }
+  ],
+  "result": {
+    "runValid": true,
+    "testedCapacityLowerBoundMessagesPerSecond": 640,
+    "recommendedSustainedMessagesPerSecond": 320,
+    "reason": "All correctness gates passed through 640 msg/s, but PostgreSQL average CPU reached 91.84% at 640 msg/s."
+  },
+  "limitations": [
+    "Cross-child delivery counts and duplicate detection are aggregated globally, but delivery latency histograms are not merged across load children.",
+    "This five-minute-per-point curve establishes a capacity lower bound and does not replace an eight-hour stability run."
+  ]
+}

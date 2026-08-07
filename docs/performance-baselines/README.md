@@ -19,3 +19,7 @@ p50/p95/p99、错误率、消息积压/失败计数、进程与依赖资源，�
   三副本硬重启恢复摘要；
 - 2026-07-28-linux-inbound-transport-ab.json：Pipelines/DirectSocket 双 Gateway、
   1000 认证连接 × 每连接 20 heartbeat/s 的短时可回退默认值门禁。
+- 2026-08-07-linux-cross-gateway-capacity.json：10,000 条 TCP 连接、1,000 个 active
+  senders、跨 Gateway 的 80/160/320/640 msg/s 固定速率曲线，以及 SQL/Outbox 分配
+  优化前后的 80 msg/s A/B。四档正确性门禁全部通过；实测容量下界为 640 msg/s，
+  PostgreSQL 资源余量约束下的持续建议值为 320 msg/s。
