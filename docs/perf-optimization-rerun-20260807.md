@@ -108,6 +108,25 @@ delivery latency histogram，也不在一个 child 内做 ACK-ID 与 delivery-ID
 零延迟。
 
 短时 A/B 和容量曲线不替代 8 小时内存稳定性验证。最终提交快照的跨 Gateway 正式 8 小时
-soak 将保持 80 msg/s，以便与 2026-08-06 的旧正式轮做稳定性对比；320 msg/s 是容量建议，
-不是本次稳定性报告的负载参数。正式轮启动后将在本节补充冻结快照、PID、报告目录和最终
-verdict。
+soak 保持 80 msg/s，以便与 2026-08-06 的旧正式轮做稳定性对比；320 msg/s 是容量建议，
+不是本次稳定性报告的负载参数。
+
+新正式轮已于 `2026-08-07T13:57:37Z` 启动：
+
+- 远端运行根目录：
+  `/home/yeluo/chatapp-perf/runs/codex-tcp-soak-opt-20260807T135316Z`；
+- 报告目录：`reports/soak-8h-cross-gateway-v3`；日志：
+  `logs/soak-8h-cross-gateway-v3.log`；
+- 主启动 PID/PGID：`1701156/1701156`；
+- TCP 提交：`600141888c7a61b5f65866c6e9b6a80345a30391`；Realtime 提交：
+  `d5e886a80f160b9a02c312a3383a705aa931097a`；
+- 最终组合源码快照 SHA-256：
+  `92c650d8fd2add8eca82000411bd2ab00eb8cc93bb5a15d6ebb28e564887a1ac`；规范包源
+  SHA-256：`00823022224bc833ba1644d74a72b3e4a39ff6ab267c979f3b009fc76ddc6e4d`；
+  .NET 10.0.301 host SHA-256：
+  `763bfd4dbb1bb3a3b5257c6800eef77bb4abe2127e6ff9c33e2a56e2e814aedf`。
+
+该轮已通过锁定还原和 Linux Release 构建（两套解决方案均 0 warning / 0 error），并已
+启动独立 NATS/PostgreSQL/Garnet、Realtime、两个 Gateway 和两个 load child。最终
+`RunValid`、`MemoryConclusive`、`MemoryStable` 以及 8 小时逐消息正确性结论须等待正式
+报告完成后填写；运行中不以中间样本提前宣告通过。

@@ -176,3 +176,9 @@ consumer 的 delivered/ACK floor 均为 9,804；三者 pending、ack-pending、r
 同负载 A/B 的 Realtime allocation 由 `127,756.48` 降至 `99,122.23 B/msg`，下降
 `22.41%`；80/160/320/640 msg/s 四档跨 Gateway 曲线均通过，当前环境的持续建议值为
 320 msg/s。最终提交快照仍需以新的正式 8 小时跨 Gateway soak 验证长期内存稳定性。
+
+该正式轮已于 `2026-08-07T13:57:37Z` 启动，独立运行根目录为
+`/home/yeluo/chatapp-perf/runs/codex-tcp-soak-opt-20260807T135316Z`，报告目录为
+`reports/soak-8h-cross-gateway-v3`，主 PID/PGID 为 `1701156/1701156`。最终组合源码
+SHA-256 为 `92c650d8fd2add8eca82000411bd2ab00eb8cc93bb5a15d6ebb28e564887a1ac`；
+本历史报告的 PASSED verdict 不与新轮混合，新轮结束后单独追加最终结论。
