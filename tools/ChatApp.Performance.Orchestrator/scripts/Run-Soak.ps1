@@ -207,6 +207,10 @@ $arguments = @{
     ReportDirectory = $ReportDirectory
     NoPipeline = $true
 }
+if ($TcpMode -eq 'chat') {
+    # 正式 chat soak 默认验证跨 Gateway sender/receiver 配对，覆盖 Sharded Routing 的真实边界。
+    $arguments.TcpCrossGateway = $true
+}
 $invocationDirectory = Join-Path $ReportDirectory 'run-invocations'
 [IO.Directory]::CreateDirectory($invocationDirectory) | Out-Null
 $invocationManifestPath = Join-Path $invocationDirectory "soak-$([Guid]::NewGuid().ToString('N')).json"

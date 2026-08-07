@@ -279,9 +279,9 @@ internal sealed partial class SessionLifecycleCoordinator
             context.DeviceId);
 
         // 步骤 2：注册会话 + Presence 上线广播。
-        if (_userSessions.Add(session) && _options.EnableEphemeralPresenceAndTyping)
+        if (_userSessions.Add(session))
         {
-            await PublishPresenceChangedAsync(context.UserId, isOnline: true, cancellationToken)
+            await UpdateGlobalPresenceAsync(context.UserId, isOnline: true, cancellationToken)
                 .ConfigureAwait(false);
         }
 
@@ -584,7 +584,7 @@ internal sealed partial class SessionLifecycleCoordinator
     /// 回滚步骤（逆序）：
     /// <list type="number">
     /// <item>UserSessionRegistry.Remove（撤销 Add）</item>
-    /// <item>PublishPresenceChangedAsync(isOnline: false)（撤销 Presence 上线，
+    /// <item>UpdateGlobalPresenceAsync(isOnline: false)（撤销全局在线路由租约与 Presence 上线，
     ///   仅当 Add 返回 true 时）</item>
     /// </list>
     /// </para>
@@ -609,11 +609,11 @@ internal sealed partial class SessionLifecycleCoordinator
         CancellationToken cancellationToken)
     {
         var removedFromRegistry = _userSessions.Remove(session);
-        if (removedFromRegistry && _options.EnableEphemeralPresenceAndTyping)
+        if (removedFromRegistry)
         {
             try
             {
-                await PublishPresenceChangedAsync(userId, isOnline: false, cancellationToken)
+                await UpdateGlobalPresenceAsync(userId, isOnline: false, cancellationToken)
                     .ConfigureAwait(false);
             }
             catch

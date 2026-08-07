@@ -162,9 +162,14 @@ internal sealed class TcpLoadReport
             SentPerSecond = measurementSeconds <= 0 ? 0 : sent / measurementSeconds,
             ReceivedPerSecond = measurementSeconds <= 0 ? 0 : received / measurementSeconds,
             PrimaryLatencyKind = options.Mode == LoadMode.Chat
-                ? "peer-delivery"
+                ? options.TargetRingFilePath is null
+                    ? "peer-delivery"
+                    : "mq-acknowledgement"
                 : "operation-round-trip",
-            Latency = TcpLatencySnapshot.Create(latency),
+            Latency = TcpLatencySnapshot.Create(
+                options.Mode == LoadMode.Chat && options.TargetRingFilePath is not null
+                    ? acknowledgementLatency
+                    : latency),
             AcknowledgementLatency = TcpLatencySnapshot.Create(acknowledgementLatency),
             DeliveryLatency = TcpLatencySnapshot.Create(deliveryLatency),
             Healthy = TcpBucketSnapshot.Create(healthyCount, healthyLatency),

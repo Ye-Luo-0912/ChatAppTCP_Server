@@ -69,6 +69,8 @@ internal static class BenchmarkReportWriter
         text.AppendLine(FormattableString.Invariant(
             $"| Realtime queue / prefetch / max ACK pending | {report.Configuration.RealtimeProcessingQueueCapacity} / {report.Configuration.RealtimePrefetchMaxMessages} / {report.Configuration.RealtimeMaxAckPending} |"));
         text.AppendLine(FormattableString.Invariant(
+            $"| Realtime routing | {(report.Configuration.RealtimeShardedRouting ? "Sharded" : "Broadcast")} |"));
+        text.AppendLine(FormattableString.Invariant(
             $"| Warmup | {report.Configuration.WarmupSeconds:F0} s |"));
         text.AppendLine(FormattableString.Invariant(
             $"| Duration | {report.Configuration.DurationSeconds:F0} s |"));
@@ -78,6 +80,8 @@ internal static class BenchmarkReportWriter
             $"| TCP connections | {report.Configuration.TcpConnections} |"));
         text.AppendLine(FormattableString.Invariant(
             $"| TCP active senders | {report.Configuration.TcpActiveSenders} |"));
+        text.AppendLine(FormattableString.Invariant(
+            $"| TCP peer routing | {(report.Configuration.TcpCrossGateway ? "Cross-Gateway" : "Same-Gateway")} |"));
         text.AppendLine(FormattableString.Invariant(
             $"| TCP messages / active sender | {report.Configuration.TcpMessagesPerSecond:G17}/s |"));
         text.AppendLine(FormattableString.Invariant(

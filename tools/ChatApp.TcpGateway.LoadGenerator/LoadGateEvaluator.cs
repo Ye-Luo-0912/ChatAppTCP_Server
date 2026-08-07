@@ -69,9 +69,8 @@ internal static class LoadGateEvaluator
                     $"message within {options.DeliveryDrain.TotalSeconds:F0} seconds.");
             }
 
-            // item 五：跨 Gateway 配对时，目标投递落在另一 Gateway 上，本地
-            // LoadGenerator 无法观测目标投递，因此投递比与“未跟踪投递”校验
-            // 不再适用（改为 ack 校验 + 接收侧 LoadGenerator 观测实际投递）。
+            // 跨 Gateway 配对的投递比由编排器汇总所有接收侧子进程后校验；
+            // 单个子进程仍校验 ACK、重复投递与本地运行时错误。
             var crossGateway = options.TargetRingFilePath is not null;
             if (!crossGateway)
             {
@@ -94,7 +93,7 @@ internal static class LoadGateEvaluator
                     $"Observed {duplicateAcknowledgements} duplicate or untracked " +
                     "message acknowledgements.");
             }
-            if (!crossGateway && duplicateDeliveries != 0)
+            if (duplicateDeliveries != 0)
             {
                 failures.Add(
                     $"Observed {duplicateDeliveries} duplicate or untracked peer deliveries.");

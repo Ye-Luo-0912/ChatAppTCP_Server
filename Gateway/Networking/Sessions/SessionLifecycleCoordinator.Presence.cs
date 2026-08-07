@@ -10,9 +10,10 @@ using Microsoft.Extensions.Logging;
 namespace ChatApp.TcpGateway.Gateway.Networking.Sessions;
 
 /// <summary>
-/// Presence 广播与发布逻辑。
+/// 全局在线路由租约、Presence 广播与发布逻辑。
 /// <para>
-/// 仅在全局状态转换（0→1 或 1→0）时广播与发布跨网关 Presence 事件。
+/// 在线路由租约始终维护；仅在启用 Presence/Typing 且全局状态转换
+/// （0→1 或 1→0）时广播与发布跨网关 Presence 事件。
 /// 旧实现每实例本地首连/断开都无条件广播，导致多实例登录时互相覆盖、误报下线。
 /// </para>
 /// <para>
@@ -23,10 +24,11 @@ namespace ChatApp.TcpGateway.Gateway.Networking.Sessions;
 internal sealed partial class SessionLifecycleCoordinator
 {
     /// <summary>
-    /// 只在全局状态转换（0→1 或 1→0）时广播与发布跨网关 Presence 事件。
+    /// 始终维护全局在线路由租约；只在启用 Presence/Typing 且全局状态转换
+    /// （0→1 或 1→0）时广播与发布跨网关 Presence 事件。
     /// 旧实现每实例本地首连/断开都无条件广播，导致多实例登录时互相覆盖、误报下线。
     /// </summary>
-    private async Task PublishPresenceChangedAsync(
+    private async Task UpdateGlobalPresenceAsync(
         long userId,
         bool isOnline,
         CancellationToken cancellationToken)
@@ -49,6 +51,13 @@ internal sealed partial class SessionLifecycleCoordinator
 
         var globalIsOnline = transition == PresenceTransition.WentOnline;
         _metrics.PresenceTransition(globalIsOnline ? "online" : "offline");
+
+        // The global presence ZSET is also the authoritative sharded-event routing
+        // directory. It must be maintained even when optional Presence/Typing fanout
+        // is disabled; only the user-visible notification remains feature-gated.
+        if (!_options.EnableEphemeralPresenceAndTyping)
+            return;
+
         BroadcastPresenceChangedLocal(userId, globalIsOnline);
 
         try

@@ -129,8 +129,34 @@ if (measurementStarted)
         await runState.AllChatSendersCompleted.ConfigureAwait(false);
         runState.SealSending();
         deliveryDrainCompleted = runState.IsDeliveryDrainCompleted;
+        var crossGatewayDrain = options.TargetRingFilePath is not null;
 
-        if (!deliveryDrainCompleted &&
+        // Each cross-Gateway child observes deliveries produced by another process.
+        // Keep receiver connections alive for the entire drain window so ACKs on this
+        // process cannot terminate it before the counterpart's final deliveries arrive.
+        if (crossGatewayDrain &&
+            options.DeliveryDrain > TimeSpan.Zero &&
+            !drainTimedOut &&
+            runState.RuntimeFailure is null)
+        {
+            var remaining = options.DeliveryDrain -
+                Stopwatch.GetElapsedTime(drainStartedAt);
+            try
+            {
+                if (remaining > TimeSpan.Zero)
+                    await Task.Delay(remaining, lifecycleCancellation.Token)
+                        .ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+                when (lifecycleCancellation.IsCancellationRequested)
+            {
+            }
+
+            deliveryDrainCompleted = runState.IsDeliveryDrainCompleted;
+        }
+
+        if (!crossGatewayDrain &&
+            !deliveryDrainCompleted &&
             options.DeliveryDrain > TimeSpan.Zero &&
             !drainTimedOut &&
             runState.RuntimeFailure is null)
@@ -208,6 +234,8 @@ var acknowledged = counters.Acknowledged;
 var rejected = counters.Rejected;
 var duplicateAcknowledgements = counters.DuplicateAcknowledgements;
 var duplicateDeliveries = counters.DuplicateDeliveries;
+var crossGateway = options.TargetRingFilePath is not null;
+var reportExpectedDeliveries = crossGateway ? sent : expectedDeliveries;
 var latency = runState.Latency.Snapshot();
 var acknowledgementLatency = runState.AcknowledgementLatency.Snapshot();
 var deliveryLatency = runState.DeliveryLatency.Snapshot();
@@ -243,7 +271,7 @@ var gate = LoadGateEvaluator.Evaluate(
     rejected,
     duplicateAcknowledgements,
     duplicateDeliveries,
-    latency.Count,
+    crossGateway ? acknowledgementLatency.Count : latency.Count,
     runState.TrackingExpired,
     runState.TrackingDropped,
     deliveryDrainCompleted,
@@ -291,7 +319,7 @@ else if (options.Mode == LoadMode.Chat)
     Console.WriteLine(
         string.Create(
             CultureInfo.InvariantCulture,
-            $"Chat messages: {sent} sent, {acknowledged} MQ-accepted, {rejected} rejected, {received}/{expectedDeliveries} expected recipient deliveries received"));
+            $"Chat messages: {sent} sent, {acknowledged} MQ-accepted, {rejected} rejected, {received}/{reportExpectedDeliveries} expected recipient deliveries received"));
     Console.WriteLine(
         string.Create(
             CultureInfo.InvariantCulture,
@@ -379,7 +407,7 @@ var report = TcpLoadReport.Create(
     completedNormally,
     runState.PeakActiveConnections,
     sent,
-    expectedDeliveries,
+    reportExpectedDeliveries,
     received,
     acknowledged,
     rejected,

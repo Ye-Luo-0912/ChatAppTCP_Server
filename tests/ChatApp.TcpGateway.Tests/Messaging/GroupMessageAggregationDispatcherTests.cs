@@ -87,6 +87,35 @@ public sealed class GroupMessageAggregationDispatcherTests
     }
 
     [Fact]
+    public async Task AggregatedDirectEvent_DeliversReceiverAndSenderOtherDevice_ButSkipsOrigin()
+    {
+        using var metrics = new GatewayMetrics();
+        var registry = new UserSessionRegistry();
+        await using var originSession = CreateSession(1, metrics);
+        await using var senderOtherDevice = CreateSession(2, metrics);
+        await using var receiverSession = CreateSession(3, metrics);
+        originSession.Authenticate(7, "origin-session", deviceIdHash: 1);
+        senderOtherDevice.Authenticate(7, "sender-device-2", deviceIdHash: 2);
+        receiverSession.Authenticate(42, "receiver-session", deviceIdHash: 3);
+        registry.Add(originSession);
+        registry.Add(senderOtherDevice);
+        registry.Add(receiverSession);
+
+        var dispatcher = CreateDispatcher(registry, metrics);
+        using var enqueueCounter = new OutboundEnqueueCounter();
+        var baseline = enqueueCounter.PositiveEnqueues;
+
+        await dispatcher.DispatchAsync(
+            BuildAggregatedDirectEvent(
+                senderUserId: 7,
+                receiverUserId: 42,
+                senderSessionId: "origin-session"),
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(2, enqueueCounter.PositiveEnqueues - baseline);
+    }
+
+    [Fact]
     public async Task AggregatedGroupEvent_NoLocalTargets_ProducesNoEnqueues()
     {
         using var metrics = new GatewayMetrics();
@@ -236,6 +265,34 @@ public sealed class GroupMessageAggregationDispatcherTests
                 clientMessageId),
             OccurredAtMs = 1_700_000_000_000L,
             TargetUserIds = null
+        };
+
+    private static RealtimeEvent BuildAggregatedDirectEvent(
+        long senderUserId,
+        long receiverUserId,
+        string senderSessionId) =>
+        new()
+        {
+            EventId = "dm-aggregated-event-1",
+            Type = RealtimeEventType.MessageReceived,
+            TargetUserId = receiverUserId,
+            ActorUserId = senderUserId,
+            MessageId = "dm-msg-1",
+            SessionId = senderSessionId,
+            PayloadJson = $$"""
+            {
+              "messageId": "dm-msg-1",
+              "clientMessageId": "dm-client-1",
+              "senderUserId": {{senderUserId}},
+              "senderSessionId": "{{senderSessionId}}",
+              "receiverUserId": {{receiverUserId}},
+              "conversationId": "dm:{{senderUserId}}:{{receiverUserId}}",
+              "content": "hello direct",
+              "receivedAtMs": 1700000000000
+            }
+            """,
+            OccurredAtMs = 1_700_000_000_000L,
+            TargetUserIds = [receiverUserId, senderUserId]
         };
 
     private static string BuildGroupChatPayloadJson(

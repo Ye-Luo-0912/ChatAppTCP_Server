@@ -7,6 +7,7 @@ param(
     [ValidateRange(1, 100000)] [int] $TcpConnections = 1000,
     [ValidateSet('connection','heartbeat','chat')] [string] $TcpMode = 'connection',
     [ValidateRange(0, 100000)] [int] $TcpActiveSenders = 0,
+    [switch] $TcpCrossGateway,
     [ValidateRange(0.001, 100000)] [double] $TcpMessagesPerSecond = 10,
     [ValidateRange(0, 3600)] [int] $TcpDeliveryDrainSeconds = 30,
     [ValidateRange(0, 3600)] [int] $TcpInactiveHeartbeatSeconds = 30,
@@ -83,6 +84,9 @@ if ($TcpActiveSenders -gt $TcpConnections - $TcpSlowReaders) {
 if ($TcpMode -in @('heartbeat','chat') -and $effectiveTcpActiveSenders -le 0) {
     throw 'Heartbeat/chat mode requires at least one active sender.'
 }
+if ($TcpCrossGateway -and $TcpMode -ne 'chat') {
+    throw 'TcpCrossGateway requires TcpMode=chat.'
+}
 
 $repositoryRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..\..'))
 $realtimeRoot = [IO.Path]::GetFullPath((Join-Path $repositoryRoot '..\ChatApp.RealtimeServices'))
@@ -146,6 +150,7 @@ function Write-CapacityManifest {
             TcpMode = $TcpMode
             TcpConnections = $TcpConnections
             TcpActiveSenders = $effectiveTcpActiveSenders
+            TcpCrossGateway = [bool]$TcpCrossGateway
             TcpConnectionsPerSecond = $TcpConnectionsPerSecond
             TcpMessagesPerSecond = $TcpMessagesPerSecond
             TcpDeliveryDrainSeconds = $TcpDeliveryDrainSeconds
@@ -231,6 +236,7 @@ function Stop-CapacityRunEarly {
             StabilizationSeconds = $WarmupSeconds
             TcpConnections = $TcpConnections
             TcpActiveSenders = $effectiveTcpActiveSenders
+            TcpCrossGateway = [bool]$TcpCrossGateway
             TcpConnectionsPerSecond = $TcpConnectionsPerSecond
             TcpMode = $TcpMode
         }
@@ -388,6 +394,9 @@ try {
                 '--report-directory',$rateDirectory)
             if ($TcpMode -in @('heartbeat','chat')) {
                 $orchestratorArgs += '--tcp-bootstrap-auth'
+            }
+            if ($TcpCrossGateway) {
+                $orchestratorArgs += '--tcp-cross-gateway'
             }
             if ($TcpSlowlorisPhase) {
                 $orchestratorArgs += @('--tcp-slowloris-phase',"$TcpSlowlorisPhase",
@@ -887,6 +896,7 @@ $summary = [pscustomobject]@{
         RealtimeProcessingConcurrency = $RealtimeProcessingConcurrency
         TcpConnections = $TcpConnections
         TcpActiveSenders = $effectiveTcpActiveSenders
+        TcpCrossGateway = [bool]$TcpCrossGateway
         TcpMode = $TcpMode
         TcpMessagesPerSecond = $TcpMessagesPerSecond
         TcpDeliveryDrainSeconds = $TcpDeliveryDrainSeconds
@@ -929,7 +939,8 @@ $lines.Add("Window: $($startedAt.ToString('O')) - $($completedAt.ToString('O'))"
 $lines.Add('')
 $lines.Add("Run validity: **$(if ($runValid) { 'VALID' } else { 'INVALID' })**")
 $lines.Add('')
-$lines.Add("Rate model: bounded closed-loop pacing; concurrency=$PipelineConcurrency; stabilization=$($WarmupSeconds)s; requested measurement=$($DurationSeconds)s; TCP connection ramp=$TcpConnectionsPerSecond/s; active senders=$effectiveTcpActiveSenders/$TcpConnections.")
+$peerRouting = if ($TcpCrossGateway) { 'cross-gateway' } else { 'same-gateway' }
+$lines.Add("Rate model: bounded closed-loop pacing; concurrency=$PipelineConcurrency; stabilization=$($WarmupSeconds)s; requested measurement=$($DurationSeconds)s; TCP connection ramp=$TcpConnectionsPerSecond/s; active senders=$effectiveTcpActiveSenders/$TcpConnections; peer routing=$peerRouting.")
 $lines.Add('')
 $lines.Add('| Target | Unit | Achieved | Attainment | Conn success | Peak conns | Ack | Delivery | DLQ | Samples | Valid |')
 $lines.Add('|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---|')

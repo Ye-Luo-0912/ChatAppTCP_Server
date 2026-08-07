@@ -38,6 +38,7 @@ internal sealed class BenchmarkConfiguration
     public int RealtimeProcessingQueueCapacity { get; init; }
     public int RealtimePrefetchMaxMessages { get; init; }
     public int RealtimeMaxAckPending { get; init; }
+    public bool RealtimeShardedRouting { get; init; }
     public required string NatsUrl { get; init; }
     public int JetStreamReplicas { get; init; }
     public bool SmokeNoopStorage { get; init; }
@@ -49,6 +50,7 @@ internal sealed class BenchmarkConfiguration
     public required string TcpMode { get; init; }
     public int TcpConnections { get; init; }
     public int TcpActiveSenders { get; init; }
+    public bool TcpCrossGateway { get; init; }
     public double TcpMessagesPerSecond { get; init; }
     public double TcpDeliveryDrainSeconds { get; init; }
     public double TcpInactiveHeartbeatSeconds { get; init; }
@@ -89,6 +91,7 @@ internal sealed class BenchmarkConfiguration
         RealtimeProcessingQueueCapacity = options.GetRealtimeProcessingQueueCapacity(),
         RealtimePrefetchMaxMessages = options.GetRealtimePrefetchMaxMessages(),
         RealtimeMaxAckPending = options.GetRealtimeMaxAckPending(),
+        RealtimeShardedRouting = options.ShouldUseShardedRealtimeRouting(),
         NatsUrl = options.NatsUrl,
         JetStreamReplicas = options.JetStreamReplicas,
         SmokeNoopStorage = options.SmokeNoopStorage,
@@ -100,6 +103,7 @@ internal sealed class BenchmarkConfiguration
         TcpMode = options.TcpMode,
         TcpConnections = options.TcpConnections,
         TcpActiveSenders = options.GetEffectiveTcpActiveSenders(),
+        TcpCrossGateway = options.TcpCrossGateway,
         TcpMessagesPerSecond = options.TcpMessagesPerSecond,
         TcpDeliveryDrainSeconds = options.TcpDeliveryDrain.TotalSeconds,
         TcpInactiveHeartbeatSeconds = options.TcpInactiveHeartbeatInterval.TotalSeconds,

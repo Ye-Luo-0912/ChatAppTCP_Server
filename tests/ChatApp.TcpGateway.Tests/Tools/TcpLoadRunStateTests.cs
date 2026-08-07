@@ -105,6 +105,39 @@ public sealed class TcpLoadRunStateTests
     }
 
     [Fact]
+    public void CrossGatewayExternalDelivery_IsCountedOnce_AndDuplicateAbortsTheRun()
+    {
+        using var lifecycleCancellation = new CancellationTokenSource();
+        var state = new LoadRunState(
+            expectedClients: 2,
+            maxInflight: 16,
+            inflightTtl: TimeSpan.FromMinutes(1),
+            expectedChatSenders: 1,
+            allowAckOnlyTracking: true);
+        state.AttachLifecycle(lifecycleCancellation);
+
+        var first = state.RecordChatDelivered(
+            "external-message-1",
+            recipientClientIndex: 0,
+            isSlowReader: false);
+
+        Assert.Equal(MessageSignalRecordKind.Recorded, first.Kind);
+        Assert.Equal(1, state.SnapshotCounters().Received);
+        Assert.Null(state.RuntimeFailure);
+
+        var duplicate = state.RecordChatDelivered(
+            "external-message-1",
+            recipientClientIndex: 0,
+            isSlowReader: false);
+
+        Assert.Equal(MessageSignalRecordKind.DuplicateOrUntracked, duplicate.Kind);
+        Assert.Equal(1, state.SnapshotCounters().Received);
+        Assert.Equal(1, state.SnapshotCounters().DuplicateDeliveries);
+        Assert.NotNull(state.RuntimeFailure);
+        Assert.True(lifecycleCancellation.IsCancellationRequested);
+    }
+
+    [Fact]
     public async Task WarmupRuntimeFailureCancelsLifecycleAndPreventsMeasurement()
     {
         using var lifecycleCancellation = new CancellationTokenSource();

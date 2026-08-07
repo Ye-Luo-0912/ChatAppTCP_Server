@@ -40,6 +40,51 @@ public sealed class SessionLifecycleCoordinatorTests
     };
 
     [Fact]
+    public async Task Authentication_MaintainsRoutingLease_WhenEphemeralPresenceIsDisabled()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        using var metrics = new GatewayMetrics();
+        var bus = new CapturingMessageBus();
+        var presence = new RecordingGlobalPresenceStore();
+        var options = new TcpGatewayOptions
+        {
+            EnableResume = false,
+            EnableEphemeralPresenceAndTyping = false,
+            ReplaceSameDeviceSession = false,
+            IdleTimeout = TimeSpan.FromSeconds(90)
+        };
+        var coordinator = CreateCoordinator(
+            metrics,
+            bus,
+            new FakeDeviceSessionLeaseStore(),
+            new FakeResumeTokenStore(),
+            options: options,
+            globalPresence: presence);
+        await using var session = CreateSession(metrics);
+
+        var result = await coordinator.OnAuthenticatedAsync(
+            session,
+            new RealtimeAuthenticationResult
+            {
+                Succeeded = true,
+                UserId = 12001,
+                SessionId = "routing-session",
+                DeviceId = "routing-device",
+                DeviceIdHash = 0xD1
+            },
+            ct);
+
+        Assert.True(result.Success);
+        Assert.Equal([(12001L, "test-instance")], presence.OnlineCalls);
+        Assert.Empty(bus.PublishedPresenceEvents);
+
+        await coordinator.OnDisconnectedAsync(session, ct);
+
+        Assert.Equal([(12001L, "test-instance")], presence.OfflineCalls);
+        Assert.Empty(bus.PublishedPresenceEvents);
+    }
+
+    [Fact]
     public async Task TryResumeAsync_BroadcastsSessionRevoked_WhenLeaseTakeoverFindsPreviousSession()
     {
         var ct = TestContext.Current.CancellationToken;
@@ -792,7 +837,8 @@ public sealed class SessionLifecycleCoordinatorTests
         IResumeTokenStore tokenStore,
         IRedisCircuitBreaker? circuitBreaker = null,
         TcpGatewayOptions? options = null,
-        UserSessionRegistry? registry = null)
+        UserSessionRegistry? registry = null,
+        IGlobalPresenceStore? globalPresence = null)
     {
         options ??= new TcpGatewayOptions
         {
@@ -805,7 +851,7 @@ public sealed class SessionLifecycleCoordinatorTests
 
         return new SessionLifecycleCoordinator(
             leaseStore,
-            new NoopGlobalPresenceStore(),
+            globalPresence ?? new NoopGlobalPresenceStore(),
             tokenStore,
             registry ?? new UserSessionRegistry(),
             new PresenceWatcherRegistry(),
@@ -841,6 +887,7 @@ public sealed class SessionLifecycleCoordinatorTests
     private sealed class CapturingMessageBus : IRealtimeMessageBus
     {
         public List<RealtimeEvent> PublishedEvents { get; } = [];
+        public List<EphemeralPresenceEvent> PublishedPresenceEvents { get; } = [];
 
         /// <summary>
         /// 为 true 时 <see cref="PublishEventAsync"/> 抛 <see cref="InvalidOperationException"/>，
@@ -990,8 +1037,11 @@ public sealed class SessionLifecycleCoordinatorTests
 
         public Task PublishEphemeralPresenceAsync(
             EphemeralPresenceEvent evt,
-            CancellationToken ct = default) =>
-            Task.CompletedTask;
+            CancellationToken ct = default)
+        {
+            PublishedPresenceEvents.Add(evt);
+            return Task.CompletedTask;
+        }
 
         public async IAsyncEnumerable<EphemeralTypingEvent> ConsumeEphemeralTypingAsync(
             [EnumeratorCancellation] CancellationToken ct = default)
@@ -1032,6 +1082,48 @@ public sealed class SessionLifecycleCoordinatorTests
 
         public Task<TimeSpan> PingAsync(CancellationToken ct = default) =>
             Task.FromResult(TimeSpan.Zero);
+    }
+
+    private sealed class RecordingGlobalPresenceStore : IGlobalPresenceStore
+    {
+        public List<(long UserId, string InstanceId)> OnlineCalls { get; } = [];
+        public List<(long UserId, string InstanceId)> OfflineCalls { get; } = [];
+
+        public Task<PresenceTransition> SetOnlineAsync(
+            long userId,
+            string instanceId,
+            CancellationToken ct = default)
+        {
+            OnlineCalls.Add((userId, instanceId));
+            return Task.FromResult(PresenceTransition.WentOnline);
+        }
+
+        public Task<PresenceTransition> SetOfflineAsync(
+            long userId,
+            string instanceId,
+            CancellationToken ct = default)
+        {
+            OfflineCalls.Add((userId, instanceId));
+            return Task.FromResult(PresenceTransition.WentOffline);
+        }
+
+        public Task RefreshOnlineAsync(
+            long userId,
+            string instanceId,
+            CancellationToken ct = default) => Task.CompletedTask;
+
+        public Task<bool> IsOnlineAsync(long userId, CancellationToken ct = default) =>
+            Task.FromResult(OnlineCalls.Any(call => call.UserId == userId));
+
+        public Task<IReadOnlyDictionary<long, bool>> GetOnlineManyAsync(
+            IReadOnlyList<long> userIds,
+            CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyDictionary<long, bool>>(
+                userIds.ToDictionary(
+                    static userId => userId,
+                    userId => OnlineCalls.Any(call => call.UserId == userId)));
+
+        public Task RunMaintenanceAsync(CancellationToken ct = default) => Task.CompletedTask;
     }
 
     private sealed class FakeDeviceSessionLeaseStore : IDeviceSessionLeaseStore

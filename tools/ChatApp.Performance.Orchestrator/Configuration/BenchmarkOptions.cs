@@ -523,6 +523,12 @@ internal sealed record BenchmarkOptions(
     public int GetRealtimeMaxAckPending() =>
         Math.Max(256, checked(RealtimeProcessingConcurrency * 4));
 
+    public bool ShouldUseShardedRealtimeRouting() =>
+        !SmokeNoopStorage
+        && !string.IsNullOrWhiteSpace(GarnetEnvironmentVariable)
+        && !string.IsNullOrWhiteSpace(
+            Environment.GetEnvironmentVariable(GarnetEnvironmentVariable));
+
     public int GetEffectiveTcpActiveSenders() =>
         TcpMode is "heartbeat" or "chat"
             ? TcpActiveSenders == 0

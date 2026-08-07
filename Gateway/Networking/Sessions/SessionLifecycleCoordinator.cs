@@ -128,8 +128,8 @@ internal sealed partial class SessionLifecycleCoordinator
             result.DeviceId);
 
         var becameOnline = _userSessions.Add(session);
-        if (becameOnline && _options.EnableEphemeralPresenceAndTyping)
-            await PublishPresenceChangedAsync(result.UserId, isOnline: true, cancellationToken)
+        if (becameOnline)
+            await UpdateGlobalPresenceAsync(result.UserId, isOnline: true, cancellationToken)
                 .ConfigureAwait(false);
 
         if (_options.ReplaceSameDeviceSession)
@@ -327,9 +327,8 @@ internal sealed partial class SessionLifecycleCoordinator
         var wentOffline = _userSessions.Remove(session);
         if (wentOffline)
         {
-            if (_options.EnableEphemeralPresenceAndTyping)
-                await PublishPresenceChangedAsync(session.UserId, isOnline: false, cancellationToken)
-                    .ConfigureAwait(false);
+            await UpdateGlobalPresenceAsync(session.UserId, isOnline: false, cancellationToken)
+                .ConfigureAwait(false);
             _presenceWatchers.RemoveWatcher(session.UserId);
         }
 

@@ -80,6 +80,39 @@ internal sealed class RealtimeEventDeliveryHelper
         IPayloadCodec<TUpdate> codec,
         TUpdate update,
         bool skipOriginSession)
+        => DeliverAggregatedCore(
+            realtimeEvent,
+            command,
+            codec,
+            update,
+            skipOriginSession,
+            skipOriginForUserId: null);
+
+    /// <summary>
+    /// 多目标 fanout：仅当遍历到 <paramref name="skipOriginForUserId"/> 时跳过来源 SessionId。
+    /// 用于单聊聚合事件，让接收方正常投递，同时只对发送方目标执行多设备回声去重。
+    /// </summary>
+    public int DeliverAggregated<TUpdate>(
+        RealtimeEvent realtimeEvent,
+        PacketCommand command,
+        IPayloadCodec<TUpdate> codec,
+        TUpdate update,
+        long skipOriginForUserId)
+        => DeliverAggregatedCore(
+            realtimeEvent,
+            command,
+            codec,
+            update,
+            skipOriginSession: true,
+            skipOriginForUserId);
+
+    private int DeliverAggregatedCore<TUpdate>(
+        RealtimeEvent realtimeEvent,
+        PacketCommand command,
+        IPayloadCodec<TUpdate> codec,
+        TUpdate update,
+        bool skipOriginSession,
+        long? skipOriginForUserId)
     {
         var targetUserIds = realtimeEvent.TargetUserIds;
         if (targetUserIds is null || targetUserIds.Length == 0)
@@ -93,7 +126,9 @@ internal sealed class RealtimeEventDeliveryHelper
             for (var i = 0; i < userTargets.Length; i++)
             {
                 var target = userTargets[i];
-                if (skipOriginSession && ShouldSkipOrigin(target, realtimeEvent))
+                if (skipOriginSession
+                    && (!skipOriginForUserId.HasValue || skipOriginForUserId.Value == userId)
+                    && ShouldSkipOrigin(target, realtimeEvent))
                     continue;
 
                 if (ShouldSkipByProtocolVersion(target, realtimeEvent))

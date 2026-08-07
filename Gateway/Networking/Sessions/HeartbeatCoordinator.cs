@@ -188,9 +188,11 @@ internal sealed class HeartbeatCoordinator
 
                 // 仅枚举当前桶，不再 ToArray 全量会话。
                 var sessionsInBucket = _bucketRegistry.GetConnectionBucket(currentBucket);
-                ICollection<long> usersInBucket = _options.EnableEphemeralPresenceAndTyping
-                    ? _bucketRegistry.GetUserBucket(currentBucket)
-                    : Array.Empty<long>();
+                // Global presence doubles as the sharded realtime routing directory,
+                // so its lease must be refreshed independently of optional ephemeral
+                // Presence/Typing notifications.
+                ICollection<long> usersInBucket =
+                    _bucketRegistry.GetUserBucket(currentBucket);
 
                 // 指标：当前 tick 扫描的连接数（仅当前桶，非全局总数）。
                 _metrics.HeartbeatSessionsScanned(sessionsInBucket.Count);
@@ -227,24 +229,21 @@ internal sealed class HeartbeatCoordinator
                 }
 
                 // Presence 刷新：按 userId 桶遍历，同用户多连接只刷新一次。
-                if (_options.EnableEphemeralPresenceAndTyping)
+                foreach (var userId in usersInBucket)
                 {
-                    foreach (var userId in usersInBucket)
-                    {
-                        _metrics.HeartbeatRefreshAttempted("presence");
-                        var work = new HeartbeatRefreshWork(
-                            HeartbeatRefreshKind.Presence,
-                            userId,
-                            0,
-                            null,
-                            TimeSpan.Zero,
-                            actualTickStart);
+                    _metrics.HeartbeatRefreshAttempted("presence");
+                    var work = new HeartbeatRefreshWork(
+                        HeartbeatRefreshKind.Presence,
+                        userId,
+                        0,
+                        null,
+                        TimeSpan.Zero,
+                        actualTickStart);
 
-                        await channel.Writer.WriteAsync(work, cancellationToken)
-                            .ConfigureAwait(false);
-                        Interlocked.Increment(ref _currentQueueDepth);
-                        Interlocked.CompareExchange(ref _oldestEnqueueTimestamp, actualTickStart, 0);
-                    }
+                    await channel.Writer.WriteAsync(work, cancellationToken)
+                        .ConfigureAwait(false);
+                    Interlocked.Increment(ref _currentQueueDepth);
+                    Interlocked.CompareExchange(ref _oldestEnqueueTimestamp, actualTickStart, 0);
                 }
 
                 var tickDuration = _timeProvider.GetElapsedTime(actualTickStart);

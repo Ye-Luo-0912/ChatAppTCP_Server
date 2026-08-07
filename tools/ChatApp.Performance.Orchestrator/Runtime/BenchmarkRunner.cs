@@ -460,6 +460,28 @@ Console.WriteLine("Starting RealtimeServices...");
         var loadReadResult = ReadLoadResults(
             artifacts.Where(static path => Path.GetExtension(path) == ".json"));
         errors.AddRange(loadReadResult.Errors);
+        if (options.TcpCrossGateway)
+        {
+            var crossGatewayLoads = loadReadResult.Summaries
+                .Where(static summary => summary.Kind == "tcp-chat")
+                .ToArray();
+            var sent = crossGatewayLoads.Sum(static summary => summary.MessagesSent);
+            var received = crossGatewayLoads.Sum(static summary => summary.MessagesReceived);
+            var deliveryRatio = sent == 0 ? 0d : received / (double)sent;
+            if (deliveryRatio < options.TcpMinimumDeliveryRatio)
+            {
+                errors.Add(
+                    $"Cross-Gateway delivery ratio {deliveryRatio:F6} is below " +
+                    $"the required {options.TcpMinimumDeliveryRatio:F6} " +
+                    $"({received}/{sent}).");
+            }
+            else if (received > sent)
+            {
+                errors.Add(
+                    $"Cross-Gateway receivers observed more unique deliveries than " +
+                    $"messages sent ({received}/{sent}).");
+            }
+        }
         var expectedLoadReports = options.GatewayCount + (options.PipelineEnabled ? 1 : 0);
         if (loadReadResult.Summaries.Count != expectedLoadReports)
         {
@@ -616,6 +638,11 @@ Console.WriteLine("Starting RealtimeServices...");
             "--Observability:OtlpEnabled=false",
             "--Logging:LogLevel:Default=Warning"
         };
+        if (options.ShouldUseShardedRealtimeRouting())
+        {
+            arguments.Add("--Nats:Routing:Mode=Sharded");
+            arguments.Add("--Nats:Routing:RealtimeEventsShardSubjectPattern=chat.realtime-events.shards.{0}");
+        }
         if (options.SmokeNoopStorage)
         {
             arguments.Add("--RealtimeDatabase:MessageStoreProvider=Noop");
@@ -697,6 +724,11 @@ Console.WriteLine("Starting RealtimeServices...");
             "--Observability:OtlpEnabled=false",
             "--Logging:LogLevel:Default=Warning"
         };
+        if (options.ShouldUseShardedRealtimeRouting())
+        {
+            arguments.Add("--RealtimeIntegration:RoutingMode=Sharded");
+            arguments.Add("--RealtimeIntegration:RealtimeEventsShardSubjectPattern=chat.realtime-events.shards.{0}");
+        }
         // Inbound 预算耗尽场景：收窄全局入站缓冲字节预算，验证 GlobalInboundBudget
         // 能在超限时对连接背压/关闭，避免配置上限形同虚设。
         if (options.TcpInboundBudgetBytes is long inboundBudget)

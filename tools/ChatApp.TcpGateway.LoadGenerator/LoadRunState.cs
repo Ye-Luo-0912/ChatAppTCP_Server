@@ -14,6 +14,7 @@ internal sealed class LoadRunState
     private readonly ConcurrentDictionary<int, string> _preparationErrors = new();
     private readonly ConcurrentDictionary<int, byte> _completedChatSenders = new();
     private readonly ConcurrentDictionary<string, InflightMessageState> _inflight = new();
+    private readonly ConcurrentDictionary<string, long> _externalDeliveries = new();
     private readonly TaskCompletionSource _allPreparationCompleted =
         new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly TaskCompletionSource<MeasurementContext> _measurementStarted =
@@ -31,7 +32,9 @@ internal sealed class LoadRunState
     private int _peakActiveConnections;
     private int _trackedCount;
     private int _pruneInProgress;
+    private int _externalPruneInProgress;
     private long _nextPruneAt;
+    private long _nextExternalPruneAt;
     private long _trackingDropped;
     private long _trackingExpired;
     private long _sent;
@@ -139,6 +142,13 @@ internal sealed class LoadRunState
         if (string.IsNullOrWhiteSpace(clientMessageId) ||
             !_inflight.TryGetValue(clientMessageId, out var state))
         {
+            if (_allowAckOnlyTracking && !string.IsNullOrWhiteSpace(clientMessageId))
+            {
+                return RecordExternalDelivery(
+                    clientMessageId,
+                    recipientClientIndex);
+            }
+
             return RecordDuplicateDelivery(clientMessageId, recipientClientIndex);
         }
 
@@ -755,6 +765,45 @@ internal sealed class LoadRunState
             $"client message {clientMessageId ?? "<missing>"} on recipient " +
             $"client {recipientClientIndex}.");
         return MessageSignalRecordResult.DuplicateOrUntracked;
+    }
+
+    private MessageSignalRecordResult RecordExternalDelivery(
+        string clientMessageId,
+        int recipientClientIndex)
+    {
+        var now = Stopwatch.GetTimestamp();
+        PruneExternalDeliveries(now);
+        if (!_externalDeliveries.TryAdd(clientMessageId, now))
+            return RecordDuplicateDelivery(clientMessageId, recipientClientIndex);
+
+        Interlocked.Increment(ref _received);
+        return new MessageSignalRecordResult(
+            MessageSignalRecordKind.Recorded,
+            0d);
+    }
+
+    private void PruneExternalDeliveries(long now)
+    {
+        if (now < Volatile.Read(ref _nextExternalPruneAt) ||
+            Interlocked.CompareExchange(ref _externalPruneInProgress, 1, 0) != 0)
+        {
+            return;
+        }
+
+        try
+        {
+            foreach (var pair in _externalDeliveries)
+            {
+                if (now - pair.Value >= _inflightTtlTicks)
+                    _externalDeliveries.TryRemove(pair);
+            }
+
+            Volatile.Write(ref _nextExternalPruneAt, now + _pruneIntervalTicks);
+        }
+        finally
+        {
+            Volatile.Write(ref _externalPruneInProgress, 0);
+        }
     }
 
     private enum MessageSignalCompletion

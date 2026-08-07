@@ -149,7 +149,7 @@ internal sealed class ChatMessageDeliveryHandler : IRealtimeEventHandler
                 PacketCommand.ChatMessage,
                 _chatMessageCodec,
                 message,
-                skipOriginSession);
+                payload.SenderUserId);
             return;
         }
 

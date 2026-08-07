@@ -177,10 +177,10 @@ public sealed class GatewayDirectoryTests
     public void Formatter_Format_ReplacesPlaceholder()
     {
         var subject = ShardedSubjectFormatter.Format(
-            "chat.realtime-events.{0}",
+            "chat.realtime-events.shards.{0}",
             "gateway-01");
 
-        Assert.Equal("chat.realtime-events.gateway-01", subject);
+        Assert.Equal("chat.realtime-events.shards.gateway-01", subject);
     }
 
     [Fact]
@@ -196,7 +196,7 @@ public sealed class GatewayDirectoryTests
     [Fact]
     public void Formatter_IsSharded_True_WhenPlaceholderPresent()
     {
-        Assert.True(ShardedSubjectFormatter.IsSharded("chat.realtime-events.{0}"));
+        Assert.True(ShardedSubjectFormatter.IsSharded("chat.realtime-events.shards.{0}"));
     }
 
     [Fact]
@@ -220,9 +220,9 @@ public sealed class GatewayDirectoryTests
     [Fact]
     public void Formatter_ToWildcard_ReplacesPlaceholderWithGt()
     {
-        var wildcard = ShardedSubjectFormatter.ToWildcard("chat.realtime-events.{0}");
+        var wildcard = ShardedSubjectFormatter.ToWildcard("chat.realtime-events.shards.{0}");
 
-        Assert.Equal("chat.realtime-events.>", wildcard);
+        Assert.Equal("chat.realtime-events.shards.>", wildcard);
     }
 
     [Fact]
