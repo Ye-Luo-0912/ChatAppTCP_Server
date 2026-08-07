@@ -23,3 +23,6 @@ p50/p95/p99、错误率、消息积压/失败计数、进程与依赖资源，�
   senders、跨 Gateway 的 80/160/320/640 msg/s 固定速率曲线，以及 SQL/Outbox 分配
   优化前后的 80 msg/s A/B。四档正确性门禁全部通过；实测容量下界为 640 msg/s，
   PostgreSQL 资源余量约束下的持续建议值为 320 msg/s。
+- 2026-08-08-linux-cross-gateway-soak-8h.json：最终优化提交快照、10,000 条连接、
+  100 个 active senders、80 msg/s 的正式 8 小时跨 Gateway 稳定性摘要；逐消息
+  ACK/投递、内存稳定性、资源覆盖率及 Outbox/JetStream 边界均已审计。

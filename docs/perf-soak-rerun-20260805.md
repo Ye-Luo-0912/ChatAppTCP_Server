@@ -181,4 +181,25 @@ consumer 的 delivered/ACK floor 均为 9,804；三者 pending、ack-pending、r
 `/home/yeluo/chatapp-perf/runs/codex-tcp-soak-opt-20260807T135316Z`，报告目录为
 `reports/soak-8h-cross-gateway-v3`，主 PID/PGID 为 `1701156/1701156`。最终组合源码
 SHA-256 为 `92c650d8fd2add8eca82000411bd2ab00eb8cc93bb5a15d6ebb28e564887a1ac`；
-本历史报告的 PASSED verdict 不与新轮混合，新轮结束后单独追加最终结论。
+本历史报告的 PASSED verdict 不与新轮混合。
+
+## 8. 优化后跨 Gateway 正式 8 小时 verdict（2026-08-08）
+
+新轮以退出码 `0` 完成，最终 verdict 为 **PASSED**：`RunValid=true`、
+`MemoryConclusive=true`、`MemoryStable=true`。实际 measurement 为
+`28,800.0165649s`；10,000/10,000 连接成功，总计发送、ACK、跨 Gateway 预期投递和
+实际收到均为 `2,304,000`，重复、漏投、拒绝、outstanding、tracking 丢失、runtime
+failure 和死信全部为 `0`，实际吞吐为 `79.999954 msg/s`。
+
+优化后 Realtime allocation 为 `225,766,484,480` bytes，即 `97,988.93 B/msg`，较本
+历史轮的 `262,842 B/msg` 下降 `62.72%`；数据库操作由 `14.27` 降至
+`10.1964 ops/msg`。Outbox 行由每消息两条降为一条，published 为 `2,304,000`；实际
+Sharded NATS target publish 仍为 `4,608,000`，因为 sender ACK 与跨 Gateway recipient
+delivery 需要两个目标 Gateway，不能将其误报为 NATS publish 减半。
+
+Gateway-1 基线/最终 RSS 中位数为 `305.92 → 264.48 MiB`，最终斜率
+`1.16 MiB/h`；Gateway-2 为 `309.70 → 265.13 MiB`、`1.36 MiB/h`，两者均独立
+判定 `STABLE`。8 条资源 series 的最小 measurement 覆盖率为 `99.243%`，Prometheus
+覆盖率为 `100%`。完整新轮分析、ACK 延迟和跨 child delivery latency 限制见
+[优化复测报告](perf-optimization-rerun-20260807.md)；本地完整报告位于
+[`.artifacts/remote-reports/soak-8h-cross-gateway-v3`](../.artifacts/remote-reports/soak-8h-cross-gateway-v3)。

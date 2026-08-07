@@ -126,7 +126,71 @@ soak 保持 80 msg/s，以便与 2026-08-06 的旧正式轮做稳定性对比；
   .NET 10.0.301 host SHA-256：
   `763bfd4dbb1bb3a3b5257c6800eef77bb4abe2127e6ff9c33e2a56e2e814aedf`。
 
-该轮已通过锁定还原和 Linux Release 构建（两套解决方案均 0 warning / 0 error），并已
-启动独立 NATS/PostgreSQL/Garnet、Realtime、两个 Gateway 和两个 load child。最终
-`RunValid`、`MemoryConclusive`、`MemoryStable` 以及 8 小时逐消息正确性结论须等待正式
-报告完成后填写；运行中不以中间样本提前宣告通过。
+该轮已通过锁定还原和 Linux Release 构建（两套解决方案均 0 warning / 0 error），并使用
+独立 NATS/PostgreSQL/Garnet、Realtime、两个 Gateway 和两个 load child。正式轮于
+`2026-08-08T06:04:09+08:00` 退出，退出码为 `0`，最终 verdict 为 **PASSED**：
+`RunValid=true`、`MemoryConclusive=true`、`MemoryStable=true`。
+
+### 7.1 8 小时正确性与延迟
+
+- 两个 child 的实际 measurement 分别为 `28,800.0164561s` 和 `28,800.0165649s`；
+  10,000/10,000 连接成功并达到峰值，100 个 active sender 全部出现。
+- 总计发送、MQ ACK、预期跨 Gateway 投递和实际收到均为 `2,304,000`；rejected、
+  duplicate ACK、duplicate delivery、outstanding、tracking expired、tracking dropped、
+  runtime failure 和漏投全部为 `0`，两个 60 秒 drain 均完成。
+- 实际吞吐 `79.999954 msg/s`，目标达成率 `99.999942%`。
+- Gateway-1 ACK 平均/P50/P95/P99/最大为
+  `1.059/1.024/1.280/1.600/192.185 ms`；Gateway-2 为
+  `1.019/0.992/1.280/1.600/193.669 ms`。
+- JetStream measurement deliveries 和 ACK 均为 `2,304,000`，最终 pending 为 `0`，
+  redelivery 为 `0`；Realtime persisted 为 `2,304,000`，死信为 `0`。
+
+跨 child 的限制仍然存在：每个 child 在另一 Gateway 收到外部投递并做计数/去重，因而
+全局数量和重复/漏投判定有效；但当前没有跨 child 合并 delivery latency histogram，也
+没有在同一 child 内相关 ACK-ID 与 delivery-ID 集合。报告里的 `DeliveryLatency.Count=0`
+表示“未采集该直方图”，不是零延迟。
+
+### 7.2 Outbox、数据库与分配
+
+- Outbox completed/published 为 `2,304,000`，即一条 Outbox 行/消息；相对旧轮
+  `4,608,000` 行下降 `50%`。最终 pending/dead/max-attempts 为 `0/0/0`，全程 pending
+  峰值为 `19`、attempts 峰值为 `1`，未形成积压；已清理发布历史 `579,021` 行。
+- Sharded Routing 实际 target publish 为 `4,608,000`，即两次 NATS shard publish/消息。
+  这是 sender ACK 与跨 Gateway recipient delivery 分属两个目标 Gateway 的结果。因此本轮
+  完成的是“一条多目标 Outbox 行”，不能宣称实际 NATS target publish 也下降了 50%；若要
+  再减半，必须重新设计可靠 ACK/投递协议语义。
+- 数据库操作总数为 `23,492,608`，即 `10.1964 ops/msg`；相对旧轮 `14.27 ops/msg`
+  下降约 `28.55%`，与将约 5 次串行授权读取聚合为一次 SQL 的预期相符。
+- Realtime 总 managed allocation 为 `225,766,484,480` bytes，即
+  `97,988.93 B/msg`；相对旧正式轮 `262,842 B/msg` 下降 `62.72%`，也略优于 5 分钟
+  优化后 A/B 的 `99,122.23 B/msg`。GC pause 累计 `70.261s`。
+
+### 7.3 采样、资源与内存稳定性
+
+- 资源覆盖 8 条 series（5 个进程 + 3 个本轮依赖容器），每条 measurement 采样
+  `14,291/14,400`，覆盖率 `99.243%`；Prometheus 覆盖率 `100%`。
+- Gateway-1 基线/最终窗口 RSS 中位数 `305.92 → 264.48 MiB`，增长 `-13.55%`，
+  最终斜率 `1.16 MiB/h`；Gateway-2 为 `309.70 → 265.13 MiB`、`-14.39%`、
+  `1.36 MiB/h`。两者均低于 `20%` 增长和 `30 MiB/h` 斜率门限，独立判定
+  `STABLE`，无重启、OOM 或 OOM kill。
+- Realtime 平均/最大 CPU `4.92%/8.25%`，最大工作集 `217.29 MiB`。两个 Gateway
+  平均 CPU `1.96%/1.94%`，最大工作集 `315.01/320.54 MiB`；两个 load child 平均
+  CPU `1.20%/1.19%`，最大工作集 `121.19/125.92 MiB`。
+- NATS/PostgreSQL/Garnet 平均 CPU 分别为 `14.07%/46.85%/5.12%`，最大内存分别为
+  `316.0/953.8/844.5 MiB`。Garnet 峰值高于旧正式轮，但后半程回落到约 400 MiB，
+  未显示持续增长；仍建议在更高连接数测试中单独观察其启动峰值。
+
+### 7.4 残余优化信号与报告
+
+本轮运行错误为 0，但 runtime 指标记录了 `2,034,057` 次已处理的
+`TaskCanceledException` 和 `68` 次 `SemaphoreFullException`。它们没有导致消息失败、
+重投或积压，也不影响本轮 PASS；但异常式控制流很可能仍贡献 allocation/GC，下一轮优化
+应使用 trace 定位其调用栈，再决定是否改为无异常的取消/竞争路径。
+
+- 本地完整报告：[`.artifacts/remote-reports/soak-8h-cross-gateway-v3`](../.artifacts/remote-reports/soak-8h-cross-gateway-v3)
+- Verdict：[soak-verdict-20260807-220430Z.json](../.artifacts/remote-reports/soak-8h-cross-gateway-v3/soak-verdict-20260807-220430Z.json)，
+  SHA-256 `00f65bd7cd9044584bb3c3581087ff5291794e499ef9b75828de96000fe75e1d`
+- Benchmark：[benchmark-report.json](../.artifacts/remote-reports/soak-8h-cross-gateway-v3/capacity-curve-20260807-135738Z/rate-1/benchmark-20260807-135744Z/benchmark-report.json)，
+  SHA-256 `cd746e07011066a71750882f598f94696323d578dc141a9b2dffc30a23da1f81`
+- 可提交的脱敏摘要：
+  `docs/performance-baselines/2026-08-08-linux-cross-gateway-soak-8h.json`

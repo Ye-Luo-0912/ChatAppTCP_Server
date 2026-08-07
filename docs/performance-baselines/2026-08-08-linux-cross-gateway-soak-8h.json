@@ -1,0 +1,146 @@
+{
+  "schemaVersion": 1,
+  "capturedAtUtc": "2026-08-07T22:04:30Z",
+  "environment": "remote-linux-isolated-dependencies",
+  "remoteRunRoot": "/home/yeluo/chatapp-perf/runs/codex-tcp-soak-opt-20260807T135316Z",
+  "reportDirectory": "reports/soak-8h-cross-gateway-v3",
+  "sourceSnapshots": {
+    "tcpCommit": "600141888c7a61b5f65866c6e9b6a80345a30391",
+    "realtimeCommit": "d5e886a80f160b9a02c312a3383a705aa931097a",
+    "combinedSourceSha256": "92c650d8fd2add8eca82000411bd2ab00eb8cc93bb5a15d6ebb28e564887a1ac",
+    "canonicalFeedSha256": "00823022224bc833ba1644d74a72b3e4a39ff6ab267c979f3b009fc76ddc6e4d",
+    "dotnetSdkVersion": "10.0.301",
+    "dotnetSha256": "763bfd4dbb1bb3a3b5257c6800eef77bb4abe2127e6ff9c33e2a56e2e814aedf"
+  },
+  "reportHashes": {
+    "verdictSha256": "00f65bd7cd9044584bb3c3581087ff5291794e499ef9b75828de96000fe75e1d",
+    "benchmarkSha256": "cd746e07011066a71750882f598f94696323d578dc141a9b2dffc30a23da1f81",
+    "capacityReportSha256": "e4a960ebc24dc0a61a75f2d20ef49aae1624534c113910a590cee1a5ceeaff42"
+  },
+  "configuration": {
+    "tcpConnections": 10000,
+    "activeSenders": 100,
+    "messagesPerSecondPerActiveSender": 0.8,
+    "aggregateTargetMessagesPerSecond": 80,
+    "payloadBytes": 512,
+    "crossGateway": true,
+    "warmupSeconds": 300,
+    "measurementSeconds": 28800.0165649,
+    "deliveryDrainSeconds": 60,
+    "realtimeProcessingConcurrency": 16
+  },
+  "verdict": {
+    "status": "PASSED",
+    "runValid": true,
+    "memoryConclusive": true,
+    "memoryStable": true,
+    "restartDetected": false,
+    "exitCode": 0
+  },
+  "correctness": {
+    "connectionsSucceeded": 10000,
+    "connectionsFailed": 0,
+    "messagesSent": 2304000,
+    "messagesAcknowledged": 2304000,
+    "expectedDeliveries": 2304000,
+    "messagesReceived": 2304000,
+    "messagesRejected": 0,
+    "duplicateAcknowledgements": 0,
+    "duplicateDeliveries": 0,
+    "outstanding": 0,
+    "trackingExpired": 0,
+    "trackingDropped": 0,
+    "deadLetters": 0,
+    "throughputMessagesPerSecond": 79.999953986,
+    "throughputAttainmentPercent": 99.999942483
+  },
+  "acknowledgementLatencyMilliseconds": {
+    "gateway1": {
+      "average": 1.059193659,
+      "p50": 1.024,
+      "p95": 1.28,
+      "p99": 1.6,
+      "maximum": 192.185
+    },
+    "gateway2": {
+      "average": 1.019121294,
+      "p50": 0.992,
+      "p95": 1.28,
+      "p99": 1.6,
+      "maximum": 193.669
+    }
+  },
+  "persistence": {
+    "jetStreamDeliveries": 2304000,
+    "jetStreamAcknowledgements": 2304000,
+    "jetStreamPendingFinal": 0,
+    "jetStreamRedelivered": 0,
+    "realtimePersisted": 2304000,
+    "outboxPublishedRows": 2304000,
+    "outboxPendingFinal": 0,
+    "outboxDeadFinal": 0,
+    "outboxMaximumAttemptsFinal": 0,
+    "outboxPendingPeak": 19,
+    "outboxCleanupDeleted": 579021,
+    "shardedNatsTargetPublishes": 4608000,
+    "databaseOperations": 23492608,
+    "databaseOperationsPerMessage": 10.196444444
+  },
+  "allocation": {
+    "totalManagedBytes": 225766484480,
+    "bytesPerMessage": 97988.925556,
+    "reductionVersusHistoricalFormalPercent": 62.71952547,
+    "gcPauseSeconds": 70.260881,
+    "gen0Collections": 7915,
+    "gen1Collections": 5267,
+    "gen2Collections": 457
+  },
+  "gatewayMemory": [
+    {
+      "name": "gateway-1",
+      "baselineMedianMiB": 305.921875,
+      "finalMedianMiB": 264.480469,
+      "growthPercent": -13.546402,
+      "finalSlopeMiBPerHour": 1.157501,
+      "maximumWorkingSetMiB": 315.011719,
+      "stable": true
+    },
+    {
+      "name": "gateway-2",
+      "baselineMedianMiB": 309.695313,
+      "finalMedianMiB": 265.132813,
+      "growthPercent": -14.389143,
+      "finalSlopeMiBPerHour": 1.364622,
+      "maximumWorkingSetMiB": 320.539063,
+      "stable": true
+    }
+  ],
+  "sampling": {
+    "seriesCount": 8,
+    "samplesPerSeries": 14291,
+    "expectedSamplesPerSeries": 14400,
+    "minimumCoveragePercent": 99.243055556,
+    "prometheusCoveragePercent": 100.0
+  },
+  "resources": {
+    "realtimeAverageCpuPercent": 4.915655,
+    "realtimeMaximumCpuPercent": 8.254596,
+    "realtimeMaximumWorkingSetMiB": 217.292969,
+    "natsAverageCpuPercent": 14.065403,
+    "natsMaximumMemoryMiB": 316.0,
+    "postgresAverageCpuPercent": 46.851719,
+    "postgresMaximumCpuPercent": 93.39,
+    "postgresMaximumMemoryMiB": 953.799999,
+    "garnetAverageCpuPercent": 5.11507,
+    "garnetMaximumMemoryMiB": 844.5
+  },
+  "residualSignals": {
+    "taskCanceledExceptions": 2034057,
+    "semaphoreFullExceptions": 68
+  },
+  "limitations": [
+    "Cross-child delivery counts and duplicate detection are aggregated globally, but delivery latency histograms and same-child ACK-ID/delivery-ID correlation are unavailable.",
+    "One multi-target Outbox row is completed per message, while two NATS shard target publishes remain necessary for sender acknowledgement and cross-Gateway recipient delivery.",
+    "Handled cancellation and semaphore exceptions did not affect correctness, but remain allocation optimization candidates."
+  ]
+}
