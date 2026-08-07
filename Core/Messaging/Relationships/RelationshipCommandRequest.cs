@@ -23,27 +23,3 @@ public sealed class RelationshipCommandRequest
     /// <summary>好友请求 Id（仅 RespondFriendRequest 时使用：接受或拒绝指定请求）。</summary>
     public string? RequestIdToRespond { get; init; }
 }
-
-/// <summary>
-/// 关系操作类型。
-/// </summary>
-public enum RelationshipOperation : byte
-{
-    /// <summary>发送好友请求。</summary>
-    SendFriendRequest = 1,
-
-    /// <summary>接受好友请求。</summary>
-    AcceptFriendRequest = 2,
-
-    /// <summary>拒绝好友请求。</summary>
-    DeclineFriendRequest = 3,
-
-    /// <summary>删除好友。</summary>
-    RemoveFriend = 4,
-
-    /// <summary>拉黑用户。</summary>
-    BlockUser = 5,
-
-    /// <summary>取消拉黑。</summary>
-    UnblockUser = 6
-}

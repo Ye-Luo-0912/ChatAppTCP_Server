@@ -1,4 +1,3 @@
-using ChatApp.TcpGateway.Core.Protocol;
 using Microsoft.Extensions.Logging;
 
 namespace ChatApp.TcpGateway.Observability.Logging;

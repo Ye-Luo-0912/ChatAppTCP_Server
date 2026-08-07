@@ -9,7 +9,6 @@ using ChatApp.TcpGateway.Core.Messaging.Relationships;
 using ChatApp.TcpGateway.Core.Messaging.Sync;
 using ChatApp.Realtime.Abstractions.Events;
 using ChatApp.Realtime.Abstractions.Push;
-using ChatApp.TcpGateway.Infrastructure.Authentication.Models;
 using ChatApp.TcpGateway.Infrastructure.Push;
 
 namespace ChatApp.TcpGateway.Infrastructure.Serialization.Json;
@@ -111,7 +110,6 @@ namespace ChatApp.TcpGateway.Infrastructure.Serialization.Json;
 [JsonSerializable(typeof(RelationshipChangeLogEntry))]
 [JsonSerializable(typeof(RelationshipChangeLogEntry[]))]
 [JsonSerializable(typeof(RelationshipChangeOperation))]
-[JsonSerializable(typeof(AccessTokenRecord))]
 [JsonSerializable(typeof(ProtocolErrorFrame))]
 [JsonSerializable(typeof(ClientHello))]
 [JsonSerializable(typeof(ServerHello))]
@@ -126,11 +124,11 @@ namespace ChatApp.TcpGateway.Infrastructure.Serialization.Json;
 [JsonSerializable(typeof(RelationshipCommandRequest))]
 [JsonSerializable(typeof(RelationshipCommandResponse))]
 [JsonSerializable(typeof(RelationshipListRequest))]
-[JsonSerializable(typeof(RelationshipListResponse))]
+[JsonSerializable(typeof(RelationshipListResponse), TypeInfoPropertyName = "RelationshipListResponse")]
 [JsonSerializable(typeof(MembersAddedUpdate))]
 [JsonSerializable(typeof(ConversationDissolvedUpdate))]
-[JsonSerializable(typeof(RelationshipItem))]
-[JsonSerializable(typeof(RelationshipItem[]))]
+[JsonSerializable(typeof(RelationshipItem), TypeInfoPropertyName = "RelationshipItem")]
+[JsonSerializable(typeof(RelationshipItem[]), TypeInfoPropertyName = "RelationshipItemArray")]
 [JsonSerializable(typeof(RealtimeAttachmentLifecyclePayload))]
 [JsonSerializable(typeof(RealtimeUserLifecycleChangedPayload))]
 [JsonSerializable(typeof(RealtimeDomainNotificationPayload))]
@@ -144,9 +142,4 @@ namespace ChatApp.TcpGateway.Infrastructure.Serialization.Json;
 [JsonSerializable(typeof(PushDlqFailedToken[]))]
 [JsonSerializable(typeof(ResumeContext))]
 [JsonSerializable(typeof(ChatApp.Realtime.Abstractions.Conversations.GroupConversationResult), TypeInfoPropertyName = "RealtimeGroupConversationResult")]
-[JsonSerializable(typeof(ChatApp.Realtime.Abstractions.Conversations.ConversationMemberItem), TypeInfoPropertyName = "RealtimeConversationMemberItem")]
-[JsonSerializable(typeof(ChatApp.Realtime.Abstractions.Conversations.ConversationMemberRole), TypeInfoPropertyName = "RealtimeConversationMemberRole")]
-[JsonSerializable(typeof(ChatApp.Realtime.Abstractions.Conversations.ConversationType), TypeInfoPropertyName = "RealtimeConversationType")]
-[JsonSerializable(typeof(List<ChatApp.Realtime.Abstractions.Conversations.ConversationMemberItem>), TypeInfoPropertyName = "RealtimeConversationMemberItemList")]
-[JsonSerializable(typeof(System.Collections.Generic.IReadOnlyList<ChatApp.Realtime.Abstractions.Conversations.ConversationMemberItem>), TypeInfoPropertyName = "RealtimeConversationMemberItemReadOnlyList")]
 public partial class GatewayJsonSerializerContext : JsonSerializerContext;

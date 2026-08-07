@@ -2,10 +2,14 @@ namespace ChatApp.TcpGateway.Core.Protocol;
 
 public static class PacketProtocol
 {
-    public const uint MagicNumber = 0x1A2B3C4D;
-    public const int CommandOffset = sizeof(uint);
-    public const int LengthOffset = sizeof(uint) + sizeof(ushort);
-    public const int HeaderSize = sizeof(uint) + sizeof(ushort) + sizeof(int);
+    public const uint MagicNumber =
+        global::ChatApp.Shared.Protocol.Tcp.TcpFrameConstants.MagicNumber;
+    public const int CommandOffset =
+        global::ChatApp.Shared.Protocol.Tcp.TcpFrameConstants.CommandOffset;
+    public const int LengthOffset =
+        global::ChatApp.Shared.Protocol.Tcp.TcpFrameConstants.LengthOffset;
+    public const int HeaderSize =
+        global::ChatApp.Shared.Protocol.Tcp.TcpFrameConstants.HeaderSize;
     public const int MaxPayloadSize = 80 * 1024;
 
     // 单一协议常量源 —— 分页条数上限与响应字节预算。
@@ -39,7 +43,8 @@ public static class PacketProtocol
     /// <summary>
     /// 当前协议版本。握手时与服务端协商，客户端必须发送 ≤ 此值的版本。
     /// </summary>
-    public const ushort CurrentProtocolVersion = 1;
+    public const ushort CurrentProtocolVersion =
+        global::ChatApp.Shared.Protocol.Tcp.TcpFrameConstants.CurrentProtocolVersion;
 
     /// <summary>
     /// 服务端最低支持的协议版本。客户端发送低于此值的版本将被拒绝

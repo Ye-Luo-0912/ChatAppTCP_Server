@@ -10,6 +10,7 @@
     <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" />
     <PackageReference Include="Microsoft.Extensions.Options" />
     <PackageReference Include="StackExchange.Redis" />
+    <PackageReference Include="ChatApp.Auth.Contracts" />
   </ItemGroup>
 
   <ItemGroup>

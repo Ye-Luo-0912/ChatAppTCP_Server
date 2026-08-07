@@ -2,6 +2,13 @@ namespace ChatApp.TcpGateway.Core.Messaging;
 
 public sealed class ChatMessage
 {
+    /// <summary>
+    /// 客户端生成的幂等消息编号。上行时与 <see cref="MessageId"/> 相同；
+    /// 下行时保留原始客户端编号，供 ACK 与多设备投递进行精确关联。
+    /// 旧版下行帧可能缺省此字段。
+    /// </summary>
+    public string? ClientMessageId { get; set; }
+
     public string? MessageId { get; set; }
 
     /// <summary>

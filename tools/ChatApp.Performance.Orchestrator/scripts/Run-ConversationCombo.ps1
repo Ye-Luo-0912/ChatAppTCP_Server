@@ -42,6 +42,11 @@ $startedAt = [DateTimeOffset]::UtcNow
 $stamp = $startedAt.ToString("yyyyMMdd-HHmmss'Z'")
 $runDirectory = Join-Path $ReportDirectory "conversation-combo-$stamp"
 [IO.Directory]::CreateDirectory($runDirectory) | Out-Null
+$dockerLifecycleHelpers = Join-Path $PSScriptRoot 'Performance-DockerLifecycle.ps1'
+if (-not (Test-Path -LiteralPath $dockerLifecycleHelpers -PathType Leaf)) {
+    throw "Docker lifecycle helpers were not found: $dockerLifecycleHelpers"
+}
+. $dockerLifecycleHelpers
 
 if (-not $SkipBuild) {
     & dotnet build (Join-Path $repositoryRoot 'ChatApp.TcpGateway.sln') -c Release --no-restore
@@ -62,13 +67,6 @@ $password = 'combo-' + [Guid]::NewGuid().ToString('N')
 [Environment]::SetEnvironmentVariable(
     $garnetEnvName, "127.0.0.1:$GarnetPort,abortConnect=false", 'Process')
 
-function Invoke-Docker([string[]] $Arguments) {
-    & docker @Arguments
-    if ($LASTEXITCODE -ne 0) {
-        throw "docker $($Arguments[0]) failed with exit code $LASTEXITCODE."
-    }
-}
-
 function Wait-Postgres([string] $Container) {
     for ($attempt = 1; $attempt -le 30; $attempt++) {
         & docker exec $Container pg_isready -U postgres -d ChatAppDatabase *> $null
@@ -82,25 +80,29 @@ $tag = $stamp.Replace('-', '').ToLowerInvariant()
 $nats = "codex-chatapp-combo-nats-$tag"
 $postgres = "codex-chatapp-combo-postgres-$tag"
 $garnet = "codex-chatapp-combo-garnet-$tag"
+$dockerRunId = "conversation-combo-$tag"
 $created = [Collections.Generic.List[string]]::new()
 
 Write-Host "Starting conversation combo: pipeline=$PipelineOperationsPerSecond/s + TCP chat($TcpConnections) slowReaders=$TcpSlowReaders."
 
 try {
     try {
-        Invoke-Docker @('run','-d','--name',$nats,
+        Start-PerformanceDockerContainer `
+            -Name $nats -RunId $dockerRunId -CreatedContainers $created `
+            -CreateArguments @(
             '-p',"127.0.0.1:$($NatsPort):4222",
             '-p',"127.0.0.1:$($NatsMonitorPort):8222",
             $NatsImage,'-js','-m','8222')
-        $created.Add($nats)
-        Invoke-Docker @('run','-d','--name',$postgres,
+        Start-PerformanceDockerContainer `
+            -Name $postgres -RunId $dockerRunId -CreatedContainers $created `
+            -CreateArguments @(
             '-e',"POSTGRES_PASSWORD=$password",
             '-e','POSTGRES_DB=ChatAppDatabase',
             '-p',"127.0.0.1:$($PostgresPort):5432",$PostgresImage)
-        $created.Add($postgres)
-        Invoke-Docker @('run','-d','--name',$garnet,
+        Start-PerformanceDockerContainer `
+            -Name $garnet -RunId $dockerRunId -CreatedContainers $created `
+            -CreateArguments @(
             '-p',"127.0.0.1:$($GarnetPort):6379",$GarnetImage)
-        $created.Add($garnet)
         Wait-Postgres $postgres
 
         $orchestratorArgs = @(
@@ -165,8 +167,9 @@ try {
         exit 0
     }
     finally {
-        foreach ($container in $created) {
-            & docker rm -f $container *> $null
+        if ($created.Count -gt 0) {
+            Remove-PerformanceDockerContainers `
+                -Names @($created) -RunId $dockerRunId -RemoveVolumes
         }
     }
 }

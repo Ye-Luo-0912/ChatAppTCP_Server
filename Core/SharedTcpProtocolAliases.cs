@@ -1,0 +1,10 @@
+global using ClientHello = ChatApp.Shared.Protocol.Tcp.ClientHello;
+global using GatewayFeature = ChatApp.Shared.Protocol.Tcp.GatewayFeature;
+global using GoAway = ChatApp.Shared.Protocol.Tcp.GoAway;
+global using PacketCommand = ChatApp.Shared.Protocol.Tcp.PacketCommand;
+global using ProtocolErrorCode = ChatApp.Shared.Protocol.Tcp.ProtocolErrorCode;
+global using ProtocolErrorFrame = ChatApp.Shared.Protocol.Tcp.ProtocolErrorFrame;
+global using ProtocolPayloadFormat = ChatApp.Shared.Protocol.Tcp.ProtocolPayloadFormat;
+global using ResumeFailureKind = ChatApp.Shared.Protocol.Tcp.ResumeFailureKind;
+global using ResumeResponse = ChatApp.Shared.Protocol.Tcp.ResumeResponse;
+global using ServerHello = ChatApp.Shared.Protocol.Tcp.ServerHello;

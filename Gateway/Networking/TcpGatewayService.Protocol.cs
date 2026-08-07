@@ -1,3 +1,4 @@
+using ChatApp.Shared.Protocol.Tcp;
 using ChatApp.TcpGateway.Core.Messaging;
 using ChatApp.TcpGateway.Core.Protocol;
 using ChatApp.TcpGateway.Core.Serialization;

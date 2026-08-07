@@ -6,15 +6,13 @@ Guidance for humans and coding agents working in this repository.
 
 | Layer | Path | May depend on | Must not |
 |-------|------|---------------|----------|
-| Core | `Core/` | BCL only | Logging, Redis, Hosting, Gateway, Infrastructure, Observability |
+| Core | `Core/` | BCL + versioned wire/Realtime contract packages | Logging, Redis, Hosting, Gateway, Infrastructure, Observability |
 | Infrastructure | `Infrastructure/` | Core, Observability, Redis, DI (incl. Hosting.Abstractions, Options), Realtime Integration | Gateway / TcpGatewayService / sessions |
 | Observability | `Observability/` | BCL + logging/metrics abstractions | Gateway / Infrastructure, Business protocol handlers |
 | Gateway | `Gateway/` | Core, Infrastructure, Observability, Realtime Integration | Direct DB / Outbox |
 | Host | `Program.cs` | All of the above | Business logic |
 
-Dependency direction: **Gateway → Infrastructure → Core**, with **Observability** as a leaf dependency shared by Infrastructure and Gateway. Cross-process messaging uses the sibling repo `../ChatApp.RealtimeServices` (`ChatApp.Realtime.Integration` / `Abstractions`). Cloning only this repo is not enough to build.
-
-Long-term: publish shared Realtime contracts as a versioned package, or merge into a single repo, so agents do not need a sibling checkout.
+Dependency direction: **Gateway → Infrastructure → Core**, with **Observability** as a leaf dependency shared by Infrastructure and Gateway. Cross-process messaging uses the versioned `ChatApp.Realtime.Contracts` / `ChatApp.Realtime.Integration` packages. Core may expose BCL-only types from the contracts packages, but must not reference Realtime implementation or transport packages.
 
 ## Protocol invariants
 

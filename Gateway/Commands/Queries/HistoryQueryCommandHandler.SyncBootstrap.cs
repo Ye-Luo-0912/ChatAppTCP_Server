@@ -16,10 +16,6 @@ using RealtimeSyncBootstrapQuery =
     ChatApp.Realtime.Abstractions.Sync.SyncBootstrapQuery;
 using RealtimeConversationSyncWatermark =
     ChatApp.Realtime.Abstractions.Sync.ConversationSyncWatermark;
-using RealtimeRelationshipSyncWatermark =
-    ChatApp.Realtime.Abstractions.Sync.RelationshipSyncWatermark;
-using RealtimeRelationshipListType =
-    ChatApp.Realtime.Abstractions.Relationships.RelationshipListType;
 
 namespace ChatApp.TcpGateway.Gateway.Commands.Queries;
 
@@ -99,13 +95,7 @@ internal sealed partial class HistoryQueryCommandHandler
                     AfterMessageId = watermark.AfterMessageId
                 })
                 .ToArray(),
-            RelationshipWatermarks = request.RelationshipWatermarks?
-                .Select(static watermark => new RealtimeRelationshipSyncWatermark
-                {
-                    ListType = (RealtimeRelationshipListType)(byte)watermark.ListType,
-                    AfterSequence = watermark.AfterSequence
-                })
-                .ToArray(),
+            RelationshipWatermarks = request.RelationshipWatermarks,
             RelationshipListLimit = request.RelationshipListLimit
         };
 
@@ -116,36 +106,9 @@ internal sealed partial class HistoryQueryCommandHandler
                 .ConfigureAwait(false);
             _metrics.HistoryQueryCompleted();
 
-            var mappedConversations = page.Conversations
-                .Select(static item => new ConversationListItem
-                {
-                    ConversationId = item.ConversationId,
-                    Type = (ConversationType)(byte)item.Type,
-                    PeerUserId = item.PeerUserId,
-                    Title = item.Title,
-                    LastMessageId = item.LastMessageId,
-                    LastMessagePreview = item.LastMessagePreview,
-                    LastMessageAtMs = item.LastMessageAtMs,
-                    LastSenderUserId = item.LastSenderUserId,
-                    UnreadCount = item.UnreadCount,
-                    LastReadMessageId = item.LastReadMessageId,
-                    LastReadAtMs = item.LastReadAtMs,
-                    IsPinned = item.IsPinned,
-                    PinnedAtMs = item.PinnedAtMs,
-                    IsMuted = item.IsMuted,
-                    MutedUntilMs = item.MutedUntilMs
-                })
-                .ToArray();
-
-            var originalConversationsCursor = page.ConversationsNextCursor is null
-                ? null
-                : new ConversationListCursor
-                {
-                    IsPinned = page.ConversationsNextCursor.IsPinned,
-                    PinnedAtMs = page.ConversationsNextCursor.PinnedAtMs,
-                    LastMessageAtMs = page.ConversationsNextCursor.LastMessageAtMs,
-                    ConversationId = page.ConversationsNextCursor.ConversationId
-                };
+            // 会话列表与关系同步模型直接来自 ChatApp.Realtime.Contracts。
+            var mappedConversations = page.Conversations.ToArray();
+            var originalConversationsCursor = page.ConversationsNextCursor;
 
             var mappedCatchUps = page.CatchUps
                 .Select(static catchUp => new ConversationHistoryCatchUp
@@ -168,14 +131,7 @@ internal sealed partial class HistoryQueryCommandHandler
                             EditedAtMs = item.EditedAtMs,
                             ChangedAtMs = item.ChangedAtMs,
                             Attachments = AttachmentWireMapper.Map(item.Attachments),
-                            Reactions = item.Reactions?
-                                .Select(static reaction => new MessageReactionSummary
-                                {
-                                    Emoji = reaction.Emoji,
-                                    Count = reaction.Count,
-                                    ReactedByMe = reaction.ReactedByMe
-                                })
-                                .ToArray(),
+                            Reactions = item.Reactions,
                             ReplyToMessageId = item.ReplyToMessageId,
                             ReplyToSenderUserId = item.ReplyToSenderUserId,
                             ReplyToPreview = item.ReplyToPreview,
@@ -199,7 +155,7 @@ internal sealed partial class HistoryQueryCommandHandler
                 .Select(static reset => new SyncCursorResetRequired
                 {
                     ConversationId = reset.ConversationId,
-                    Reason = (SyncCursorResetReason)(byte)reset.Reason,
+                    Reason = reset.Reason,
                     TipMessageId = reset.TipMessageId,
                     // 保持 v1 JSON 字段兼容；值的语义已经升级为 changed_at_ms。
                     TipReceivedAtMs = reset.TipChangedAtMs,
@@ -257,13 +213,11 @@ internal sealed partial class HistoryQueryCommandHandler
             var conversationsWasTruncated = truncatedConversations.Length < mappedConversations.Length;
             var conversationsCursor = conversationsWasTruncated
                 ? (truncatedConversations.Length > 0
-                    ? new ConversationListCursor
-                    {
-                        IsPinned = truncatedConversations[^1].IsPinned,
-                        PinnedAtMs = truncatedConversations[^1].PinnedAtMs,
-                        LastMessageAtMs = truncatedConversations[^1].LastMessageAtMs,
-                        ConversationId = truncatedConversations[^1].ConversationId
-                    }
+                    ? new ConversationListCursor(
+                        truncatedConversations[^1].IsPinned,
+                        truncatedConversations[^1].PinnedAtMs,
+                        truncatedConversations[^1].LastMessageAtMs,
+                        truncatedConversations[^1].ConversationId)
                     : null)
                 : originalConversationsCursor;
             var conversationsHasMore = conversationsWasTruncated || page.ConversationsHasMore;
@@ -346,31 +300,6 @@ internal sealed partial class HistoryQueryCommandHandler
                 RelationshipCatchUps = page.RelationshipCatchUps is null || page.RelationshipCatchUps.Count == 0
                     ? null
                     : page.RelationshipCatchUps
-                        .Select(static catchUp => new RelationshipCatchUp
-                        {
-                            ListType = (RelationshipListType)(byte)catchUp.ListType,
-                            Changes = catchUp.Changes
-                                .Select(static change => new RelationshipChangeLogEntry
-                                {
-                                    ChangeSequence = change.ChangeSequence,
-                                    Operation = (RelationshipChangeOperation)(byte)change.Operation,
-                                    ResourceId = change.ResourceId,
-                                    UserId = change.UserId,
-                                    Status = change.Status,
-                                    Message = change.Message,
-                                    CreatedAtMs = change.CreatedAtMs,
-                                    OccurredAtMs = change.OccurredAtMs,
-                                    RequestId = change.RequestId
-                                })
-                                .ToArray(),
-                            HasMore = catchUp.HasMore,
-                            NextCursor = catchUp.NextCursor,
-                            NextSequence = catchUp.NextSequence,
-                            RetentionFloorSequence = catchUp.RetentionFloorSequence,
-                            ResetRequired = catchUp.ResetRequired,
-                            ResetReason = catchUp.ResetReason
-                        })
-                        .ToArray()
             };
 
             var totalSize = ResponseByteBudget.MeasurePayload(

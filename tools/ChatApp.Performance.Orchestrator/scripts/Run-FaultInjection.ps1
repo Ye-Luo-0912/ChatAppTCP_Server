@@ -41,6 +41,11 @@ $startedAt = [DateTimeOffset]::UtcNow
 $stamp = $startedAt.ToString("yyyyMMdd-HHmmss'Z'")
 $runDirectory = Join-Path $ReportDirectory "fault-injection-$stamp"
 [IO.Directory]::CreateDirectory($runDirectory) | Out-Null
+$dockerLifecycleHelpers = Join-Path $PSScriptRoot 'Performance-DockerLifecycle.ps1'
+if (-not (Test-Path -LiteralPath $dockerLifecycleHelpers -PathType Leaf)) {
+    throw "Docker lifecycle helpers were not found: $dockerLifecycleHelpers"
+}
+. $dockerLifecycleHelpers
 
 if (-not $SkipBuild) {
     & dotnet build (Join-Path $repositoryRoot 'ChatApp.TcpGateway.sln') -c Release --no-restore
@@ -164,6 +169,7 @@ try {
         $nats = "codex-chatapp-fault-nats-$tag"
         $postgres = "codex-chatapp-fault-postgres-$tag"
         $garnet = "codex-chatapp-fault-garnet-$tag"
+        $dockerRunId = "fault-$tag"
         $containers = [ordered]@{ Nats = $nats; Postgres = $postgres; Garnet = $garnet }
         $created = [Collections.Generic.List[string]]::new()
         $scenarioDirectory = Join-Path $runDirectory $target.ToLowerInvariant()
@@ -175,19 +181,22 @@ try {
 
         Write-Host "Starting $target fault scenario..."
         try {
-            Invoke-Docker @('run','-d','--name',$nats,
+            Start-PerformanceDockerContainer `
+                -Name $nats -RunId $dockerRunId -CreatedContainers $created `
+                -CreateArguments @(
                 '-p',"127.0.0.1:$($NatsPort):4222",
                 '-p',"127.0.0.1:$($NatsMonitorPort):8222",
                 $NatsImage,'-js','-m','8222')
-            $created.Add($nats)
-            Invoke-Docker @('run','-d','--name',$postgres,
+            Start-PerformanceDockerContainer `
+                -Name $postgres -RunId $dockerRunId -CreatedContainers $created `
+                -CreateArguments @(
                 '-e',"POSTGRES_PASSWORD=$password",
                 '-e','POSTGRES_DB=ChatAppDatabase',
                 '-p',"127.0.0.1:$($PostgresPort):5432",$PostgresImage)
-            $created.Add($postgres)
-            Invoke-Docker @('run','-d','--name',$garnet,
+            Start-PerformanceDockerContainer `
+                -Name $garnet -RunId $dockerRunId -CreatedContainers $created `
+                -CreateArguments @(
                 '-p',"127.0.0.1:$($GarnetPort):6379",$GarnetImage)
-            $created.Add($garnet)
             Wait-Postgres $postgres
 
             $durationSeconds = $FaultAfterSeconds + $FaultDurationSeconds + $RecoveryWindowSeconds
@@ -318,10 +327,8 @@ try {
                 $process.WaitForExit()
             }
             if ($created.Count -gt 0) {
-                & docker rm -f @($created) | Out-Null
-                if ($LASTEXITCODE -ne 0) {
-                    Write-Warning "Temporary container cleanup failed for $target."
-                }
+                Remove-PerformanceDockerContainers `
+                    -Names @($created) -RunId $dockerRunId -RemoveVolumes
             }
         }
     }

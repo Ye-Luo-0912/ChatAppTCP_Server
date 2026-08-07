@@ -67,6 +67,7 @@ internal sealed class ChatMessageDeliveryHandler : IRealtimeEventHandler
 
         if (payload is null
             || string.IsNullOrWhiteSpace(payload.MessageId)
+            || string.IsNullOrWhiteSpace(payload.ClientMessageId)
             || payload.SenderUserId <= 0
             || (string.IsNullOrWhiteSpace(payload.Content)
                 && payload.Attachments is not { Count: > 0 }))
@@ -107,6 +108,7 @@ internal sealed class ChatMessageDeliveryHandler : IRealtimeEventHandler
         var message = new ChatMessage
         {
             MessageId = payload.MessageId,
+            ClientMessageId = payload.ClientMessageId,
             ConversationId = payload.ConversationId,
             TargetUserId = isGroup ? realtimeEvent.TargetUserId : payload.ReceiverUserId,
             SenderUserId = payload.SenderUserId,

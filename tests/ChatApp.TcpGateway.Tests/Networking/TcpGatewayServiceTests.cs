@@ -147,7 +147,7 @@ public sealed class TcpGatewayServiceTests
             new JsonPayloadCodec<ConversationListResponse>(
                 GatewayJsonSerializerContext.Default.ConversationListResponse);
         var conversationListItemCodec =
-            new JsonPayloadCodec<ChatApp.TcpGateway.Core.Messaging.Conversations.ConversationListItem[]>(
+            new JsonPayloadCodec<ChatApp.Realtime.Abstractions.Conversations.ConversationListItem[]>(
                 GatewayJsonSerializerContext.Default.ConversationListItemArray);
         var conversationMarkReadRequestCodec =
             new JsonPayloadCodec<ConversationMarkReadRequest>(
@@ -579,6 +579,9 @@ public sealed class TcpGatewayServiceTests
                     deliveredFrame.Payload));
             Assert.NotNull(deliveredMessage);
             Assert.Equal(command.CommandId, deliveredMessage.MessageId);
+            Assert.Equal(
+                command.ClientMessageId,
+                deliveredMessage.ClientMessageId);
             Assert.Equal(command.SenderUserId, deliveredMessage.SenderUserId);
             Assert.Equal(command.ReceiverUserId, deliveredMessage.TargetUserId);
             Assert.Equal(command.Content, deliveredMessage.Content);

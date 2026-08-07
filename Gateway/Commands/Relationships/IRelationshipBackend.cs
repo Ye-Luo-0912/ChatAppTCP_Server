@@ -4,14 +4,8 @@ using ChatApp.TcpGateway.Observability.Logging;
 using Microsoft.Extensions.Logging;
 using RealtimeRelationshipCommand =
     ChatApp.Realtime.Abstractions.Relationships.RelationshipCommand;
-using RealtimeRelationshipOperation =
-    ChatApp.Realtime.Abstractions.Relationships.RelationshipOperation;
 using RealtimeRelationshipListQuery =
     ChatApp.Realtime.Abstractions.Relationships.RelationshipListQuery;
-using RealtimeRelationshipListType =
-    ChatApp.Realtime.Abstractions.Relationships.RelationshipListType;
-using RealtimeRelationshipListItem =
-    ChatApp.Realtime.Abstractions.Relationships.RelationshipListItem;
 
 namespace ChatApp.TcpGateway.Gateway.Commands.Relationships;
 
@@ -152,8 +146,8 @@ internal sealed class StubRelationshipBackend : IRelationshipBackend
 /// （<see cref="RealtimeAttachmentBackend"/> / <c>GroupCommandHandler</c>）的异常约定一致。
 /// </para>
 /// <para>
-/// Gateway 与 Realtime 两侧的 <c>RelationshipOperation</c> / <c>RelationshipListType</c>
-/// 均为 byte 枚举且数值一一对应，通过强制转换映射，避免在边界处维护字典。
+/// <c>RelationshipOperation</c> / <c>RelationshipListType</c> 直接使用
+/// ChatApp.Realtime.Contracts 的共享枚举，不再维护本地副本或数值转换。
 /// </para>
 /// </summary>
 internal sealed class RealtimeRelationshipBackend : IRelationshipBackend
@@ -179,7 +173,7 @@ internal sealed class RealtimeRelationshipBackend : IRelationshipBackend
         {
             RequestId = requestId,
             ActorUserId = actorUserId,
-            Operation = (RealtimeRelationshipOperation)(byte)operation,
+            Operation = operation,
             TargetUserId = targetUserId,
             Message = message,
             RequestIdToRespond = requestIdToRespond,
@@ -195,9 +189,7 @@ internal sealed class RealtimeRelationshipBackend : IRelationshipBackend
             result.Succeeded,
             result.ErrorCode,
             result.ErrorMessage,
-            result.Operation is null
-                ? null
-                : (RelationshipOperation)(byte)result.Operation.Value,
+            result.Operation,
             result.TargetUserId,
             result.ResourceId);
     }
@@ -214,7 +206,7 @@ internal sealed class RealtimeRelationshipBackend : IRelationshipBackend
         {
             RequestId = requestId,
             ActorUserId = actorUserId,
-            ListType = (RealtimeRelationshipListType)(byte)listType,
+            ListType = listType,
             PageSize = pageSize,
             Cursor = cursor
         };
@@ -223,31 +215,12 @@ internal sealed class RealtimeRelationshipBackend : IRelationshipBackend
             .QueryRelationshipListAsync(query, cancellationToken)
             .ConfigureAwait(false);
 
-        IReadOnlyList<RelationshipItem>? items = null;
-        if (result.Items is { Count: > 0 } source)
-        {
-            var mapped = new RelationshipItem[source.Count];
-            for (var i = 0; i < source.Count; i++)
-            {
-                RealtimeRelationshipListItem item = source[i];
-                mapped[i] = new RelationshipItem
-                {
-                    UserId = item.UserId,
-                    ResourceId = item.ResourceId,
-                    Status = item.Status,
-                    Message = item.Message,
-                    CreatedAtMs = item.CreatedAtMs
-                };
-            }
-            items = mapped;
-        }
-
         return new RelationshipListBackendResult(
             result.RequestId,
             result.Succeeded,
             result.ErrorCode,
             result.ErrorMessage,
-            items,
+            result.Items,
             result.NextCursor,
             result.HasMore);
     }

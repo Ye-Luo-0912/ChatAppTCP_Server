@@ -10,7 +10,9 @@ internal sealed class ManagedProcess : IAsyncDisposable
     private readonly StreamWriter _stderrWriter;
     private readonly Task _stdoutPump;
     private readonly Task _stderrPump;
+    private readonly SemaphoreSlim _lifecycle = new(1, 1);
     private bool _stopRequested;
+    private bool _disposed;
 
     private ManagedProcess(
         string label,
@@ -120,29 +122,45 @@ internal sealed class ManagedProcess : IAsyncDisposable
 
     public async Task StopAsync()
     {
-        if (!HasExited)
+        await _lifecycle.WaitAsync().ConfigureAwait(false);
+        try
         {
-            _stopRequested = true;
+            if (_disposed)
+                return;
+
+            if (!HasExited)
+            {
+                _stopRequested = true;
+                try
+                {
+                    Process.Kill(entireProcessTree: true);
+                }
+                catch (InvalidOperationException)
+                {
+                }
+                catch (System.ComponentModel.Win32Exception) when (HasExited)
+                {
+                }
+            }
+
             try
             {
-                Process.Kill(entireProcessTree: true);
+                await Process.WaitForExitAsync().ConfigureAwait(false);
+                await Task.WhenAll(_stdoutPump, _stderrPump).ConfigureAwait(false);
             }
             catch (InvalidOperationException)
             {
             }
         }
-
-        try
+        finally
         {
-            await Process.WaitForExitAsync().ConfigureAwait(false);
-            await Task.WhenAll(_stdoutPump, _stderrPump).ConfigureAwait(false);
-        }
-        catch (InvalidOperationException)
-        {
+            _lifecycle.Release();
         }
     }
 
-    public BenchmarkProcessResult CreateResult()
+    public BenchmarkProcessResult CreateResult(
+        long cgroupOomEvents = 0,
+        long cgroupOomKillEvents = 0)
     {
         int? exitCode = null;
         if (HasExited)
@@ -156,6 +174,23 @@ internal sealed class ManagedProcess : IAsyncDisposable
             }
         }
 
+        var standardOutputTail = ReadTail(StandardOutputPath, 20);
+        var standardErrorTail = ReadTail(StandardErrorPath, 20);
+        // item 八：退出归因分类，避免将 exit 137 一律判成服务内存泄漏。
+        var oomClassification = OomClassifier.Classify(
+            exitCode,
+            _stopRequested,
+            standardOutputTail,
+            standardErrorTail,
+            cgroupOomKillEvents);
+        var oomEvidence = OomClassifier.BuildEvidence(
+            exitCode,
+            _stopRequested,
+            standardOutputTail,
+            standardErrorTail,
+            cgroupOomEvents,
+            cgroupOomKillEvents);
+
         return new BenchmarkProcessResult
         {
             Label = Label,
@@ -163,20 +198,56 @@ internal sealed class ManagedProcess : IAsyncDisposable
             ProcessId = Process.Id,
             ExitCode = exitCode,
             StoppedByOrchestrator = _stopRequested,
+            OomClassification = oomClassification,
+            OomEvidence = oomEvidence,
             StandardOutputPath = StandardOutputPath,
             StandardErrorPath = StandardErrorPath,
-            StandardOutputTail = ReadTail(StandardOutputPath, 20),
-            StandardErrorTail = ReadTail(StandardErrorPath, 20)
+            StandardOutputTail = standardOutputTail,
+            StandardErrorTail = standardErrorTail
         };
     }
 
     public async ValueTask DisposeAsync()
     {
-        if (!HasExited)
-            await StopAsync().ConfigureAwait(false);
-        await _stdoutWriter.DisposeAsync().ConfigureAwait(false);
-        await _stderrWriter.DisposeAsync().ConfigureAwait(false);
-        Process.Dispose();
+        await _lifecycle.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            if (_disposed)
+                return;
+
+            if (!HasExited)
+            {
+                _stopRequested = true;
+                try
+                {
+                    Process.Kill(entireProcessTree: true);
+                }
+                catch (InvalidOperationException)
+                {
+                }
+                catch (System.ComponentModel.Win32Exception) when (HasExited)
+                {
+                }
+            }
+
+            try
+            {
+                await Process.WaitForExitAsync().ConfigureAwait(false);
+                await Task.WhenAll(_stdoutPump, _stderrPump).ConfigureAwait(false);
+            }
+            catch (InvalidOperationException)
+            {
+            }
+
+            await _stdoutWriter.DisposeAsync().ConfigureAwait(false);
+            await _stderrWriter.DisposeAsync().ConfigureAwait(false);
+            Process.Dispose();
+            _disposed = true;
+        }
+        finally
+        {
+            _lifecycle.Release();
+        }
     }
 
     private static async Task PumpAsync(StreamReader reader, StreamWriter writer)

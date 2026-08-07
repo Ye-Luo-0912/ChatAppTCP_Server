@@ -6,8 +6,6 @@ using ChatApp.TcpGateway.Core.Messaging.Conversations;
 using ChatApp.TcpGateway.Core.Protocol;
 using ChatApp.TcpGateway.Core.Serialization;
 using ChatApp.TcpGateway.Observability.Logging;
-using ConversationMemberRole = ChatApp.TcpGateway.Core.Messaging.Conversations.ConversationMemberRole;
-
 namespace ChatApp.TcpGateway.Gateway.Messaging.Realtime.Handlers;
 
 /// <summary>

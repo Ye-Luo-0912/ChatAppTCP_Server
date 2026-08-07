@@ -55,6 +55,11 @@ $startedAt = [DateTimeOffset]::UtcNow
 $stamp = $startedAt.ToString("yyyyMMdd-HHmmss'Z'")
 $runDirectory = Join-Path $ReportDirectory "resume-stress-$stamp"
 [IO.Directory]::CreateDirectory($runDirectory) | Out-Null
+$dockerLifecycleHelpers = Join-Path $PSScriptRoot 'Performance-DockerLifecycle.ps1'
+if (-not (Test-Path -LiteralPath $dockerLifecycleHelpers -PathType Leaf)) {
+    throw "Docker lifecycle helpers were not found: $dockerLifecycleHelpers"
+}
+. $dockerLifecycleHelpers
 
 if (-not $SkipBuild) {
     Write-Host "Building Gateway solution..." -ForegroundColor Cyan
@@ -202,22 +207,26 @@ try {
     $nats = "resume-verify-nats-$tag"
     $postgres = "resume-verify-pg-$tag"
     $garnet = "resume-verify-garnet-$tag"
+    $dockerRunId = "resume-stress-$tag"
 
-    Invoke-Docker @('run','-d','--name',$nats,
+    Start-PerformanceDockerContainer `
+        -Name $nats -RunId $dockerRunId -CreatedContainers $createdContainers `
+        -CreateArguments @(
         '-p',"127.0.0.1:$($NatsPort):4222",
         '-p',"127.0.0.1:$($NatsMonitorPort):8222",
         $NatsImage,'-js','-m','8222')
-    $createdContainers.Add($nats)
 
-    Invoke-Docker @('run','-d','--name',$postgres,
+    Start-PerformanceDockerContainer `
+        -Name $postgres -RunId $dockerRunId -CreatedContainers $createdContainers `
+        -CreateArguments @(
         '-e',"POSTGRES_PASSWORD=$password",
         '-e','POSTGRES_DB=ChatAppDatabase',
         '-p',"127.0.0.1:$($PostgresPort):5432",$PostgresImage)
-    $createdContainers.Add($postgres)
 
-    Invoke-Docker @('run','-d','--name',$garnet,
+    Start-PerformanceDockerContainer `
+        -Name $garnet -RunId $dockerRunId -CreatedContainers $createdContainers `
+        -CreateArguments @(
         '-p',"127.0.0.1:$($GarnetPort):6379",$GarnetImage)
-    $createdContainers.Add($garnet)
 
     Wait-Postgres $postgres
 
@@ -445,7 +454,8 @@ try {
     # 清理 Docker 容器
     if ($createdContainers.Count -gt 0) {
         Write-Host "Cleaning up containers..." -ForegroundColor DarkGray
-        & docker rm -f @($createdContainers) 2>$null | Out-Null
+        Remove-PerformanceDockerContainers `
+            -Names @($createdContainers) -RunId $dockerRunId -RemoveVolumes
     }
     [Environment]::SetEnvironmentVariable($dbEnvName, $oldDbEnv, 'Process')
     [Environment]::SetEnvironmentVariable($garnetEnvName, $oldGarnetEnv, 'Process')

@@ -32,11 +32,22 @@ internal sealed record LoadOptions(
     IReadOnlyList<string> AccessTokens,
     ulong? DeviceIdHash,
     long? TargetUserId,
-    int MessagesPerSecond,
+    int ActiveSenders,
+    double MessagesPerSecond,
     int PayloadBytes,
     int SlowReaders,
+    int ConnectionsPerSecond,
+    TimeSpan Stabilization,
+    TimeSpan ConnectTimeout,
+    int MaxInflight,
+    TimeSpan InflightTtl,
+    TimeSpan DeliveryDrain,
+    TimeSpan InactiveHeartbeatInterval,
+    double MinimumAcknowledgementRatio,
+    double MinimumDeliveryRatio,
     SlowlorisPhase? SlowlorisPhase,
     int SlowlorisDelayMs,
+    string? TargetRingFilePath,
     string? ReportDirectory)
 {
     public static LoadOptions Parse(string[] args)
@@ -49,11 +60,22 @@ internal sealed record LoadOptions(
         var accessTokens = new List<string>();
         ulong? deviceIdHash = null;
         long? targetUserId = null;
-        var messagesPerSecond = 10;
+        int? activeSenders = null;
+        var messagesPerSecond = 10d;
         var payloadBytes = 128;
         var slowReaders = 0;
+        var connectionsPerSecond = 0;
+        var stabilizationSeconds = 0;
+        var connectTimeoutSeconds = 30;
+        var maxInflight = 1_000_000;
+        var inflightTtlSeconds = 120;
+        var deliveryDrainSeconds = 30;
+        var inactiveHeartbeatSeconds = 30;
+        var minimumAcknowledgementRatio = 0.95d;
+        var minimumDeliveryRatio = 0.90d;
         SlowlorisPhase? slowlorisPhase = null;
         var slowlorisDelayMs = 1_000;
+        string? targetRingFilePath = null;
         string? reportDirectory = null;
 
         for (var index = 0; index < args.Length; index++)
@@ -96,8 +118,11 @@ internal sealed record LoadOptions(
                         NumberStyles.None,
                         CultureInfo.InvariantCulture);
                     break;
+                case "--active-senders":
+                    activeSenders = ParseInt(value, "active-senders");
+                    break;
                 case "--messages-per-second":
-                    messagesPerSecond = ParseInt(value, "messages-per-second");
+                    messagesPerSecond = ParsePositiveDouble(value, "messages-per-second");
                     break;
                 case "--payload-bytes":
                     payloadBytes = ParseInt(value, "payload-bytes");
@@ -105,11 +130,44 @@ internal sealed record LoadOptions(
                 case "--slow-readers":
                     slowReaders = ParseInt(value, "slow-readers");
                     break;
+                case "--connections-per-second":
+                    connectionsPerSecond = ParseInt(value, "connections-per-second");
+                    break;
+                case "--stabilization-seconds":
+                    stabilizationSeconds = ParseInt(value, "stabilization-seconds");
+                    break;
+                case "--connect-timeout-seconds":
+                    connectTimeoutSeconds = ParseInt(value, "connect-timeout-seconds");
+                    break;
+                case "--max-inflight":
+                    maxInflight = ParseInt(value, "max-inflight");
+                    break;
+                case "--inflight-ttl-seconds":
+                    inflightTtlSeconds = ParseInt(value, "inflight-ttl-seconds");
+                    break;
+                case "--delivery-drain-seconds":
+                    deliveryDrainSeconds = ParseInt(value, "delivery-drain-seconds");
+                    break;
+                case "--inactive-heartbeat-seconds":
+                    inactiveHeartbeatSeconds = ParseInt(value, "inactive-heartbeat-seconds");
+                    break;
+                case "--min-ack-ratio":
+                    minimumAcknowledgementRatio = ParseRatio(value, "min-ack-ratio");
+                    break;
+                case "--min-delivery-ratio":
+                    minimumDeliveryRatio = ParseRatio(value, "min-delivery-ratio");
+                    break;
                 case "--slowloris-phase":
                     slowlorisPhase = ParseSlowlorisPhase(value);
                     break;
                 case "--slowloris-delay-ms":
                     slowlorisDelayMs = ParseInt(value, "slowloris-delay-ms");
+                    break;
+                case "--target-ring-file":
+                    targetRingFilePath = string.IsNullOrWhiteSpace(value)
+                        ? throw new ArgumentException(
+                            "Target ring file path cannot be empty.")
+                        : value;
                     break;
                 case "--report-directory":
                     reportDirectory = string.IsNullOrWhiteSpace(value)
@@ -135,6 +193,13 @@ internal sealed record LoadOptions(
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(messagesPerSecond);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(payloadBytes);
         ArgumentOutOfRangeException.ThrowIfNegative(slowReaders);
+        ArgumentOutOfRangeException.ThrowIfNegative(connectionsPerSecond);
+        ArgumentOutOfRangeException.ThrowIfNegative(stabilizationSeconds);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(connectTimeoutSeconds);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxInflight);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(inflightTtlSeconds);
+        ArgumentOutOfRangeException.ThrowIfNegative(deliveryDrainSeconds);
+        ArgumentOutOfRangeException.ThrowIfNegative(inactiveHeartbeatSeconds);
 
         if (slowReaders > connections)
         {
@@ -175,6 +240,58 @@ internal sealed record LoadOptions(
                 "--slow-readers is only valid in chat mode.");
         }
 
+        if (targetRingFilePath is not null && selectedMode != LoadMode.Chat)
+        {
+            throw new ArgumentException(
+                "--target-ring-file is only valid in chat mode.");
+        }
+
+        if (selectedMode == LoadMode.Chat &&
+            slowReaders > 0 &&
+            inactiveHeartbeatSeconds == 0)
+        {
+            throw new ArgumentException(
+                "Chat slow readers require --inactive-heartbeat-seconds greater " +
+                "than zero so idle disconnects cannot produce a false pass.");
+        }
+
+        if (activeSenders is not null &&
+            selectedMode is not (LoadMode.Heartbeat or LoadMode.Chat))
+        {
+            throw new ArgumentException(
+                "--active-senders is only valid in heartbeat or chat mode.");
+        }
+
+        var effectiveActiveSenders = selectedMode is LoadMode.Heartbeat or LoadMode.Chat
+            ? activeSenders ?? (connections - slowReaders)
+            : 0;
+        if (selectedMode is LoadMode.Heartbeat or LoadMode.Chat &&
+            effectiveActiveSenders <= 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(args),
+                "Heartbeat/chat mode requires at least one active sender.");
+        }
+        if (effectiveActiveSenders > connections - slowReaders)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(args),
+                "Active senders cannot exceed non-slow-reader connections.");
+        }
+
+        var inactiveAuthenticatedClients = selectedMode switch
+        {
+            LoadMode.Heartbeat => connections - effectiveActiveSenders,
+            LoadMode.Chat => connections - effectiveActiveSenders - slowReaders,
+            _ => 0
+        };
+        if (inactiveAuthenticatedClients > 0 && inactiveHeartbeatSeconds == 0)
+        {
+            throw new ArgumentException(
+                "Inactive authenticated clients require " +
+                "--inactive-heartbeat-seconds greater than zero.");
+        }
+
         if (selectedMode == LoadMode.Slowloris && slowlorisPhase is null)
         {
             throw new ArgumentException(
@@ -198,11 +315,22 @@ internal sealed record LoadOptions(
             accessTokens,
             deviceIdHash,
             targetUserId,
+            effectiveActiveSenders,
             messagesPerSecond,
             payloadBytes,
             slowReaders,
+            connectionsPerSecond,
+            TimeSpan.FromSeconds(stabilizationSeconds),
+            TimeSpan.FromSeconds(connectTimeoutSeconds),
+            maxInflight,
+            TimeSpan.FromSeconds(inflightTtlSeconds),
+            TimeSpan.FromSeconds(deliveryDrainSeconds),
+            TimeSpan.FromSeconds(inactiveHeartbeatSeconds),
+            minimumAcknowledgementRatio,
+            minimumDeliveryRatio,
             slowlorisPhase,
             slowlorisDelayMs,
+            targetRingFilePath,
             reportDirectory);
     }
 
@@ -240,6 +368,39 @@ internal sealed record LoadOptions(
 
         throw new ArgumentException(
             $"Option --{optionName} requires an integer value.");
+    }
+
+    private static double ParseRatio(string value, string optionName)
+    {
+        if (double.TryParse(
+                value,
+                NumberStyles.AllowDecimalPoint,
+                CultureInfo.InvariantCulture,
+                out var result) &&
+            result is >= 0d and <= 1d)
+        {
+            return result;
+        }
+
+        throw new ArgumentException(
+            $"Option --{optionName} requires a number between 0 and 1.");
+    }
+
+    private static double ParsePositiveDouble(string value, string optionName)
+    {
+        if (double.TryParse(
+                value,
+                NumberStyles.AllowDecimalPoint,
+                CultureInfo.InvariantCulture,
+                out var result) &&
+            double.IsFinite(result) &&
+            result > 0d)
+        {
+            return result;
+        }
+
+        throw new ArgumentException(
+            $"Option --{optionName} requires a positive finite number.");
     }
 
     private static string[] ReadTokensFromFile(string path)

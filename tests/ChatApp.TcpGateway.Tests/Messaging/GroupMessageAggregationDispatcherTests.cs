@@ -138,6 +138,30 @@ public sealed class GroupMessageAggregationDispatcherTests
     }
 
     [Fact]
+    public async Task MessageEvent_WithBlankClientMessageId_IsRejected()
+    {
+        using var metrics = new GatewayMetrics();
+        var registry = new UserSessionRegistry();
+        await using var recipient = CreateSession(1, metrics);
+        recipient.Authenticate(42, "recipient-session", deviceIdHash: 1);
+        registry.Add(recipient);
+        var dispatcher = CreateDispatcher(registry, metrics);
+
+        using var enqueueCounter = new OutboundEnqueueCounter();
+        var baseline = enqueueCounter.PositiveEnqueues;
+
+        await dispatcher.DispatchAsync(
+            BuildSingleTargetGroupEvent(
+                senderUserId: 7,
+                senderSessionId: "sender-session",
+                targetUserId: 42,
+                clientMessageId: " "),
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(baseline, enqueueCounter.PositiveEnqueues);
+    }
+
+    [Fact]
     public async Task AggregatedGroupEvent_RecordsAggregatedDispatchMetrics()
     {
         using var metrics = new GatewayMetrics();
@@ -196,7 +220,8 @@ public sealed class GroupMessageAggregationDispatcherTests
     private static RealtimeEvent BuildSingleTargetGroupEvent(
         long senderUserId,
         string senderSessionId,
-        long targetUserId) =>
+        long targetUserId,
+        string clientMessageId = "grp-client-1") =>
         new()
         {
             EventId = "grp-single-event-1",
@@ -205,16 +230,22 @@ public sealed class GroupMessageAggregationDispatcherTests
             ActorUserId = senderUserId,
             MessageId = "grp-msg-1",
             SessionId = senderSessionId,
-            PayloadJson = BuildGroupChatPayloadJson(senderUserId, senderSessionId),
+            PayloadJson = BuildGroupChatPayloadJson(
+                senderUserId,
+                senderSessionId,
+                clientMessageId),
             OccurredAtMs = 1_700_000_000_000L,
             TargetUserIds = null
         };
 
-    private static string BuildGroupChatPayloadJson(long senderUserId, string senderSessionId) =>
+    private static string BuildGroupChatPayloadJson(
+        long senderUserId,
+        string senderSessionId,
+        string clientMessageId = "grp-client-1") =>
         $$"""
         {
           "messageId": "grp-msg-1",
-          "clientMessageId": "grp-client-1",
+          "clientMessageId": "{{clientMessageId}}",
           "senderUserId": {{senderUserId}},
           "senderSessionId": "{{senderSessionId}}",
           "receiverUserId": 0,

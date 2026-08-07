@@ -7,8 +7,10 @@ internal sealed class PrometheusTrendSampler
 {
     private readonly ConcurrentDictionary<string, MetricAccumulator> _metrics = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, byte> _errors = new(StringComparer.Ordinal);
+    private int _successfulPolls;
 
     public IReadOnlyList<string> Errors => _errors.Keys.Order(StringComparer.Ordinal).ToArray();
+    public int SuccessfulPolls => Volatile.Read(ref _successfulPolls);
 
     public async Task RunAsync(Uri endpoint, TimeSpan interval, CancellationToken ct)
     {
@@ -23,6 +25,7 @@ internal sealed class PrometheusTrendSampler
                     if (IsSoakRelevant(series))
                         _metrics.GetOrAdd(series, static name => new MetricAccumulator(name)).Sample(value);
                 }
+                Interlocked.Increment(ref _successfulPolls);
             }
             catch (Exception exception) when (exception is HttpRequestException or TaskCanceledException)
             {

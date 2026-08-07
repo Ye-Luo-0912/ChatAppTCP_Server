@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Net;
 using System.Text.Json;
 using System.Net.Sockets;
@@ -8,9 +9,17 @@ namespace ChatApp.Performance.Orchestrator.Runtime;
 
 internal sealed class BenchmarkRunner(BenchmarkOptions options)
 {
+    private string _dotnetExecutable = "dotnet";
+
     public async Task<BenchmarkRunResult> RunAsync(CancellationToken ct)
     {
         var startedAt = DateTimeOffset.UtcNow;
+        var provenance = await BenchmarkProvenanceCapture.CaptureAsync(
+                options.RepositoryRoot,
+                options.RealtimeRepositoryRoot,
+                CancellationToken.None)
+            .ConfigureAwait(false);
+        _dotnetExecutable = provenance.SnapshotBinding.DotnetExecutablePath ?? "dotnet";
         var sessionDirectory = CreateSessionDirectory(options.ReportDirectory, startedAt);
         var logDirectory = Path.Combine(sessionDirectory, "logs");
         var managedProcesses = new List<ManagedProcess>();
@@ -20,8 +29,23 @@ internal sealed class BenchmarkRunner(BenchmarkOptions options)
         var resourceSampler = new ResourceSampler();
         var prometheusTrendSampler = new PrometheusTrendSampler();
         TcpAuthenticationBootstrap? tcpAuthenticationBootstrap = null;
-        IReadOnlyList<string> tcpTokens = options.TcpTokens;
-        string? tcpTokenFilePath = null;
+        PostgresIdentityBootstrap? postgresIdentityBootstrap = null;
+        string[][] tcpTokenPartitions =
+            Enumerable.Range(0, options.GatewayCount)
+                .Select(_ => options.TcpTokens.ToArray())
+                .ToArray();
+        var tcpTokenFilePaths = new string?[options.GatewayCount];
+        var tcpTargetRingFilePaths = new string?[options.GatewayCount];
+        TimeSpan? bootstrapTokenLifetime = null;
+        DateTimeOffset? loadStartedAtUtc = null;
+        DateTimeOffset? measurementStartedAtUtc = null;
+        DateTimeOffset? measurementCompletedAtUtc = null;
+        long measurementStartedTimestamp = 0;
+        long measurementCompletedTimestamp = 0;
+        var expectedLoadProcesses = options.GatewayCount + (options.PipelineEnabled ? 1 : 0);
+        var completedLoadProcesses = 0;
+        var servicesAliveThroughMeasurement = true;
+        var prometheusPollsAtMeasurementStart = 0;
         using var samplerCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         Task? samplerTask = null;
         Task? prometheusTrendTask = null;
@@ -75,15 +99,82 @@ Console.WriteLine("Starting RealtimeServices...");
 
             if (options.TcpBootstrapAuthentication)
             {
+                bootstrapTokenLifetime = options.GetBootstrapTokenLifetime();
                 tcpAuthenticationBootstrap = await TcpAuthenticationBootstrap
                     .CreateAsync(
                         Environment.GetEnvironmentVariable(options.GarnetEnvironmentVariable!)!,
                         options.TcpBootstrapUserId,
+                        options.GetTcpBootstrapIdentityCount(),
+                        bootstrapTokenLifetime.Value,
                         ct)
                     .ConfigureAwait(false);
-                tcpTokens = [tcpAuthenticationBootstrap.Token];
+                var identityPlan = TcpBootstrapIdentityPlanner.Create(
+                    tcpAuthenticationBootstrap.Identities,
+                    Enumerable.Range(0, options.GatewayCount)
+                        .Select(index => new TcpBootstrapPartitionShape(
+                            options.GetTcpConnections(index),
+                            options.GetTcpSlowReaders(index),
+                            options.GetTcpActiveSenders(index)))
+                        .ToArray());
+                tcpTokenPartitions = identityPlan.ConnectionPartitions
+                    .Select(static partition =>
+                        partition.Select(static identity => identity.Token).ToArray())
+                    .ToArray();
+                if (options.TcpMode == "chat")
+                {
+                    if (options.TcpCrossGateway)
+                    {
+                        var crossGatewayPlan = BuildCrossGatewayPlan(
+                            identityPlan.ConnectionPartitions);
+                        for (var gatewayIndex = 0;
+                             gatewayIndex < crossGatewayPlan.TargetRings.Count;
+                             gatewayIndex++)
+                        {
+                            tcpTargetRingFilePaths[gatewayIndex] = WriteTargetRingFile(
+                                sessionDirectory,
+                                gatewayIndex,
+                                crossGatewayPlan.TargetRings[gatewayIndex]);
+                        }
+
+                        postgresIdentityBootstrap =
+                            await PostgresIdentityBootstrap.CreateCrossGatewayAsync(
+                                    Environment.GetEnvironmentVariable(
+                                        options.RealtimeDatabaseEnvironmentVariable!)!,
+                                    identityPlan.HealthyPartitions
+                                        .SelectMany(static partition =>
+                                            partition.Select(static identity => identity.UserId))
+                                        .ToArray(),
+                                    crossGatewayPlan.FriendshipEdges,
+                                    ct)
+                                .ConfigureAwait(false);
+                    }
+                    else
+                    {
+                        postgresIdentityBootstrap = await PostgresIdentityBootstrap.CreateAsync(
+                                Environment.GetEnvironmentVariable(options.RealtimeDatabaseEnvironmentVariable!)!,
+                                identityPlan.HealthyPartitions
+                                    .Select(static partition =>
+                                        (IReadOnlyList<long>)partition.Select(static identity => identity.UserId).ToArray())
+                                    .ToArray(),
+                                ct)
+                            .ConfigureAwait(false);
+                    }
+                }
+                var bootstrapIdentityLayout = options.TcpSlowReaders == 0
+                    ? "one unique identity per connection"
+                    : $"{options.TcpSlowReaders} slow readers reuse actively targeted healthy identities";
                 Console.WriteLine(
-                    $"Seeded temporary TCP benchmark authentication for user {options.TcpBootstrapUserId}; the token is not written to reports.");
+                    $"Seeded {tcpAuthenticationBootstrap.Identities.Count} temporary healthy TCP benchmark users " +
+                    $"for {options.TcpConnections} connections with a " +
+                    $"{bootstrapTokenLifetime.Value.TotalMinutes:F0}-minute token lifetime; " +
+                    $"{bootstrapIdentityLayout}; tokens are not written to reports.");
+                if (options.TcpCrossGateway)
+                {
+                    Console.WriteLine(
+                        "Cross-gateway pairing: each Gateway's connection targets the " +
+                        "counterpart connection on the next Gateway, so every chat message " +
+                        "crosses the Gateway boundary through JetStream.");
+                }
             }
 
             Console.WriteLine($"Starting {options.GatewayCount} Gateway instance(s)...");
@@ -106,25 +197,21 @@ Console.WriteLine("Starting RealtimeServices...");
                     .ConfigureAwait(false);
             }
 
-            if (options.Warmup > TimeSpan.Zero)
-            {
-                Console.WriteLine($"Service warmup: {options.Warmup.TotalSeconds:F0}s...");
-                await Task.Delay(options.Warmup, ct).ConfigureAwait(false);
-            }
-
-            metricsBefore = await EndpointProbe.CapturePrometheusAsync(
-                    new Uri(realtimeBaseUri, "/metrics"),
-                    ct)
-                .ConfigureAwait(false);
-
             Console.WriteLine("Starting load generators...");
-            if (tcpTokens.Count > 0)
+            for (var index = 0; index < tcpTokenPartitions.Length; index++)
             {
-                tcpTokenFilePath = WriteTcpTokenFile(sessionDirectory, tcpTokens);
-                Console.WriteLine("Prepared temporary TCP benchmark credentials.");
+                if (tcpTokenPartitions[index].Length == 0)
+                    continue;
+                tcpTokenFilePaths[index] = WriteTcpTokenFile(
+                    sessionDirectory,
+                    index,
+                    tcpTokenPartitions[index]);
             }
+            if (tcpTokenFilePaths.Any(static path => path is not null))
+                Console.WriteLine("Prepared partitioned temporary TCP benchmark credentials.");
 
             var loads = new List<ManagedProcess>();
+            var expectedLoadRuntimes = new List<TimeSpan>();
             if (options.PipelineEnabled)
             {
                 var pipeline = StartPipelineLoad(
@@ -133,6 +220,8 @@ Console.WriteLine("Starting RealtimeServices...");
                     logDirectory);
                 managedProcesses.Add(pipeline);
                 loads.Add(pipeline);
+                expectedLoadRuntimes.Add(
+                    options.GetEstimatedTcpRamp() + options.Warmup + options.Duration);
                 resourceSampler.AddProcess(pipeline.Label, pipeline.Process);
             }
 
@@ -143,36 +232,94 @@ Console.WriteLine("Starting RealtimeServices...");
                     index,
                     sessionDirectory,
                     logDirectory,
-                    tcpTokens,
-                    tcpTokenFilePath);
+                    tcpTokenPartitions[index],
+                    tcpTokenFilePaths[index],
+                    tcpTargetRingFilePaths[index]);
                 managedProcesses.Add(tcpLoad);
                 loads.Add(tcpLoad);
+                expectedLoadRuntimes.Add(GetEstimatedTcpRamp(index) + options.Warmup + options.Duration);
                 resourceSampler.AddProcess(tcpLoad.Label, tcpLoad.Process);
             }
 
+            loadStartedAtUtc = DateTimeOffset.UtcNow;
+            var loadStartedTimestamp = Stopwatch.GetTimestamp();
             using var loadTimeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            loadTimeout.CancelAfter(
-                options.Duration + options.PipelineOperationTimeout + TimeSpan.FromSeconds(30));
-            var exitCodes = await Task.WhenAll(
-                    loads.Select(load => load.WaitForExitAsync(loadTimeout.Token)))
+            loadTimeout.CancelAfter(BenchmarkTiming.CalculateLoadTimeout(
+                options.GetEstimatedTcpRamp(),
+                options.Warmup,
+                options.Duration,
+                options.TcpMode == "chat",
+                options.TcpDeliveryDrain,
+                options.PipelineEnabled,
+                options.PipelineOperationTimeout));
+            var exitTasks = loads
+                .Select((load, index) => ObserveLoadExitAsync(
+                    load,
+                    loadStartedTimestamp,
+                    expectedLoadRuntimes[index],
+                    loadTimeout.Token))
+                .ToArray();
+
+            var monitoredServices = gateways.Prepend(realtime).ToArray();
+            await WaitForMeasurementStartAsync(
+                    loads,
+                    monitoredServices,
+                    options.GetEstimatedTcpRamp() + options.Warmup,
+                    loadTimeout.Token)
                 .ConfigureAwait(false);
-            for (var index = 0; index < loads.Count; index++)
-            {
-                if (exitCodes[index] != 0)
-                    errors.Add($"{loads[index].Label} exited with code {exitCodes[index]}.");
-            }
-
-            foreach (var service in managedProcesses.Where(
-                         static process => process.Kind is "gateway" or "realtime"))
-            {
-                if (service.HasExited)
-                    errors.Add($"{service.Label} exited during the benchmark.");
-            }
-
-            metricsAfter = await EndpointProbe.CapturePrometheusAsync(
+            measurementStartedAtUtc = DateTimeOffset.UtcNow;
+            measurementStartedTimestamp = Stopwatch.GetTimestamp();
+            prometheusPollsAtMeasurementStart = prometheusTrendSampler.SuccessfulPolls;
+            metricsBefore = await EndpointProbe.CapturePrometheusAsync(
                     new Uri(realtimeBaseUri, "/metrics"),
                     ct)
                 .ConfigureAwait(false);
+
+            var monitoring = await LoadMonitoringCoordinator.WaitForCompletionAsync(
+                    exitTasks,
+                    () => monitoredServices
+                        .FirstOrDefault(static process => process.HasExited)
+                        ?.Label,
+                    TimeSpan.FromMilliseconds(250),
+                    loadTimeout.Token)
+                .ConfigureAwait(false);
+            servicesAliveThroughMeasurement = monitoring.ServicesAlive;
+            if (!monitoring.ServicesAlive)
+                errors.Add("A Gateway or Realtime service exited during the measurement window.");
+
+            foreach (var observation in monitoring.Loads)
+            {
+                completedLoadProcesses++;
+                var observationFailure =
+                    LoadMonitoringCoordinator.GetFailureReason(observation);
+                if (observationFailure is not null)
+                    errors.Add(observationFailure);
+            }
+
+            if (monitoring.FailFastReason is not null)
+            {
+                errors.Add(monitoring.FailFastReason);
+                samplerCts.Cancel();
+                await StopLoadsAfterFailFastAsync(loads, errors)
+                    .ConfigureAwait(false);
+            }
+
+            if (monitoredServices.Any(static process => process.HasExited))
+            {
+                servicesAliveThroughMeasurement = false;
+                errors.Add(
+                    "A Gateway or Realtime service exited during the measurement window.");
+            }
+
+            measurementCompletedAtUtc = DateTimeOffset.UtcNow;
+            measurementCompletedTimestamp = Stopwatch.GetTimestamp();
+            if (!realtime.HasExited)
+            {
+                metricsAfter = await EndpointProbe.CapturePrometheusAsync(
+                        new Uri(realtimeBaseUri, "/metrics"),
+                        ct)
+                    .ConfigureAwait(false);
+            }
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
@@ -218,15 +365,25 @@ Console.WriteLine("Starting RealtimeServices...");
         }
         errors.AddRange(prometheusTrendSampler.Errors);
         var processResources = resourceSampler.GetProcessSummaries();
+        var processTimelines = resourceSampler.GetProcessTimelines();
         var dockerResources = resourceSampler.GetDockerSummaries();
+        var dockerTimelines = resourceSampler.GetDockerTimelines();
         var processResults = new List<BenchmarkProcessResult>(managedProcesses.Count);
+        var processResourceByLabel = processResources.ToDictionary(
+            static resource => resource.Label,
+            static resource => resource,
+            StringComparer.Ordinal);
         for (var index = managedProcesses.Count - 1; index >= 0; index--)
         {
             var process = managedProcesses[index];
             try
             {
                 await process.StopAsync().ConfigureAwait(false);
-                processResults.Add(process.CreateResult());
+                // item 八：把同进程采集到的 cgroup oom/oom_kill 计数传给退出归因。
+                var resource = processResourceByLabel.GetValueOrDefault(process.Label);
+                processResults.Add(process.CreateResult(
+                    resource?.CgroupOomEvents ?? 0,
+                    resource?.CgroupOomKillEvents ?? 0));
             }
             catch (Exception exception)
             {
@@ -234,10 +391,28 @@ Console.WriteLine("Starting RealtimeServices...");
             }
             finally
             {
-                await process.DisposeAsync().ConfigureAwait(false);
+                try
+                {
+                    await process.DisposeAsync().ConfigureAwait(false);
+                }
+                catch (Exception exception)
+                {
+                    errors.Add($"Failed to dispose {process.Label}: {exception.Message}");
+                }
             }
         }
         processResults.Reverse();
+        if (postgresIdentityBootstrap is not null)
+        {
+            try
+            {
+                await postgresIdentityBootstrap.DisposeAsync().ConfigureAwait(false);
+            }
+            catch (Exception exception)
+            {
+                errors.Add($"Failed to remove temporary PostgreSQL benchmark identities: {exception.Message}");
+            }
+        }
         if (tcpAuthenticationBootstrap is not null)
         {
             try
@@ -249,15 +424,26 @@ Console.WriteLine("Starting RealtimeServices...");
                 errors.Add($"Failed to remove temporary TCP benchmark authentication: {exception.Message}");
             }
         }
-        if (tcpTokenFilePath is not null)
+        foreach (var tcpTokenFilePath in tcpTokenFilePaths.Where(static path => path is not null))
         {
             try
             {
-                File.Delete(tcpTokenFilePath);
+                File.Delete(tcpTokenFilePath!);
             }
             catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
             {
                 errors.Add($"Failed to remove temporary TCP benchmark credentials: {exception.Message}");
+            }
+        }
+        foreach (var tcpTargetRingFilePath in tcpTargetRingFilePaths.Where(static path => path is not null))
+        {
+            try
+            {
+                File.Delete(tcpTargetRingFilePath!);
+            }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+            {
+                errors.Add($"Failed to remove temporary TCP benchmark target ring: {exception.Message}");
             }
         }
 
@@ -280,6 +466,21 @@ Console.WriteLine("Starting RealtimeServices...");
             errors.Add(
                 $"Expected {expectedLoadReports} load JSON reports but found {loadReadResult.Summaries.Count}.");
         }
+        var validity = CreateValidity(
+            loadStartedAtUtc,
+            measurementStartedAtUtc,
+            measurementCompletedAtUtc,
+            measurementStartedTimestamp,
+            measurementCompletedTimestamp,
+            expectedLoadProcesses,
+            completedLoadProcesses,
+            servicesAliveThroughMeasurement,
+            processTimelines,
+            dockerTimelines,
+            prometheusPollsAtMeasurementStart,
+            prometheusTrendSampler.SuccessfulPolls,
+            loadReadResult.Summaries);
+        errors.AddRange(validity.InvalidReasons);
         var metricDeltas = metricsAfter.ToDictionary(
             static pair => pair.Key,
             pair => pair.Value - metricsBefore.GetValueOrDefault(pair.Key),
@@ -293,8 +494,13 @@ Console.WriteLine("Starting RealtimeServices...");
             StartedAtUtc = startedAt,
             CompletedAtUtc = DateTimeOffset.UtcNow,
             Succeeded = distinctErrors.Length == 0,
-            Configuration = BenchmarkConfiguration.Create(options),
+            Validity = validity,
+            Configuration = BenchmarkConfiguration.Create(
+                options,
+                tcpAuthenticationBootstrap?.Identities.Count ?? options.TcpTokens.Count,
+                bootstrapTokenLifetime),
             Environment = BenchmarkEnvironment.Create(),
+            Provenance = provenance,
             Processes = processResults,
             LoadResults = loadReadResult.Summaries,
             ProcessResources = processResources,
@@ -306,7 +512,7 @@ Console.WriteLine("Starting RealtimeServices...");
             Artifacts = artifacts,
             Errors = distinctErrors
         };
-        return new BenchmarkRunResult(report, sessionDirectory);
+        return new BenchmarkRunResult(report, processTimelines, sessionDirectory);
     }
 
     private async Task BuildTargetsAsync(CancellationToken ct)
@@ -337,7 +543,7 @@ Console.WriteLine("Starting RealtimeServices...");
         {
             Console.WriteLine($"  build {Path.GetFileNameWithoutExtension(project)}");
             await CommandRunner.EnsureSuccessAsync(
-                    "dotnet",
+                    _dotnetExecutable,
                     ["build", project, "-c", options.BuildConfiguration],
                     options.RepositoryRoot,
                     ct)
@@ -402,6 +608,10 @@ Console.WriteLine("Starting RealtimeServices...");
             $"--urls=http://127.0.0.1:{options.RealtimePort}",
             $"--Nats:Url={options.NatsUrl}",
             "--Nats:Mode=JetStream",
+            $"--Realtime:ProcessingConcurrency={options.RealtimeProcessingConcurrency}",
+            $"--Realtime:ProcessingQueueCapacity={options.GetRealtimeProcessingQueueCapacity()}",
+            $"--Nats:JetStream:Consumer:PrefetchMaxMsgs={options.GetRealtimePrefetchMaxMessages()}",
+            $"--Nats:JetStream:Consumer:MaxAckPending={options.GetRealtimeMaxAckPending()}",
             $"--RealtimeIntegration:Replicas={options.JetStreamReplicas}",
             "--Observability:OtlpEnabled=false",
             "--Logging:LogLevel:Default=Warning"
@@ -433,7 +643,7 @@ Console.WriteLine("Starting RealtimeServices...");
         return ManagedProcess.Start(
             "realtime-1",
             "realtime",
-            "dotnet",
+            _dotnetExecutable,
             arguments,
             Path.Combine(options.RealtimeRepositoryRoot, "ChatApp.RealtimeServices"),
             logDirectory,
@@ -497,7 +707,7 @@ Console.WriteLine("Starting RealtimeServices...");
         return ManagedProcess.Start(
             $"gateway-{index + 1}",
             "gateway",
-            "dotnet",
+            _dotnetExecutable,
             arguments,
             options.RepositoryRoot,
             logDirectory,
@@ -515,11 +725,11 @@ Console.WriteLine("Starting RealtimeServices...");
         return ManagedProcess.Start(
             "pipeline-load",
             "load",
-            "dotnet",
+            _dotnetExecutable,
             [
                 assemblyPath,
                 "--nats-url", options.NatsUrl,
-                "--warmup-seconds", "0",
+                "--warmup-seconds", FormatNonNegativeSeconds(options.GetEstimatedTcpRamp() + options.Warmup),
                 "--duration-seconds", FormatSeconds(options.Duration),
                 "--concurrency", options.PipelineConcurrency.ToString(System.Globalization.CultureInfo.InvariantCulture),
                 "--operations-per-second", options.PipelineOperationsPerSecond.ToString(System.Globalization.CultureInfo.InvariantCulture),
@@ -538,10 +748,12 @@ Console.WriteLine("Starting RealtimeServices...");
         string sessionDirectory,
         string logDirectory,
         IReadOnlyList<string> tcpTokens,
-        string? tcpTokenFilePath)
+        string? tcpTokenFilePath,
+        string? tcpTargetRingFilePath)
     {
-        var connections = Divide(options.TcpConnections, options.GatewayCount, gatewayIndex);
-        var slowReaders = Divide(options.TcpSlowReaders, options.GatewayCount, gatewayIndex);
+        var connections = options.GetTcpConnections(gatewayIndex);
+        var slowReaders = options.GetTcpSlowReaders(gatewayIndex);
+        var activeSenders = options.GetTcpActiveSenders(gatewayIndex);
         var arguments = new List<string>
         {
             assemblyPath,
@@ -550,11 +762,22 @@ Console.WriteLine("Starting RealtimeServices...");
             "--port", (options.GatewayBasePort + gatewayIndex).ToString(System.Globalization.CultureInfo.InvariantCulture),
             "--connections", connections.ToString(System.Globalization.CultureInfo.InvariantCulture),
             "--duration-seconds", FormatSeconds(options.Duration),
-            "--messages-per-second", options.TcpMessagesPerSecond.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            "--stabilization-seconds", FormatNonNegativeSeconds(options.Warmup),
+            "--messages-per-second", options.TcpMessagesPerSecond.ToString("G17", System.Globalization.CultureInfo.InvariantCulture),
+            "--delivery-drain-seconds", FormatNonNegativeSeconds(options.TcpDeliveryDrain),
+            "--inactive-heartbeat-seconds", FormatNonNegativeSeconds(options.TcpInactiveHeartbeatInterval),
+            "--min-ack-ratio", options.TcpMinimumAcknowledgementRatio.ToString("G17", System.Globalization.CultureInfo.InvariantCulture),
+            "--min-delivery-ratio", options.TcpMinimumDeliveryRatio.ToString("G17", System.Globalization.CultureInfo.InvariantCulture),
             "--payload-bytes", options.TcpPayloadBytes.ToString(System.Globalization.CultureInfo.InvariantCulture),
             "--slow-readers", slowReaders.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            "--connections-per-second", options.GetTcpConnectionsPerSecond(gatewayIndex).ToString(System.Globalization.CultureInfo.InvariantCulture),
             "--report-directory", Path.Combine(sessionDirectory, $"tcp-gateway-{gatewayIndex + 1}")
         };
+        if (activeSenders > 0)
+        {
+            arguments.Add("--active-senders");
+            arguments.Add(activeSenders.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        }
         if (options.TcpSlowlorisPhase is not null)
         {
             arguments.Add("--slowloris-phase");
@@ -580,11 +803,16 @@ Console.WriteLine("Starting RealtimeServices...");
             arguments.Add("--target-user-id");
             arguments.Add(options.TcpTargetUserId.Value.ToString(System.Globalization.CultureInfo.InvariantCulture));
         }
+        if (tcpTargetRingFilePath is not null)
+        {
+            arguments.Add("--target-ring-file");
+            arguments.Add(tcpTargetRingFilePath);
+        }
 
         return ManagedProcess.Start(
             $"tcp-load-{gatewayIndex + 1}",
             "load",
-            "dotnet",
+            _dotnetExecutable,
             arguments,
             options.RepositoryRoot,
             logDirectory);
@@ -592,9 +820,12 @@ Console.WriteLine("Starting RealtimeServices...");
 
     private static string WriteTcpTokenFile(
         string sessionDirectory,
+        int gatewayIndex,
         IReadOnlyList<string> tcpTokens)
     {
-        var path = Path.Combine(sessionDirectory, $".tcp-tokens-{Guid.NewGuid():N}");
+        var path = Path.Combine(
+            sessionDirectory,
+            $".tcp-tokens-gateway-{gatewayIndex + 1}-{Guid.NewGuid():N}");
         File.WriteAllLines(path, tcpTokens);
         if (OperatingSystem.IsLinux() || OperatingSystem.IsMacOS())
         {
@@ -604,6 +835,65 @@ Console.WriteLine("Starting RealtimeServices...");
         }
 
         return path;
+    }
+
+    /// <summary>
+    /// item 五：为单个 Gateway 写跨 Gateway 目标环文件。第 i 行 = 连接 i 的
+    /// 目标用户 id（LoadGenerator 按连接序号读取，未写行号注释）。
+    /// </summary>
+    private static string WriteTargetRingFile(
+        string sessionDirectory,
+        int gatewayIndex,
+        IReadOnlyList<long> targetUserIds)
+    {
+        var path = Path.Combine(
+            sessionDirectory,
+            $".tcp-target-ring-gateway-{gatewayIndex + 1}-{Guid.NewGuid():N}");
+        File.WriteAllLines(
+            path,
+            targetUserIds.Select(userId => userId.ToString(System.Globalization.CultureInfo.InvariantCulture)));
+        if (OperatingSystem.IsLinux() || OperatingSystem.IsMacOS())
+        {
+            File.SetUnixFileMode(
+                path,
+                UnixFileMode.UserRead | UnixFileMode.UserWrite);
+        }
+
+        return path;
+    }
+
+    /// <summary>
+    /// item 五：跨 Gateway 目标环。Gateway g 的连接槽 i 的目标是下一个 Gateway
+    /// (g+1)%N 的连接槽 i（按下一个 Gateway 的连接数取模）。每个 sender 与目标
+    /// 用户建立双向 friendship，保证消息真实跨 Gateway 且被接收侧 LoadGenerator
+    /// 观测到。
+    /// </summary>
+    private static TcpCrossGatewayPlan BuildCrossGatewayPlan(
+        IReadOnlyList<TcpBootstrapIdentity>[] connectionPartitions)
+    {
+        var gatewayCount = connectionPartitions.Length;
+        var targetRings = new List<long[]>(gatewayCount);
+        var friendshipEdges = new HashSet<(long UserId, long FriendId)>();
+        for (var gatewayIndex = 0; gatewayIndex < gatewayCount; gatewayIndex++)
+        {
+            var next = (gatewayIndex + 1) % gatewayCount;
+            var nextCount = connectionPartitions[next].Count;
+            var ring = new long[connectionPartitions[gatewayIndex].Count];
+            for (var connectionIndex = 0;
+                 connectionIndex < ring.Length;
+                 connectionIndex++)
+            {
+                var sender = connectionPartitions[gatewayIndex][connectionIndex];
+                var target = connectionPartitions[next][connectionIndex % nextCount];
+                ring[connectionIndex] = target.UserId;
+                friendshipEdges.Add((sender.UserId, target.UserId));
+                friendshipEdges.Add((target.UserId, sender.UserId));
+            }
+
+            targetRings.Add(ring);
+        }
+
+        return new TcpCrossGatewayPlan(targetRings, friendshipEdges);
     }
 
     private static LoadSummaryReadResult ReadLoadResults(IEnumerable<string> jsonReports)
@@ -619,6 +909,7 @@ Console.WriteLine("Starting RealtimeServices...");
                 var fileName = Path.GetFileName(reportPath);
                 if (fileName.StartsWith("pipeline-load-", StringComparison.Ordinal))
                 {
+                    var configuration = root.GetProperty("Configuration");
                     var latency = root
                         .GetProperty("Latencies")
                         .GetProperty("complete_pipeline");
@@ -633,6 +924,8 @@ Console.WriteLine("Starting RealtimeServices...");
                         P50Milliseconds = latency.GetProperty("P50Ms").GetDouble(),
                         P95Milliseconds = latency.GetProperty("P95Ms").GetDouble(),
                         P99Milliseconds = latency.GetProperty("P99Ms").GetDouble(),
+                        StabilizationSeconds = configuration.GetProperty("WarmupSeconds").GetDouble(),
+                        MeasurementSeconds = root.GetProperty("ElapsedSeconds").GetDouble(),
                         SourceReport = Path.GetFullPath(reportPath)
                     });
                     continue;
@@ -644,9 +937,14 @@ Console.WriteLine("Starting RealtimeServices...");
                     var latency = root.GetProperty("Latency");
                     var elapsed = root.GetProperty("ElapsedSeconds").GetDouble();
                     var mode = configuration.GetProperty("Mode").GetString() ?? "unknown";
-                    var latencyCount = latency.GetProperty("Count").GetInt32();
+                    var latencyCount = latency.GetProperty("Count").GetInt64();
                     var succeeded = root.GetProperty("SuccessfulConnections").GetInt32();
                     var failed = root.GetProperty("FailedConnections").GetInt32();
+                    var peakActive = root.TryGetProperty("PeakActiveConnections", out var peakProp)
+                        ? peakProp.GetInt32()
+                        : succeeded;
+                    var hasHealthy = root.TryGetProperty("Healthy", out var healthy);
+                    var hasSlow = root.TryGetProperty("Slow", out var slow);
                     var throughput = mode.Equals("Chat", StringComparison.Ordinal)
                         ? root.GetProperty("SentPerSecond").GetDouble()
                         : latencyCount > 0 && elapsed > 0
@@ -660,6 +958,13 @@ Console.WriteLine("Starting RealtimeServices...");
                         Kind = $"tcp-{mode.ToLowerInvariant()}",
                         Succeeded = succeeded,
                         Failed = failed,
+                        TcpConnectFailed = GetInt64OrDefault(root, "TcpConnectFailed"),
+                        AuthInvalidToken = GetInt64OrDefault(root, "AuthInvalidToken"),
+                        AuthDependencyUnavailable = GetInt64OrDefault(root, "AuthDependencyUnavailable"),
+                        AuthOtherFailure = GetInt64OrDefault(root, "AuthOtherFailure"),
+                        AuthSucceededWithoutResumeToken = GetInt64OrDefault(root, "AuthSucceededWithoutResumeToken"),
+                        ServerClosed = GetInt64OrDefault(root, "ServerClosed"),
+                        ProtocolRejected = GetInt64OrDefault(root, "ProtocolRejected"),
                         ErrorRatePercent = succeeded + failed == 0
                             ? 0
                             : failed * 100d / (succeeded + failed),
@@ -667,6 +972,36 @@ Console.WriteLine("Starting RealtimeServices...");
                         P50Milliseconds = latency.GetProperty("P50Ms").GetDouble(),
                         P95Milliseconds = latency.GetProperty("P95Ms").GetDouble(),
                         P99Milliseconds = latency.GetProperty("P99Ms").GetDouble(),
+                        PeakActiveConnections = peakActive,
+                        HealthyP95Milliseconds = hasHealthy
+                            ? healthy.GetProperty("P95Ms").GetDouble()
+                            : 0,
+                        SlowP95Milliseconds = hasSlow
+                            ? slow.GetProperty("P95Ms").GetDouble()
+                            : 0,
+                        MessagesSent = GetInt64OrDefault(root, "Sent"),
+                        MessagesExpectedDeliveries = root.TryGetProperty(
+                            "ExpectedDeliveries",
+                            out var expectedDeliveries)
+                                ? expectedDeliveries.GetInt64()
+                                : GetInt64OrDefault(root, "Sent"),
+                        MessagesAcknowledged = GetInt64OrDefault(root, "Acknowledged"),
+                        MessagesRejected = GetInt64OrDefault(root, "Rejected"),
+                        MessagesReceived = GetInt64OrDefault(root, "Received"),
+                        RampSeconds = GetDoubleOrDefault(root, "RampSeconds"),
+                        StabilizationSeconds = GetDoubleOrDefault(root, "StabilizationSeconds"),
+                        MeasurementSeconds = root.TryGetProperty("MeasurementSeconds", out var measurement)
+                            ? measurement.GetDouble()
+                            : elapsed,
+                        TargetStrategy = root.TryGetProperty("TargetStrategy", out var targetStrategy)
+                            ? targetStrategy.GetString()
+                            : null,
+                        UniqueAuthenticatedUsers = root.TryGetProperty("UniqueAuthenticatedUsers", out var uniqueUsers)
+                            ? uniqueUsers.GetInt32()
+                            : 0,
+                        ActiveSenders = configuration.TryGetProperty("ActiveSenders", out var activeSenders)
+                            ? activeSenders.GetInt32()
+                            : succeeded,
                         SourceReport = Path.GetFullPath(reportPath)
                     });
                 }
@@ -681,11 +1016,213 @@ Console.WriteLine("Starting RealtimeServices...");
         return new LoadSummaryReadResult(summaries, readErrors);
     }
 
+    private static long GetInt64OrDefault(JsonElement element, string propertyName) =>
+        element.TryGetProperty(propertyName, out var property) && property.TryGetInt64(out var value)
+            ? value
+            : 0;
+
+    private static double GetDoubleOrDefault(JsonElement element, string propertyName) =>
+        element.TryGetProperty(propertyName, out var property) && property.TryGetDouble(out var value)
+            ? value
+            : 0;
+
+    private TimeSpan GetEstimatedTcpRamp(int gatewayIndex)
+    {
+        var rate = options.GetTcpConnectionsPerSecond(gatewayIndex);
+        return rate == 0
+            ? TimeSpan.Zero
+            : TimeSpan.FromSeconds(Math.Ceiling(
+                options.GetTcpConnections(gatewayIndex) / (double)rate));
+    }
+
+    private static async Task<LoadExitObservation> ObserveLoadExitAsync(
+        ManagedProcess load,
+        long phaseStartedTimestamp,
+        TimeSpan expectedMinimumRuntime,
+        CancellationToken cancellationToken)
+    {
+        var exitCode = await load.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
+        return new LoadExitObservation(
+            load.Label,
+            exitCode,
+            Stopwatch.GetElapsedTime(phaseStartedTimestamp),
+            expectedMinimumRuntime);
+    }
+
+    private static async Task WaitForMeasurementStartAsync(
+        IReadOnlyList<ManagedProcess> loads,
+        IReadOnlyList<ManagedProcess> services,
+        TimeSpan delay,
+        CancellationToken cancellationToken)
+    {
+        var started = Stopwatch.GetTimestamp();
+        while (Stopwatch.GetElapsedTime(started) < delay)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var exitedLoad = loads.FirstOrDefault(static process => process.HasExited);
+            if (exitedLoad is not null)
+                throw new InvalidOperationException($"{exitedLoad.Label} exited before measurement started.");
+            var exitedService = services.FirstOrDefault(static process => process.HasExited);
+            if (exitedService is not null)
+                throw new InvalidOperationException($"{exitedService.Label} exited before measurement started.");
+
+            var remaining = delay - Stopwatch.GetElapsedTime(started);
+            await Task.Delay(
+                    remaining < TimeSpan.FromMilliseconds(250)
+                        ? remaining
+                        : TimeSpan.FromMilliseconds(250),
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
+
+        var finalExited = loads.Concat(services).FirstOrDefault(static process => process.HasExited);
+        if (finalExited is not null)
+            throw new InvalidOperationException($"{finalExited.Label} exited before measurement started.");
+    }
+
+    private static async Task StopLoadsAfterFailFastAsync(
+        IReadOnlyList<ManagedProcess> loads,
+        List<string> errors)
+    {
+        foreach (var load in loads)
+        {
+            if (load.HasExited)
+                continue;
+
+            try
+            {
+                await load.StopAsync().ConfigureAwait(false);
+            }
+            catch (Exception exception)
+            {
+                errors.Add(
+                    $"Fail-fast could not stop {load.Label}: {exception.Message}");
+            }
+        }
+    }
+
+    private BenchmarkRunValidity CreateValidity(
+        DateTimeOffset? loadStartedAtUtc,
+        DateTimeOffset? measurementStartedAtUtc,
+        DateTimeOffset? measurementCompletedAtUtc,
+        long measurementStartedTimestamp,
+        long measurementCompletedTimestamp,
+        int expectedLoadProcesses,
+        int completedLoadProcesses,
+        bool servicesAlive,
+        IReadOnlyList<ProcessTimeline> timelines,
+        IReadOnlyList<DockerTimeline> dockerTimelines,
+        int prometheusPollsAtStart,
+        int prometheusPollsAtEnd,
+        IReadOnlyList<LoadResultSummary> loadSummaries)
+    {
+        const double minimumCoveragePercent = 80;
+        var reasons = new List<string>();
+        var hasMeasurementWindow = measurementStartedAtUtc is not null
+                                   && measurementCompletedAtUtc is not null
+                                   && measurementStartedTimestamp > 0
+                                   && measurementCompletedTimestamp >= measurementStartedTimestamp;
+        var observed = hasMeasurementWindow
+            ? Stopwatch.GetElapsedTime(measurementStartedTimestamp, measurementCompletedTimestamp)
+            : TimeSpan.Zero;
+        var expectedSamples = Math.Max(
+            1,
+            (int)Math.Floor(options.Duration.TotalMilliseconds / options.SampleInterval.TotalMilliseconds));
+        var resourceSamplingSeriesCoverage = ResourceSamplingCoverage.Calculate(
+            timelines,
+            dockerTimelines,
+            options.DockerContainers,
+            measurementStartedTimestamp,
+            measurementCompletedTimestamp,
+            options.Duration,
+            options.SampleInterval);
+        var processSeriesCoverage = resourceSamplingSeriesCoverage
+            .Where(static series => series.Kind == "process")
+            .ToArray();
+        var minimumProcessSamples = processSeriesCoverage.Length == 0
+            ? 0
+            : processSeriesCoverage.Min(static series => series.SamplesInMeasurement);
+        var processCoverage = processSeriesCoverage.Length == 0
+            ? 0
+            : processSeriesCoverage.Min(static series => series.CoveragePercent);
+        var prometheusSamples = Math.Max(0, prometheusPollsAtEnd - prometheusPollsAtStart);
+        var prometheusCoverage = Math.Min(100, prometheusSamples * 100d / expectedSamples);
+
+        if (!hasMeasurementWindow)
+            reasons.Add("The coordinated measurement window was not completed.");
+        else if (observed + TimeSpan.FromSeconds(1) < options.Duration)
+            reasons.Add("The coordinated measurement window ended early.");
+        if (completedLoadProcesses != expectedLoadProcesses)
+            reasons.Add($"Only {completedLoadProcesses} of {expectedLoadProcesses} load processes completed.");
+        if (!servicesAlive)
+            reasons.Add("A service process exited during measurement.");
+        if (loadSummaries.Count != expectedLoadProcesses)
+            reasons.Add($"Only {loadSummaries.Count} of {expectedLoadProcesses} child reports were readable.");
+        foreach (var summary in loadSummaries.Where(summary =>
+                     summary.MeasurementSeconds + 1 < options.Duration.TotalSeconds))
+        {
+            reasons.Add(
+                $"{summary.Name} reported only {summary.MeasurementSeconds:F2}s of measurement data.");
+        }
+        if (options.TcpBootstrapAuthentication && options.TcpMode is "heartbeat" or "chat")
+        {
+            var authenticatedUsers = loadSummaries
+                .Where(static summary => summary.Name.StartsWith("tcp:", StringComparison.Ordinal))
+                .Sum(static summary => summary.UniqueAuthenticatedUsers);
+            var expectedAuthenticatedUsers = options.GetTcpBootstrapIdentityCount();
+            if (authenticatedUsers != expectedAuthenticatedUsers)
+            {
+                reasons.Add(
+                    $"TCP children authenticated {authenticatedUsers} distinct users; " +
+                    $"{expectedAuthenticatedUsers} were required for healthy connections. " +
+                    "Slow readers intentionally reuse healthy identities.");
+            }
+        }
+        if (options.TcpBootstrapAuthentication && options.TcpMode == "chat" &&
+            loadSummaries.Any(static summary =>
+                summary.Name.StartsWith("tcp:", StringComparison.Ordinal) &&
+                !string.Equals(summary.TargetStrategy, "peer-ring", StringComparison.Ordinal)))
+        {
+            reasons.Add("A TCP chat child did not report peer-ring non-self targeting.");
+        }
+        if (processCoverage < minimumCoveragePercent)
+            reasons.Add($"Process sampling coverage was {processCoverage:F1}%, below {minimumCoveragePercent:F0}%.");
+        if (prometheusCoverage < minimumCoveragePercent)
+            reasons.Add($"Prometheus sampling coverage was {prometheusCoverage:F1}%, below {minimumCoveragePercent:F0}%.");
+
+        return new BenchmarkRunValidity
+        {
+            IsValid = reasons.Count == 0,
+            LoadStartedAtUtc = loadStartedAtUtc,
+            MeasurementStartedAtUtc = measurementStartedAtUtc,
+            MeasurementCompletedAtUtc = measurementCompletedAtUtc,
+            ExpectedMeasurementSeconds = options.Duration.TotalSeconds,
+            ObservedMeasurementSeconds = observed.TotalSeconds,
+            MeasurementBoundarySource =
+                "orchestrator estimated ramp + stabilization; validity uses child MeasurementSeconds",
+            ExpectedLoadProcesses = expectedLoadProcesses,
+            CompletedLoadProcesses = completedLoadProcesses,
+            ServicesAliveThroughMeasurement = servicesAlive,
+            ExpectedProcessSamplesPerProcess = expectedSamples,
+            MinimumProcessSamples = minimumProcessSamples,
+            ProcessSamplingCoveragePercent = processCoverage,
+            ExpectedPrometheusSamples = expectedSamples,
+            PrometheusSamples = prometheusSamples,
+            PrometheusSamplingCoveragePercent = prometheusCoverage,
+            ResourceSamplingSeriesCoverage = resourceSamplingSeriesCoverage,
+            InvalidReasons = reasons,
+        };
+    }
+
     private static int Divide(int total, int partitions, int index) =>
         total / partitions + (index < total % partitions ? 1 : 0);
 
     private static string FormatSeconds(TimeSpan value) =>
         Math.Max(1, (int)Math.Ceiling(value.TotalSeconds))
+            .ToString(System.Globalization.CultureInfo.InvariantCulture);
+
+    private static string FormatNonNegativeSeconds(TimeSpan value) =>
+        Math.Max(0, (int)Math.Ceiling(value.TotalSeconds))
             .ToString(System.Globalization.CultureInfo.InvariantCulture);
 
     private static void EnsurePortAvailable(int port)
@@ -723,6 +1260,10 @@ Console.WriteLine("Starting RealtimeServices...");
         IReadOnlyList<LoadResultSummary> Summaries,
         IReadOnlyList<string> Errors);
 
+    private sealed record TcpCrossGatewayPlan(
+        IReadOnlyList<long[]> TargetRings,
+        IReadOnlySet<(long UserId, long FriendId)> FriendshipEdges);
+
     private sealed record BenchmarkBinaries(
         string Gateway,
         string RealtimeService,
@@ -732,4 +1273,5 @@ Console.WriteLine("Starting RealtimeServices...");
 
 internal sealed record BenchmarkRunResult(
     BenchmarkReport Report,
+    IReadOnlyList<ProcessTimeline> ProcessTimelines,
     string SessionDirectory);

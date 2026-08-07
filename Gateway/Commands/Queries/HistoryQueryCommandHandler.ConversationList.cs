@@ -79,36 +79,10 @@ internal sealed partial class HistoryQueryCommandHandler
                 .ConfigureAwait(false);
             _metrics.HistoryQueryCompleted();
 
-            var mappedItems = page.Items
-                .Select(static item => new ConversationListItem
-                {
-                    ConversationId = item.ConversationId,
-                    Type = (ConversationType)(byte)item.Type,
-                    PeerUserId = item.PeerUserId,
-                    Title = item.Title,
-                    LastMessageId = item.LastMessageId,
-                    LastMessagePreview = item.LastMessagePreview,
-                    LastMessageAtMs = item.LastMessageAtMs,
-                    LastSenderUserId = item.LastSenderUserId,
-                    UnreadCount = item.UnreadCount,
-                    LastReadMessageId = item.LastReadMessageId,
-                    LastReadAtMs = item.LastReadAtMs,
-                    IsPinned = item.IsPinned,
-                    PinnedAtMs = item.PinnedAtMs,
-                    IsMuted = item.IsMuted,
-                    MutedUntilMs = item.MutedUntilMs
-                })
-                .ToArray();
-
-            var originalNextCursor = page.NextCursor is null
-                ? null
-                : new ConversationListCursor
-                {
-                    IsPinned = page.NextCursor.IsPinned,
-                    PinnedAtMs = page.NextCursor.PinnedAtMs,
-                    LastMessageAtMs = page.NextCursor.LastMessageAtMs,
-                    ConversationId = page.NextCursor.ConversationId
-                };
+            // ConversationListItem/Cursor 由 ChatApp.Realtime.Contracts 单点拥有，
+            // 总线页与 TCP 响应直接复用同一 wire model，不再逐字段复制。
+            var mappedItems = page.Items.ToArray();
+            var originalNextCursor = page.NextCursor;
 
             // 按字节预算截断，确保响应可装入单帧 TCP Payload。
             // 截断时以第 k 条（最后保留条目）派生新 NextCursor，HasMore=true。
@@ -139,13 +113,11 @@ internal sealed partial class HistoryQueryCommandHandler
                         ? Array.Empty<ConversationListItem>()
                         : original.Items.Take(k).ToArray();
                     var cursor = k > 0
-                        ? new ConversationListCursor
-                        {
-                            IsPinned = prefix[k - 1].IsPinned,
-                            PinnedAtMs = prefix[k - 1].PinnedAtMs,
-                            LastMessageAtMs = prefix[k - 1].LastMessageAtMs,
-                            ConversationId = prefix[k - 1].ConversationId
-                        }
+                        ? new ConversationListCursor(
+                            prefix[k - 1].IsPinned,
+                            prefix[k - 1].PinnedAtMs,
+                            prefix[k - 1].LastMessageAtMs,
+                            prefix[k - 1].ConversationId)
                         : null;
                     return original with
                     {

@@ -19,16 +19,3 @@ public sealed class RelationshipListRequest
     /// <summary>分页游标（opaque）。null 表示首页。</summary>
     public string? Cursor { get; init; }
 }
-
-/// <summary>关系列表类型。</summary>
-public enum RelationshipListType : byte
-{
-    /// <summary>好友列表。</summary>
-    Friends = 1,
-
-    /// <summary>好友请求列表（收到的请求）。</summary>
-    FriendRequests = 2,
-
-    /// <summary>黑名单列表。</summary>
-    BlockedUsers = 3
-}

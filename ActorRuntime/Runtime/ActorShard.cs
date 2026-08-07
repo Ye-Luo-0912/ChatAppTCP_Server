@@ -1074,7 +1074,7 @@ internal sealed class ActorShard<TKey, TState, TMessage>
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private bool TryReserveCompletionCredit()
+    internal bool TryReserveCompletionCredit()
     {
         var current = Volatile.Read(ref _completionCredits);
         while (current < _completionCreditCapacity)

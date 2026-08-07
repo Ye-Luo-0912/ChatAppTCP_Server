@@ -1,10 +1,10 @@
-using ChatApp.TcpGateway.Infrastructure.Authentication.Models;
+using ChatApp.Auth.Contracts;
 
 namespace ChatApp.TcpGateway.Infrastructure.Authentication;
 
 internal interface IAccessTokenStore
 {
-    ValueTask<AccessTokenRecord?> FindAsync(
+    ValueTask<AccessTokenCacheRecord?> FindAsync(
         string accessToken,
         CancellationToken cancellationToken);
 }

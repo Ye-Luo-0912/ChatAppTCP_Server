@@ -1,8 +1,6 @@
 using System.Security.Cryptography;
-using System.Text;
 using System.Text.Json;
-using ChatApp.TcpGateway.Infrastructure.Authentication.Models;
-using ChatApp.TcpGateway.Infrastructure.Serialization.Json;
+using ChatApp.Auth.Contracts;
 using StackExchange.Redis;
 
 namespace ChatApp.ResumeVerification.Runtime;
@@ -10,13 +8,10 @@ namespace ChatApp.ResumeVerification.Runtime;
 /// <summary>
 /// 在 Redis 中引导写入 AccessToken，供网关认证使用。
 /// 镜像 <c>TcpAuthenticationBootstrap</c> 的行为，但使用源生成 JSON 上下文，
-/// 并允许设置 <see cref="AccessTokenRecord.DeviceIdHash"/> 以便设备绑定场景验证。
+/// 并允许设置 <see cref="AccessTokenCacheRecord.DeviceIdHash"/> 以便设备绑定场景验证。
 /// </summary>
 internal sealed class ResumeTokenBootstrap : IAsyncDisposable
 {
-    private const string CacheKeyPrefix = "cache:AT:";
-    private const string ValueField = "value";
-
     private readonly ConnectionMultiplexer _connection;
     private readonly RedisKey _cacheKey;
 
@@ -36,7 +31,7 @@ internal sealed class ResumeTokenBootstrap : IAsyncDisposable
     public string Token { get; }
 
     /// <summary>
-    /// 写入 Redis 的 <see cref="AccessTokenRecord.DeviceIdHash"/>。
+    /// 写入 Redis 的 <see cref="AccessTokenCacheRecord.DeviceIdHash"/>。
     /// 调用方应将同一值通过 <c>AuthenticationRequest.DeviceIdHash</c> 发送给网关，
     /// 使 same-device fencing 路径被执行（AccessToken 与认证请求的设备指纹一致）。
     /// </summary>
@@ -58,10 +53,9 @@ internal sealed class ResumeTokenBootstrap : IAsyncDisposable
         try
         {
             var token = Convert.ToHexString(RandomNumberGenerator.GetBytes(32));
-            var tokenHash = SHA256.HashData(Encoding.UTF8.GetBytes(token));
-            var cacheKey = CacheKeyPrefix + Convert.ToHexString(tokenHash);
+            var cacheKey = AccessTokenCacheKey.Create(token);
 
-            var record = new AccessTokenRecord
+            var record = new AccessTokenCacheRecord
             {
                 UserId = userId,
                 UserName = "resume-verification",
@@ -74,10 +68,10 @@ internal sealed class ResumeTokenBootstrap : IAsyncDisposable
 
             var payload = JsonSerializer.SerializeToUtf8Bytes(
                 record,
-                GatewayJsonSerializerContext.Default.AccessTokenRecord);
+                AuthContractsJsonSerializerContext.Default.AccessTokenCacheRecord);
 
             await connection.GetDatabase()
-                .HashSetAsync(cacheKey, ValueField, payload)
+                .StringSetAsync(cacheKey, payload)
                 .WaitAsync(cancellationToken)
                 .ConfigureAwait(false);
 

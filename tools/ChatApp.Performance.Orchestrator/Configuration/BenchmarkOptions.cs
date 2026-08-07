@@ -10,6 +10,7 @@ internal sealed record BenchmarkOptions(
     int GatewayCount,
     int GatewayBasePort,
     int RealtimePort,
+    int RealtimeProcessingConcurrency,
     string NatsUrl,
     int JetStreamReplicas,
     bool SmokeNoopStorage,
@@ -21,14 +22,21 @@ internal sealed record BenchmarkOptions(
     TimeSpan SampleInterval,
     string TcpMode,
     int TcpConnections,
-    int TcpMessagesPerSecond,
+    int TcpActiveSenders,
+    double TcpMessagesPerSecond,
+    TimeSpan TcpDeliveryDrain,
+    TimeSpan TcpInactiveHeartbeatInterval,
+    double TcpMinimumAcknowledgementRatio,
+    double TcpMinimumDeliveryRatio,
     int TcpPayloadBytes,
     int TcpSlowReaders,
+    int TcpConnectionsPerSecond,
     string? TcpSlowlorisPhase,
     int TcpSlowlorisDelayMs,
     long? TcpInboundBudgetBytes,
     IReadOnlyList<string> TcpTokens,
     bool TcpBootstrapAuthentication,
+    bool TcpCrossGateway,
     long TcpBootstrapUserId,
     long? TcpTargetUserId,
     bool PipelineEnabled,
@@ -49,15 +57,22 @@ internal sealed record BenchmarkOptions(
         "Usage: [--repository-root PATH] [--realtime-root PATH] " +
         "[--configuration Release] [--no-build] [--gateway-count 1] " +
         "[--gateway-base-port 18888] [--realtime-port 18080] " +
+        "[--realtime-processing-concurrency 4] " +
         "[--nats-url nats://127.0.0.1:4222] [--jetstream-replicas 1] [--smoke-noop-storage] " +
         "[--realtime-database-environment NAME] [--garnet-environment NAME] " +
         "[--startup-timeout-seconds 60] " +
         "[--warmup-seconds 10] [--duration-seconds 30] [--sample-interval-ms 1000] " +
         "[--tcp-mode connection|heartbeat|chat] [--tcp-connections 100] " +
+        "[--tcp-active-senders N] " +
         "[--tcp-messages-per-second 10] [--tcp-payload-bytes 128] " +
-        "[--tcp-slow-readers 0] [--tcp-slowloris-phase header|payload] " +
+        "[--tcp-delivery-drain-seconds 30] [--tcp-min-ack-ratio 0.95] " +
+        "[--tcp-inactive-heartbeat-seconds 30] " +
+        "[--tcp-min-delivery-ratio 0.90] " +
+        "[--tcp-slow-readers 0] [--tcp-connections-per-second N] " +
+        "[--tcp-slowloris-phase header|payload] " +
         "[--tcp-slowloris-delay-ms 1000] [--tcp-inbound-budget-bytes N] " +
         "[--tcp-token TOKEN] [--tcp-bootstrap-auth] " +
+        "[--tcp-cross-gateway] " +
         "[--tcp-bootstrap-user-id 9300000000] [--tcp-target-user-id ID] " +
         "[--no-pipeline] [--pipeline-concurrency 4] [--pipeline-operations-per-second 0] " +
         "[--pipeline-payload-bytes 128] [--pipeline-operation-timeout-seconds 15] " +
@@ -78,6 +93,7 @@ internal sealed record BenchmarkOptions(
         var gatewayCount = 1;
         var gatewayBasePort = 18_888;
         var realtimePort = 18_080;
+        var realtimeProcessingConcurrency = 4;
         var natsUrl = "nats://127.0.0.1:4222";
         var jetStreamReplicas = 1;
         var smokeNoopStorage = false;
@@ -89,14 +105,21 @@ internal sealed record BenchmarkOptions(
         var sampleIntervalMs = 1_000;
         var tcpMode = "connection";
         var tcpConnections = 100;
-        var tcpMessagesPerSecond = 10;
+        var tcpActiveSenders = 0;
+        var tcpMessagesPerSecond = 10d;
+        var tcpDeliveryDrainSeconds = 30;
+        var tcpInactiveHeartbeatSeconds = 30;
+        var tcpMinimumAcknowledgementRatio = 0.95d;
+        var tcpMinimumDeliveryRatio = 0.90d;
         var tcpPayloadBytes = 128;
         var tcpSlowReaders = 0;
+        var tcpConnectionsPerSecond = 0;
         string? tcpSlowlorisPhase = null;
         var tcpSlowlorisDelayMs = 1000;
         long? tcpInboundBudgetBytes = null;
         var tcpTokens = new List<string>();
         var tcpBootstrapAuthentication = false;
+        var tcpCrossGateway = false;
         long tcpBootstrapUserId = 9_300_000_000;
         long? tcpTargetUserId = null;
         var pipelineEnabled = true;
@@ -134,6 +157,9 @@ internal sealed record BenchmarkOptions(
                 case "--tcp-bootstrap-auth":
                     tcpBootstrapAuthentication = true;
                     continue;
+                case "--tcp-cross-gateway":
+                    tcpCrossGateway = true;
+                    continue;
             }
 
             var value = GetValue(args, ref index, option);
@@ -156,6 +182,9 @@ internal sealed record BenchmarkOptions(
                     break;
                 case "--realtime-port":
                     realtimePort = ParseInt(value, option);
+                    break;
+                case "--realtime-processing-concurrency":
+                    realtimeProcessingConcurrency = ParseInt(value, option);
                     break;
                 case "--nats-url":
                     natsUrl = value;
@@ -187,14 +216,32 @@ internal sealed record BenchmarkOptions(
                 case "--tcp-connections":
                     tcpConnections = ParseInt(value, option);
                     break;
+                case "--tcp-active-senders":
+                    tcpActiveSenders = ParseInt(value, option);
+                    break;
                 case "--tcp-messages-per-second":
-                    tcpMessagesPerSecond = ParseInt(value, option);
+                    tcpMessagesPerSecond = ParsePositiveDouble(value, option);
+                    break;
+                case "--tcp-delivery-drain-seconds":
+                    tcpDeliveryDrainSeconds = ParseInt(value, option);
+                    break;
+                case "--tcp-inactive-heartbeat-seconds":
+                    tcpInactiveHeartbeatSeconds = ParseInt(value, option);
+                    break;
+                case "--tcp-min-ack-ratio":
+                    tcpMinimumAcknowledgementRatio = ParseRatio(value, option);
+                    break;
+                case "--tcp-min-delivery-ratio":
+                    tcpMinimumDeliveryRatio = ParseRatio(value, option);
                     break;
                 case "--tcp-payload-bytes":
                     tcpPayloadBytes = ParseInt(value, option);
                     break;
                 case "--tcp-slow-readers":
                     tcpSlowReaders = ParseInt(value, option);
+                    break;
+                case "--tcp-connections-per-second":
+                    tcpConnectionsPerSecond = ParseInt(value, option);
                     break;
                 case "--tcp-slowloris-phase":
                     tcpSlowlorisPhase = value;
@@ -273,6 +320,12 @@ internal sealed record BenchmarkOptions(
         ValidatePort(gatewayBasePort, nameof(gatewayBasePort));
         ValidatePort(gatewayBasePort + gatewayCount - 1, nameof(gatewayCount));
         ValidatePort(realtimePort, nameof(realtimePort));
+        if (realtimeProcessingConcurrency is <= 0 or > 1024)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(args),
+                "Realtime processing concurrency must be between 1 and 1024.");
+        }
         if (Enumerable.Range(gatewayBasePort, gatewayCount).Contains(realtimePort))
             throw new ArgumentException("Realtime port overlaps a Gateway port.");
         ArgumentException.ThrowIfNullOrWhiteSpace(natsUrl);
@@ -291,11 +344,34 @@ internal sealed record BenchmarkOptions(
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(tcpConnections);
         if (tcpConnections < gatewayCount)
             throw new ArgumentException("TCP connections cannot be fewer than Gateway instances.");
+        ArgumentOutOfRangeException.ThrowIfNegative(tcpActiveSenders);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(tcpMessagesPerSecond);
+        ArgumentOutOfRangeException.ThrowIfNegative(tcpDeliveryDrainSeconds);
+        ArgumentOutOfRangeException.ThrowIfNegative(tcpInactiveHeartbeatSeconds);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(tcpPayloadBytes);
         ArgumentOutOfRangeException.ThrowIfNegative(tcpSlowReaders);
         if (tcpSlowReaders > tcpConnections)
             throw new ArgumentException("TCP slow readers cannot exceed TCP connections.");
+        if (tcpSlowReaders != 0 && tcpMode != "chat")
+            throw new ArgumentException("TCP slow readers are only valid in chat mode.");
+        if (tcpActiveSenders != 0 && tcpMode is not ("heartbeat" or "chat"))
+            throw new ArgumentException("--tcp-active-senders requires TCP heartbeat or chat mode.");
+        if (tcpActiveSenders > tcpConnections - tcpSlowReaders)
+        {
+            throw new ArgumentException(
+                "TCP active senders cannot exceed non-slow-reader connections.");
+        }
+        if (tcpMode is "heartbeat" or "chat" && tcpConnections - tcpSlowReaders <= 0)
+        {
+            throw new ArgumentException(
+                "TCP heartbeat/chat requires at least one non-slow-reader connection.");
+        }
+        if (tcpActiveSenders is > 0 && tcpActiveSenders < gatewayCount)
+        {
+            throw new ArgumentException(
+                "TCP active senders cannot be fewer than Gateway instances.");
+        }
+        ArgumentOutOfRangeException.ThrowIfNegative(tcpConnectionsPerSecond);
         if (tcpSlowlorisPhase is not null &&
             tcpSlowlorisPhase is not ("header" or "payload"))
             throw new ArgumentException(
@@ -313,9 +389,51 @@ internal sealed record BenchmarkOptions(
             throw new ArgumentException("Use either --tcp-token or --tcp-bootstrap-auth, not both.");
         if (tcpBootstrapAuthentication && garnetEnvironmentVariable is null)
             throw new ArgumentException("--tcp-bootstrap-auth requires --garnet-environment.");
+        if (tcpBootstrapAuthentication && tcpMode == "chat" && realtimeDatabaseEnvironmentVariable is null)
+        {
+            throw new ArgumentException(
+                "TCP chat bootstrap requires --realtime-database-environment for an isolated fresh performance database.");
+        }
+        if (tcpBootstrapAuthentication && tcpMode == "chat" && tcpTargetUserId is not null)
+        {
+            throw new ArgumentException(
+                "TCP chat bootstrap builds a non-self ring per Gateway; do not specify --tcp-target-user-id.");
+        }
+        if (tcpCrossGateway && !tcpBootstrapAuthentication)
+        {
+            throw new ArgumentException("--tcp-cross-gateway requires --tcp-bootstrap-auth.");
+        }
+        if (tcpCrossGateway && tcpMode != "chat")
+        {
+            throw new ArgumentException("--tcp-cross-gateway requires --tcp-mode chat.");
+        }
+        if (tcpCrossGateway && gatewayCount < 2)
+        {
+            throw new ArgumentException("--tcp-cross-gateway requires at least two Gateway instances.");
+        }
         if (tcpMode is "heartbeat" or "chat" && tcpTokens.Count == 0 && !tcpBootstrapAuthentication)
             throw new ArgumentException($"TCP mode {tcpMode} requires --tcp-token or --tcp-bootstrap-auth.");
+        var distinctTcpTokens = tcpTokens.Distinct(StringComparer.Ordinal).ToArray();
+        if (tcpMode == "chat" && !tcpBootstrapAuthentication && tcpTargetUserId is null && distinctTcpTokens.Length < 2)
+        {
+            throw new ArgumentException(
+                "TCP chat ring mode requires at least two distinct --tcp-token values or an explicit non-self target.");
+        }
+        if (tcpBootstrapAuthentication && tcpMode == "chat" &&
+            Enumerable.Range(0, gatewayCount).Any(index =>
+                Divide(tcpConnections, gatewayCount, index) -
+                Divide(tcpSlowReaders, gatewayCount, index) < 2))
+        {
+            throw new ArgumentException(
+                "TCP chat bootstrap requires at least two healthy users per Gateway " +
+                "load partition after slow-reader slots are reserved.");
+        }
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(tcpBootstrapUserId);
+        if (tcpBootstrapAuthentication)
+        {
+            var bootstrapIdentityCount = checked(tcpConnections - tcpSlowReaders);
+            _ = checked(tcpBootstrapUserId + bootstrapIdentityCount - 1L);
+        }
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(pipelineConcurrency);
         ArgumentOutOfRangeException.ThrowIfNegative(pipelineOperationsPerSecond);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(pipelinePayloadBytes);
@@ -343,6 +461,7 @@ internal sealed record BenchmarkOptions(
             gatewayCount,
             gatewayBasePort,
             realtimePort,
+            realtimeProcessingConcurrency,
             natsUrl,
             jetStreamReplicas,
             smokeNoopStorage,
@@ -354,14 +473,21 @@ internal sealed record BenchmarkOptions(
             TimeSpan.FromMilliseconds(sampleIntervalMs),
             tcpMode,
             tcpConnections,
+            tcpActiveSenders,
             tcpMessagesPerSecond,
+            TimeSpan.FromSeconds(tcpDeliveryDrainSeconds),
+            TimeSpan.FromSeconds(tcpInactiveHeartbeatSeconds),
+            tcpMinimumAcknowledgementRatio,
+            tcpMinimumDeliveryRatio,
             tcpPayloadBytes,
             tcpSlowReaders,
+            tcpConnectionsPerSecond,
             tcpSlowlorisPhase,
             tcpSlowlorisDelayMs,
             tcpInboundBudgetBytes,
-            tcpTokens,
+            distinctTcpTokens,
             tcpBootstrapAuthentication,
+            tcpCrossGateway,
             tcpBootstrapUserId,
             tcpTargetUserId,
             pipelineEnabled,
@@ -377,6 +503,93 @@ internal sealed record BenchmarkOptions(
             onDemandSendBurstLimit,
             reportDirectory,
             dockerContainers.Distinct(StringComparer.Ordinal).ToArray());
+    }
+
+    public int GetTcpConnections(int gatewayIndex) =>
+        Divide(TcpConnections, GatewayCount, gatewayIndex);
+
+    public int GetTcpSlowReaders(int gatewayIndex) =>
+        Divide(TcpSlowReaders, GatewayCount, gatewayIndex);
+
+    public int GetTcpBootstrapIdentityCount() =>
+        TcpConnections - TcpSlowReaders;
+
+    public int GetRealtimeProcessingQueueCapacity() =>
+        Math.Max(512, checked(RealtimeProcessingConcurrency * 32));
+
+    public int GetRealtimePrefetchMaxMessages() =>
+        Math.Max(16, checked(RealtimeProcessingConcurrency * 4));
+
+    public int GetRealtimeMaxAckPending() =>
+        Math.Max(256, checked(RealtimeProcessingConcurrency * 4));
+
+    public int GetEffectiveTcpActiveSenders() =>
+        TcpMode is "heartbeat" or "chat"
+            ? TcpActiveSenders == 0
+                ? TcpConnections - TcpSlowReaders
+                : TcpActiveSenders
+            : 0;
+
+    public int GetTcpActiveSenders(int gatewayIndex)
+    {
+        if (TcpMode is not ("heartbeat" or "chat"))
+            return 0;
+
+        var eligible = Enumerable.Range(0, GatewayCount)
+            .Select(index => GetTcpConnections(index) -
+                GetTcpSlowReaders(index))
+            .ToArray();
+        if (TcpActiveSenders == 0)
+            return eligible[gatewayIndex];
+
+        var allocated = new int[GatewayCount];
+        var remaining = TcpActiveSenders;
+        while (remaining > 0)
+        {
+            var madeProgress = false;
+            for (var index = 0; index < allocated.Length && remaining > 0; index++)
+            {
+                if (allocated[index] >= eligible[index])
+                    continue;
+                allocated[index]++;
+                remaining--;
+                madeProgress = true;
+            }
+
+            if (!madeProgress)
+                throw new InvalidOperationException("TCP active sender allocation exceeded eligible connections.");
+        }
+
+        return allocated[gatewayIndex];
+    }
+
+    /// <summary>
+    /// The CLI rate is global. Each child gets its deterministic share; zero
+    /// remains the explicit unlimited mode. A positive share is never emitted
+    /// as zero because the child interprets zero as unlimited.
+    /// </summary>
+    public int GetTcpConnectionsPerSecond(int gatewayIndex) =>
+        TcpConnectionsPerSecond == 0
+            ? 0
+            : Math.Max(1, Divide(TcpConnectionsPerSecond, GatewayCount, gatewayIndex));
+
+    public TimeSpan GetEstimatedTcpRamp() =>
+        TcpConnectionsPerSecond == 0
+            ? TimeSpan.Zero
+            : TimeSpan.FromSeconds(
+                Math.Ceiling(TcpConnections / (double)TcpConnectionsPerSecond));
+
+    public TimeSpan GetBootstrapTokenLifetime()
+    {
+        // Bootstrap happens before Gateway readiness. Include a complete
+        // startup budget, ramp, stabilization, measurement, and a one-hour
+        // operational buffer for slow CI/diagnostic hosts.
+        var seconds = StartupTimeout.TotalSeconds * (GatewayCount + 1)
+                      + GetEstimatedTcpRamp().TotalSeconds
+                      + Warmup.TotalSeconds
+                      + Duration.TotalSeconds
+                      + 3_600;
+        return TimeSpan.FromSeconds(Math.Ceiling(seconds));
     }
 
     private static string FindRepositoryRoot(string startDirectory)
@@ -415,6 +628,9 @@ internal sealed record BenchmarkOptions(
             throw new ArgumentOutOfRangeException(name, "Port must be between 1 and 65535.");
     }
 
+    private static int Divide(int total, int partitions, int index) =>
+        total / partitions + (index < total % partitions ? 1 : 0);
+
     private static string GetValue(string[] args, ref int index, string option)
     {
         index++;
@@ -432,6 +648,20 @@ internal sealed record BenchmarkOptions(
         long.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed)
             ? parsed
             : throw new ArgumentException($"{option} requires an integer.");
+
+    private static double ParsePositiveDouble(string value, string option) =>
+        double.TryParse(value, NumberStyles.AllowDecimalPoint, CultureInfo.InvariantCulture, out var parsed) &&
+        double.IsFinite(parsed) &&
+        parsed > 0d
+            ? parsed
+            : throw new ArgumentException($"{option} requires a positive finite number.");
+
+    private static double ParseRatio(string value, string option) =>
+        double.TryParse(value, NumberStyles.AllowDecimalPoint, CultureInfo.InvariantCulture, out var parsed) &&
+        double.IsFinite(parsed) &&
+        parsed is >= 0d and <= 1d
+            ? parsed
+            : throw new ArgumentException($"{option} requires a finite number between 0 and 1.");
 }
 
 internal sealed class HelpRequestedException : Exception;

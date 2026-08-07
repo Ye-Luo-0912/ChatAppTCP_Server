@@ -54,6 +54,7 @@ param(
     [ValidateSet('all','BoundedChannel','LazySegmented')] [string] $OutboundQueueMode = 'all',
     [ValidateRange(15, 7200)] [int] $DurationSeconds = 60,
     [ValidateRange(0, 3600)] [int] $WarmupSeconds = 10,
+    [ValidateRange(1, 100000)] [int] $TcpConnectionsPerSecond = 0,
     [string] $ReportDirectory,
     [switch] $SkipBuild
 )
@@ -115,7 +116,7 @@ $scenarioDefs = [ordered]@{
     }
     'conn-storm' = @{
         Connections = 1000; MessagesPerSecond = 1; PayloadBytes = 128
-        Mode = 'connection'; DurationOverride = 30
+        Mode = 'connection'; ConnectionsPerSecond = 200; DurationOverride = 30
     }
     'slowloris-header' = @{
         Connections = 500; MessagesPerSecond = 1; PayloadBytes = 128
@@ -206,6 +207,11 @@ foreach ($scn in $scenariosToRun) {
                 if ($def.ContainsKey('SlowReaders') -and $def.SlowReaders -gt 0) {
                     $arguments.TcpSlowReaders = $def.SlowReaders
                 }
+                if ($def.ContainsKey('ConnectionsPerSecond') -and $def.ConnectionsPerSecond -gt 0) {
+                    $arguments.TcpConnectionsPerSecond = $def.ConnectionsPerSecond
+                } elseif ($TcpConnectionsPerSecond -gt 0) {
+                    $arguments.TcpConnectionsPerSecond = $TcpConnectionsPerSecond
+                }
                 if ($def.ContainsKey('SlowlorisPhase')) {
                     $arguments.TcpSlowlorisPhase = $def.SlowlorisPhase
                     $arguments.TcpSlowlorisDelayMs = $def.SlowlorisDelayMs
@@ -253,12 +259,33 @@ foreach ($scn in $scenariosToRun) {
                     $outboxPending = Get-MetricSumByIdentifier $report.MetricsAfter 'realtime_outbox_pending'
                     $outboxLagSeconds = Get-MetricSumByIdentifier $report.MetricsAfter 'realtime_outbox_oldest_age_seconds'
 
+                    # R1：真实活跃连接数（网关 Prometheus gauge，二楼跨实例求和）。
+                    $activeConnections = Get-MetricSumByIdentifier $report.MetricsAfter 'gateway_connections_active'
+                    # R1：真实资源泄漏计数。
+                    #  Budget：出站预算拒绝（运行期增量，应为 0）。
+                    #  Frame：出站队列滞留帧（结束快照，应为 0）。
+                    #  Segment：出站/入站打包滞留字节（结束快照，应为 0）。
+                    $budgetRejected = Get-MetricSumByIdentifier $report.MetricDeltas 'gateway_outbound_rejected_global_budget'
+                    $outboundCommittedBytes = Get-MetricSumByIdentifier $report.MetricsAfter 'gateway_outbound_committed_bytes'
+                    $inboundCommittedBytes = Get-MetricSumByIdentifier $report.MetricsAfter 'gateway_inbound_committed_bytes'
+
                     $bytesPerConn = 0.0
                     $connCount = [long](($tcpLoads | Measure-Object Succeeded -Sum).Sum)
                     $maxWs = [long](($gateways | Measure-Object MaximumWorkingSetBytes -Sum).Sum)
                     if ($connCount -gt 0 -and $maxWs -gt 0) {
                         $bytesPerConn = $maxWs / $connCount
                     }
+
+                    # R1：消息成功数独立于连接数（避免混用）。
+                    $messagesAcknowledged = [long](($tcpLoads | Measure-Object MessagesAcknowledged -Sum).Sum)
+                    $messagesRejected = [long](($tcpLoads | Measure-Object MessagesRejected -Sum).Sum)
+                    $messagesSent = [long](($tcpLoads | Measure-Object MessagesSent -Sum).Sum)
+                    $peakActiveConnections = [long](($tcpLoads | Measure-Object PeakActiveConnections -Sum).Sum)
+                    # R1：健康/慢连接分桶延迟（取最大 p95 作为最差情况）。
+                    $healthyP95 = [double](($tcpLoads | Measure-Object HealthyP95Milliseconds -Maximum).Maximum)
+                    $slowP95 = [double](($tcpLoads | Measure-Object SlowP95Milliseconds -Maximum).Maximum)
+                    $expectedConnections = [long]$def.Connections
+                    $activeRatio = if ($expectedConnections -gt 0) { 100.0 * $activeConnections / $expectedConnections } else { 0.0 }
 
                     $results.Add([pscustomobject]@{
                         Scenario = $scn
@@ -269,9 +296,17 @@ foreach ($scn in $scenariosToRun) {
                         Passed = [bool]$report.Succeeded -and $runnerExitCode -eq 0
                         SuccessfulConnections = $connCount
                         FailedConnections = [long](($tcpLoads | Measure-Object Failed -Sum).Sum)
+                        ActiveConnectionCount = $activeConnections
+                        ActiveConnectionRatio = $activeRatio
+                        PeakActiveConnections = $peakActiveConnections
                         ThroughputPerSecond = [double](($tcpLoads | Measure-Object ThroughputPerSecond -Sum).Sum)
                         P95Milliseconds = [double](($tcpLoads | Measure-Object P95Milliseconds -Maximum).Maximum)
                         P99Milliseconds = [double](($tcpLoads | Measure-Object P99Milliseconds -Maximum).Maximum)
+                        HealthyP95Milliseconds = $healthyP95
+                        SlowP95Milliseconds = $slowP95
+                        MessagesSent = $messagesSent
+                        MessagesAcknowledged = $messagesAcknowledged
+                        MessagesRejected = $messagesRejected
                         GatewayAverageCpuPercent = [double](($gateways | Measure-Object AverageCpuPercent -Sum).Sum)
                         GatewayMaximumWorkingSetBytes = $maxWs
                         BytesPerConnection = $bytesPerConn
@@ -283,6 +318,9 @@ foreach ($scn in $scenariosToRun) {
                         ActorProcessed = $actorProcessed
                         OutboxPending = $outboxPending
                         OutboxLagSeconds = $outboxLagSeconds
+                        BudgetRejected = $budgetRejected
+                        OutboundCommittedBytes = $outboundCommittedBytes
+                        InboundCommittedBytes = $inboundCommittedBytes
                         Report = $reportFile.FullName
                         Errors = @($report.Errors)
                     })
@@ -298,9 +336,17 @@ foreach ($scn in $scenariosToRun) {
                         Passed = $false
                         SuccessfulConnections = 0
                         FailedConnections = 0
+                        ActiveConnectionCount = 0
+                        ActiveConnectionRatio = 0
+                        PeakActiveConnections = 0
                         ThroughputPerSecond = 0
                         P95Milliseconds = 0
                         P99Milliseconds = 0
+                        HealthyP95Milliseconds = 0
+                        SlowP95Milliseconds = 0
+                        MessagesSent = 0
+                        MessagesAcknowledged = 0
+                        MessagesRejected = 0
                         GatewayAverageCpuPercent = 0
                         GatewayMaximumWorkingSetBytes = 0
                         BytesPerConnection = 0
@@ -312,6 +358,9 @@ foreach ($scn in $scenariosToRun) {
                         ActorProcessed = 0
                         OutboxPending = 0
                         OutboxLagSeconds = 0
+                        BudgetRejected = 0
+                        OutboundCommittedBytes = 0
+                        InboundCommittedBytes = 0
                         Report = $null
                         Errors = @($_.ToString())
                     })
@@ -354,16 +403,19 @@ foreach ($scn in $scenariosToRun) {
 
     $lines.Add("## Scenario: $scn")
     $lines.Add('')
-    $lines.Add('| Inbound + Send + Queue | Passed | Conns | Failed | Thr/s | p95 ms | p99 ms | Queue Depth | Actor Act/Busy | Actor Proc | Outbox Pending | Outbox Lag s |')
-    $lines.Add('|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|')
+    $lines.Add('| Inbound + Send + Queue | Passed | Conns | Active | Act % | Failed | Msg A/C | Thr/s | p95 ms | p99 ms | Hp95 | Sp95 | Queue | Actor | Outbox | Outbox Lag s |')
+    $lines.Add('|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|')
     foreach ($r in $scnResults) {
         $lines.Add([string]::Format(
             [Globalization.CultureInfo]::InvariantCulture,
-            '| {0} | {1} | {2} | {3} | {4:F2} | {5:F2} | {6:F2} | {7:F0} | {8:F0}/{9:F0} | {10:F0} | {11:F0} | {12:F1} |',
-            $r.Combo, $r.Passed, $r.SuccessfulConnections, $r.FailedConnections,
+            '| {0} | {1} | {2} | {3:F0} | {4:F1}% | {5} | {6} | {7:F2} | {8:F2} | {9:F2} | {10:F2} | {11:F2} | {12:F0} | {13:F0}/{14:F0} | {15:F0} | {16:F1} |',
+            $r.Combo, $r.Passed, $r.SuccessfulConnections, $r.ActiveConnectionCount,
+            $r.ActiveConnectionRatio, $r.FailedConnections,
+            "$($r.MessagesAcknowledged)/$($r.MessagesRejected)",
             $r.ThroughputPerSecond, $r.P95Milliseconds, $r.P99Milliseconds,
+            $r.HealthyP95Milliseconds, $r.SlowP95Milliseconds,
             $r.OutboundQueueDepth, $r.ActorActive, $r.ActorBusy,
-            $r.ActorProcessed, $r.OutboxPending, $r.OutboxLagSeconds))
+            $r.OutboxPending, $r.OutboxLagSeconds))
     }
     $lines.Add('')
 }
@@ -390,16 +442,20 @@ $lines.Add('> Working Set 明显下降 · alloc/sec 不升高 · p99 不恶化�
 $lines.Add('')
 $lines.Add('判定规则：')
 $lines.Add('- 0 correctness failures：FailedConnections == 0 且无运行错误。')
-$lines.Add('- 0 budget leaks / 0 stranded frames / 0 unbounded collections：需由运行器上报泄漏与滞留帧计数（当前报告聚合到 Errors）。')
+$lines.Add('- 0 budget leaks：BudgetRejected（gateway.outbound.rejected.global_budget 运行期增量）== 0。')
+$lines.Add('- 0 stranded frames / 0 unbounded collections：OutboundQueueDepth == 0 且 OutboundCommittedBytes == 0 且 InboundCommittedBytes == 0（结束快照）。')
 $lines.Add('- p99 不恶化超过 5%：(candidate.p99 - baseline.p99) / baseline.p99 <= 5%。')
-$lines.Add('- Working Set 明显下降：candidate.WS < baseline.WS。')
+$lines.Add('- Working Set 明显下降：candidate.WS < baseline.WS（wsOk 纳入 eligibility）。')
 $lines.Add('- alloc/sec 不升高：candidate.AllocatedBytes <= baseline.AllocatedBytes。')
-$lines.Add('- 慢消费者不影响健康连接：slow-consumer 场景下健康连接延迟不劣化（需按连接分桶统计）。')
+$lines.Add('- 慢消费者不影响健康连接：slow-consumer 场景下健康连接延迟不劣化（按连接分桶统计，Hp95）。')
 $lines.Add('- 队列有界：结束快照 Queue Depth 应接近 0（表示已排空）；若持续高位说明存在未排空/滞留帧。')
 $lines.Add('- Actor 稳定：Actor Active/Busy 结束快照应回到基线水平，Actor Proc 为运行期增量（churn 无异常放大）。')
 $lines.Add('- Outbox 收敛：Outbox Pending 结束快照应接近 0，Outbox Lag 应不随时间增长（体现后端消费健康）。')
 $lines.Add('')
+$lines.Add('> 上述 Queue/Actor/Outbox/泄漏门禁均参与判定：任一候选不满足即令整体退出码非 0。')
+$lines.Add('')
 
+$gateViolations = [Collections.Generic.List[string]]::new()
 foreach ($scn in $scenariosToRun) {
     $checkResults = @($results | Where-Object { $_.Scenario -eq $scn })
     if ($checkResults.Count -eq 0) { continue }
@@ -409,12 +465,20 @@ foreach ($scn in $scenariosToRun) {
 
     $lines.Add("### Scenario: $scn")
     $lines.Add('')
-    $lines.Add('| Combo | 0 correctness | 0 leaks | 0 stranded | p99 Δ | WS Δ | alloc Δ | Switch-eligible |')
-    $lines.Add('|---|---|---|---:|---:|---:|---:|')
+    $lines.Add('| Combo | 0 correctness | 0 leaks | 0 stranded | Queue | Actor | Outbox | p99 Δ | WS Δ | alloc Δ | Switch-eligible |')
+    $lines.Add('|---|---|---|---|---|---|---:|---:|---:|---:|')
     foreach ($candidate in $candidates) {
         $correctness = $candidate.SuccessfulConnections -gt 0 -and $candidate.FailedConnections -eq 0 -and $candidate.Errors.Count -eq 0
-        $noLeaks = $candidate.Errors.Count -eq 0
-        $noStranded = $true  # 运行器需上报滞留帧计数；当前聚合到 Errors
+        # 真实泄漏计数：预算拒绝（运行期增量）应为 0。
+        $noLeaks = $candidate.BudgetRejected -eq 0
+        # 真实滞留：出站队列滞留帧 + 出站/入站打包滞留字节均为 0。
+        $noStranded = $candidate.OutboundQueueDepth -le 0 -and
+                      $candidate.OutboundCommittedBytes -le 0 -and
+                      $candidate.InboundCommittedBytes -le 0
+        # 队列/门禁：Outbox 收敛。
+        $queueOk = $candidate.OutboundQueueDepth -le 0
+        $actorOk = $candidate.ActorActive -le 0 -and $candidate.ActorBusy -le 0
+        $outboxOk = $candidate.OutboxPending -le 0 -and $candidate.OutboxLagSeconds -le 1.0
 
         $p99Delta = 0.0; $wsDelta = 0.0; $allocDelta = 0.0
         if ($null -ne $base -and $base.P99Milliseconds -gt 0) {
@@ -430,12 +494,20 @@ foreach ($scn in $scenariosToRun) {
         $p99Ok = $p99Delta -le 5.0
         $wsOk = $wsDelta -lt 0.0
         $allocOk = $allocDelta -le 0.0
-        $eligible = $correctness -and $noLeaks -and $noStranded -and $p99Ok -and $allocOk
+        # wsOk 纳入 eligibility；Queue/Actor/Outbox 门禁也参与判定。
+        $eligible = $correctness -and $noLeaks -and $noStranded -and
+                    $p99Ok -and $wsOk -and $allocOk -and
+                    $queueOk -and $actorOk -and $outboxOk
+
+        if (-not $eligible) {
+            $gateViolations.Add("$scn/$($candidate.Combo): el=$eligible corr=$correctness leaks=$noLeaks stranded=$noStranded queue=$queueOk actor=$actorOk outbox=$outboxOk p99=$p99Ok ws=$wsOk alloc=$allocOk")
+        }
 
         $lines.Add([string]::Format(
             [Globalization.CultureInfo]::InvariantCulture,
-            '| {0} | {1} | {2} | {3} | {4:F1}% | {5:F1}% | {6:F1}% | {7} |',
+            '| {0} | {1} | {2} | {3} | {4} | {5} | {6} | {7:F1}% | {8:F1}% | {9:F1}% | {10} |',
             $candidate.Combo, $correctness, $noLeaks, $noStranded,
+            $queueOk, $actorOk, $outboxOk,
             $p99Delta, $wsDelta, $allocDelta, $eligible))
     }
     $lines.Add('')

@@ -44,10 +44,22 @@ internal sealed class ResourceSampler
             .Select(static accumulator => accumulator.CreateSummary())
             .ToArray();
 
+    public IReadOnlyList<ProcessTimeline> GetProcessTimelines() =>
+        _processes.Values
+            .OrderBy(static accumulator => accumulator.Label, StringComparer.Ordinal)
+            .Select(static accumulator => accumulator.CreateTimeline())
+            .ToArray();
+
     public IReadOnlyList<DockerResourceSummary> GetDockerSummaries() =>
         _containers.Values
             .OrderBy(static accumulator => accumulator.Name, StringComparer.Ordinal)
             .Select(static accumulator => accumulator.CreateSummary())
+            .ToArray();
+
+    public IReadOnlyList<DockerTimeline> GetDockerTimelines() =>
+        _containers.Values
+            .OrderBy(static accumulator => accumulator.Name, StringComparer.Ordinal)
+            .Select(static accumulator => accumulator.CreateTimeline())
             .ToArray();
 
     private void SampleProcesses()
@@ -184,6 +196,7 @@ internal sealed class ResourceSampler
     {
         private long _lastTimestamp;
         private TimeSpan _lastCpu;
+        private double _totalCpuSeconds;
         private int _samples;
         private int _cpuSamples;
         private double _cpuSum;
@@ -200,7 +213,14 @@ internal sealed class ResourceSampler
         private long _privateMemoryMax;
         private int _threadMax;
         private int _handleMax;
-        private double _totalCpuSeconds;
+        // item 八：Linux /proc 与 cgroup-v2 内存压力信号（best-effort）。
+        private long _vmHwmMax;
+        private long _vmRssMax;
+        private long _cgroupMemoryCurrentMax;
+        private long _cgroupMemoryPeakMax;
+        private long _cgroupOomEvents;
+        private long _cgroupOomKillEvents;
+        private readonly List<(long TimestampTicks, long WorkingSetBytes)> _samplesTimeline = [];
 
         public string Label { get; } = label;
 
@@ -242,6 +262,7 @@ internal sealed class ResourceSampler
             _workingSetMin = Math.Min(_workingSetMin, workingSet);
             _workingSetSum += workingSet;
             _workingSetMax = Math.Max(_workingSetMax, workingSet);
+            _samplesTimeline.Add((now, workingSet));
             _privateMemoryLast = privateMemory;
             _privateMemoryMin = Math.Min(_privateMemoryMin, privateMemory);
             _privateMemorySum += privateMemory;
@@ -254,6 +275,24 @@ internal sealed class ResourceSampler
             catch (PlatformNotSupportedException)
             {
             }
+
+            // item 八：合并 Linux /proc + cgroup 内存压力信号（非 Linux 上为 null）。
+            if (LinuxProcessMetrics.SampleBestEffort(process.Id) is { } linux)
+            {
+                if (linux.VmHwmBytes is { } vmHwm)
+                    _vmHwmMax = Math.Max(_vmHwmMax, vmHwm);
+                if (linux.VmRssBytes is { } vmRss)
+                    _vmRssMax = Math.Max(_vmRssMax, vmRss);
+                if (linux.CgroupMemoryCurrentBytes is { } cgroupCurrent)
+                    _cgroupMemoryCurrentMax = Math.Max(_cgroupMemoryCurrentMax, cgroupCurrent);
+                if (linux.CgroupMemoryPeakBytes is { } cgroupPeak)
+                    _cgroupMemoryPeakMax = Math.Max(_cgroupMemoryPeakMax, cgroupPeak);
+                if (linux.CgroupOomEvents is { } oomEvents)
+                    _cgroupOomEvents = Math.Max(_cgroupOomEvents, oomEvents);
+                if (linux.CgroupOomKillEvents is { } oomKillEvents)
+                    _cgroupOomKillEvents = Math.Max(_cgroupOomKillEvents, oomKillEvents);
+            }
+
             _samples++;
         }
 
@@ -276,8 +315,20 @@ internal sealed class ResourceSampler
             AveragePrivateMemoryBytes = _samples == 0 ? 0 : _privateMemorySum / _samples,
             MaximumPrivateMemoryBytes = _privateMemoryMax,
             MaximumThreadCount = _threadMax,
-            MaximumHandleCount = _handleMax
+            MaximumHandleCount = _handleMax,
+            // item 八：Linux /proc 与 cgroup-v2 内存压力信号（0 = 不可用）。
+            MaximumVmRssBytes = _vmRssMax,
+            MaximumVmHwmBytes = _vmHwmMax,
+            MaximumCgroupMemoryCurrentBytes = _cgroupMemoryCurrentMax,
+            MaximumCgroupMemoryPeakBytes = _cgroupMemoryPeakMax,
+            CgroupOomEvents = _cgroupOomEvents,
+            CgroupOomKillEvents = _cgroupOomKillEvents
         };
+
+        public ProcessTimeline CreateTimeline() => new(
+            Label,
+            process.Id,
+            _samplesTimeline.ToArray());
     }
 
     private sealed class DockerAccumulator(string name)
@@ -292,11 +343,13 @@ internal sealed class ResourceSampler
         private long _memoryMax;
         private string? _lastNetworkIo;
         private string? _lastBlockIo;
+        private readonly List<long> _sampleTimestamps = [];
 
         public string Name { get; } = name;
 
         public void Sample(double cpu, long memory, string? networkIo, string? blockIo)
         {
+            _sampleTimestamps.Add(Stopwatch.GetTimestamp());
             if (_samples == 0)
                 _memoryFirst = memory;
             _samples++;
@@ -324,5 +377,9 @@ internal sealed class ResourceSampler
             LastNetworkIo = _lastNetworkIo,
             LastBlockIo = _lastBlockIo
         };
+
+        public DockerTimeline CreateTimeline() => new(
+            Name,
+            _sampleTimestamps.ToArray());
     }
 }

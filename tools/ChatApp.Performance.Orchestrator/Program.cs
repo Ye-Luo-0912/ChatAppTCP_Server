@@ -31,6 +31,7 @@ var result = await new BenchmarkRunner(options)
     .ConfigureAwait(false);
 var paths = BenchmarkReportWriter.Write(
     result.Report,
+    result.ProcessTimelines,
     result.SessionDirectory);
 
 Console.WriteLine($"Result: {(result.Report.Succeeded ? "PASSED" : "FAILED")}");

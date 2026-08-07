@@ -13,12 +13,13 @@ namespace ChatApp.TcpGateway.Tests.Architecture;
 public sealed class ProjectDependencyBoundaryTests
 {
     /// <summary>
-    /// Core 层只能依赖 BCL。禁止引用 Logging / Redis / Hosting / Gateway / Infrastructure / Observability。
+    /// Core 层只能依赖 BCL 与版本化共享契约包。
+    /// 禁止引用 Logging / Redis / Hosting / Gateway / Infrastructure / Observability。
     /// </summary>
     [Fact]
     public void Core_Assembly_DoesNot_Reference_Forbidden_Assemblies()
     {
-        var coreAssembly = typeof(AttachmentRef).Assembly;
+        var coreAssembly = typeof(ChatMessage).Assembly;
         var forbidden = new HashSet<string>(StringComparer.Ordinal)
         {
             "Microsoft.Extensions.Logging",
@@ -41,8 +42,8 @@ public sealed class ProjectDependencyBoundaryTests
     }
 
     /// <summary>
-    /// Observability 层不得引用 Gateway / Infrastructure 业务类型。
-    /// 允许：BCL、Logging 抽象、Metrics 抽象。
+    /// Observability 层不得引用 Core / Gateway / Infrastructure 业务类型。
+    /// 允许：BCL、Logging 抽象、Metrics 抽象和版本化协议包。
     /// </summary>
     [Fact]
     public void Observability_Assembly_DoesNot_Reference_Gateway_Or_Infrastructure()
@@ -50,6 +51,7 @@ public sealed class ProjectDependencyBoundaryTests
         var observabilityAssembly = typeof(GatewayMetrics).Assembly;
         var forbidden = new HashSet<string>(StringComparer.Ordinal)
         {
+            "ChatApp.TcpGateway.Core",
             "ChatApp.TcpGateway.Gateway",
             "ChatApp.TcpGateway.Infrastructure",
         };

@@ -481,8 +481,13 @@ public sealed class ActorRuntimeTests
 
         // Completion Ring 容量派生自 MaxActiveActorsPerShard（≥100 槽）；
         // 停止前未消费的 Completion 必须在 StopAsync 中以 RuntimeStopping 释放。
+        //
+        // 生产契约：每个 Completion 在提交异步 Operation 时预留 Credit（Ring 槽也随之预留）。
+        // 此测试绕过行为层直接回投 Completion，故先为每个 Key 显式预留 Credit，
+        // 才能在 Stop 时释放，避免 "Completion credit released more than reserved"。
         for (var i = 0; i < 100; i++)
         {
+            Assert.True(runtime.TryReserveCompletionCreditForTest(i));
             var message = new AtomicCountMessage();
             Assert.Equal(
                 ActorPostStatus.Accepted,

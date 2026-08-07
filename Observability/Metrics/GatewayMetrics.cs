@@ -1,6 +1,4 @@
 using System.Diagnostics.Metrics;
-using ChatApp.TcpGateway.Core.Authentication;
-using ChatApp.TcpGateway.Core.Protocol;
 using ChatApp.TcpGateway.Observability.Logging;
 
 namespace ChatApp.TcpGateway.Observability.Metrics;
@@ -303,12 +301,25 @@ public sealed partial class GatewayMetrics : IDisposable
 
     public void ProtocolError() => _protocolErrors.Add(1);
 
-    public void AuthenticationFailed(AuthenticationFailureKind kind) =>
+    public void AuthenticationInvalidCredentials() =>
+        AuthenticationFailed("invalid_credentials");
+
+    public void AuthenticationDeviceMismatch() =>
+        AuthenticationFailed("device_mismatch");
+
+    public void AuthenticationDependencyUnavailable() =>
+        AuthenticationFailed("dependency_unavailable");
+
+    public void AuthenticationUserFrozen() =>
+        AuthenticationFailed("user_frozen");
+
+    public void AuthenticationFailureUnknown() =>
+        AuthenticationFailed("unknown");
+
+    private void AuthenticationFailed(string kind) =>
         _authenticationFailures.Add(
             1,
-            new KeyValuePair<string, object?>(
-                "failure.kind",
-                GetFailureKindName(kind)));
+            new KeyValuePair<string, object?>("failure.kind", kind));
 
     // Resume 路径可观测性：每次 TryResumeAsync 调用 +1；
     // 成功/失败分别计数；失败按 reason 分组（invalid_token/redis_failure/circuit_open/lease_mismatch）。
@@ -555,17 +566,6 @@ public sealed partial class GatewayMetrics : IDisposable
     /// </summary>
     public void HeartbeatFullCycleCompleted(TimeSpan duration) =>
         _heartbeatFullCycleDuration.Record(duration.TotalMilliseconds);
-
-    private static string GetFailureKindName(AuthenticationFailureKind kind) =>
-        kind switch
-        {
-            AuthenticationFailureKind.InvalidCredentials => "invalid_credentials",
-            AuthenticationFailureKind.DeviceMismatch => "device_mismatch",
-            AuthenticationFailureKind.DependencyUnavailable => "dependency_unavailable",
-            AuthenticationFailureKind.UserFrozen => "user_frozen",
-            AuthenticationFailureKind.None => "none",
-            _ => "unknown"
-        };
 
     private static string GetRejectReasonName(RealtimeRejectReason reason) =>
         reason switch

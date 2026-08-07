@@ -1,22 +1,36 @@
 using System.Text.Json;
-using ChatApp.TcpGateway.Infrastructure.Authentication.Models;
+using ChatApp.Auth.Contracts;
 using ChatApp.TcpGateway.Infrastructure.Caching;
-using ChatApp.TcpGateway.Infrastructure.Serialization.Json;
 using ChatApp.TcpGateway.Observability.Logging;
 using Microsoft.Extensions.Logging;
 using StackExchange.Redis;
 
 namespace ChatApp.TcpGateway.Infrastructure.Authentication;
 
-internal sealed class RedisAccessTokenStore(
-    RedisConnectionProvider connectionProvider,
-    ILogger<RedisAccessTokenStore> logger)
-    : IAccessTokenStore
+internal sealed class RedisAccessTokenStore : IAccessTokenStore
 {
-    private const string ValueField = "value";
     private const string NullValueMarker = "__NULL__";
+    private readonly Func<IDatabase> _databaseAccessor;
+    private readonly ILogger<RedisAccessTokenStore> _logger;
 
-    public async ValueTask<AccessTokenRecord?> FindAsync(
+    public RedisAccessTokenStore(
+        RedisConnectionProvider connectionProvider,
+        ILogger<RedisAccessTokenStore> logger)
+        : this(() => connectionProvider.Database, logger)
+    {
+    }
+
+    internal RedisAccessTokenStore(
+        Func<IDatabase> databaseAccessor,
+        ILogger<RedisAccessTokenStore> logger)
+    {
+        ArgumentNullException.ThrowIfNull(databaseAccessor);
+        ArgumentNullException.ThrowIfNull(logger);
+        _databaseAccessor = databaseAccessor;
+        _logger = logger;
+    }
+
+    public async ValueTask<AccessTokenCacheRecord?> FindAsync(
         string accessToken,
         CancellationToken cancellationToken)
     {
@@ -25,14 +39,14 @@ internal sealed class RedisAccessTokenStore(
         RedisValue value;
         try
         {
-            value = await connectionProvider.Database
-                .HashGetAsync(key, ValueField)
+            value = await _databaseAccessor()
+                .StringGetAsync(key)
                 .WaitAsync(cancellationToken)
                 .ConfigureAwait(false);
         }
         catch (RedisException exception)
         {
-            logger.DependencyUnavailable(
+            _logger.DependencyUnavailable(
                 GatewayDependency.Redis,
                 GatewayDependencyOperation.AccessTokenLookup,
                 exception);
@@ -56,7 +70,7 @@ internal sealed class RedisAccessTokenStore(
 
             var record = JsonSerializer.Deserialize(
                 utf8,
-                GatewayJsonSerializerContext.Default.AccessTokenRecord);
+                AuthContractsJsonSerializerContext.Default.AccessTokenCacheRecord);
 
             if (record is null)
             {
@@ -68,7 +82,7 @@ internal sealed class RedisAccessTokenStore(
         }
         catch (JsonException exception)
         {
-            logger.DependencyDataInvalid(
+            _logger.DependencyDataInvalid(
                 GatewayDependency.Redis,
                 GatewayDependencyOperation.AccessTokenLookup,
                 exception);

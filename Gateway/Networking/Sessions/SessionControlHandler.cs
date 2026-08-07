@@ -2,6 +2,7 @@ using System.Buffers;
 using System.Net.Sockets;
 using ChatApp.Realtime.Abstractions.Events;
 using ChatApp.Realtime.Integration;
+using ChatApp.Shared.Protocol.Tcp;
 using ChatApp.TcpGateway.Core.Authentication;
 using ChatApp.TcpGateway.Core.Messaging;
 using ChatApp.TcpGateway.Core.Protocol;
@@ -425,7 +426,24 @@ internal sealed class SessionControlHandler
         string message,
         AuthenticationFailureKind failureKind)
     {
-        _metrics.AuthenticationFailed(failureKind);
+        switch (failureKind)
+        {
+            case AuthenticationFailureKind.InvalidCredentials:
+                _metrics.AuthenticationInvalidCredentials();
+                break;
+            case AuthenticationFailureKind.DeviceMismatch:
+                _metrics.AuthenticationDeviceMismatch();
+                break;
+            case AuthenticationFailureKind.DependencyUnavailable:
+                _metrics.AuthenticationDependencyUnavailable();
+                break;
+            case AuthenticationFailureKind.UserFrozen:
+                _metrics.AuthenticationUserFrozen();
+                break;
+            default:
+                _metrics.AuthenticationFailureUnknown();
+                break;
+        }
 
         var response = new AuthenticationResponse
         {

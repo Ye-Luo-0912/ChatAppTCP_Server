@@ -210,49 +210,45 @@ internal sealed class LazySegmentedOutboundQueue : IOutboundQueue, IValueTaskSou
         if (Volatile.Read(ref _completed) != 0)
             return new ValueTask<bool>(false);
 
-        // 注册等待方：先 Reset 信号再标记 _hasWaiter=1。SignalWaiter 的 SetResult 仅在
-        // Exchange(_hasWaiter,0)==1（即 _hasWaiter==1）时发生，故 SetResult 一定晚于 Reset，
-        // 避免生产者在 _signal 仍处于 Complete 状态时 SetResult 抛 InvalidOperationException。
-        // Reset 与 _hasWaiter=1 之间生产者的 SignalWaiter 因 Exchange 不命中而跳过 SetResult，
-        // 由下方注册后重检（TryPeek / _completed）兜底，不丢失唤醒。
+        // 先 Reset，再注册取消，最后发布 waiter。取消注册必须先于 waiter 可见：这样任一
+        // SignalWaiter/取消回调一旦认领 waiter，GetResult 都能可靠释放对应 registration。
+        // token 若已取消，UnsafeRegister 的同步回调此时因 waiter 尚未发布而不会认领；
+        // 发布后显式重检 IsCancellationRequested 即可补上该唤醒，不会丢失取消。
         _signal.Reset();
-        Volatile.Write(ref _hasWaiter, 1);
-
-        // 注册后重检：catch 生产者在 fast-path 与 _hasWaiter=1 之间的入队（丢失唤醒修复）。
-        if (TryPeek(out _))
-        {
-            Volatile.Write(ref _hasWaiter, 0);
-            return new ValueTask<bool>(true);
-        }
-        if (Volatile.Read(ref _completed) != 0)
-        {
-            Volatile.Write(ref _hasWaiter, 0);
-            return new ValueTask<bool>(false);
-        }
-
-        // 注册取消回调（可与 TryComplete 竞争，Exchange 保证仅一方 SetResult/SetException）。
-        // 若 token 已取消，UnsafeRegister 同步触发回调 → SetException，下方返回的 ValueTask 即已完成。
         _registeredToken = cancellationToken;
-        if (cancellationToken.CanBeCanceled)
-        {
-            _registration = cancellationToken.UnsafeRegister(
+        _registration = cancellationToken.CanBeCanceled
+            ? cancellationToken.UnsafeRegister(
                 static state =>
                 {
                     var q = (LazySegmentedOutboundQueue)state!;
-                    if (Interlocked.Exchange(ref q._hasWaiter, 0) == 1)
-                    {
-                        q._signal.SetException(
-                            new OperationCanceledException(q._registeredToken));
-                    }
+                    q.TryCancelWaiter();
                 },
-                this);
+                this)
+            : default;
+        Volatile.Write(ref _hasWaiter, 1);
+
+        // 发布后按取消、可读、完成的顺序重检。重检只能通过 CAS 撤销自己仍拥有的 waiter。
+        // 若 CAS 失败，说明 SignalWaiter/取消回调已认领本代信号；此时必须返回 MRVTSC-backed
+        // ValueTask 等待认领方完成，不能同步返回并 Reset 下一代，否则旧认领方会完成新版本。
+        if (cancellationToken.IsCancellationRequested)
+            TryCancelWaiter();
+
+        if (TryPeek(out _) && TryWithdrawWaiter())
+        {
+            DisposeCancellationRegistration();
+            return new ValueTask<bool>(true);
+        }
+        if (Volatile.Read(ref _completed) != 0 && TryWithdrawWaiter())
+        {
+            DisposeCancellationRegistration();
+            return new ValueTask<bool>(false);
         }
 
         return new ValueTask<bool>(this, _signal.Version);
     }
 
     /// <summary>
-    /// 唤醒等待方。仅首个 Exchange 命中者实际 SetResult，防止重复完成 MRVTSC。
+    /// 唤醒等待方。仅成功 CAS 认领当前 waiter 的线程实际 SetResult。
     /// <para>
     /// 始终 SetResult(true)：生产者线程不可触碰 <see cref="_tail"/>（单消费者不变量），
     /// 因此不能调用 <see cref="TryPeek"/> 判断是否有可读项。消费者被唤醒后通过自身的
@@ -262,10 +258,34 @@ internal sealed class LazySegmentedOutboundQueue : IOutboundQueue, IValueTaskSou
     /// </summary>
     private void SignalWaiter()
     {
-        if (Interlocked.Exchange(ref _hasWaiter, 0) != 1)
+        if (Interlocked.CompareExchange(ref _hasWaiter, 0, 1) != 1)
             return;
 
         _signal.SetResult(true);
+    }
+
+    /// <summary>
+    /// 取消当前 waiter。与入队/完成信号竞争同一个 CAS 线性化点，只有胜者完成 MRVTSC。
+    /// </summary>
+    private void TryCancelWaiter()
+    {
+        if (Interlocked.CompareExchange(ref _hasWaiter, 0, 1) != 1)
+            return;
+
+        _signal.SetException(new OperationCanceledException(_registeredToken));
+    }
+
+    /// <summary>
+    /// 注册线程在发布后重检命中时撤销 waiter。失败表示另一个线程已认领本代信号，
+    /// 调用方必须返回 MRVTSC-backed ValueTask，等待认领方完成。
+    /// </summary>
+    private bool TryWithdrawWaiter() =>
+        Interlocked.CompareExchange(ref _hasWaiter, 0, 1) == 1;
+
+    private void DisposeCancellationRegistration()
+    {
+        _registration.Dispose();
+        _registration = default;
     }
 
     /// <summary>
@@ -314,11 +334,15 @@ internal sealed class LazySegmentedOutboundQueue : IOutboundQueue, IValueTaskSou
 
     bool IValueTaskSource<bool>.GetResult(short token)
     {
-        var result = _signal.GetResult(token);
-        // 清理取消注册（无论正常完成还是取消）：防止回调泄漏。
-        _registration.Dispose();
-        _registration = default;
-        return result;
+        try
+        {
+            return _signal.GetResult(token);
+        }
+        finally
+        {
+            // 正常完成与取消异常都必须释放注册，防止 callback/queue 引用泄漏。
+            DisposeCancellationRegistration();
+        }
     }
 
     /// <summary>

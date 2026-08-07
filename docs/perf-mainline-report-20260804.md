@@ -66,12 +66,16 @@
 
 **结论**: 在 50 连接 / 500 msg/s 规模下，两种 Send Mode 性能无显著差异，均无内存泄漏迹象。
 
-### 3.2 8 小时 Linux Soak 测试
+### 3.2 8 小时 Linux Soak 测试（历史基线 · 2026-07-21）
+
+> ⚠️ **历史数据标记**：本小节为 **2026-07-21** 的历史基线记录，仅用于追溯。
+> 其内存判定方法（首值→末值、聚合结论）已被后续报告脚本取代，**不作为当前稳定性结论**。
+> 当前门禁采用：排除 Warmup 后建基线 + 最终窗口斜率 + 分位中位数 + 每进程单独判定（见 `Run-Soak.ps1`）。
 
 - 日期: 2026-07-21
 - 配置: 2 Gateway, 1000 TCP 连接 (500/GW), Pipeline 32 并发, 8h (28800s)
 - 环境: CachyOS, .NET 10.0.10, 12 核, 16 GB RAM
-- 结果: **PASSED，0 错误**
+- 结果: **PASSED，0 错误**（正确性门禁通过；内存稳定性按旧口径标记，见下方修正）
 
 | 指标 | 值 |
 |------|------|
@@ -81,13 +85,20 @@
 | Pipeline 吞吐/s | 79.98 |
 | Pipeline p50 / p95 / p99 | 68.5 / 200.5 / 270.0 ms |
 
-**内存稳定性（8h Working Set）:**
+**内存稳定性（8h Working Set，首值→末值口径）:**
 
-| 进程 | Start WS | End WS | 增量 | Max WS |
-|------|---------:|-------:|-----:|-------:|
-| gateway-1 | 77.63 MiB | 112.52 MiB | +34.89 MiB | 136.12 MiB |
-| gateway-2 | 77.59 MiB | 115.94 MiB | +38.35 MiB | 134.51 MiB |
-| realtime-1 | 118.67 MiB | 203.41 MiB | +84.74 MiB | 211.07 MiB |
+| 进程 | Start WS | End WS | 增量 | 增占比 | Max WS |
+|------|---------:|-------:|-----:|-------:|-------:|
+| gateway-1 | 77.63 MiB | 112.52 MiB | +34.89 MiB | +44.9% | 136.12 MiB |
+| gateway-2 | 77.59 MiB | 115.94 MiB | +38.35 MiB | +49.4% | 134.51 MiB |
+| realtime-1 | 118.67 MiB | 203.41 MiB | +84.74 MiB | +71.4% | 211.07 MiB |
+
+> **修正说明**：旧文称「内存增量 < 40 MiB/Gateway（远低于 20% 阈值），进入稳定平台」**不成立**。
+> - 按首/末口径，gateway-1 增长 +44.9%、gateway-2 增长 +49.4%，均**远超 20% 阈值**；
+> - realtime-1 增量 +84.74 MiB（>40 MiB），增长 +71.4%；
+> - 因此按当前门禁（最终窗口斜率 + 中位数平台判定）**不能判定为 STABLE**，内存仍处于爬升阶段。
+>
+> 该记录仅作为历史基线，不作为当前稳定性验收依据。
 
 **GC 与队列稳定性（8h）:**
 
@@ -103,11 +114,10 @@
 | Outbox Oldest Age | 0s | 0s | 4.6s |
 | DB idle connections | 2 | 6 | 18 |
 
-**结论**:
-- 8h 内 0 错误，内存增量 < 40 MiB/Gateway（远低于 20% 阈值），进入稳定平台
-- JetStream / Outbox pending 全程接近 0，无积压
-- ThreadPool 队列最大 9，无饱和
+**结论（历史基线）**:
+- 8h 内 0 错误，正确性通过（JetStream / Outbox pending 全程接近 0，无积压；ThreadPool 队列最大 9，无饱和）
 - GC Gen2 仅 61 次（8h），Pause total 208s / 28800s ≈ 0.72%，可接受
+- ⚠️ **内存稳定性：未达 STABLE**。按当前门禁口径（排除 Warmup 后基线 + 最终窗口斜率 + 中位数平台），gateway 与 realtime 内存仍在爬升（+44.9% / +49.4% / +71.4%），**不判定为稳定平台**。需后续用新口径复跑确认。
 
 ## 4. Realtime SQL 门禁（Gate 4）
 
@@ -125,7 +135,8 @@
 
 | 项目 | 说明 | 阻塞项 |
 |------|------|--------|
-| 8h Soak（Runtime V2, PersistentSendLoop + BoundedChannel） | Linux 测试机执行 | RealtimeServices 构建路径修复 (`ChatApp.RealtimeServices/bin/Release` 缺失) |
+| 8h Soak（Runtime V2, PersistentSendLoop + BoundedChannel） | Linux 测试机执行；须用新口径（Warmup 后基线 + 最终窗口斜率 + 分位中位数 + 每进程判定 + PID 稳定性）复测，确认内存达 STABLE | RealtimeServices 构建路径修复 (`ChatApp.RealtimeServices/bin/Release` 缺失) |
+| 历史基线（2026-07-21）内存结论修订 | 已修正：+44.9% / +49.4% / +71.4%，未达 STABLE，标记为历史基线 | 无（已修订） |
 | Transport Matrix 全量执行 | 12 组合 × 10 场景 | 依赖 Linux Soak 环境就绪 |
 | 性能基线复跑 | 会话翻页 + SyncBootstrap + TCP chat 扇出/慢消费者 | 依赖 Linux 环境就绪 |
 | 版本化 JSON 短期门禁接入定时 CI | 自托管 Linux runner | P1 CI runner 部署 |

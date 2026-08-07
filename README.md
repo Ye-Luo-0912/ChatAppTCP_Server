@@ -17,14 +17,16 @@
 - Gateway/Diagnostics：System.Diagnostics.Metrics 指标。
 - Gateway/Networking：监听服务、会话、发送队列和池化帧。
 - Gateway/Messaging：JetStream 事件消费、在线分发、消息回执和会话撤销。
-- ../ChatApp.RealtimeServices/ChatApp.Realtime.Integration：共享 NATS/JetStream 契约与客户端。
+- `ChatApp.Realtime.Contracts` / `ChatApp.Realtime.Integration` NuGet 包：共享 NATS/JetStream 契约与客户端。
 - tests/：协议、序列化和内存所有权测试。
 - tools/ChatApp.TcpGateway.LoadGenerator：连接、心跳、扇出和慢消费者负载工具。
 - tools/ChatApp.Realtime.PipelineLoadGenerator：持久消息、回执和历史查询链路负载工具。
 - tools/ChatApp.Performance.Orchestrator：多 Gateway/RealtimeServices、双负载与资源采样的一键编排器。
 
 项目内依赖方向为 Gateway -> Infrastructure -> Core。Core 不依赖日志、Redis
-或宿主框架。跨进程消息直接复用同级 RealtimeServices 的 Integration/Abstractions，
+或宿主框架。跨进程消息通过版本化的 Realtime Contracts/Integration 包复用，仓库内
+`packages/` 是可复现的本地 feed，因此独立克隆即可构建，不需要 sibling 源码目录。
+性能编排器仍可按配置启动相邻 RealtimeServices 作为运行时进程，但这不是编译依赖。
 TCP 网关不实现消息数据库或 Outbox。消息送达/已读状态也由 RealtimeServices
 通过独立的 chat.message-receipts Subject 持久化并发布状态事件；历史读取通过
 chat.message-history.query 的 Core NATS request/reply 完成。
@@ -97,9 +99,9 @@ AccessToken 缓存键保持现有约定：
 目标框架 `net10.0`。所有项目（Core / Infrastructure / Observability / Gateway / Host / Tests）
 共享同一 SDK 与 TFM，不引入 preview。
 
-    dotnet restore ChatApp.TcpGateway.sln
-    dotnet build ChatApp.TcpGateway.sln -c Release
-    dotnet test ChatApp.TcpGateway.sln -c Release
+    dotnet restore ChatApp.TcpGateway.sln --locked-mode
+    dotnet build ChatApp.TcpGateway.sln -c Release --no-restore
+    dotnet test ChatApp.TcpGateway.sln -c Release --no-build --no-restore
     dotnet publish ChatApp.TcpGateway.csproj -c Release -r win-x64 --self-contained true
 
 连接风暴烟雾测试：
@@ -112,7 +114,11 @@ AccessToken 缓存键保持现有约定：
 
 聊天扇出和慢消费者测试：
 
-    dotnet run --project tools/ChatApp.TcpGateway.LoadGenerator -c Release -- --mode chat --connections 100 --duration-seconds 30 --token "<access-token>" --messages-per-second 10 --payload-bytes 512 --slow-readers 5
+    dotnet run --project tools/ChatApp.TcpGateway.LoadGenerator -c Release -- --mode chat --connections 100 --duration-seconds 30 --token-file "tokens.txt" --active-senders 10 --messages-per-second 0.8 --payload-bytes 512 --inactive-heartbeat-seconds 30 --slow-readers 5
+
+`tokens.txt` 每行一个访问令牌；peer-ring 模式至少需要两个不同用户。固定目标场景可改用
+`--target-user-id`，但目标不能与任一主动发送者相同。慢读连接必须配置大于 0 的
+`--inactive-heartbeat-seconds`，以便维持会话并及时暴露服务端断连。
 
 非法包断开测试：
 

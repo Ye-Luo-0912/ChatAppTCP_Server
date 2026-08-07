@@ -8,62 +8,93 @@ using StackExchange.Redis;
 namespace ChatApp.TcpGateway.Infrastructure.Routing;
 
 /// <summary>
-/// Redis 实现：使用 HASH 存储被观察用户的 watcher 路由。
+/// Redis watcher 路由目录。
 /// <para>
-/// key = <c>pw:{watchedUserId}</c>，field = <c>{instanceId}:{watcherUserId}</c>，value = 引用计数。
-/// 新接口移除了 <c>gatewaySessionId</c> 参数，改用引用计数维持多会话隔离：
-/// 同一 (watchedUserId, watcherUserId, instanceId) 上的多个并发会话各自 Register +1、Unregister -1，
-/// 计数归零时移除 field。
+/// canonical schema 与 RealtimeServices 保持一致：
+/// <c>watchers:{watchedUserId}:instances</c> 是 ZSET，member 为
+/// <c>{watcherUserId}:{instanceId}</c>、score 为租约到期 Unix 毫秒；
+/// <c>watchers:{watchedUserId}:gateways</c> 是去重后的 Gateway instance SET。
 /// </para>
 /// <para>
-/// 复合 field 保证 watcher 维度幂等：相同 (watchedUserId, watcherUserId, instanceId) 重复 Register
-/// 累加计数而非产生重复条目，重复 Unregister 减少计数。
+/// 为支持从旧 Gateway 的 <c>pw:{watchedUserId}</c> HASH 滚动升级，查询暂时合并旧 HASH，
+/// 写入暂时双写旧 HASH。旧结构仅作为迁移兼容层；canonical ZSET + SET 是跨进程真值。
 /// </para>
 /// <para>
-/// 注册时通过 PEXPIRE 续期，Gateway 异常退出后整条 HASH 自然过期。
-/// 查询时 HKEYS 返回全部复合 field，应用层解析出唯一 instanceId 集合。
-/// 写操作通过 Lua 脚本保证 HINCRBY 与 PEXPIRE 的原子性，并在 HASH 清空后自动 DEL。
-/// </para>
-/// <para>
-/// 新接口语义：查询失败时返回空集合，调用方据此回退到 fallback broadcast subject；不抛异常。
+/// 查询失败返回空集合，使调用方回退到 broadcast；主动取消仍向上传播。
 /// </para>
 /// </summary>
 internal sealed class RedisWatcherGatewayDirectory(
     RedisConnectionProvider connectionProvider,
     ILogger<RedisWatcherGatewayDirectory> logger) : IWatcherGatewayDirectory
 {
-    private const string KeyPrefix = "pw:";
-    private const string FieldSeparator = ":";
-    private const string ActiveShardsKey = "watchers:__active_shards__";
+    internal const long WatcherLeaseMs = 300_000;
+    internal const string ActiveShardsKey = "watchers:__active_shards__";
+    internal const string GatewayInstancesKey = "gateway_instances:__active__";
 
-    // HINCRBY key field 1; PEXPIRE key ttl。返回当前 field 数量。
-    // 引用计数：同 watcher+instance 的多次 Register 累加计数。
-    private static readonly LuaScript RegisterScript = LuaScript.Prepare(
-        """
-        redis.call('HINCRBY', @key, @field, 1)
-        redis.call('PEXPIRE', @key, tonumber(@ttlMs))
-        return redis.call('HLEN', @key)
-        """);
+    private const long LegacyTtlMs = 1_800_000;
+    private const string KeyPrefix = "watchers:";
+    private const string InstancesKeySuffix = ":instances";
+    private const string GatewaysKeySuffix = ":gateways";
+    private const string LegacyKeyPrefix = "pw:";
+    private const char MemberSeparator = ':';
 
-    // HINCRBY key field -1; 若计数 <= 0 则 HDEL；HASH 为空则 DEL，否则 PEXPIRE。
-    // 引用计数：归零时移除 field，保证任一会话注销不影响其它并发会话条目。
-    private static readonly LuaScript UnregisterScript = LuaScript.Prepare(
-        """
-        local n = redis.call('HINCRBY', @key, @field, -1)
-        if tonumber(n) <= 0 then
-          redis.call('HDEL', @key, @field)
+    // KEYS[1] = watchers:{watchedUserId}:instances
+    // KEYS[2] = watchers:{watchedUserId}:gateways
+    // ARGV[1] = {watcherUserId}:{instanceId}; ARGV[2] = expiresAtMs; ARGV[3] = instanceId
+    private const string AddWatcherScript = """
+        redis.call('ZADD', KEYS[1], ARGV[2], ARGV[1])
+        redis.call('SADD', KEYS[2], ARGV[3])
+        return 1
+        """;
+
+    // 移除关系后，仅当同一 instance 已无其它 watcher 时才从聚合 SET 移除。
+    // watcherUserId 固定为十进制数字，因此第一个 ':' 后的全部内容均为 instanceId。
+    private const string RemoveWatcherScript = """
+        redis.call('ZREM', KEYS[1], ARGV[1])
+        local remaining = redis.call('ZRANGE', KEYS[1], 0, -1)
+        local hasGateway = false
+        for _, m in ipairs(remaining) do
+          local sep = string.find(m, ':', 1, true)
+          if sep and sep < #m and string.sub(m, sep + 1) == ARGV[2] then
+            hasGateway = true
+            break
+          end
         end
-        if redis.call('HLEN', @key) == 0 then
-          redis.call('DEL', @key)
-        else
-          redis.call('PEXPIRE', @key, tonumber(@ttlMs))
+        if not hasGateway then
+          redis.call('SREM', KEYS[2], ARGV[2])
         end
-        return redis.call('HLEN', @key)
-        """);
+        return 1
+        """;
 
-    // watcher 路由条目过期时间：与 PresenceWatcherRegistry.DefaultWatchTtl 对齐（30 分钟）。
-    private static readonly long DefaultTtlMs =
-        (long)TimeSpan.FromMinutes(30).TotalMilliseconds;
+    // 查询时原子清理过期关系，并同步修剪聚合 SET 中的陈旧 instance。
+    private const string QueryWatcherGatewaysScript = """
+        redis.call('ZREMRANGEBYSCORE', KEYS[1], -1, ARGV[1])
+        local members = redis.call('ZRANGE', KEYS[1], 0, -1)
+        local found = {}
+        for _, m in ipairs(members) do
+          local sep = string.find(m, ':', 1, true)
+          if sep and sep < #m then
+            found[string.sub(m, sep + 1)] = true
+          end
+        end
+        local gateways = redis.call('SMEMBERS', KEYS[2])
+        local result = {}
+        for _, gw in ipairs(gateways) do
+          if found[gw] then
+            table.insert(result, gw)
+          else
+            redis.call('SREM', KEYS[2], gw)
+          end
+        end
+        return result
+        """;
+
+    // 旧 HASH 只用于迁移兼容。HSET 而非 HINCRBY，保持接口要求的幂等注册语义。
+    private const string LegacyWriteScript = """
+        redis.call('HSET', KEYS[1], ARGV[1], 1)
+        redis.call('PEXPIRE', KEYS[1], ARGV[2])
+        return 1
+        """;
 
     public async Task<IReadOnlyList<string>> GetWatcherGatewaysAsync(
         long watchedUserId,
@@ -74,12 +105,25 @@ internal sealed class RedisWatcherGatewayDirectory(
 
         try
         {
-            var fields = await connectionProvider.Database
-                .HashKeysAsync(Key(watchedUserId))
+            var db = connectionProvider.Database;
+            var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            var canonicalTask = db.ScriptEvaluateAsync(
+                QueryWatcherGatewaysScript,
+                [InstancesKey(watchedUserId), GatewaysKey(watchedUserId)],
+                [nowMs]);
+            var legacyTask = db.HashKeysAsync(LegacyKey(watchedUserId));
+
+            await Task.WhenAll(canonicalTask, legacyTask)
                 .WaitAsync(cancellationToken)
                 .ConfigureAwait(false);
 
-            return ExtractInstances(fields);
+            return MergeInstances(
+                ConvertRedisResultToStrings(await canonicalTask.ConfigureAwait(false)),
+                await legacyTask.ConfigureAwait(false));
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
         }
         catch (Exception ex)
         {
@@ -99,29 +143,32 @@ internal sealed class RedisWatcherGatewayDirectory(
         if (watchedUserIds.Count == 0)
             return result;
 
-        // 默认填充空集合（无人观察），仅当批量查询抛异常时整体保持空集合（回退广播）。
         foreach (var userId in watchedUserIds)
             result[userId] = Array.Empty<string>();
 
         try
         {
-            var batch = connectionProvider.Database.CreateBatch();
-            var tasks = new Task<RedisValue[]>[watchedUserIds.Count];
+            var db = connectionProvider.Database;
+            var batch = db.CreateBatch();
+            var canonicalTasks = new Task<RedisValue[]>[watchedUserIds.Count];
+            var legacyTasks = new Task<RedisValue[]>[watchedUserIds.Count];
+            var allTasks = new Task[watchedUserIds.Count * 2];
 
             for (var i = 0; i < watchedUserIds.Count; i++)
             {
                 var userId = watchedUserIds[i];
-                if (userId <= 0)
-                {
-                    tasks[i] = Task.FromResult(Array.Empty<RedisValue>());
-                    continue;
-                }
-
-                tasks[i] = batch.HashKeysAsync(Key(userId));
+                canonicalTasks[i] = userId <= 0
+                    ? Task.FromResult(Array.Empty<RedisValue>())
+                    : batch.SetMembersAsync(GatewaysKey(userId));
+                legacyTasks[i] = userId <= 0
+                    ? Task.FromResult(Array.Empty<RedisValue>())
+                    : batch.HashKeysAsync(LegacyKey(userId));
+                allTasks[i] = canonicalTasks[i];
+                allTasks[watchedUserIds.Count + i] = legacyTasks[i];
             }
 
             batch.Execute();
-            var results = await Task.WhenAll(tasks).WaitAsync(cancellationToken).ConfigureAwait(false);
+            await Task.WhenAll(allTasks).WaitAsync(cancellationToken).ConfigureAwait(false);
 
             for (var i = 0; i < watchedUserIds.Count; i++)
             {
@@ -129,10 +176,14 @@ internal sealed class RedisWatcherGatewayDirectory(
                 if (userId <= 0)
                     continue;
 
-                var gateways = ExtractInstances(results[i]);
-                if (gateways.Count > 0)
-                    result[userId] = gateways;
+                result[userId] = MergeInstances(
+                    ConvertRedisValuesToStrings(await canonicalTasks[i].ConfigureAwait(false)),
+                    await legacyTasks[i].ConfigureAwait(false));
             }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
         }
         catch (Exception ex)
         {
@@ -155,35 +206,41 @@ internal sealed class RedisWatcherGatewayDirectory(
         if (watcherUserId <= 0 || watchedUserIds.Count == 0)
             return;
 
-        var field = BuildField(instanceId, watcherUserId);
+        var member = Member(watcherUserId, instanceId);
+        var legacyField = LegacyField(instanceId, watcherUserId);
+
         try
         {
-            // 批量执行：N 个 watchedUserId 合并为单次 batch 往返，避免 N 次串行 EVAL。
             var db = connectionProvider.Database;
             var batch = db.CreateBatch();
-            var tasks = new List<Task<RedisResult>>(watchedUserIds.Count);
+            var expiryMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() + WatcherLeaseMs;
+            var tasks = new List<Task>((watchedUserIds.Count * 2) + 1);
 
             foreach (var watchedUserId in watchedUserIds)
             {
                 if (watchedUserId <= 0)
                     continue;
 
-                tasks.Add(RegisterScript.EvaluateAsync(
-                    batch,
-                    new { key = (RedisKey)Key(watchedUserId), field, ttlMs = DefaultTtlMs }));
+                tasks.Add(batch.ScriptEvaluateAsync(
+                    AddWatcherScript,
+                    [InstancesKey(watchedUserId), GatewaysKey(watchedUserId)],
+                    [member, expiryMs, instanceId]));
+                tasks.Add(batch.ScriptEvaluateAsync(
+                    LegacyWriteScript,
+                    [LegacyKey(watchedUserId)],
+                    [legacyField, LegacyTtlMs]));
             }
 
+            if (tasks.Count == 0)
+                return;
+
+            tasks.Add(batch.SortedSetAddAsync(ActiveShardsKey, instanceId, expiryMs));
             batch.Execute();
             await Task.WhenAll(tasks).WaitAsync(cancellationToken).ConfigureAwait(false);
-            var expiresAt = DateTimeOffset.UtcNow
-                .AddMilliseconds(DefaultTtlMs)
-                .ToUnixTimeMilliseconds();
-            await db.SortedSetAddAsync(
-                    ActiveShardsKey,
-                    instanceId,
-                    expiresAt)
-                .WaitAsync(cancellationToken)
-                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
         }
         catch (Exception ex)
         {
@@ -204,26 +261,36 @@ internal sealed class RedisWatcherGatewayDirectory(
         if (watcherUserId <= 0 || watchedUserIds.Count == 0)
             return;
 
-        var field = BuildField(instanceId, watcherUserId);
+        var member = Member(watcherUserId, instanceId);
+        var legacyField = LegacyField(instanceId, watcherUserId);
+
         try
         {
-            // 批量执行：N 个 watchedUserId 合并为单次 batch 往返，避免 N 次串行 EVAL。
             var db = connectionProvider.Database;
             var batch = db.CreateBatch();
-            var tasks = new List<Task<RedisResult>>(watchedUserIds.Count);
+            var tasks = new List<Task>(watchedUserIds.Count * 2);
 
             foreach (var watchedUserId in watchedUserIds)
             {
                 if (watchedUserId <= 0)
                     continue;
 
-                tasks.Add(UnregisterScript.EvaluateAsync(
-                    batch,
-                    new { key = (RedisKey)Key(watchedUserId), field, ttlMs = DefaultTtlMs }));
+                tasks.Add(batch.ScriptEvaluateAsync(
+                    RemoveWatcherScript,
+                    [InstancesKey(watchedUserId), GatewaysKey(watchedUserId)],
+                    [member, instanceId]));
+                tasks.Add(batch.HashDeleteAsync(LegacyKey(watchedUserId), legacyField));
             }
+
+            if (tasks.Count == 0)
+                return;
 
             batch.Execute();
             await Task.WhenAll(tasks).WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
         }
         catch (Exception ex)
         {
@@ -234,34 +301,52 @@ internal sealed class RedisWatcherGatewayDirectory(
         }
     }
 
-    public Task<IReadOnlyList<string>> ListActiveShardsAsync(
+    public async Task<IReadOnlyList<string>> ListActiveShardsAsync(
         CancellationToken cancellationToken = default)
-        => RedisSafeOperation.ExecuteAsync<IReadOnlyList<string>>(
-            async ct =>
-            {
-                var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-                var db = connectionProvider.Database;
-                var members = await db.SortedSetRangeByScoreAsync(
-                        ActiveShardsKey,
-                        nowMs,
-                        double.PositiveInfinity,
-                        Exclude.Start)
-                    .WaitAsync(ct)
-                    .ConfigureAwait(false);
-                if (members.Length == 0)
-                    return Array.Empty<string>();
+    {
+        try
+        {
+            var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            var db = connectionProvider.Database;
 
-                var result = new string[members.Length];
-                for (var i = 0; i < members.Length; i++)
-                    result[i] = members[i].ToString();
-                return result;
-            },
-            Array.Empty<string>(),
-            logger,
-            GatewayDependencyOperation.WatcherDirectoryQuery,
-            cancellationToken);
+            var watcherCleanup = db.SortedSetRemoveRangeByScoreAsync(ActiveShardsKey, -1, nowMs);
+            var gatewayCleanup = db.SortedSetRemoveRangeByScoreAsync(GatewayInstancesKey, -1, nowMs);
+            await Task.WhenAll(watcherCleanup, gatewayCleanup)
+                .WaitAsync(cancellationToken)
+                .ConfigureAwait(false);
 
-    // 四-4：Gateway 实例注册自身活跃状态（ZADD ActiveShardsKey，score = 租约到期 Unix 毫秒）。
+            var watcherTask = db.SortedSetRangeByScoreAsync(
+                ActiveShardsKey,
+                nowMs,
+                double.PositiveInfinity,
+                Exclude.Start);
+            var gatewayTask = db.SortedSetRangeByScoreAsync(
+                GatewayInstancesKey,
+                nowMs,
+                double.PositiveInfinity,
+                Exclude.Start);
+            await Task.WhenAll(watcherTask, gatewayTask)
+                .WaitAsync(cancellationToken)
+                .ConfigureAwait(false);
+
+            return MergeInstances(
+                ConvertRedisValuesToStrings(await watcherTask.ConfigureAwait(false)),
+                ConvertRedisValuesToStrings(await gatewayTask.ConfigureAwait(false)));
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            logger.DependencyOperationFailed(
+                GatewayDependency.Redis,
+                GatewayDependencyOperation.WatcherDirectoryQuery,
+                ex);
+            return Array.Empty<string>();
+        }
+    }
+
     public Task RegisterGatewayInstanceAsync(
         string instanceId,
         TimeSpan leaseDuration,
@@ -271,18 +356,18 @@ internal sealed class RedisWatcherGatewayDirectory(
         return RedisSafeOperation.ExecuteAsync(
             async ct =>
             {
-                var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-                var expiryMs = nowMs + (long)leaseDuration.TotalMilliseconds;
+                var expiryMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+                    + (long)leaseDuration.TotalMilliseconds;
                 await connectionProvider.Database
-                    .SortedSetAddAsync(ActiveShardsKey, instanceId, expiryMs)
-                    .WaitAsync(ct).ConfigureAwait(false);
+                    .SortedSetAddAsync(GatewayInstancesKey, instanceId, expiryMs)
+                    .WaitAsync(ct)
+                    .ConfigureAwait(false);
             },
             logger,
             GatewayDependencyOperation.WatcherDirectoryQuery,
             cancellationToken);
     }
 
-    // 四-4：Gateway 实例注销自身活跃状态（ZREM ActiveShardsKey）。
     public Task UnregisterGatewayInstanceAsync(
         string instanceId,
         CancellationToken cancellationToken = default)
@@ -290,41 +375,65 @@ internal sealed class RedisWatcherGatewayDirectory(
         ArgumentException.ThrowIfNullOrWhiteSpace(instanceId);
         return RedisSafeOperation.ExecuteAsync(
             async ct => await connectionProvider.Database
-                .SortedSetRemoveAsync(ActiveShardsKey, instanceId)
-                .WaitAsync(ct).ConfigureAwait(false),
+                .SortedSetRemoveAsync(GatewayInstancesKey, instanceId)
+                .WaitAsync(ct)
+                .ConfigureAwait(false),
             logger,
             GatewayDependencyOperation.WatcherDirectoryQuery,
             cancellationToken);
     }
 
     /// <summary>
-    /// 五-1：账号删除时显式清理该用户作为被观察者的全部 watcher 路由 HASH（pw:{watchedUserId}）。
-    /// 失败仅记录日志，不抛异常，不阻塞账号清理 Saga。
+    /// 删除 canonical ZSET + SET，同时清除迁移期旧 HASH。失败仅记录日志。
     /// </summary>
     public Task PurgeUserRoutingAsync(
         long watchedUserId,
         CancellationToken cancellationToken = default)
         => RedisSafeOperation.ExecuteAsync(
-            async ct => await connectionProvider.Database
-                .KeyDeleteAsync(Key(watchedUserId))
-                .WaitAsync(ct)
-                .ConfigureAwait(false),
+            async ct =>
+            {
+                var db = connectionProvider.Database;
+                var batch = db.CreateBatch();
+                var instancesTask = batch.KeyDeleteAsync(InstancesKey(watchedUserId));
+                var gatewaysTask = batch.KeyDeleteAsync(GatewaysKey(watchedUserId));
+                var legacyTask = batch.KeyDeleteAsync(LegacyKey(watchedUserId));
+                batch.Execute();
+                await Task.WhenAll(instancesTask, gatewaysTask, legacyTask)
+                    .WaitAsync(ct)
+                    .ConfigureAwait(false);
+            },
             logger,
             GatewayDependencyOperation.WatcherDirectoryQuery,
             cancellationToken);
 
-    private static RedisKey Key(long watchedUserId) =>
-        string.Concat(KeyPrefix, watchedUserId.ToString(CultureInfo.InvariantCulture));
+    internal static RedisKey InstancesKey(long watchedUserId) =>
+        string.Concat(
+            KeyPrefix,
+            watchedUserId.ToString(CultureInfo.InvariantCulture),
+            InstancesKeySuffix);
 
-    private static string BuildField(string instanceId, long watcherUserId) =>
+    internal static RedisKey GatewaysKey(long watchedUserId) =>
+        string.Concat(
+            KeyPrefix,
+            watchedUserId.ToString(CultureInfo.InvariantCulture),
+            GatewaysKeySuffix);
+
+    internal static RedisKey LegacyKey(long watchedUserId) =>
+        string.Concat(LegacyKeyPrefix, watchedUserId.ToString(CultureInfo.InvariantCulture));
+
+    internal static string Member(long watcherUserId, string instanceId) =>
+        string.Concat(
+            watcherUserId.ToString(CultureInfo.InvariantCulture),
+            MemberSeparator,
+            instanceId);
+
+    internal static string LegacyField(string instanceId, long watcherUserId) =>
         string.Concat(
             instanceId,
-            FieldSeparator,
+            MemberSeparator,
             watcherUserId.ToString(CultureInfo.InvariantCulture));
 
-    // 从 HASH field（格式 "instanceId:watcherUserId"）中提取唯一 instanceId。
-    // 仅取第一个分隔符之前的部分；watcherUserId 中若包含 ':' 也不影响 instanceId 提取。
-    private static IReadOnlyList<string> ExtractInstances(RedisValue[] fields)
+    internal static IReadOnlyList<string> ExtractLegacyInstances(RedisValue[] fields)
     {
         if (fields.Length == 0)
             return Array.Empty<string>();
@@ -336,16 +445,80 @@ internal sealed class RedisWatcherGatewayDirectory(
             if (string.IsNullOrEmpty(field))
                 continue;
 
-            var sep = field.IndexOf(FieldSeparator[0]);
-            if (sep <= 0)
+            // 旧格式是 instanceId:watcherUserId；从最后一个 ':' 拆分以兼容含 ':' 的 instanceId。
+            var separator = field.LastIndexOf(MemberSeparator);
+            if (separator <= 0
+                || !long.TryParse(
+                    field.AsSpan(separator + 1),
+                    NumberStyles.None,
+                    CultureInfo.InvariantCulture,
+                    out var watcherUserId)
+                || watcherUserId <= 0)
+            {
                 continue;
+            }
 
-            (instances ??= new HashSet<string>(StringComparer.Ordinal))
-                .Add(field[..sep]);
+            (instances ??= new HashSet<string>(StringComparer.Ordinal)).Add(field[..separator]);
         }
 
-        return instances is null
-            ? Array.Empty<string>()
-            : new List<string>(instances);
+        return instances is null ? Array.Empty<string>() : [.. instances];
+    }
+
+    private static IReadOnlyList<string> ConvertRedisResultToStrings(RedisResult result)
+    {
+        if (result.IsNull)
+            return Array.Empty<string>();
+
+        var values = (RedisResult[]?)result;
+        if (values is null || values.Length == 0)
+            return Array.Empty<string>();
+
+        var strings = new List<string>(values.Length);
+        foreach (var value in values)
+        {
+            if (value.IsNull)
+                continue;
+
+            var text = (string?)value;
+            if (!string.IsNullOrEmpty(text))
+                strings.Add(text);
+        }
+
+        return strings;
+    }
+
+    private static IReadOnlyList<string> ConvertRedisValuesToStrings(RedisValue[] values)
+    {
+        if (values.Length == 0)
+            return Array.Empty<string>();
+
+        var strings = new List<string>(values.Length);
+        foreach (var value in values)
+        {
+            var text = (string?)value;
+            if (!string.IsNullOrEmpty(text))
+                strings.Add(text);
+        }
+
+        return strings;
+    }
+
+    private static IReadOnlyList<string> MergeInstances(
+        IReadOnlyList<string> canonical,
+        RedisValue[] legacyFields) =>
+        MergeInstances(canonical, ExtractLegacyInstances(legacyFields));
+
+    private static IReadOnlyList<string> MergeInstances(
+        IReadOnlyList<string> first,
+        IReadOnlyList<string> second)
+    {
+        if (first.Count == 0)
+            return second;
+        if (second.Count == 0)
+            return first;
+
+        var result = new HashSet<string>(first, StringComparer.Ordinal);
+        result.UnionWith(second);
+        return [.. result];
     }
 }

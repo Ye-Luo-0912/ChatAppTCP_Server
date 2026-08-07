@@ -25,7 +25,7 @@ Gateway Microsoft.Extensions.* package versions are pinned to **10.0.5** via
 3. When bumping (for example 10.0.x → 10.0.y, or later to .NET 11 stable):
    - Update each repo’s `global.json` together.
    - Update Gateway `Directory.Build.props` / `Directory.Packages.props`.
-   - Rebuild Gateway against the sibling Realtime Integration project.
+   - 发布新的 Realtime Contracts/Integration 包，更新 Gateway 的集中版本和锁文件，并校验 canonical 包 hash。
 4. Preview APIs are not a reason to leave Gateway on a different major forever;
    either wait for stable or isolate the preview surface behind an optional package.
 

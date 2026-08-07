@@ -12,15 +12,15 @@
   StackExchange.Redis 等依赖仍存在 trim/AOT 警告，未重新启用。
 - **JSON 序列化**：协议/存储 JSON 全部走源生成 `GatewayJsonSerializerContext`，
   不使用反射 `JsonSerializerOptions`，为未来重新启用 AOT 保留可能。
-- 构建/测试：`dotnet build` 0 警告 0 错误；`dotnet test` **447/447** 通过
-  （`tests/ChatApp.TcpGateway.Tests`）；RealtimeServices **278/278** 通过
-  （`ChatApp.Realtime.Tests`）。
+- 构建/测试：`dotnet build` 0 警告 0 错误；Gateway 全量测试 **517** 项中
+  **516** 通过、**1** 项外部 Redis 环境测试跳过；RealtimeServices 全量测试 **285/285** 通过。
 
 ## 架构边界
 
 依赖方向：**Gateway → Infrastructure → Core**，**Observability** 为叶依赖被
-Infrastructure 和 Gateway 共享。跨进程消息使用同级仓库 `../ChatApp.RealtimeServices`
-（`ChatApp.Realtime.Integration` / `Abstractions`）。仅克隆本仓库无法构建。
+Infrastructure 和 Gateway 共享，且只依赖协议包与 Logging。跨进程消息通过仓库本地
+feed 中的 `ChatApp.Realtime.Contracts 2.3.0` / `ChatApp.Realtime.Integration 3.0.0`
+版本化包引用；所有项目有锁文件，独立克隆可以 locked restore/build。
 完整边界表见 `AGENTS.md`。
 
 ## 协议不变量
@@ -220,5 +220,5 @@ Infrastructure 和 Gateway 共享。跨进程消息使用同级仓库 `../ChatAp
 
 - `ChatApp.Performance.Gate` 已实现：对编排器报告做失败闭环检查，
   支持 `--require-conversation-stages` 阶段 p95 闭环。
-- **未配置**：本仓库无 `.github/workflows/` / `.gitlab-ci.yml` / `azure-pipelines.yml`。
-  Linux 自托管 CI runner 待注册，Release 构建/测试/真实依赖探针/定时浸泡/性能门禁待接入。
+- `.github/workflows/build.yml` 已配置 locked restore、Release build 与完整架构/行为测试门禁。
+- Linux 自托管 runner、真实依赖探针、定时浸泡和性能门禁仍属于运行环境治理，不影响独立构建。

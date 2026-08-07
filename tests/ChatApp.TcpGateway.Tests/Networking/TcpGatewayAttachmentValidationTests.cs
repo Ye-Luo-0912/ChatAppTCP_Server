@@ -331,7 +331,7 @@ public sealed class TcpGatewayAttachmentValidationTests
                 GatewayJsonSerializerContext.Default.ConversationListRequest);
             var conversationListResponseCodec = new JsonPayloadCodec<ConversationListResponse>(
                 GatewayJsonSerializerContext.Default.ConversationListResponse);
-            var conversationListItemCodec = new JsonPayloadCodec<ChatApp.TcpGateway.Core.Messaging.Conversations.ConversationListItem[]>(
+            var conversationListItemCodec = new JsonPayloadCodec<ChatApp.Realtime.Abstractions.Conversations.ConversationListItem[]>(
                 GatewayJsonSerializerContext.Default.ConversationListItemArray);
             var conversationMarkReadRequestCodec = new JsonPayloadCodec<ConversationMarkReadRequest>(
                 GatewayJsonSerializerContext.Default.ConversationMarkReadRequest);

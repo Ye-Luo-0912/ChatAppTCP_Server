@@ -4,6 +4,7 @@
     <RootNamespace>ChatApp.TcpGateway.Core</RootNamespace>
   </PropertyGroup>
   <ItemGroup>
+    <PackageReference Include="ChatApp.Protocol.Tcp" />
     <!--
       P1-1：Realtime 契约层改为版本化 NuGet 包 ChatApp.Realtime.Contracts（本地 feed packages/）。
       Realtime.Abstractions 是 BCL-only 共享契约层（无任何外部依赖），

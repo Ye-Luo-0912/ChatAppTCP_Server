@@ -186,6 +186,122 @@ public sealed class LazySegmentedOutboundQueueTests
     }
 
     [Fact]
+    public async Task WaitToReadAsync_CanceledGeneration_CanRearmWithNewVersion()
+    {
+        var q = new LazySegmentedOutboundQueue(1);
+        using var cts = new CancellationTokenSource();
+
+        var canceledGeneration = q.WaitToReadAsync(cts.Token);
+        cts.Cancel();
+        await Assert.ThrowsAsync<OperationCanceledException>(
+            async () => await canceledGeneration);
+
+        var nextGeneration = q.WaitToReadAsync(CancellationToken.None);
+        Assert.False(nextGeneration.IsCompleted);
+        Assert.True(q.TryWrite(Write(7)));
+        Assert.True(await nextGeneration);
+        Assert.True(q.TryRead(out var item));
+        Assert.Equal(7, item.ByteCount);
+    }
+
+    [Fact]
+    public async Task WaitToReadAsync_EnqueueVsCancel_RearmsAcrossGenerations()
+    {
+        const int iterations = 10_000;
+        var q = new LazySegmentedOutboundQueue(1);
+
+        for (var i = 0; i < iterations; i++)
+        {
+            using var cts = new CancellationTokenSource();
+
+            // Schedule enqueue and cancellation immediately before registration so both
+            // race the fast path, waiter publication, post-registration recheck, and
+            // MRVTSC completion. Fresh work items vary which participant wins each round.
+            var writer = Task.Run(
+                () => q.TryWrite(Write(i)),
+                TestContext.Current.CancellationToken);
+            var canceller = Task.Run(
+                cts.Cancel,
+                TestContext.Current.CancellationToken);
+            var wait = q.WaitToReadAsync(cts.Token);
+
+            Assert.True(await writer, $"write {i} was rejected");
+            await canceller;
+
+            try
+            {
+                Assert.True(await wait);
+            }
+            catch (OperationCanceledException exception)
+            {
+                Assert.Equal(cts.Token, exception.CancellationToken);
+            }
+
+            Assert.True(q.TryRead(out var item), $"iteration {i} lost its enqueue");
+            Assert.Equal(i, item.ByteCount);
+            Assert.False(q.TryRead(out _));
+        }
+
+        // A stale completion from any prior MRVTSC version must not complete the next waiter.
+        using var finalCancellation = new CancellationTokenSource();
+        var finalWait = q.WaitToReadAsync(finalCancellation.Token);
+        Assert.False(finalWait.IsCompleted);
+        finalCancellation.Cancel();
+        await Assert.ThrowsAsync<OperationCanceledException>(async () => await finalWait);
+    }
+
+    [Fact]
+    public async Task WaitToReadAsync_CompleteVsCancel_HasSingleCompletionWinner()
+    {
+        const int iterations = 5_000;
+
+        for (var i = 0; i < iterations; i++)
+        {
+            var q = new LazySegmentedOutboundQueue(1);
+            using var cts = new CancellationTokenSource();
+
+            var completer = Task.Run(
+                q.TryComplete,
+                TestContext.Current.CancellationToken);
+            var canceller = Task.Run(
+                cts.Cancel,
+                TestContext.Current.CancellationToken);
+            var wait = q.WaitToReadAsync(cts.Token);
+
+            await Task.WhenAll(completer, canceller);
+
+            try
+            {
+                // Completion may win before registration (false fast path) or after
+                // waiter publication (true wake-up followed by the false fast path).
+                _ = await wait;
+            }
+            catch (OperationCanceledException exception)
+            {
+                Assert.Equal(cts.Token, exception.CancellationToken);
+            }
+
+            Assert.False(await q.WaitToReadAsync(CancellationToken.None));
+        }
+    }
+
+    [Fact]
+    public async Task WaitToReadAsync_ReadyFastPath_DoesNotAllocate()
+    {
+        var q = new LazySegmentedOutboundQueue(1);
+        Assert.True(q.TryWrite(Write(1)));
+
+        // Warm up JIT before measuring the synchronous ValueTask fast path.
+        Assert.True(await q.WaitToReadAsync(CancellationToken.None));
+        var before = GC.GetAllocatedBytesForCurrentThread();
+
+        for (var i = 0; i < 10_000; i++)
+            Assert.True(await q.WaitToReadAsync(CancellationToken.None));
+
+        Assert.Equal(0, GC.GetAllocatedBytesForCurrentThread() - before);
+    }
+
+    [Fact]
     public async Task ConcurrentProducers_AllItemsDelivered_InPerProducerOrder()
     {
         const int producers = 8;

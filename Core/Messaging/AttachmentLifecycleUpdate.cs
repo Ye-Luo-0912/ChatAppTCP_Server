@@ -7,7 +7,14 @@ public sealed class AttachmentLifecycleUpdate
 {
     public required string AttachmentId { get; init; }
 
-    /// <summary>新状态，取值见 <see cref="AttachmentWireStatus"/>。</summary>
+    /// <summary>
+    /// 生命周期事件状态：0=Scanning、1=Available、2=UploadConfirmed、
+    /// 3=Rejected、4=Expired、5=ThumbnailUpdated。
+    /// <para>
+    /// 该字段比 <see cref="AttachmentWireStatus"/> 的附件引用可用性状态更宽，
+    /// 因而刻意保留为 short，不能复用后者的二值枚举。
+    /// </para>
+    /// </summary>
     public short Status { get; init; }
 
     /// <summary>状态变更时间（毫秒）。</summary>

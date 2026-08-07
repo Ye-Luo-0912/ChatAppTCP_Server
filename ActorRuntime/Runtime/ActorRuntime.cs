@@ -145,6 +145,14 @@ public sealed class ActorRuntime<TKey, TState, TMessage> :
     }
 
     /// <summary>
+    /// 测试专用：为指定 Key 所在 Shard 预留一个 Completion Credit，以维持
+    /// "每个 Completion 必须先预留 Credit" 的生产不变量。仅供测试直接回投
+    /// Completion（绕过行为层 Operation 提交）时使用。
+    /// </summary>
+    internal bool TryReserveCompletionCreditForTest(in TKey key)
+        => _shards[GetShardIndex(in key)].TryReserveCompletionCredit();
+
+    /// <summary>
     /// 投递 Invalidation 控制消息：经普通 Ingress Ring 路由，由 Shard Consumer
     /// 投递到 ActorCell 的 Invalidation 控制槽（优先级高于 Completion）。
     /// </summary>

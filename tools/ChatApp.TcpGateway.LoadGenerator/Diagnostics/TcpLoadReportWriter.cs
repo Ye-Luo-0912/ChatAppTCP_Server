@@ -40,18 +40,54 @@ internal static class TcpLoadReportWriter
         text.AppendLine();
         text.AppendLine("| Metric | Value |");
         text.AppendLine("|---|---:|");
-        text.AppendLine(FormattableString.Invariant($"| Elapsed | {report.ElapsedSeconds:F2} s |"));
+        text.AppendLine(FormattableString.Invariant($"| Ramp | {report.RampSeconds:F2} s |"));
+        text.AppendLine(FormattableString.Invariant($"| Stabilization | {report.StabilizationSeconds:F2} s |"));
+        text.AppendLine(FormattableString.Invariant($"| Measurement | {report.MeasurementSeconds:F2} s |"));
+        text.AppendLine(FormattableString.Invariant($"| Delivery drain configured | {report.Configuration.DeliveryDrainSeconds:F2} s |"));
+        text.AppendLine(FormattableString.Invariant($"| Inactive chat heartbeat | {report.Configuration.InactiveHeartbeatSeconds:F2} s |"));
+        text.AppendLine(FormattableString.Invariant($"| Delivery drain elapsed | {report.DeliveryDrainElapsedSeconds:F2} s |"));
+        text.AppendLine(FormattableString.Invariant($"| Delivery drain completed | {report.DeliveryDrainCompleted} |"));
+        text.AppendLine(FormattableString.Invariant($"| Total elapsed | {report.TotalElapsedSeconds:F2} s |"));
+        text.AppendLine(FormattableString.Invariant($"| Target strategy | {report.TargetStrategy} |"));
+        text.AppendLine(FormattableString.Invariant($"| Unique authenticated users | {report.UniqueAuthenticatedUsers} |"));
+        text.AppendLine(FormattableString.Invariant($"| Active senders | {report.Configuration.ActiveSenders} |"));
         text.AppendLine(FormattableString.Invariant($"| Connections succeeded | {report.SuccessfulConnections} |"));
         text.AppendLine(FormattableString.Invariant($"| Connections failed | {report.FailedConnections} |"));
+        text.AppendLine(FormattableString.Invariant($"| TCP connect succeeded | {report.TcpConnectSucceeded} |"));
+        text.AppendLine(FormattableString.Invariant($"| TCP connect failed | {report.TcpConnectFailed} |"));
+        text.AppendLine(FormattableString.Invariant($"| Auth succeeded | {report.AuthSucceeded} |"));
+        text.AppendLine(FormattableString.Invariant($"| Auth invalid token | {report.AuthInvalidToken} |"));
+        text.AppendLine(FormattableString.Invariant($"| Auth dependency unavailable | {report.AuthDependencyUnavailable} |"));
+        text.AppendLine(FormattableString.Invariant($"| Auth other failure | {report.AuthOtherFailure} |"));
+        text.AppendLine(FormattableString.Invariant($"| Auth succeeded w/o resume token | {report.AuthSucceededWithoutResumeToken} |"));
+        text.AppendLine(FormattableString.Invariant($"| Chat send failed | {report.ChatSendFailed} |"));
+        text.AppendLine(FormattableString.Invariant($"| Chat receive failed | {report.ChatReceiveFailed} |"));
+        text.AppendLine(FormattableString.Invariant($"| Server closed | {report.ServerClosed} |"));
+        text.AppendLine(FormattableString.Invariant($"| Protocol rejected | {report.ProtocolRejected} |"));
+        text.AppendLine(FormattableString.Invariant($"| Completed normally | {report.CompletedNormally} |"));
+        text.AppendLine(FormattableString.Invariant($"| Peak active connections | {report.PeakActiveConnections} |"));
+        text.AppendLine(FormattableString.Invariant($"| Healthy conns (p95) | {report.Healthy.Connections} conns, {report.Healthy.P95Ms:F3} ms |"));
+        text.AppendLine(FormattableString.Invariant($"| Slow conns (p95) | {report.Slow.Connections} conns, {report.Slow.P95Ms:F3} ms |"));
         text.AppendLine(FormattableString.Invariant($"| Sent | {report.Sent} |"));
+        text.AppendLine(FormattableString.Invariant($"| Expected recipient deliveries | {report.ExpectedDeliveries} |"));
         text.AppendLine(FormattableString.Invariant($"| Received | {report.Received} |"));
         text.AppendLine(FormattableString.Invariant($"| MQ accepted | {report.Acknowledged} |"));
         text.AppendLine(FormattableString.Invariant($"| Rejected | {report.Rejected} |"));
+        text.AppendLine(FormattableString.Invariant($"| Duplicate/untracked MQ ACK | {report.DuplicateAcknowledgements} |"));
+        text.AppendLine(FormattableString.Invariant($"| Duplicate/untracked peer delivery | {report.DuplicateDeliveries} |"));
+        text.AppendLine(FormattableString.Invariant($"| Outstanding | {report.Outstanding} |"));
+        text.AppendLine(FormattableString.Invariant($"| Tracking TTL-expired | {report.TrackingExpired} |"));
+        text.AppendLine(FormattableString.Invariant($"| Tracking dropped | {report.TrackingDropped} |"));
+        text.AppendLine(FormattableString.Invariant($"| Runtime failure | {report.RuntimeFailure ?? "none"} |"));
         text.AppendLine(FormattableString.Invariant($"| Sent/s | {report.SentPerSecond:F2} |"));
         text.AppendLine(FormattableString.Invariant($"| Received/s | {report.ReceivedPerSecond:F2} |"));
-        text.AppendLine(FormattableString.Invariant($"| Latency p50 | {report.Latency.P50Ms:F3} ms |"));
-        text.AppendLine(FormattableString.Invariant($"| Latency p95 | {report.Latency.P95Ms:F3} ms |"));
-        text.AppendLine(FormattableString.Invariant($"| Latency p99 | {report.Latency.P99Ms:F3} ms |"));
+        text.AppendLine(FormattableString.Invariant($"| Primary latency kind | {report.PrimaryLatencyKind} |"));
+        text.AppendLine(FormattableString.Invariant($"| Primary latency p50 | {report.Latency.P50Ms:F3} ms |"));
+        text.AppendLine(FormattableString.Invariant($"| Primary latency p95 | {report.Latency.P95Ms:F3} ms |"));
+        text.AppendLine(FormattableString.Invariant($"| Primary latency p99 | {report.Latency.P99Ms:F3} ms |"));
+        text.AppendLine(FormattableString.Invariant($"| MQ ACK latency p50/p95/p99 | {report.AcknowledgementLatency.P50Ms:F3} / {report.AcknowledgementLatency.P95Ms:F3} / {report.AcknowledgementLatency.P99Ms:F3} ms |"));
+        text.AppendLine(FormattableString.Invariant($"| Peer delivery latency p50/p95/p99 | {report.DeliveryLatency.P50Ms:F3} / {report.DeliveryLatency.P95Ms:F3} / {report.DeliveryLatency.P99Ms:F3} ms |"));
+        text.AppendLine(FormattableString.Invariant($"| Semantic gate | {(report.Gate.Passed ? "PASSED" : "FAILED")} |"));
         text.AppendLine();
         text.AppendLine("```text");
         text.AppendLine(FormattableString.Invariant(
@@ -59,8 +95,17 @@ internal static class TcpLoadReportWriter
         text.AppendLine(FormattableString.Invariant(
             $"Connections={report.Configuration.Connections}; Duration={report.Configuration.DurationSeconds:F0}s"));
         text.AppendLine(FormattableString.Invariant(
-            $"MessagesPerSecond={report.Configuration.MessagesPerSecond}; PayloadBytes={report.Configuration.PayloadBytes}; SlowReaders={report.Configuration.SlowReaders}"));
+            $"ActiveSenders={report.Configuration.ActiveSenders}; MessagesPerSecond={report.Configuration.MessagesPerSecond}; PayloadBytes={report.Configuration.PayloadBytes}; SlowReaders={report.Configuration.SlowReaders}; DeliveryDrain={report.Configuration.DeliveryDrainSeconds:F0}s; InactiveHeartbeat={report.Configuration.InactiveHeartbeatSeconds:F0}s"));
         text.AppendLine("```");
+
+        if (report.Gate.Failures.Count != 0)
+        {
+            text.AppendLine();
+            text.AppendLine("## Semantic gate failures");
+            text.AppendLine();
+            foreach (var failure in report.Gate.Failures)
+                text.Append("- ").AppendLine(failure);
+        }
 
         if (report.ErrorSamples.Count != 0)
         {

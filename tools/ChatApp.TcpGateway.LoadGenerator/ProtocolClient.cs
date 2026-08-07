@@ -48,7 +48,7 @@ internal sealed class ProtocolClient : IAsyncDisposable
         _stream = _client.GetStream();
     }
 
-    public async ValueTask<AuthenticatedIdentity> AuthenticateAsync(
+    public async ValueTask<AuthenticationResult> AuthenticateAsync(
         string accessToken,
         ulong? deviceIdHash,
         CancellationToken cancellationToken)
@@ -82,14 +82,47 @@ internal sealed class ProtocolClient : IAsyncDisposable
 
         if (response?.Success != true)
         {
-            throw new InvalidOperationException(
-                response?.ErrorMessage ?? "Authentication failed.");
+            return new AuthenticationResult(
+                Succeeded: false,
+                FailureKind: ClassifyAuthFailure(response?.ErrorMessage),
+                ErrorMessage: response?.ErrorMessage ?? "Authentication failed.",
+                Identity: null,
+                ResumeTokenIssued: false);
         }
 
-        return new AuthenticatedIdentity(
-            response.UserId,
-            response.SessionId,
-            response.DeviceIdHash);
+        return new AuthenticationResult(
+            Succeeded: true,
+            FailureKind: AuthFailureKind.None,
+            ErrorMessage: null,
+            Identity: new AuthenticatedIdentity(
+                response.UserId,
+                response.SessionId,
+                response.DeviceIdHash),
+            ResumeTokenIssued: !string.IsNullOrWhiteSpace(response.ResumeToken));
+    }
+
+    private static AuthFailureKind ClassifyAuthFailure(string? errorMessage)
+    {
+        if (string.IsNullOrWhiteSpace(errorMessage))
+            return AuthFailureKind.Other;
+
+        var normalized = errorMessage.ToLowerInvariant();
+        if (normalized.Contains("dependency", StringComparison.Ordinal) ||
+            normalized.Contains("unavailable", StringComparison.Ordinal) ||
+            normalized.Contains("redis", StringComparison.Ordinal))
+        {
+            return AuthFailureKind.DependencyUnavailable;
+        }
+
+        if (normalized.Contains("无效", StringComparison.Ordinal) ||
+            normalized.Contains("过期", StringComparison.Ordinal) ||
+            normalized.Contains("invalid", StringComparison.Ordinal) ||
+            normalized.Contains("suspend", StringComparison.Ordinal))
+        {
+            return AuthFailureKind.InvalidToken;
+        }
+
+        return AuthFailureKind.Other;
     }
 
     public ValueTask SendHeartbeatAsync(
@@ -97,6 +130,21 @@ internal sealed class ProtocolClient : IAsyncDisposable
         SendEmptyAsync(
             PacketCommand.Heartbeat,
             cancellationToken);
+
+    public async ValueTask WaitForRemoteCloseAsync(
+        CancellationToken cancellationToken)
+    {
+        var probe = new byte[1];
+        var read = await GetStream()
+            .ReadAsync(probe, cancellationToken)
+            .ConfigureAwait(false);
+        if (read == 0)
+            return;
+
+        throw new InvalidDataException(
+            "Connection-only client received unexpected protocol data while " +
+            "observing remote liveness.");
+    }
 
     public async ValueTask ReceiveHeartbeatAsync(
         CancellationToken cancellationToken)
@@ -134,14 +182,21 @@ internal sealed class ProtocolClient : IAsyncDisposable
                 ChatMessageCodec.Deserialize(payload)
                 ?? throw new InvalidDataException(
                     "Received an empty chat message."),
-                Acknowledgement: null),
+                Acknowledgement: null,
+                IsHeartbeatAcknowledgement: false),
             PacketCommand.MessageAcknowledgement => new ChatInboundFrame(
                 Message: null,
                 MessageAcknowledgementCodec.Deserialize(payload)
                 ?? throw new InvalidDataException(
-                    "Received an empty message acknowledgement.")),
+                    "Received an empty message acknowledgement."),
+                IsHeartbeatAcknowledgement: false),
+            PacketCommand.HeartbeatAcknowledgement => new ChatInboundFrame(
+                Message: null,
+                Acknowledgement: null,
+                IsHeartbeatAcknowledgement: true),
             _ => throw new InvalidDataException(
-                $"Expected chat message or acknowledgement, received {frame.Command}.")
+                $"Expected chat message, message acknowledgement, or heartbeat " +
+                $"acknowledgement; received {frame.Command}.")
         };
     }
 
@@ -343,6 +398,22 @@ internal sealed record AuthenticatedIdentity(
     long UserId,
     string? SessionId,
     ulong? DeviceIdHash);
+
+internal enum AuthFailureKind
+{
+    None,
+    InvalidToken,
+    DependencyUnavailable,
+    Other
+}
+
+internal sealed record AuthenticationResult(
+    bool Succeeded,
+    AuthFailureKind FailureKind,
+    string? ErrorMessage,
+    AuthenticatedIdentity? Identity,
+    bool ResumeTokenIssued);
 internal sealed record ChatInboundFrame(
     ChatMessage? Message,
-    MessageAcknowledgement? Acknowledgement);
+    MessageAcknowledgement? Acknowledgement,
+    bool IsHeartbeatAcknowledgement);

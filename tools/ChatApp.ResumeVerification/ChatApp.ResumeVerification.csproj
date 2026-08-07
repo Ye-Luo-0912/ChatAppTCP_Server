@@ -6,6 +6,8 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageReference Include="ChatApp.Auth.Contracts" />
+    <PackageReference Include="ChatApp.Protocol.Tcp" />
     <ProjectReference Include="..\..\Core\Core.csproj" />
     <ProjectReference Include="..\..\Infrastructure\Infrastructure.csproj" />
     <PackageReference Include="StackExchange.Redis" />

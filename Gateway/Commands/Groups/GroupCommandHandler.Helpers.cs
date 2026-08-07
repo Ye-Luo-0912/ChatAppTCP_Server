@@ -140,14 +140,7 @@ internal sealed partial class GroupCommandHandler
     {
         if (members is null)
             return null;
-        return members
-            .Select(static m => new ConversationMemberItem
-            {
-                UserId = m.UserId,
-                Role = (ConversationMemberRole)(byte)m.Role,
-                JoinedAtMs = m.JoinedAtMs
-            })
-            .ToArray();
+        return members.ToArray();
     }
 
     /// <summary>

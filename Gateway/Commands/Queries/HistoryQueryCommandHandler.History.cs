@@ -109,14 +109,7 @@ internal sealed partial class HistoryQueryCommandHandler
                     EditedAtMs = item.EditedAtMs,
                     ChangedAtMs = item.ChangedAtMs,
                     Attachments = AttachmentWireMapper.Map(item.Attachments),
-                    Reactions = item.Reactions?
-                        .Select(static reaction => new MessageReactionSummary
-                        {
-                            Emoji = reaction.Emoji,
-                            Count = reaction.Count,
-                            ReactedByMe = reaction.ReactedByMe
-                        })
-                        .ToArray(),
+                    Reactions = item.Reactions,
                     ReplyToMessageId = item.ReplyToMessageId,
                     ReplyToSenderUserId = item.ReplyToSenderUserId,
                     ReplyToPreview = item.ReplyToPreview,

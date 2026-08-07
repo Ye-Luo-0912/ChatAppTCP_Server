@@ -1,5 +1,4 @@
 using System.Diagnostics;
-using ChatApp.TcpGateway.Core.Protocol;
 
 namespace ChatApp.TcpGateway.Observability.Tracing;
 
