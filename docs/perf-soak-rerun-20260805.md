@@ -203,3 +203,60 @@ Gateway-1 基线/最终 RSS 中位数为 `305.92 → 264.48 MiB`，最终斜率
 覆盖率为 `100%`。完整新轮分析、ACK 延迟和跨 child delivery latency 限制见
 [优化复测报告](perf-optimization-rerun-20260807.md)；本地完整报告位于
 [`.artifacts/remote-reports/soak-8h-cross-gateway-v3`](../.artifacts/remote-reports/soak-8h-cross-gateway-v3)。
+
+2026-08-08 已继续针对该轮的异常式控制流、数据库准入往返和 UTF-8 临时分配完成第二轮
+代码优化；具体共享层、安全边界、本地测试与微基准见优化复测报告第 8 节。该批改动尚未
+执行新的正式 Linux 8 小时运行，因此本节历史 verdict 只证明 `d5e886a` 冻结版本，不能
+作为第二轮改动的性能或长期内存结论。
+
+## 9. 第二轮共享层复测进度（2026-08-08）
+
+第二轮组合源码 SHA-256
+`0e132e482e252156ac92baf3bd88a7ab0934a9906076ce622d69f828f23923cd`
+已先通过 10,000 连接、80 msg/s、600 秒 measurement 的短时跨 Gateway 门禁：
+`PASSED / VALID`，48,000 条发送、ACK、预期投递和实际投递完全一致，重复、漏投、
+死信与运行错误为 0。数据库操作降至 `8.9546 ops/msg`，managed allocation 降至
+`94,933.63 B/msg`；完整数据见优化复测报告第 9 节。
+
+同一冻结源码的正式 8 小时轮已于 `2026-08-08T08:04:08Z` 启动：
+
+- 运行目录：`/home/yeluo/chatapp-perf/runs/codex-tcp-soak-shared-20260808T080154Z`；
+- 报告目录：`reports/soak-8h-cross-gateway-shared-v1`；
+- 主 PID/PGID：`1905586/1905586`；
+- 容器标签：`20260808080428z-1`；
+- 规范包源 SHA-256：
+  `00823022224bc833ba1644d74a72b3e4a39ff6ab267c979f3b009fc76ddc6e4d`；
+- .NET host SHA-256：
+  `763bfd4dbb1bb3a3b5257c6800eef77bb4abe2127e6ff9c33e2a56e2e814aedf`。
+
+该轮与 2026-08-05/07 历史轮及短时 canary 完全隔离；最终只有在
+`RunValid=true`、`MemoryConclusive=true`、`MemoryStable=true` 且 ACK/跨 Gateway
+投递、重复/漏投、JetStream/Outbox/死信和异常式控制流全部通过后，才能替换本节的
+“运行中”状态。
+
+## 10. 第二轮共享层正式 8 小时最终结论（2026-08-09）
+
+上一节的“运行中”状态现已完成，且不改变 2026-08-05 历史轮结论。本轮组合源码快照
+`0E132E482E252156AC92BAF3BD88A7AB0934A9906076CE622D69F828F23923CD` 在
+`/home/yeluo/chatapp-perf/runs/codex-tcp-soak-shared-20260808T080154Z` 运行，退出码
+`0`，verdict 为 **PASSED**：`RunValid=true`、`MemoryConclusive=true`、
+`MemoryStable=true`。
+
+- 10,000/10,000 连接成功；两 child 合计发送、ACK、跨 Gateway 预期投递和实际收到
+  `2,304,000`，重复、漏投、拒绝、outstanding、tracking 丢失、runtime failure、死信
+  均为 `0`；总吞吐约 `80 msg/s`。
+- ACK P50/P95/P99：gateway-1 `1.024/1.280/1.600 ms`，gateway-2
+  `0.960/1.280/1.536 ms`。Delivery latency histogram 未由 harness 跨 child 汇总，
+  `DeliveryLatency.Count=0` 代表未采集；不能据此得出零延迟或同 ID 相关性结论。
+- JetStream pending `0`、redelivery 增量 `1`；Outbox persisted/published
+  `2,304,000`，最终 pending/dead/max-attempts `0/0/0`，清理发布历史增量 `576,000`。
+- 数据库操作 `8.203062 ops/msg`，managed allocation `89,889.49 B/msg`；
+  `TaskCanceledException`、`SemaphoreFullException` 未出现，唯一 exception series
+  `ArgumentException` 增量 `0`。
+- 8 条资源 series 覆盖率 `99.243%`（Prometheus `100%`）。Gateway-1 RSS 中位数
+  `296.93 → 272.16 MiB`、斜率 `-1.95 MiB/h`；Gateway-2 `304.11 → 267.67 MiB`、
+  斜率 `-0.52 MiB/h`，均稳定且无 OOM/重启。
+
+完整报告已归档至
+[`.artifacts/remote-reports/soak-8h-cross-gateway-shared-v1`](../.artifacts/remote-reports/soak-8h-cross-gateway-shared-v1)，
+详细分析见[优化复测报告](perf-optimization-rerun-20260807.md)。

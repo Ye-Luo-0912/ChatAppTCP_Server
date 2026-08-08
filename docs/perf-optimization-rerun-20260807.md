@@ -194,3 +194,118 @@ soak 保持 80 msg/s，以便与 2026-08-06 的旧正式轮做稳定性对比；
   SHA-256 `cd746e07011066a71750882f598f94696323d578dc141a9b2dffc30a23da1f81`
 - 可提交的脱敏摘要：
   `docs/performance-baselines/2026-08-08-linux-cross-gateway-soak-8h.json`
+
+## 8. 报告后第二轮资源优化（2026-08-08，待 Linux 复测）
+
+针对 8 小时报告残留的 `2,034,057` 次 `TaskCanceledException`、68 次
+`SemaphoreFullException`、`97,988.93 B/msg` 和 `10.1964 DB ops/msg`，Realtime
+源码已完成第二轮本地优化：
+
+- 将 ACK 与 Outbox 的逐操作续租任务统一下沉到 `Infrastructure.Core` 共享租约层；每个
+  worker runtime 只保留一个定时器和一个可索引最小堆，快速完成时立即移除并复用节点，
+  不再为每条消息/每批 Outbox 创建 linked CTS、`Task.Delay` 或独立续租 Task；对象池上限
+  为 4,096，版本令牌和 in-flight 状态阻止旧句柄影响复用节点。
+- Outbox 唤醒改为原子单槽合并信号，删除 `CurrentCount -> Release -> catch
+  SemaphoreFullException` 竞争路径。
+- 消息写入的生命周期锁、tombstone 状态与幂等 canonical 合并为一条事务内 admission
+  SQL，并移除每消息用户 ID 临时数组；直接消息授权的三次用户表探测合并为一次聚合扫描。
+- Outbox 常见单行发布走精确 `claim_token` 更新快路径；多行路径按需分配结果集合；租约
+  丢失后停止无效状态 SQL，由新所有者重试。
+- typed chat payload 通过版本化、线程内两槽、64 KiB 上限的共享 UTF-8 缓冲写入 wire，
+  不再创建 PayloadJson UTF-16 中间字符串。版本 token 使用单原子 CAS，旧租约不能释放新租约。
+- Published 清理从 500×50 调整为 2,000×30，每分钟仍为有界 60,000 行，足以覆盖
+  640 msg/s（38,400 行/分钟）并保留约 56% 余量，同时减少 DELETE 命令次数；6 小时保留
+  和 pending/dead 可靠性语义不变。
+
+本地 Release 构建为 0 warning / 0 error；Realtime 单元测试 `293` 项、集成测试 `37`
+项（含 lifecycle race、消息幂等事务、Outbox claim-token/lease）将在本轮最终验证处记录。
+新增 wire `ShortRun` 微基准在 512-byte content 下把 managed allocation 从 `3.88 KB`
+降到 `2.09 KB/event`（约 `-46%`），耗时从 `2.331 us` 增至 `2.699 us`（约 `+16%`）。
+因此该项定位为降低 GC 的明确取舍；异常消除、SQL 合并和清理批次调整能否使端到端 CPU、
+GC、WAL/磁盘同时下降，必须由新的 Linux 容量曲线和 8 小时 soak 验证，不能沿用本报告
+上一轮 PASSED 数据代替。
+
+## 9. 第二轮 Linux 跨 Gateway 门禁（2026-08-08）
+
+第二轮工作树以组合源码归档 SHA-256
+`0e132e482e252156ac92baf3bd88a7ab0934a9906076ce622d69f828f23923cd`
+冻结到 `/home/yeluo/chatapp-perf/runs/codex-tcp-shared-canary-20260808T073952Z`。规范包源与
+.NET host SHA-256 分别保持
+`00823022224bc833ba1644d74a72b3e4a39ff6ab267c979f3b009fc76ddc6e4d` 和
+`763bfd4dbb1bb3a3b5257c6800eef77bb4abe2127e6ff9c33e2a56e2e814aedf`。SDK、NuGet 缓存与
+规范包使用只共享文件内容的硬链接，源码、构建输出、报告和临时容器仍按本轮隔离，避免
+为一次验证重复占用数 GB 磁盘。
+
+10,000 连接、100 active sender、80 msg/s、120 秒稳定期、600 秒 measurement、60 秒
+drain 的短时跨 Gateway 门禁退出码为 `0`，结果为 **PASSED / VALID**：
+
+- 两个 Gateway 各成功建立 5,000 条连接；总计发送、MQ ACK、预期跨 Gateway 投递和实际
+  收到均为 `48,000`，拒绝、重复 ACK、重复投递、漏投、outstanding、TTL-expired、
+  tracking-dropped、死信和 runtime failure 全部为 `0`。
+- 实际吞吐 `80.00 msg/s`，达成率 `100%`；两个 child 的 ACK P50/P95/P99 分别为
+  `1.088/1.280/1.600 ms` 与 `0.992/1.280/1.472 ms`。
+- 资源 measurement 覆盖率 `99.3%`，Prometheus 覆盖率 `100%`；JetStream pending
+  始终为 `0`，Outbox pending 峰值仅 `2`、最终为 `0`，published/persisted 均为
+  `48,000`。
+- 上一轮遗留的 `TaskCanceledException` 与 `SemaphoreFullException` 指标不再出现；
+  本轮唯一导出的异常 series 为 `ArgumentException`，增量为 `0`。五个受管进程 stderr
+  均为空。
+- 数据库操作从上一轮正式报告的 `10.1964` 降到 `8.9546 ops/msg`（`-12.18%`）；
+  PostgreSQL 平均 CPU 从 `46.85%` 降到 `34.29%`。Realtime 平均 CPU 从 `4.92%`
+  降到 `3.75%`。由于两个窗口长度不同，CPU 只作为回归趋势，最终以同快照 8 小时轮为准。
+- Realtime managed allocation 为 `4,556,814,152` bytes，即 `94,933.63 B/msg`；
+  相对上一轮正式报告的 `97,988.93 B/msg` 再下降 `3.12%`。GC pause 为 `3.60s`，短窗口
+  包含启动/JIT，不能与 8 小时累计值直接同比。
+- 末段 Realtime 工作集约 `168 MiB`，两个 Gateway 约 `299/302 MiB`；短测没有失控增长，
+  但不据此宣称 `MemoryStable`，内存稳定性仍由正式 8 小时分窗门禁判定。
+
+完整本地报告：
+[`canary-cross-gateway-shared-v1`](../.artifacts/remote-reports/canary-cross-gateway-shared-v1)。
+跨 child 的既有限制不变：全局 ACK/投递数量和重复/漏投判定有效，但 delivery latency
+histogram 未跨 child 汇总，报告中的 `0 ms` 表示未采集，不表示零延迟。
+
+## 10. 第二轮共享层正式 8 小时跨 Gateway verdict（2026-08-09）
+
+本轮使用组合源码快照 `0E132E482E252156AC92BAF3BD88A7AB0934A9906076CE622D69F828F23923CD`，
+运行根目录为 `/home/yeluo/chatapp-perf/runs/codex-tcp-soak-shared-20260808T080154Z`，
+报告为 `soak-8h-cross-gateway-shared-v1`，容器标签为 `20260808080428z-1`。退出码为
+`0`，正式 verdict 为 **PASSED**：`RunValid=true`、`MemoryConclusive=true`、
+`MemoryStable=true`；两个 child 的 measurement 均为约 `28,800.03s`，10,000/10,000
+连接成功，8 条资源 series 的 measurement 覆盖率均为 `14,291/14,400=99.243%`，
+Prometheus 覆盖率为 `100%`。
+
+### 10.1 ACK、跨 Gateway 投递与延迟
+
+- 两个 child 各发送/ACK/预期投递/实际收到 `1,152,000`，合计 `2,304,000`；拒绝、
+  重复 ACK、重复投递、漏投、outstanding、tracking 丢失、runtime failure 和死信均为
+  `0`。child 吞吐分别为 `39.999953` 与 `39.999951 msg/s`，合计约 `80 msg/s`。
+- ACK 延迟：gateway-1 平均/P50/P95/P99/最大为
+  `1.0546/1.024/1.280/1.600/203.160 ms`；gateway-2 为
+  `1.0133/0.960/1.280/1.536/195.314 ms`。
+- JetStream measurement pending 为 `0`，ACK 为约 `2,304,001`，redelivery 增量为 `1`，
+  但 child 级消息语义仍为全量成功；Outbox persisted/published 均为 `2,304,000`，
+  pending/dead/max-attempts 为 `0/0/0`，清理历史发布行增量 `576,000`。
+- 当前 harness 没有跨 child 合并 delivery latency histogram，也没有同 ID 的
+  ACK-ID 与 delivery-ID 集合相关性；因此两个 child 的 `DeliveryLatency.Count=0` 表示
+  **未采集**，不能解释为零延迟。全局数量、重复/漏投门禁仍然有效。
+
+### 10.2 数据库、分配与异常式控制流
+
+- Npgsql 操作计数增量 `18,899,854`，折合 `8.203062 ops/msg`；managed allocation
+  增量 `207,105,393,144 bytes`，折合 `89,889.49 B/msg`。这两个值应与短时 canary
+  的 `8.9546 ops/msg`、`94,933.63 B/msg` 分开看，正式轮包含完整启动、稳定和长尾窗口。
+- 报告和五个受管进程 stderr 中均未出现 `TaskCanceledException` 或
+  `SemaphoreFullException`；runtime exception series 只有 `ArgumentException`，增量为
+  `0`。Realtime、两个 Gateway 和两个 load child 均无 OOM 证据；退出码 `137` 仅为
+  orchestrator 在报告完成后的清理动作。
+
+### 10.3 资源与 Gateway 内存趋势
+
+- gateway-1 RSS 基线/最终窗口中位数 `296.93 → 272.16 MiB`，增长 `-8.34%`，末段
+  斜率 `-1.95 MiB/h`；gateway-2 为 `304.11 → 267.67 MiB`，增长 `-11.98%`，末段
+  斜率 `-0.52 MiB/h`。两者均 `Stable=true`，无重启、OOM 或持续增长。
+- 平均 CPU：Realtime `4.51%`，Gateway-1/Gateway-2 `1.96%/1.94%`，load child
+  `1.20%/1.19%`；NATS/PostgreSQL/Garnet 容器约 `14.02%/43.67%/5.16%`。8 条 series
+  （5 个进程 + 3 个依赖容器）均满足 `>=90%` 采样覆盖门禁。
+
+完整可复核报告：[`.artifacts/remote-reports/soak-8h-cross-gateway-shared-v1`](../.artifacts/remote-reports/soak-8h-cross-gateway-shared-v1)。
