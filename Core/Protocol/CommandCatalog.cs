@@ -330,6 +330,15 @@ internal static class CommandCatalog
         PacketCommand.MessageReadReceiptQueryResponse => new(
             PacketCommand.MessageReadReceiptQueryResponse, CommandDirection.ServerToClient,
             ConnectionPhase.Authenticated, CommandLane.Inline, -1, 1),
+        PacketCommand.DissolveGroupRequest => new(
+            PacketCommand.DissolveGroupRequest, CommandDirection.ClientToServer,
+            ConnectionPhase.Authenticated, CommandLane.OrderedWrite, 4 * 1024, 4)
+        {
+            RequiredFeature = GatewayFeature.GroupManagement
+        },
+        PacketCommand.DissolveGroupResponse => new(
+            PacketCommand.DissolveGroupResponse, CommandDirection.ServerToClient,
+            ConnectionPhase.Authenticated, CommandLane.Inline, -1, 1),
         PacketCommand.MemberJoined => new(
             PacketCommand.MemberJoined, CommandDirection.ServerToClient,
             ConnectionPhase.Authenticated, CommandLane.Inline, -1, 1),

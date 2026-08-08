@@ -66,6 +66,21 @@ public sealed class LeaveGroupResponse
     public string? ConversationId { get; init; }
 }
 
+public sealed class DissolveGroupRequest
+{
+    public required string RequestId { get; init; }
+    public required string ConversationId { get; init; }
+}
+
+public sealed class DissolveGroupResponse
+{
+    public required string RequestId { get; init; }
+    public required bool Succeeded { get; init; }
+    public string? ErrorCode { get; init; }
+    public string? ErrorMessage { get; init; }
+    public string? ConversationId { get; init; }
+}
+
 public sealed class ChangeMemberRoleRequest
 {
     public required string RequestId { get; init; }

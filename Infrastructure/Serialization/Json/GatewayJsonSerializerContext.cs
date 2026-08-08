@@ -61,6 +61,8 @@ namespace ChatApp.TcpGateway.Infrastructure.Serialization.Json;
 [JsonSerializable(typeof(ListGroupMembersResponse))]
 [JsonSerializable(typeof(MessageReadReceiptQueryRequest))]
 [JsonSerializable(typeof(MessageReadReceiptQueryResponse))]
+[JsonSerializable(typeof(DissolveGroupRequest))]
+[JsonSerializable(typeof(DissolveGroupResponse))]
 [JsonSerializable(typeof(MessageReadReceiptItem))]
 [JsonSerializable(typeof(List<MessageReadReceiptItem>))]
 [JsonSerializable(typeof(ConversationMemberItem))]

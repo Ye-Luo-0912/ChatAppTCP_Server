@@ -230,6 +230,10 @@ public sealed class AttachmentDownloadAuthorizeTests
             GatewayJsonSerializerContext.Default.MessageReadReceiptQueryRequest);
         var messageReadReceiptQueryResponseCodec = new JsonPayloadCodec<MessageReadReceiptQueryResponse>(
             GatewayJsonSerializerContext.Default.MessageReadReceiptQueryResponse);
+        var dissolveGroupRequestCodec = new JsonPayloadCodec<DissolveGroupRequest>(
+            GatewayJsonSerializerContext.Default.DissolveGroupRequest);
+        var dissolveGroupResponseCodec = new JsonPayloadCodec<DissolveGroupResponse>(
+            GatewayJsonSerializerContext.Default.DissolveGroupResponse);
         var groupHandler = new GroupCommandHandler(
             messageBus,
             createGroupRequestCodec,
@@ -246,6 +250,8 @@ public sealed class AttachmentDownloadAuthorizeTests
             listGroupMembersResponseCodec,
             messageReadReceiptQueryRequestCodec,
             messageReadReceiptQueryResponseCodec,
+            dissolveGroupRequestCodec,
+            dissolveGroupResponseCodec,
             metrics,
             NullLogger<GroupCommandHandler>.Instance);
 

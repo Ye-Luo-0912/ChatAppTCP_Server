@@ -49,13 +49,13 @@ using TcpGatewayService = ChatApp.TcpGateway.Gateway.Networking.TcpGatewayServic
 namespace ChatApp.TcpGateway.Tests.Networking;
 
 /// <summary>
-/// 验证 CommandDispatcher 路径：Push / Reaction 命令通过 handler 处理，
+/// 验证 CommandDispatcher 路径：Push / Reaction / 群已读回执 / 群解散命令通过 handler 处理，
 /// 而非 TcpGatewayService 内联 switch。通过 TCP 端到端验证响应正确。
 /// </summary>
 public sealed class CommandDispatcherIntegrationTests
 {
     [Fact(Timeout = 15_000)]
-    public async Task PushTokenAndReactionCommandsAreHandledByDispatcher()
+    public async Task DispatcherRoutesCommandsToHandlersOverTcp()
     {
         var port = ReserveLoopbackPort();
         var options = new TcpGatewayOptions
@@ -230,6 +230,10 @@ public sealed class CommandDispatcherIntegrationTests
             GatewayJsonSerializerContext.Default.MessageReadReceiptQueryRequest);
         var messageReadReceiptQueryResponseCodec = new JsonPayloadCodec<MessageReadReceiptQueryResponse>(
             GatewayJsonSerializerContext.Default.MessageReadReceiptQueryResponse);
+        var dissolveGroupRequestCodec = new JsonPayloadCodec<DissolveGroupRequest>(
+            GatewayJsonSerializerContext.Default.DissolveGroupRequest);
+        var dissolveGroupResponseCodec = new JsonPayloadCodec<DissolveGroupResponse>(
+            GatewayJsonSerializerContext.Default.DissolveGroupResponse);
         var groupHandler = new GroupCommandHandler(
             messageBus,
             createGroupRequestCodec,
@@ -246,6 +250,8 @@ public sealed class CommandDispatcherIntegrationTests
             listGroupMembersResponseCodec,
             messageReadReceiptQueryRequestCodec,
             messageReadReceiptQueryResponseCodec,
+            dissolveGroupRequestCodec,
+            dissolveGroupResponseCodec,
             metrics,
             NullLogger<GroupCommandHandler>.Instance);
 
@@ -449,6 +455,55 @@ public sealed class CommandDispatcherIntegrationTests
             Assert.Equal("msg-read-receipt-1", messageBus.LastReadReceiptCommand!.MessageId);
             Assert.Equal(42, messageBus.LastReadReceiptCommand!.ActorUserId);
             Assert.Equal(20, messageBus.LastReadReceiptCommand!.PageSize);
+
+            // 群解散：fake bus 返回成功，验证 Operation=Dissolve 透传与响应映射。
+            var dissolveRequestId = Guid.CreateVersion7().ToString("N");
+            await WriteFrameAsync(
+                stream,
+                PacketCommand.DissolveGroupRequest,
+                dissolveGroupRequestCodec,
+                new DissolveGroupRequest
+                {
+                    RequestId = dissolveRequestId,
+                    ConversationId = "grp-dispatcher-test"
+                },
+                timeout.Token);
+
+            var dissolveFrame = await ReadFrameAsync(stream, timeout.Token);
+            Assert.Equal(PacketCommand.DissolveGroupResponse, dissolveFrame.Command);
+            var dissolveResponse = dissolveGroupResponseCodec.Deserialize(
+                new ReadOnlySequence<byte>(dissolveFrame.Payload));
+            Assert.NotNull(dissolveResponse);
+            Assert.True(dissolveResponse.Succeeded);
+            Assert.Equal(dissolveRequestId, dissolveResponse.RequestId);
+            Assert.Equal("grp-dispatcher-test", dissolveResponse.ConversationId);
+            // 验证 handler 正确透传请求参数到 Realtime bus（仅 Owner 判定在 Realtime 侧）
+            Assert.NotNull(messageBus.LastMutateCommand);
+            Assert.Equal(GroupConversationOperation.Dissolve, messageBus.LastMutateCommand!.Operation);
+            Assert.Equal("grp-dispatcher-test", messageBus.LastMutateCommand!.ConversationId);
+            Assert.Equal(42, messageBus.LastMutateCommand!.ActorUserId);
+
+            // 群解散参数无效：空 ConversationId → invalid_request 失败响应。
+            var badDissolveRequestId = Guid.CreateVersion7().ToString("N");
+            await WriteFrameAsync(
+                stream,
+                PacketCommand.DissolveGroupRequest,
+                dissolveGroupRequestCodec,
+                new DissolveGroupRequest
+                {
+                    RequestId = badDissolveRequestId,
+                    ConversationId = ""
+                },
+                timeout.Token);
+
+            var badDissolveFrame = await ReadFrameAsync(stream, timeout.Token);
+            Assert.Equal(PacketCommand.DissolveGroupResponse, badDissolveFrame.Command);
+            var badDissolveResponse = dissolveGroupResponseCodec.Deserialize(
+                new ReadOnlySequence<byte>(badDissolveFrame.Payload));
+            Assert.NotNull(badDissolveResponse);
+            Assert.False(badDissolveResponse.Succeeded);
+            Assert.Equal("invalid_request", badDissolveResponse.ErrorCode);
+            Assert.Equal(badDissolveRequestId, badDissolveResponse.RequestId);
         }
         finally
         {
@@ -614,9 +669,17 @@ public sealed class CommandDispatcherIntegrationTests
             ConversationSetPrefsCommand command, CancellationToken ct = default) =>
             Task.FromResult(ConversationSetPrefsResult.Failed(command.RequestId, "x", "x"));
 
+        public GroupConversationCommand? LastMutateCommand { get; private set; }
+
         public Task<GroupConversationResult> MutateGroupConversationAsync(
-            GroupConversationCommand command, CancellationToken ct = default) =>
-            Task.FromResult(GroupConversationResult.Failed(command.RequestId, "x", "x"));
+            GroupConversationCommand command, CancellationToken ct = default)
+        {
+            LastMutateCommand = command;
+            return Task.FromResult(
+                command.Operation == GroupConversationOperation.Dissolve
+                    ? GroupConversationResult.Success(command.RequestId, command.ConversationId!)
+                    : GroupConversationResult.Failed(command.RequestId, "x", "x"));
+        }
 
         public GroupConversationCommand? LastReadReceiptCommand { get; private set; }
 

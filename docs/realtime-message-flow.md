@@ -168,5 +168,7 @@ REALTIME_EVENTS 是独立 Stream；历史读取 subject 使用 Core NATS，不�
 ## 下一阶段
 
 阶段 1–5（会话模型、列表未读、会话历史、多设备 SyncBootstrap、事件契约对齐）已完成。
-下一阶段继续性能门禁：用 `Run-ConversationCombo.ps1` 校准会话阶段延迟阈值，复跑浸泡，
-并将版本化门禁接入 Linux 定时 CI；门禁稳定后再推进群聊等扩展能力。
+群聊扩展能力已全量落地（创建 / 加人 / 移除 / 退群 / 角色 / 成员分页 / 已读回执查询 169-170 /
+群解散 171-172，解散成功后 Realtime 广播 `ConversationDissolvedUpdate`(166)，网关透传推送）。
+后续继续性能门禁：用 `Run-ConversationCombo.ps1` 校准会话阶段延迟阈值，复跑浸泡，
+并将版本化门禁接入 Linux 定时 CI。

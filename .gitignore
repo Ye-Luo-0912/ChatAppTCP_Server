@@ -8,6 +8,8 @@ obj/
 !/packages/ChatApp.Realtime.Integration.2.3.0.nupkg
 !/packages/ChatApp.Realtime.Contracts.2.3.0.nupkg
 !/packages/ChatApp.Realtime.Integration.3.0.0.nupkg
+!/packages/ChatApp.Protocol.Tcp.0.3.0.nupkg
+!/packages/ChatApp.Protocol.Tcp.Json.0.3.0.nupkg
 /.nuget/
 riderModule.iml
 /_ReSharper.Caches/

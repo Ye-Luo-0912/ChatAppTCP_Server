@@ -105,7 +105,8 @@ internal sealed class CommandDispatcher
         or PacketCommand.LeaveGroupRequest
         or PacketCommand.ChangeMemberRoleRequest
         or PacketCommand.ListGroupMembersRequest
-        or PacketCommand.MessageReadReceiptQueryRequest =>
+        or PacketCommand.MessageReadReceiptQueryRequest
+        or PacketCommand.DissolveGroupRequest =>
             InvokeAsync(_groupHandler, frame, context, cancellationToken),
 
         // Typing

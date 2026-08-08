@@ -293,6 +293,12 @@ public static class InfrastructureServiceCollectionExtensions
         services.AddSingleton<IPayloadCodec<MessageReadReceiptQueryResponse>>(
             static _ => new JsonPayloadCodec<MessageReadReceiptQueryResponse>(
                 GatewayJsonSerializerContext.Default.MessageReadReceiptQueryResponse));
+        services.AddSingleton<IPayloadCodec<DissolveGroupRequest>>(
+            static _ => new JsonPayloadCodec<DissolveGroupRequest>(
+                GatewayJsonSerializerContext.Default.DissolveGroupRequest));
+        services.AddSingleton<IPayloadCodec<DissolveGroupResponse>>(
+            static _ => new JsonPayloadCodec<DissolveGroupResponse>(
+                GatewayJsonSerializerContext.Default.DissolveGroupResponse));
 
         // Typing / Presence（TypingCommandHandler / PresenceCommandHandler 使用）
         services.AddSingleton<IPayloadCodec<TypingNotify>>(

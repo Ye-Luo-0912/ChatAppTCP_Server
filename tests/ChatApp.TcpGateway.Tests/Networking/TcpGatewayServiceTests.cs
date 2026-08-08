@@ -238,6 +238,10 @@ public sealed class TcpGatewayServiceTests
             GatewayJsonSerializerContext.Default.MessageReadReceiptQueryRequest);
         var messageReadReceiptQueryResponseCodec = new JsonPayloadCodec<MessageReadReceiptQueryResponse>(
             GatewayJsonSerializerContext.Default.MessageReadReceiptQueryResponse);
+        var dissolveGroupRequestCodec = new JsonPayloadCodec<DissolveGroupRequest>(
+            GatewayJsonSerializerContext.Default.DissolveGroupRequest);
+        var dissolveGroupResponseCodec = new JsonPayloadCodec<DissolveGroupResponse>(
+            GatewayJsonSerializerContext.Default.DissolveGroupResponse);
 
         // Typing / Presence handler 专用 codec
         var typingNotifyCodec = new JsonPayloadCodec<TypingNotify>(
@@ -324,6 +328,8 @@ public sealed class TcpGatewayServiceTests
             listGroupMembersResponseCodec,
             messageReadReceiptQueryRequestCodec,
             messageReadReceiptQueryResponseCodec,
+            dissolveGroupRequestCodec,
+            dissolveGroupResponseCodec,
             metrics,
             NullLogger<GroupCommandHandler>.Instance);
         var typingHandler = new TypingCommandHandler(

@@ -22,7 +22,7 @@ namespace ChatApp.TcpGateway.Gateway.Commands.Groups;
 
 /// <summary>
 /// 群组会话相关命令处理器（CreateGroupRequest / AddGroupMembersRequest / RemoveGroupMemberRequest /
-/// LeaveGroupRequest / ChangeMemberRoleRequest / ListGroupMembersRequest）。
+/// LeaveGroupRequest / ChangeMemberRoleRequest / ListGroupMembersRequest / DissolveGroupRequest）。
 /// <para>
 /// 从 <c>TcpGatewayService</c> 抽取，自带 codec 与 <see cref="IRealtimeMessageBus"/>，
 /// 不再依赖 service 私有字段。行为与原内联 handler 完全等价（校验顺序、错误码、metric 与日志事件）。
@@ -54,6 +54,8 @@ internal sealed partial class GroupCommandHandler : ICommandHandler
     private readonly IPayloadCodec<ListGroupMembersResponse> _listGroupMembersResponseCodec;
     private readonly IPayloadCodec<MessageReadReceiptQueryRequest> _messageReadReceiptQueryRequestCodec;
     private readonly IPayloadCodec<MessageReadReceiptQueryResponse> _messageReadReceiptQueryResponseCodec;
+    private readonly IPayloadCodec<DissolveGroupRequest> _dissolveGroupRequestCodec;
+    private readonly IPayloadCodec<DissolveGroupResponse> _dissolveGroupResponseCodec;
     private readonly GatewayMetrics _metrics;
     private readonly ILogger<GroupCommandHandler> _logger;
     private readonly IGroupIdempotencyStore? _idempotencyCache;
@@ -74,6 +76,8 @@ internal sealed partial class GroupCommandHandler : ICommandHandler
         IPayloadCodec<ListGroupMembersResponse> listGroupMembersResponseCodec,
         IPayloadCodec<MessageReadReceiptQueryRequest> messageReadReceiptQueryRequestCodec,
         IPayloadCodec<MessageReadReceiptQueryResponse> messageReadReceiptQueryResponseCodec,
+        IPayloadCodec<DissolveGroupRequest> dissolveGroupRequestCodec,
+        IPayloadCodec<DissolveGroupResponse> dissolveGroupResponseCodec,
         GatewayMetrics metrics,
         ILogger<GroupCommandHandler> logger,
         IGroupIdempotencyStore? idempotencyCache = null)
@@ -93,6 +97,8 @@ internal sealed partial class GroupCommandHandler : ICommandHandler
         _listGroupMembersResponseCodec = listGroupMembersResponseCodec;
         _messageReadReceiptQueryRequestCodec = messageReadReceiptQueryRequestCodec;
         _messageReadReceiptQueryResponseCodec = messageReadReceiptQueryResponseCodec;
+        _dissolveGroupRequestCodec = dissolveGroupRequestCodec;
+        _dissolveGroupResponseCodec = dissolveGroupResponseCodec;
         _metrics = metrics;
         _logger = logger;
         _idempotencyCache = idempotencyCache;
@@ -116,6 +122,8 @@ internal sealed partial class GroupCommandHandler : ICommandHandler
         PacketCommand.ListGroupMembersRequest => HandleListGroupMembersRequestAsync(
             frame.Payload, context.Session, cancellationToken),
         PacketCommand.MessageReadReceiptQueryRequest => HandleMessageReadReceiptQueryRequestAsync(
+            frame.Payload, context.Session, cancellationToken),
+        PacketCommand.DissolveGroupRequest => HandleDissolveGroupRequestAsync(
             frame.Payload, context.Session, cancellationToken),
         _ => default
     };

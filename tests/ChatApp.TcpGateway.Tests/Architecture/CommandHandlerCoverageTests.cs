@@ -52,6 +52,7 @@ public sealed class CommandHandlerCoverageTests
         PacketCommand.ChangeMemberRoleRequest,
         PacketCommand.ListGroupMembersRequest,
         PacketCommand.MessageReadReceiptQueryRequest,
+        PacketCommand.DissolveGroupRequest,
         // Typing
         PacketCommand.TypingNotify,
         // Presence
