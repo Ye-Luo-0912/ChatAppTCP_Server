@@ -105,8 +105,8 @@ public sealed class TcpClientSessionEphemeralCloseRaceTests
 
         public bool TryWrite(OutboundWrite item)
         {
-            Assert.Null(item.Frame);
             SentinelWriteEntered.Set();
+            Assert.Null(item.Frame);
             _release.Wait(TimeSpan.FromSeconds(2));
             return Volatile.Read(ref _completed) == 0;
         }
