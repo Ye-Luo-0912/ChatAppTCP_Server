@@ -10,8 +10,9 @@
     并行采集每例 Gateway 的 dotnet-gcdump 与 socket 证据（ss -tinm、/proc/net/sockstat）。
 
     三类画像的映射：
-      - silent：heartbeat 长间隔近似。10000 连接只认证、保持空闲；少部分 active sender
-        以极低速率发心跳，其余连接的 keepalive 间隔远大于测量窗口，从而近似静默。
+      - silent：低活跃静默近似。10000 连接只认证、保持空闲；少部分 active sender
+        以极低速率发心跳，其余连接以低于 Gateway 空闲超时（IdleTimeout 90s）的
+        keepalive 间隔保活，从而近似低流量静默且不因 idle timeout 被断开。
       - heartbeat：heartbeat-only。全部连接按配置速率发心跳。
       - active：chat。1% 连接为 active sender，另 1% 为 slow reader，其余保持空闲心跳。
 
@@ -52,8 +53,10 @@
     active 画像中 active sender 与 slow reader 各占连接的比例。默认 0.01（1%）。
 
 .PARAMETER SilentInactiveHeartbeatSeconds
-    silent 画像非 active 连接的 keepalive 间隔；应远大于测量窗口（上限 900s）以近似静默。
-    默认 3600（受底层容量曲线校验上限约束）。
+    silent 画像非 active 连接的 keepalive 间隔。必须小于 Gateway 空闲超时
+    （IdleTimeout 默认 90s），否则连接会在测量中被 `IdleTimedOut` 断开（smoke 因
+    60s<90s 未暴露，正式 10 分钟测量会触发）。取值 60 既保证连接存活，又比
+    heartbeat 画像（2 msg/s）轻得多，近似低活跃静默。
 
 .PARAMETER ActiveInactiveHeartbeatSeconds
     heartbeat/active 画像非发送连接的 keepalive 间隔。默认 30。
@@ -95,7 +98,7 @@ param(
     [ValidateRange(0.001, 100)] [double] $HeartbeatMessagesPerSecond = 2.0,
     [ValidateRange(1, 1048576)] [int] $TcpPayloadBytes = 512,
     [ValidateRange(0.0001, 0.5)] [double] $ActiveSenderFraction = 0.01,
-    [ValidateRange(0, 3600)] [int] $SilentInactiveHeartbeatSeconds = 3600,
+    [ValidateRange(1, 3600)] [int] $SilentInactiveHeartbeatSeconds = 60,
     [ValidateRange(0, 3600)] [int] $ActiveInactiveHeartbeatSeconds = 30,
     [ValidateRange(0.001, 100)] [double] $ActiveMessagesPerSecond = 1.0,
     [ValidateRange(1024, 65535)] [int] $GatewayBasePort = 18888,
@@ -165,13 +168,15 @@ $activePercent = [int]($ActiveSenderFraction * 100)
 $profileConfigs = [ordered]@{
     silent = [ordered]@{
         Label = 'silent'
-        Description = '10k authenticated idle (heartbeat long-interval approximation)'
+        Description = '10k authenticated near-idle (low-activity keepalive below gateway idle timeout)'
         TcpMode = 'heartbeat'
         TcpActiveSenders = $silentSenders
         TcpMessagesPerSecond = 0.01
         TcpInactiveHeartbeatSeconds = $SilentInactiveHeartbeatSeconds
         TcpSlowReaders = 0
         TcpPayloadBytes = 128
+        TcpDeliveryDrainSeconds = 30
+        MaximumDeadLetters = 0
     }
     heartbeat = [ordered]@{
         Label = 'heartbeat'
@@ -182,6 +187,8 @@ $profileConfigs = [ordered]@{
         TcpInactiveHeartbeatSeconds = $ActiveInactiveHeartbeatSeconds
         TcpSlowReaders = 0
         TcpPayloadBytes = 128
+        TcpDeliveryDrainSeconds = 30
+        MaximumDeadLetters = 0
     }
     active = [ordered]@{
         Label = 'active'
@@ -192,6 +199,12 @@ $profileConfigs = [ordered]@{
         TcpInactiveHeartbeatSeconds = $ActiveInactiveHeartbeatSeconds
         TcpSlowReaders = $slowReaders
         TcpPayloadBytes = $TcpPayloadBytes
+        # slow reader 刻意不消费 chat 投递，交付 drain 门在 30s 窗口内必然无法完成；
+        # 该画像只测内存归因，不校验端到端交付收尾，故禁用 delivery drain 语义门。
+        TcpDeliveryDrainSeconds = 0
+        # slow reader 不消费导致指向它们的投递被实时服务限流而死信（rate_limited），
+        # 属 slow-reader 画像的固有语义；放宽死信门上限（按 slow reader 数量比例）。
+        MaximumDeadLetters = [long]($slowReaders * 2)
     }
 }
 
@@ -364,7 +377,8 @@ foreach ($profileName in $selectedProfiles) {
             TcpActiveSenders = [int]$config.TcpActiveSenders
             TcpMode = [string]$config.TcpMode
             TcpMessagesPerSecond = [double]$config.TcpMessagesPerSecond
-            TcpDeliveryDrainSeconds = 30
+            TcpDeliveryDrainSeconds = [int]$config.TcpDeliveryDrainSeconds
+            MaximumDeadLetters = [long]$config.MaximumDeadLetters
             TcpInactiveHeartbeatSeconds = [int]$config.TcpInactiveHeartbeatSeconds
             TcpPayloadBytes = [int]$config.TcpPayloadBytes
             TcpSlowReaders = [int]$config.TcpSlowReaders

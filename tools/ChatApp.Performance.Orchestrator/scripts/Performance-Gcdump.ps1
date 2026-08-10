@@ -44,7 +44,10 @@ function Invoke-PerformanceGcdumpCollect {
     param(
         [Parameter(Mandatory)] [int] $ProcessId,
         [Parameter(Mandatory)] [string] $OutputDirectory,
-        [Parameter(Mandatory)] [string] $Label
+        [Parameter(Mandatory)] [string] $Label,
+        # dotnet-gcdump 默认 30s 超时；10k 高负载 Gateway 暂停+dump 可能超过该窗口，
+        # 导致 attach 超时退出码 255。按每 Gateway 内存规模放大超时。
+        [int] $TimeoutSeconds = 120
     )
 
     [IO.Directory]::CreateDirectory($OutputDirectory) | Out-Null
@@ -53,8 +56,8 @@ function Invoke-PerformanceGcdumpCollect {
     if (-not (Test-PerformanceGcdumpTool)) {
         throw 'dotnet-gcdump 未安装。请先执行: dotnet tool install -g dotnet-gcdump'
     }
-    Write-Host "采集 $Label (pid=$ProcessId) gcdump -> $outputFile"
-    & dotnet-gcdump collect -p $ProcessId -o $outputFile
+    Write-Host "采集 $Label (pid=$ProcessId) gcdump -> $outputFile (timeout=$TimeoutSeconds s)"
+    & dotnet-gcdump collect -p $ProcessId -o $outputFile -t $TimeoutSeconds -v
     if ($LASTEXITCODE -ne 0) {
         throw "dotnet-gcdump 采集失败 (pid=$ProcessId, exit=$LASTEXITCODE)"
     }
