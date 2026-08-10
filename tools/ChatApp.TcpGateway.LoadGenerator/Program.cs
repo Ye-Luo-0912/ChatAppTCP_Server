@@ -239,6 +239,8 @@ var reportExpectedDeliveries = crossGateway ? sent : expectedDeliveries;
 var latency = runState.Latency.Snapshot();
 var acknowledgementLatency = runState.AcknowledgementLatency.Snapshot();
 var deliveryLatency = runState.DeliveryLatency.Snapshot();
+var acknowledgementIdFingerprint = runState.SnapshotAcknowledgementIds();
+var deliveryIdFingerprint = runState.SnapshotDeliveryIds();
 var healthyLatency = runState.HealthyLatency.Snapshot();
 var slowLatency = runState.SlowLatency.Snapshot();
 var healthyCount = results.Count(
@@ -413,6 +415,8 @@ var report = TcpLoadReport.Create(
     rejected,
     duplicateAcknowledgements,
     duplicateDeliveries,
+    acknowledgementIdFingerprint,
+    deliveryIdFingerprint,
     runState.OutstandingCount,
     runState.TrackingExpired,
     runState.TrackingDropped,
@@ -861,10 +865,11 @@ static async Task RunChatSenderAsync(
 
         while (!sendingCancellationToken.IsCancellationRequested)
         {
-            var messageId = Guid.CreateVersion7().ToString("N");
+            var startedAt = Stopwatch.GetTimestamp();
+            var messageId = LoadMessageCorrelation.Create(startedAt);
             var tracked = runState.TryTrack(
                 messageId,
-                Stopwatch.GetTimestamp(),
+                startedAt,
                 expectedRecipientClientIndexes);
 
             try

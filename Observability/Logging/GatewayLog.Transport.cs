@@ -26,6 +26,15 @@ public static partial class GatewayLog
     public static partial void GatewayStopped(this ILogger logger);
 
     [LoggerMessage(
+        GatewayEventIds.SessionCloseSummary,
+        LogLevel.Information,
+        "TCP gateway session close summary: {Summary}.",
+        EventName = "TcpGateway.SessionCloseSummary")]
+    public static partial void SessionCloseSummary(
+        this ILogger logger,
+        string summary);
+
+    [LoggerMessage(
         GatewayEventIds.GatewayFatal,
         LogLevel.Critical,
         "TCP gateway stopped due to a fatal error.",

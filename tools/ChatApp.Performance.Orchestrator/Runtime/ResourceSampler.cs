@@ -216,6 +216,9 @@ internal sealed class ResourceSampler
         // item 八：Linux /proc 与 cgroup-v2 内存压力信号（best-effort）。
         private long _vmHwmMax;
         private long _vmRssMax;
+        // TCP-MEM-1：PSS（smaps_rollup）与文件描述符计数归因。
+        private long _pssMax;
+        private int _fdMax;
         private long _cgroupMemoryCurrentMax;
         private long _cgroupMemoryPeakMax;
         private long _cgroupOomEvents;
@@ -283,6 +286,11 @@ internal sealed class ResourceSampler
                     _vmHwmMax = Math.Max(_vmHwmMax, vmHwm);
                 if (linux.VmRssBytes is { } vmRss)
                     _vmRssMax = Math.Max(_vmRssMax, vmRss);
+                // TCP-MEM-1：记录 PSS 峰值与峰值 fd 数（0 = 非 Linux 不可用）。
+                if (linux.PssBytes is { } pss)
+                    _pssMax = Math.Max(_pssMax, pss);
+                if (linux.FileDescriptorCount is { } fdCount)
+                    _fdMax = Math.Max(_fdMax, fdCount);
                 if (linux.CgroupMemoryCurrentBytes is { } cgroupCurrent)
                     _cgroupMemoryCurrentMax = Math.Max(_cgroupMemoryCurrentMax, cgroupCurrent);
                 if (linux.CgroupMemoryPeakBytes is { } cgroupPeak)
@@ -319,6 +327,9 @@ internal sealed class ResourceSampler
             // item 八：Linux /proc 与 cgroup-v2 内存压力信号（0 = 不可用）。
             MaximumVmRssBytes = _vmRssMax,
             MaximumVmHwmBytes = _vmHwmMax,
+            // TCP-MEM-1：PSS 峰值与峰值 fd 数（0 = 非 Linux 不可用）。
+            MaximumPssBytes = _pssMax,
+            MaximumFileDescriptorCount = _fdMax,
             MaximumCgroupMemoryCurrentBytes = _cgroupMemoryCurrentMax,
             MaximumCgroupMemoryPeakBytes = _cgroupMemoryPeakMax,
             CgroupOomEvents = _cgroupOomEvents,

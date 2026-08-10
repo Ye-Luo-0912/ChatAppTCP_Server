@@ -35,6 +35,8 @@ internal sealed class TcpLoadReport
     public long Rejected { get; init; }
     public long DuplicateAcknowledgements { get; init; }
     public long DuplicateDeliveries { get; init; }
+    public required MessageIdFingerprintSnapshot AcknowledgementIdFingerprint { get; init; }
+    public required MessageIdFingerprintSnapshot DeliveryIdFingerprint { get; init; }
     public int Outstanding { get; init; }
     public long TrackingExpired { get; init; }
     public long TrackingDropped { get; init; }
@@ -42,6 +44,8 @@ internal sealed class TcpLoadReport
     public double SentPerSecond { get; init; }
     public double ReceivedPerSecond { get; init; }
     public required string PrimaryLatencyKind { get; init; }
+    public required string DeliveryLatencySource { get; init; }
+    public required string MessageIdCorrelationEvidence { get; init; }
     public required TcpLatencySnapshot Latency { get; init; }
     public required TcpLatencySnapshot AcknowledgementLatency { get; init; }
     public required TcpLatencySnapshot DeliveryLatency { get; init; }
@@ -81,6 +85,8 @@ internal sealed class TcpLoadReport
         long rejected,
         long duplicateAcknowledgements,
         long duplicateDeliveries,
+        MessageIdFingerprintSnapshot acknowledgementIdFingerprint,
+        MessageIdFingerprintSnapshot deliveryIdFingerprint,
         int outstanding,
         long trackingExpired,
         long trackingDropped,
@@ -155,6 +161,8 @@ internal sealed class TcpLoadReport
             Rejected = rejected,
             DuplicateAcknowledgements = duplicateAcknowledgements,
             DuplicateDeliveries = duplicateDeliveries,
+            AcknowledgementIdFingerprint = acknowledgementIdFingerprint,
+            DeliveryIdFingerprint = deliveryIdFingerprint,
             Outstanding = outstanding,
             TrackingExpired = trackingExpired,
             TrackingDropped = trackingDropped,
@@ -166,6 +174,11 @@ internal sealed class TcpLoadReport
                     ? "peer-delivery"
                     : "mq-acknowledgement"
                 : "operation-round-trip",
+            DeliveryLatencySource = options.TargetRingFilePath is null
+                ? "in-process Stopwatch timestamp tracked by ClientMessageId"
+                : "receiving child using the monotonic timestamp encoded in ClientMessageId; same load host only",
+            MessageIdCorrelationEvidence =
+                "probabilistic count + 64-bit sum/xor fingerprint; not a per-id log or cryptographic proof",
             Latency = TcpLatencySnapshot.Create(
                 options.Mode == LoadMode.Chat && options.TargetRingFilePath is not null
                     ? acknowledgementLatency

@@ -48,7 +48,8 @@ public sealed class SessionCommandExecutorTests
         var command = CreateCommand(session);
 
         // 未注册连接：入队失败。
-        Assert.False(executor.TryEnqueue(connectionId: 999u, in command));
+        var registration = default(SessionCommandExecutor.Registration);
+        Assert.False(registration.TryEnqueue(in command));
 
         await executor.DisposeAsync();
         await session.DisposeAsync();
@@ -67,9 +68,19 @@ public sealed class SessionCommandExecutorTests
             perUserConcurrency: 0,
             onFatalError: null);
 
-        Assert.True(executor.TryRegisterConnection(connectionId: 1u, userId: 100));
+        Assert.True(executor.TryRegisterConnection(
+            connectionId: 1u,
+            userId: 100,
+            out var registration));
+        Assert.True(registration.IsValid);
         // 重复注册同一 connectionId：幂等返回 false。
-        Assert.False(executor.TryRegisterConnection(connectionId: 1u, userId: 100));
+        Assert.False(executor.TryRegisterConnection(
+            connectionId: 1u,
+            userId: 100,
+            out var duplicate));
+        Assert.False(duplicate.IsValid);
+        duplicate.Unregister();
+        Assert.Equal(1, executor.RegisteredConnectionCount);
 
         await executor.DisposeAsync();
     }
@@ -96,17 +107,20 @@ public sealed class SessionCommandExecutorTests
         await executor.StartAsync(cts.Token);
 
         var session = TestSessionFactory.Create();
-        executor.TryRegisterConnection(session.ConnectionId, session.UserId);
+        Assert.True(executor.TryRegisterConnection(
+            session.ConnectionId,
+            session.UserId,
+            out var registration));
 
         // 入队 2 条（达到容量上限）。
         var c1 = CreateCommand(session);
         var c2 = CreateCommand(session);
-        Assert.True(executor.TryEnqueue(session.ConnectionId, in c1));
-        Assert.True(executor.TryEnqueue(session.ConnectionId, in c2));
+        Assert.True(registration.TryEnqueue(in c1));
+        Assert.True(registration.TryEnqueue(in c2));
 
         // 第 3 条：超过容量，返回 false。
         var c3 = CreateCommand(session);
-        Assert.False(executor.TryEnqueue(session.ConnectionId, in c3));
+        Assert.False(registration.TryEnqueue(in c3));
 
         // 等待前两条被处理。
         await processed.Reader.ReadAsync(TestContext.Current.CancellationToken);
@@ -155,12 +169,15 @@ public sealed class SessionCommandExecutorTests
         await executor.StartAsync(cts.Token);
 
         var session = TestSessionFactory.Create();
-        executor.TryRegisterConnection(session.ConnectionId, session.UserId);
+        Assert.True(executor.TryRegisterConnection(
+            session.ConnectionId,
+            session.UserId,
+            out var registration));
 
         for (var i = 0; i < 8; i++)
         {
             var cmd = CreateCommand(session);
-            Assert.True(executor.TryEnqueue(session.ConnectionId, in cmd));
+            Assert.True(registration.TryEnqueue(in cmd));
         }
 
         // 等待 8 条全部处理完。
@@ -192,7 +209,10 @@ public sealed class SessionCommandExecutorTests
 
         // 不启动 worker，使入队命令停留在队列中。
         var session = TestSessionFactory.Create();
-        executor.TryRegisterConnection(session.ConnectionId, session.UserId);
+        Assert.True(executor.TryRegisterConnection(
+            session.ConnectionId,
+            session.UserId,
+            out var registration));
 
         // 入队带 pooled buffer + inbound budget 的命令。
         var payloadLen = 64;
@@ -211,10 +231,10 @@ public sealed class SessionCommandExecutorTests
         inboundBudget.TryReserve(payloadLen);
         Assert.Equal(budgetBefore + payloadLen, inboundBudget.CurrentBytes);
 
-        Assert.True(executor.TryEnqueue(session.ConnectionId, in cmd));
+        Assert.True(registration.TryEnqueue(in cmd));
 
         // 注销连接：应释放缓冲区与预算。
-        executor.UnregisterConnection(session.ConnectionId);
+        registration.Unregister();
 
         // 预算已归还。
         Assert.Equal(budgetBefore, inboundBudget.CurrentBytes);
@@ -239,7 +259,10 @@ public sealed class SessionCommandExecutorTests
 
         // 不启动 worker，命令停留在队列中。
         var session = TestSessionFactory.Create();
-        executor.TryRegisterConnection(session.ConnectionId, session.UserId);
+        Assert.True(executor.TryRegisterConnection(
+            session.ConnectionId,
+            session.UserId,
+            out var registration));
 
         for (var i = 0; i < 3; i++)
         {
@@ -256,7 +279,7 @@ public sealed class SessionCommandExecutorTests
                 Session = session,
                 RemoteIp = "127.0.0.1"
             };
-            Assert.True(executor.TryEnqueue(session.ConnectionId, in cmd));
+            Assert.True(registration.TryEnqueue(in cmd));
         }
 
         Assert.Equal(96, inboundBudget.CurrentBytes);
@@ -269,6 +292,262 @@ public sealed class SessionCommandExecutorTests
 
         await executor.DisposeAsync();
         await session.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task IdleRegistrationsDoNotAllocateCommandQueues()
+    {
+        var executor = new SessionCommandExecutor(
+            (_, _) => ValueTask.CompletedTask,
+            workerCount: 1,
+            burstLimit: 4,
+            perConnectionCapacity: 8,
+            globalCapacity: 16,
+            commandTimeout: TimeSpan.Zero,
+            perUserConcurrency: 0,
+            onFatalError: null);
+
+        await using var session = TestSessionFactory.Create();
+        const int connectionCount = 10_000;
+        var registrations = new SessionCommandExecutor.Registration[connectionCount];
+        for (uint connectionId = 1; connectionId <= connectionCount; connectionId++)
+        {
+            Assert.True(executor.TryRegisterConnection(
+                connectionId,
+                userId: 0,
+                out registrations[connectionId - 1]));
+        }
+
+        Assert.Equal(connectionCount, executor.RegisteredConnectionCount);
+        Assert.Equal(0, executor.AllocatedCommandQueueCount);
+
+        var command = CreateCommand(session);
+        Assert.True(registrations[0].TryEnqueue(in command));
+        Assert.Equal(1, executor.AllocatedCommandQueueCount);
+
+        foreach (var registration in registrations)
+            registration.Unregister();
+
+        Assert.Equal(0, executor.RegisteredConnectionCount);
+        Assert.Equal(0, executor.AllocatedCommandQueueCount);
+        await executor.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task UnregisterRacingFirstEnqueueNeverStrandsOwnedResources()
+    {
+        var budget = new GlobalInboundBudget(maxBytes: 4096);
+        var executor = new SessionCommandExecutor(
+            (_, _) => ValueTask.CompletedTask,
+            workerCount: 1,
+            burstLimit: 1,
+            perConnectionCapacity: 8,
+            globalCapacity: 16,
+            commandTimeout: TimeSpan.Zero,
+            perUserConcurrency: 0,
+            onFatalError: null);
+
+        await using var session = TestSessionFactory.Create();
+        const int iterations = 256;
+        for (uint connectionId = 1; connectionId <= iterations; connectionId++)
+        {
+            Assert.True(executor.TryRegisterConnection(
+                connectionId,
+                userId: 0,
+                out var registration));
+            Assert.True(budget.TryReserve(1));
+
+            var command = new SessionCommand
+            {
+                Command = PacketCommand.Heartbeat,
+                RentedBuffer = new byte[1],
+                PayloadLength = 1,
+                IsPooled = false,
+                ReservedInboundBytes = 1,
+                InboundBudget = budget,
+                Session = session,
+                RemoteIp = "127.0.0.1"
+            };
+
+            using var start = new Barrier(participantCount: 2);
+            var enqueueTask = Task.Run(() =>
+            {
+                start.SignalAndWait(TestContext.Current.CancellationToken);
+                var local = command;
+                if (!registration.TryEnqueue(in local))
+                    SessionCommandResources.Release(in local);
+            }, TestContext.Current.CancellationToken);
+            var unregisterTask = Task.Run(() =>
+            {
+                start.SignalAndWait(TestContext.Current.CancellationToken);
+                registration.Unregister();
+            }, TestContext.Current.CancellationToken);
+
+            await Task.WhenAll(enqueueTask, unregisterTask);
+
+            // 幂等关闭，并验证已捕获旧 holder 的生产者不能留下命令。
+            registration.Unregister();
+            var probe = CreateCommand(session);
+            Assert.False(registration.TryEnqueue(in probe));
+        }
+
+        Assert.Equal(0, budget.CurrentBytes);
+        Assert.Equal(0, executor.RegisteredConnectionCount);
+        await executor.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task MultipleProducersPreservePerProducerFifoAndReleaseEveryCommand()
+    {
+        const int producerCount = 4;
+        const int commandsPerProducer = 64;
+        var expectedCount = producerCount * commandsPerProducer;
+        var budget = new GlobalInboundBudget(maxBytes: expectedCount * 2L);
+        var processed = Channel.CreateUnbounded<(byte Producer, byte Sequence)>();
+        var executor = new SessionCommandExecutor(
+            (command, _) =>
+            {
+                processed.Writer.TryWrite((
+                    command.RentedBuffer[0],
+                    command.RentedBuffer[1]));
+                return ValueTask.CompletedTask;
+            },
+            workerCount: 4,
+            burstLimit: 3,
+            perConnectionCapacity: expectedCount,
+            globalCapacity: 16,
+            commandTimeout: TimeSpan.Zero,
+            perUserConcurrency: 0,
+            onFatalError: null);
+
+        await using var session = TestSessionFactory.Create();
+        Assert.True(executor.TryRegisterConnection(
+            connectionId: 77,
+            userId: 0,
+            out var registration));
+        await executor.StartAsync(TestContext.Current.CancellationToken);
+
+        using var start = new Barrier(participantCount: producerCount);
+        var producers = new Task[producerCount];
+        for (var producerIndex = 0; producerIndex < producerCount; producerIndex++)
+        {
+            var producer = (byte)producerIndex;
+            producers[producerIndex] = Task.Run(() =>
+            {
+                start.SignalAndWait(TestContext.Current.CancellationToken);
+                for (byte sequence = 0; sequence < commandsPerProducer; sequence++)
+                {
+                    Assert.True(budget.TryReserve(2));
+                    var command = new SessionCommand
+                    {
+                        Command = PacketCommand.Heartbeat,
+                        RentedBuffer = [producer, sequence],
+                        PayloadLength = 2,
+                        IsPooled = false,
+                        ReservedInboundBytes = 2,
+                        InboundBudget = budget,
+                        Session = session,
+                        RemoteIp = "127.0.0.1"
+                    };
+                    Assert.True(registration.TryEnqueue(in command));
+                }
+            }, TestContext.Current.CancellationToken);
+        }
+
+        await Task.WhenAll(producers);
+
+        var observed = new List<(byte Producer, byte Sequence)>(expectedCount);
+        for (var i = 0; i < expectedCount; i++)
+        {
+            observed.Add(await processed.Reader.ReadAsync(
+                TestContext.Current.CancellationToken));
+        }
+
+        Assert.True(SpinWait.SpinUntil(
+            () => budget.CurrentBytes == 0,
+            TimeSpan.FromSeconds(5)));
+        Assert.Equal(expectedCount, observed.Distinct().Count());
+        for (byte producer = 0; producer < producerCount; producer++)
+        {
+            Assert.Equal(
+                Enumerable.Range(0, commandsPerProducer).Select(value => (byte)value),
+                observed
+                    .Where(item => item.Producer == producer)
+                    .Select(item => item.Sequence));
+        }
+
+        await executor.StopAsync(CancellationToken.None);
+        await executor.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task UnregisterDrainsPendingWhileInflightCommandRetainsSingleOwnership()
+    {
+        var processorEntered = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseProcessor = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var processed = 0;
+        var budget = new GlobalInboundBudget(maxBytes: 1024);
+        var executor = new SessionCommandExecutor(
+            async (_, cancellationToken) =>
+            {
+                Interlocked.Increment(ref processed);
+                processorEntered.TrySetResult();
+                await releaseProcessor.Task.WaitAsync(cancellationToken);
+            },
+            workerCount: 1,
+            burstLimit: 8,
+            perConnectionCapacity: 16,
+            globalCapacity: 16,
+            commandTimeout: TimeSpan.Zero,
+            perUserConcurrency: 0,
+            onFatalError: null);
+
+        await using var session = TestSessionFactory.Create();
+        Assert.True(executor.TryRegisterConnection(
+            connectionId: 91,
+            userId: 0,
+            out var registration));
+        await executor.StartAsync(TestContext.Current.CancellationToken);
+
+        for (var i = 0; i < 9; i++)
+        {
+            Assert.True(budget.TryReserve(1));
+            var command = new SessionCommand
+            {
+                Command = PacketCommand.Heartbeat,
+                RentedBuffer = new byte[1],
+                PayloadLength = 1,
+                IsPooled = false,
+                ReservedInboundBytes = 1,
+                InboundBudget = budget,
+                Session = session,
+                RemoteIp = "127.0.0.1"
+            };
+            Assert.True(registration.TryEnqueue(in command));
+        }
+
+        await processorEntered.Task.WaitAsync(TestContext.Current.CancellationToken);
+        registration.Unregister();
+
+        // 8 条 pending 已由关闭路径释放；in-flight 仍由 processor 独占。
+        Assert.Equal(1, budget.CurrentBytes);
+        var rejected = CreateCommand(session);
+        Assert.False(registration.TryEnqueue(in rejected));
+
+        releaseProcessor.TrySetResult();
+        Assert.True(SpinWait.SpinUntil(
+            () => budget.CurrentBytes == 0,
+            TimeSpan.FromSeconds(5)));
+        Assert.Equal(1, Volatile.Read(ref processed));
+
+        await executor.StopAsync(CancellationToken.None);
+        Assert.False(executor.TryRegisterConnection(
+            92,
+            userId: 0,
+            out _));
+        await executor.DisposeAsync();
     }
 }
 

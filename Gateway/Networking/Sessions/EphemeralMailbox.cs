@@ -42,6 +42,9 @@ internal sealed class EphemeralMailbox
     // 初始 8 槽覆盖常见 2～8 个 distinct ephemeral key；满时翻倍扩容，但不超过 MaxEphemeralKeys。
     private (EphemeralKey Key, EphemeralEntry Entry)[] _slots = new (EphemeralKey, EphemeralEntry)[8];
     private int _count;
+    // lock 内递增并写入 EphemeralEntry，作为条件移除的 ABA 防护。
+    // 同一 SharedOutboundFrame 可被重复存入同一 key，不能只比较 Frame 引用。
+    private long _nextEntryVersion;
 
     // 可复用的 drain 缓冲：避免每次排空分配新 List。
     // 安全性：Drain 由 send loop 单线程调用（同一 session 不会并发 drain），
@@ -63,12 +66,28 @@ internal sealed class EphemeralMailbox
     /// </summary>
     /// <param name="rejected">true 表示因达到 <see cref="MaxEphemeralKeys"/> 上限新 key 被拒绝存储；
     /// 此时返回值为 null（无旧条目），新条目未被存储，调用者必须 dispose 新帧并释放预算。</param>
+    /// <param name="storedEntry">实际写入槽位、带唯一版本的条目；拒绝时为 default。
+    /// 关闭竞态回滚必须把它作为 expected entry 传给 <see cref="TryRemove"/>。</param>
     /// <returns>被覆盖的旧条目（如有）；调用者负责 dispose 旧帧与释放预算。null 表示新插入或被拒绝（用 <paramref name="rejected"/> 区分）。</returns>
-    public EphemeralEntry? TryStore(EphemeralKey key, EphemeralEntry newEntry, out bool rejected)
+    public EphemeralEntry? TryStore(
+        EphemeralKey key,
+        EphemeralEntry newEntry,
+        out bool rejected,
+        out EphemeralEntry storedEntry)
     {
         rejected = false;
+        storedEntry = default;
         lock (_lock)
         {
+            var entryVersion = ++_nextEntryVersion;
+            // 0 保留给 default；long 回绕在现实生命周期内不可达，但仍保持哨兵不变量。
+            if (entryVersion == 0)
+                entryVersion = ++_nextEntryVersion;
+            storedEntry = new EphemeralEntry(
+                newEntry.Frame,
+                newEntry.ByteCount,
+                entryVersion);
+
             // 先扫描已存在 key：覆盖旧条目（不增加 _count）。
             for (int i = 0; i < _slots.Length; i++)
             {
@@ -76,7 +95,7 @@ internal sealed class EphemeralMailbox
                 if (slot.Key == key)
                 {
                     var old = slot.Entry;
-                    slot.Entry = newEntry;
+                    slot.Entry = storedEntry;
                     return old;
                 }
             }
@@ -87,6 +106,7 @@ internal sealed class EphemeralMailbox
             if (_count >= MaxEphemeralKeys)
             {
                 rejected = true;
+                storedEntry = default;
                 return null;
             }
 
@@ -97,7 +117,7 @@ internal sealed class EphemeralMailbox
                 if (slot.Key.Kind == 0)
                 {
                     slot.Key = key;
-                    slot.Entry = newEntry;
+                    slot.Entry = storedEntry;
                     _count++;
                     return null;
                 }
@@ -106,10 +126,43 @@ internal sealed class EphemeralMailbox
             // 所有槽已被不同 key 占用：扩容后插入（扩容后仍受 MaxEphemeralKeys 检查保护）。
             var oldLen = _slots.Length;
             Array.Resize(ref _slots, oldLen * 2);
-            _slots[oldLen] = (key, newEntry);
+            _slots[oldLen] = (key, storedEntry);
             _count++;
             return null;
         }
+    }
+
+    /// <summary>
+    /// 仅当 <paramref name="key"/> 当前仍指向 <paramref name="expectedEntry"/> 时移除。
+    /// 用于连接关闭窗口中撤销刚存入、但未能写入 flush sentinel 的条目。
+    /// <para>
+    /// 不能调用 <see cref="Drain"/> 做失败回滚：发送线程可能正在遍历其复用 List，
+    /// 并发 Drain 会 Clear 同一实例，导致丢帧或重复释放。这里在 mailbox lock 内只摘除
+    /// 当前生产者拥有的精确条目；若它已被覆盖或被 Drain 取得，所有权留给胜者。
+    /// </para>
+    /// </summary>
+    public bool TryRemove(
+        EphemeralKey key,
+        EphemeralEntry expectedEntry,
+        out EphemeralEntry removedEntry)
+    {
+        lock (_lock)
+        {
+            for (var index = 0; index < _slots.Length; index++)
+            {
+                ref var slot = ref _slots[index];
+                if (slot.Key == key && slot.Entry == expectedEntry)
+                {
+                    removedEntry = slot.Entry;
+                    slot = default;
+                    _count--;
+                    return true;
+                }
+            }
+        }
+
+        removedEntry = default;
+        return false;
     }
 
     /// <summary>

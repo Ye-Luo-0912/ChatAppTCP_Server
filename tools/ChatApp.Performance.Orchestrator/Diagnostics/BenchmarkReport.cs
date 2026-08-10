@@ -17,12 +17,51 @@ internal sealed class BenchmarkReport
     public required IReadOnlyList<LoadResultSummary> LoadResults { get; init; }
     public required IReadOnlyList<ProcessResourceSummary> ProcessResources { get; init; }
     public required IReadOnlyList<DockerResourceSummary> DockerResources { get; init; }
+    public required PostgresDiagnosticsReport PostgresDiagnostics { get; init; }
     public required Dictionary<string, double> MetricsBefore { get; init; }
     public required Dictionary<string, double> MetricsAfter { get; init; }
     public required Dictionary<string, double> MetricDeltas { get; init; }
     public required IReadOnlyList<PrometheusMetricTrend> MetricTrends { get; init; }
     public required IReadOnlyList<string> Artifacts { get; init; }
     public required IReadOnlyList<string> Errors { get; init; }
+}
+
+internal sealed class PostgresDiagnosticsReport
+{
+    public bool Available { get; init; }
+    public string? Error { get; init; }
+    public required Dictionary<string, double> MetricsBefore { get; init; }
+    public required Dictionary<string, double> MetricsAfter { get; init; }
+    public required Dictionary<string, double> MetricDeltas { get; init; }
+    public required IReadOnlyList<PostgresStatementSummary> TopStatements { get; init; }
+
+    public static PostgresDiagnosticsReport Unavailable(string? error = null) => new()
+    {
+        Available = false,
+        Error = error,
+        MetricsBefore = new Dictionary<string, double>(StringComparer.Ordinal),
+        MetricsAfter = new Dictionary<string, double>(StringComparer.Ordinal),
+        MetricDeltas = new Dictionary<string, double>(StringComparer.Ordinal),
+        TopStatements = Array.Empty<PostgresStatementSummary>()
+    };
+}
+
+internal sealed class PostgresStatementSummary
+{
+    public required string QueryId { get; init; }
+    public long Calls { get; init; }
+    public double TotalExecutionMilliseconds { get; init; }
+    public long Rows { get; init; }
+    public long SharedBlocksHit { get; init; }
+    public long SharedBlocksRead { get; init; }
+    public long SharedBlocksDirtied { get; init; }
+    public long SharedBlocksWritten { get; init; }
+    public long TempBlocksRead { get; init; }
+    public long TempBlocksWritten { get; init; }
+    public long WalRecords { get; init; }
+    public long WalFullPageImages { get; init; }
+    public double WalBytes { get; init; }
+    public required string Query { get; init; }
 }
 
 internal sealed class BenchmarkConfiguration
@@ -194,6 +233,12 @@ internal sealed class LoadResultSummary
     public long MessagesAcknowledged { get; init; }
     public long MessagesRejected { get; init; }
     public long MessagesReceived { get; init; }
+    public long DeliveryLatencySamples { get; init; }
+    public double DeliveryP50Milliseconds { get; init; }
+    public double DeliveryP95Milliseconds { get; init; }
+    public double DeliveryP99Milliseconds { get; init; }
+    public MessageIdFingerprintSummary? AcknowledgementIdFingerprint { get; init; }
+    public MessageIdFingerprintSummary? DeliveryIdFingerprint { get; init; }
     public double RampSeconds { get; init; }
     public double StabilizationSeconds { get; init; }
     public double MeasurementSeconds { get; init; }
@@ -202,6 +247,11 @@ internal sealed class LoadResultSummary
     public int ActiveSenders { get; init; }
     public required string SourceReport { get; init; }
 }
+
+internal sealed record MessageIdFingerprintSummary(
+    long Count,
+    ulong Sum,
+    ulong Xor);
 
 internal sealed class BenchmarkRunValidity
 {
@@ -278,6 +328,9 @@ internal sealed class ProcessResourceSummary
     // item 八：Linux /proc 与 cgroup-v2 内存压力信号（0 = 不可用）。
     public long MaximumVmRssBytes { get; init; }
     public long MaximumVmHwmBytes { get; init; }
+    // TCP-MEM-1：PSS（smaps_rollup）峰值与峰值文件描述符数（0 = 非 Linux 不可用）。
+    public long MaximumPssBytes { get; init; }
+    public int MaximumFileDescriptorCount { get; init; }
     public long MaximumCgroupMemoryCurrentBytes { get; init; }
     public long MaximumCgroupMemoryPeakBytes { get; init; }
     public long CgroupOomEvents { get; init; }

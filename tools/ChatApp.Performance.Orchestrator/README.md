@@ -109,6 +109,11 @@ TCP chat/heartbeat 模式需要认证令牌。隔离的性能场景应优先使�
 吞吐分母。非主动发送连接由 `--tcp-inactive-heartbeat-seconds` 维持认证会话；这些 heartbeat
 不进入 durable chat 消息、ACK、投递或吞吐计数。
 
+长连接资源 A/B 可用 `--gateway-device-lease-refresh-seconds` 和
+`--gateway-global-presence-refresh-seconds` 显式覆盖 Gateway 的 Redis 刷新 cadence；两项值会写入
+`BenchmarkOptions`/最终 JSON，不能只靠目录名推断配置。它们不改变客户端 heartbeat 周期，且仍受
+Gateway TTL 安全校验约束。
+
 不要把“10,000 长连接”直接解释为“10,000 个用户各 5 msg/s 持续写入”。默认业务限流为
 每用户 30 秒 30 条，且 50,000 msg/s 持续 8 小时会产生 14.4 亿条 durable 消息；这既不是
 有效业务负载，也会把容量、磁盘和内存稳定性混成一个不可解释的失败。
@@ -131,6 +136,44 @@ JSON/Markdown，并在 finally 中只删除本次创建的容器。容器创建�
 负载模型是有界闭环节流：worker 变慢后实际注入速率会下降。报告同时保留目标速率、
 实际速率和达成率；高档位的目标未达成不能解释为开放环形负载的服务端排队量。每档
 持久链路基准会显式把 RealtimeServices 配置为 JetStream，确保全新 NATS 能创建 streams。
+容量报告和 `run-manifest.json` 会记录实际生效的
+`OutboxHintCoalescingWindowMs`，避免把不同合并窗口的结果误作同构 A/B。
+
+## 分层性能验证（默认入口）
+
+日常修改不要直接运行 8 小时 soak。统一入口把相同的逐消息正确性、跨 Gateway、资源覆盖率、
+Outbox/JetStream 和 PostgreSQL 诊断门禁组合成固定档位：
+
+| Profile | 典型用时 | 用途 | 是否可作为发布结论 |
+|---|---:|---|---|
+| `Smoke` | 1–2 分钟 | 脚本、依赖、基本 ACK/投递闭环 | 否 |
+| `Change` | 3–5 分钟 | 每轮热路径修改，80/320 msg/s | 否 |
+| `Capacity` | 6–10 分钟 | 合并前容量筛查，80/320/640 msg/s | 否 |
+| `Candidate` | 约 30 分钟 | 发布候选资源趋势和退化筛查 | 仅候选筛查 |
+| `Formal` | 8 小时 | 最终长期内存/WAL/稳定性证据 | 是 |
+
+```powershell
+# 日常默认；已完成 Release 构建时使用 SkipBuild
+.\tools\ChatApp.Performance.Orchestrator\scripts\Run-PerformanceValidation.ps1 `
+  -Profile Change -SkipBuild
+
+# 合并前容量筛查
+.\tools\ChatApp.Performance.Orchestrator\scripts\Run-PerformanceValidation.ps1 `
+  -Profile Capacity -SkipBuild
+
+# 只查看将要执行的精确配置，不启动容器
+.\tools\ChatApp.Performance.Orchestrator\scripts\Run-PerformanceValidation.ps1 `
+  -Profile Candidate -ConfirmLongRun -DryRun
+```
+
+`Candidate` 和 `Formal` 必须显式提供 `-ConfirmLongRun`。`Formal` 继续委托
+`Run-Soak.ps1`，因此还必须满足冻结源码/规范包/.NET host 的 SHA-256 绑定；轻量档不能产生
+`MemoryStable` 的长期结论，也不能替代正式发布证据。每轮根目录的
+`validation-profile.json` 和容量报告中的 `ValidationProfile` 可防止后续汇总混用不同档位。
+容量汇总会直接列出 `WAL/msg`、`WAL sync/msg`、`DB ops/msg`、managed allocation/msg、
+Pending 索引读取/msg、Outbox 精确/恢复/完成调用数和 Conversation HOT 比例；日常 A/B 无需
+再手工遍历每个子报告。短窗口的 FPI/JIT/启动成本占比更高，跨 Profile 比较时仍应以相同
+连接数、速率、warmup 和 measurement 时长为前提。
 
 `resource-sample-coverage` 按 process/container 的每条 series 分别计算，只统计协调后的
 measurement phase（不含连接爬坡、稳定期和 chat drain），并将每条覆盖率限制在

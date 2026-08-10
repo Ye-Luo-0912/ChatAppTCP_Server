@@ -15,7 +15,12 @@ using SharedConversationMemberItem = ChatApp.Realtime.Abstractions.Conversations
 using SharedConversationMemberRole = ChatApp.Realtime.Abstractions.Conversations.ConversationMemberRole;
 using SharedConversationType = ChatApp.Realtime.Abstractions.Conversations.ConversationType;
 using SharedMessageHistoryCursor = ChatApp.Realtime.Abstractions.Messaging.History.MessageHistoryCursor;
+using TcpSharedMessageHistoryCursor = ChatApp.Shared.Protocol.Tcp.MessageHistoryCursor;
 using SharedMessageReactionSummary = ChatApp.Realtime.Abstractions.Messaging.History.MessageReactionSummary;
+using TcpMessageReactionSummary = ChatApp.Shared.Protocol.Tcp.MessageReactionSummary;
+using TcpRelationshipCatchUp = ChatApp.Shared.Protocol.Tcp.RelationshipCatchUp;
+using TcpRelationshipSyncWatermark = ChatApp.Shared.Protocol.Tcp.RelationshipSyncWatermark;
+using TcpSyncCursorResetReason = ChatApp.Shared.Protocol.Tcp.TcpSyncCursorResetReason;
 using SharedRelationshipCatchUp = ChatApp.Realtime.Abstractions.Sync.RelationshipCatchUp;
 using SharedRelationshipChangeLogEntry = ChatApp.Realtime.Abstractions.Sync.RelationshipChangeLogEntry;
 using SharedRelationshipChangeOperation = ChatApp.Realtime.Abstractions.Relationships.RelationshipChangeOperation;
@@ -81,7 +86,7 @@ public sealed class RealtimeContractConsolidationTests
             typeof(IReadOnlyList<SharedAttachmentRef>));
         AssertPropertyType<MessageHistoryItem>(
             nameof(MessageHistoryItem.Reactions),
-            typeof(IReadOnlyList<SharedMessageReactionSummary>));
+            typeof(IReadOnlyList<TcpMessageReactionSummary>));
         AssertPropertyType<ConversationListResponse>(
             nameof(ConversationListResponse.Items),
             typeof(IReadOnlyList<SharedConversationListItem>));
@@ -99,13 +104,13 @@ public sealed class RealtimeContractConsolidationTests
             typeof(SharedRelationshipListType));
         AssertPropertyType<SyncBootstrapRequest>(
             nameof(SyncBootstrapRequest.RelationshipWatermarks),
-            typeof(IReadOnlyList<SharedRelationshipSyncWatermark>));
+            typeof(IReadOnlyList<TcpRelationshipSyncWatermark>));
         AssertPropertyType<SyncBootstrapResponse>(
             nameof(SyncBootstrapResponse.RelationshipCatchUps),
-            typeof(IReadOnlyList<SharedRelationshipCatchUp>));
+            typeof(IReadOnlyList<TcpRelationshipCatchUp>));
         AssertPropertyType<SyncCursorResetRequired>(
             nameof(SyncCursorResetRequired.Reason),
-            typeof(SharedSyncCursorResetReason));
+            typeof(TcpSyncCursorResetReason));
 
         Assert.Equal(typeof(SharedRelationshipItem), typeof(RelationshipItem));
         Assert.Equal(typeof(SharedRelationshipListResponse), typeof(RelationshipListResponse));
@@ -195,7 +200,7 @@ public sealed class RealtimeContractConsolidationTests
         };
         var catchUpJson = JsonSerializer.Serialize(
             catchUp,
-            GatewayJsonSerializerContext.Default.RelationshipCatchUp);
+            GatewayJsonSerializerContext.Default.RealtimeRelationshipCatchUp);
         Assert.Equal(
             "{\"listType\":1,\"changes\":[{\"changeSequence\":9,\"operation\":0,\"resourceId\":\"friendship-1\",\"userId\":42,\"status\":\"Accepted\",\"createdAtMs\":10,\"occurredAtMs\":11,\"requestId\":\"req-1\"}],\"hasMore\":false,\"nextSequence\":9,\"retentionFloorSequence\":1,\"resetRequired\":false}",
             catchUpJson);
@@ -208,7 +213,40 @@ public sealed class RealtimeContractConsolidationTests
             GatewayJsonSerializerContext.Default.ConversationListCursor));
         Assert.NotNull(JsonSerializer.Deserialize(
             catchUpJson,
-            GatewayJsonSerializerContext.Default.RelationshipCatchUp));
+            GatewayJsonSerializerContext.Default.RealtimeRelationshipCatchUp));
+    }
+
+    [Fact]
+    public void Older_Gateway_Ignores_New_Relationship_Projection_Delta()
+    {
+        const string json = """
+            {
+              "resource": "friendship",
+              "action": "Upsert",
+              "resourceId": "1:2",
+              "projection": {
+                "schemaVersion": 1,
+                "eventId": "relproj-1",
+                "ownerUserId": 1,
+                "listType": 2,
+                "version": 1,
+                "operation": 1,
+                "resourceId": "1:2",
+                "subjectUserId": 2,
+                "actorUserId": 1,
+                "occurredAtMs": 100
+              }
+            }
+            """;
+
+        var payload = JsonSerializer.Deserialize(
+            json,
+            GatewayJsonSerializerContext.Default.RealtimeDomainNotificationPayload);
+
+        Assert.NotNull(payload);
+        Assert.Equal("friendship", payload.Resource);
+        Assert.Equal("Upsert", payload.Action);
+        Assert.Equal("1:2", payload.ResourceId);
     }
 
     [Fact]
@@ -219,8 +257,11 @@ public sealed class RealtimeContractConsolidationTests
         Assert.Null(typeof(ConversationSyncWatermark).GetProperty("AfterChangedAtMs"));
         AssertPropertyType<SharedConversationSyncWatermark>("AfterChangedAtMs", typeof(long));
 
+        Assert.Equal(typeof(TcpSharedMessageHistoryCursor), typeof(MessageHistoryCursor));
+        Assert.Equal("ChatApp.Protocol.Tcp", typeof(MessageHistoryItem).Assembly.GetName().Name);
+        // The Client/Gateway cursor is independent from the Realtime query cursor.
         Assert.NotEqual(typeof(MessageHistoryCursor), typeof(SharedMessageHistoryCursor));
-        Assert.Null(typeof(MessageHistoryCursor).GetProperty("ChangedAtMs"));
+        AssertPropertyType<MessageHistoryCursor>("ChangedAtMs", typeof(long?));
         AssertPropertyType<SharedMessageHistoryCursor>("ChangedAtMs", typeof(long?));
 
         Assert.NotEqual(typeof(SyncCursorResetRequired), typeof(SharedSyncCursorResetRequired));

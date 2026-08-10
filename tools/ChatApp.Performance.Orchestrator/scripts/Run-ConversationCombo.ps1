@@ -67,15 +67,6 @@ $password = 'combo-' + [Guid]::NewGuid().ToString('N')
 [Environment]::SetEnvironmentVariable(
     $garnetEnvName, "127.0.0.1:$GarnetPort,abortConnect=false", 'Process')
 
-function Wait-Postgres([string] $Container) {
-    for ($attempt = 1; $attempt -le 30; $attempt++) {
-        & docker exec $Container pg_isready -U postgres -d ChatAppDatabase *> $null
-        if ($LASTEXITCODE -eq 0) { return }
-        Start-Sleep -Seconds 1
-    }
-    throw "PostgreSQL did not become ready: $Container"
-}
-
 $tag = $stamp.Replace('-', '').ToLowerInvariant()
 $nats = "codex-chatapp-combo-nats-$tag"
 $postgres = "codex-chatapp-combo-postgres-$tag"
@@ -103,7 +94,7 @@ try {
             -Name $garnet -RunId $dockerRunId -CreatedContainers $created `
             -CreateArguments @(
             '-p',"127.0.0.1:$($GarnetPort):6379",$GarnetImage)
-        Wait-Postgres $postgres
+        Wait-PerformancePostgres -Container $postgres
 
         $orchestratorArgs = @(
             'run','--project',$orchestratorProject,'-c','Release','--no-build','--',

@@ -111,15 +111,6 @@ function Invoke-Docker([string[]] $Arguments) {
     }
 }
 
-function Wait-Postgres([string] $Container) {
-    for ($attempt = 1; $attempt -le 30; $attempt++) {
-        & docker exec $Container pg_isready -U postgres -d ChatAppDatabase *> $null
-        if ($LASTEXITCODE -eq 0) { return }
-        Start-Sleep -Seconds 1
-    }
-    throw "PostgreSQL did not become ready: $Container"
-}
-
 function Wait-GatewayReady([int] $Port, [int] $TimeoutSeconds = 60) {
     # Gateway 是纯 TCP 服务（无 HTTP /metrics 端点），用 TCP 连接探测就绪状态。
     $deadline = [DateTimeOffset]::UtcNow.AddSeconds($TimeoutSeconds)
@@ -228,7 +219,7 @@ try {
         -CreateArguments @(
         '-p',"127.0.0.1:$($GarnetPort):6379",$GarnetImage)
 
-    Wait-Postgres $postgres
+    Wait-PerformancePostgres -Container $postgres
 
     Write-Host "Starting Realtime service..." -ForegroundColor Cyan
     $realtimeArgs = @(

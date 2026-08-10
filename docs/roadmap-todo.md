@@ -1,233 +1,126 @@
 # 待办路线图
 
-本文件列出**尚未完成**的工作。当前状态见 `roadmap-current-state.md`，
-历史变更见 `roadmap-changelog.md`。完成的项目从本文件移除并记入 changelog。
+本文件只保留尚未完成的工作。当前状态见 `roadmap-current-state.md`，已完成事项见
+`roadmap-changelog.md`；跨仓统一顺序和验收口径见 `docs/NEXT-STAGE.md`。
 
-## 四、极致性能主线
+## 当前执行批次与交接顺序
 
-### 1. 冻结新底层原语
-已冻结：新 Actor Mailbox、Durable Actor 迁移、更多自定义异步等待器、二进制协议、Native AOT、ActorCell slab 等新功能开发暂停。先验证现有 DirectSocket、三种 Send Mode（Persistent/OnDemand/PerSession）和两种 Outbound Queue（BoundedChannel/LazySegmented）。
+| 批次 | Owner / 可并行性 | 前置条件 | 必须交付的接手证据 |
+| --- | --- | --- | --- |
+| `PROTO-FEED-1` | Shared；Gateway/Client 验证，可与 `REL-GATE-1` 并行 | 六包候选源码和版本冻结 | 不可变 nupkg/hash、locked restore、Gateway/Client 短联调报告 |
+| `REL-GATE-1` | Server + Realtime | Contracts `2.5.2`、Integration `3.1.3` 与 Migration 060–062 冻结 | `run-manifest.json`、reconcile report、故障矩阵；密钥不得入档 |
+| `REL-WIRE-2` | Shared；必须等待 `REL-GATE-1` 通过 | 两轮全量对账和故障恢复均通过 | list/catch-up/reset schema、reserved 字段、old/new golden、包/hash |
+| `REL-READ-3` | Realtime → Gateway → Client | `REL-WIRE-2` 的不可变包已发布 | 默认关闭的 capability、HTTP 权威对照、短时 canary/回滚报告 |
+| `TCP-MEM-1` | Gateway，只测量，可与前三项并行 | 单独冻结源码、二进制和负载 | 三类 10k 短画像及 gcdump/PSS/socket 归因；不得夹带功能改动 |
 
-### 2. 扩展 Transport Matrix 至 12 组合（已完成基础设施扩展）
-- 维度：Inbound (Pipelines/DirectSocket) × Send (3) × Queue (2) → 12 组合全部覆盖
-- 新增场景：`slowloris-header`（不完整 Header 慢速攻击）、`slowloris-payload`（不完整 Payload 慢速攻击）、`inbound-budget`（全局入站字节预算耗尽）
-- 所有场景定义于 `Run-TransportMatrix.ps1`，可通过 `-Scenario all` 完整执行
-- 验收检查点已整合在输出报告中（门禁3：默认值切换门槛）
+后续 Agent 只接一个批次，并先读取上一批次证据；没有证据时不得按“代码已存在”推定门禁通过。
+`REL-READ-3` 完成前，关系 mutation 永久走 Server HTTP，TCP 入口继续 fail-closed。二进制生产协商、
+语音/通话和 QUIC 不与关系只读首轮同时灰度。
 
-### 3. Realtime SQL 门禁（Gate 4）
-以下功能已新增基准文件并设定 SQL 上限断言：
-- ✅ Relationship 操作（7/9/6/5 SQL）→ `RelationshipBenchmarks.cs`
-- ✅ Attachment Finalize（1 SQL）→ `AttachmentFinalizeBenchmarks.cs`
-- ✅ Reply/Mention 批量富集（1 SQL 批量）→ `ReplyMentionBenchmarks.cs`
-- ✅ SyncBootstrap 批量查询（1 SQL 批量，无 N+1）→ `SyncBootstrapBenchmarks.cs`
-- ✅ Authorization (ACL)（5 SQL 链）→ `AuthorizationChainBenchmarks.cs`
-- ✅ Read Receipt（1 SQL 聚合）→ `ReadReceiptBenchmarks.cs`
-- ✅ Mention 可见性过滤（0/1/1/1 SQL）→ `MentionValidationBenchmarks.cs`
-  （空提及集合 0 SQL 跳过成员列表；发送方角色 1 SQL；5/20 提及批量校验均 1 SQL，无 N+1）
-  ⚠️ 该基准创建于兄弟仓库但彼时对兄弟仓库的 Write/Edit 被拒，`Direct_NoMention`
-  基准命名有误导（实际调用 GetMemberRoleAsync 发 1 次查询）；如需修正需重新授权兄弟仓库。
+## P0：共享契约候选发布
 
-### 4. 性能指标采集补充
-- ✅ 指标采集：Working Set / GC 分配 / p95/p99 / 连接数 / 已失败连接 已覆盖
-- ✅ Queue depth / Actor active/busy/churn / Outbox lag 已加入 Transport Matrix 报告汇总列
-  （`Run-TransportMatrix.ps1` 新增 `Get-MetricSumByIdentifier` 按指标名汇总，
-  场景表新增 Queue Depth、Actor Act/Busy、Actor Proc、Outbox Pending、Outbox Lag 列；
-  门禁3 判定规则补充「队列有界、Actor 稳定、Outbox 收敛」检查点）
+1. 在 Shared 补帧级超限/畸形输入 fuzz，以及旧附件、关系字段组合的 old/new fixture。
+2. 在干净 CI 中重新打包六个 `0.4.1` 候选包并核对已记录 SHA-256；任何源码或包元数据变化都升新版本，禁止覆盖同版本。
+3. 发布不可变 feed 后，让 Gateway 与 Client 只从 feed 做 locked restore，并运行一次短时 TCP 联调，覆盖 request-id 错配、JSON 降级、超限和截断。
+4. 回滚只切回上一不可变包；不恢复本地重复 DTO，也不回滚已经成功的客户端 SQLite migration。
 
-### 5. 8～24 小时 Soak 测试
-- ✅ Run-Soak.ps1 已扩展支持长时间运行与内存稳定性监控
-  （新增 `-TcpMode heartbeat/chat`、`-TcpPayloadBytes`、`-TcpSlowReaders` 真实聊天负载浸泡；
-  浸泡后读取 Gateway 进程 Working Set 首/末/均值/最大值，按
-  `-MemoryGrowthThresholdPercent`（默认 20%）与 `-MemoryDeparturePercent`（默认 15%）
-  判定是否进入稳定平台，输出 `soak-verdict-*.json/md` 与 STABLE/FAILED 判定）
-- ⏳ 需 Linux 远程执行验证 24h 后内存是否进入稳定平台
+## P0：关系只读投影
 
-### 6. 脚本编码修复
-- ✅ 所有含中文注释的性能脚本（Run-TransportMatrix / Run-Soak / Run-OutboundSendModeAB /
-  Run-ResumeFaultStress / Run-InboundTransportAB / Run-FaultInjection）已补 UTF-8 BOM，
-  修复 PowerShell `ParseFile` 在无 BOM 时对 UTF-8 中文字符的误解析（导致幽灵语法错误）
-- ✅ Run-TransportMatrix.ps1 / Run-Soak.ps1 换行符统一为 CRLF
-- ✅ Run-Soak.ps1 反引号续行改为单行（避免 CRLF 下的续行失效）
-- ✅ 全部 8 个 .ps1 脚本通过 `ParseFile` 语法校验，0 错误
+当前 Server HTTP 和 public `T_*` 表是唯一关系权威。Server 已在关系事务内写 Realtime Outbox
+连续版本 delta；Realtime 已在 JetStream ACK 前原子提交 inbox/item/version，并能通过权威 stream
+快照回填、重复扫描和 count/hash 对账修复单流。Rebuilder 与 snapshot-gated list processor 均默认关闭，
+TCP relation list/sync/mutation 继续 fail-closed，旧 Realtime 关系表不得恢复为在线权威。
 
-## 主线一：Push 正式闭环（Gateway 侧已完成，跨仓库待补）
+1. 在隔离环境以 secret store 服务密钥启用 Rebuilder，验证多实例抢租/过期接管、取消重启、整页失败续跑、
+   429/5xx/超时退避、密钥轮换、并发 mutation 和扫描期间新增较小 owner id；不得把 key、列表正文或响应体写日志。
+2. 受 Ops API key 保护的 status/streams 已提供持久化 cursor、稳定轮次、租约/最后错误，以及逐 stream
+   current/snapshot version、数量/hash、快照后 inbox count/max version 和本地连续性。隔离环境用 secret store
+   注入 key，运行 Realtime 的 `scripts/Invoke-RelationshipProjectionReconcile.ps1`；工具自动从空 cursor 分页、
+   校验每轮前后状态 token，并比较连续两轮全量 SHA-256 指纹。200 表示页面一致，409 带稳定差异原因，
+   503 表示权威摘要源或本地投影不可用；报告不得包含服务密钥、好友明细或响应正文。
+3. 只有连续两轮 stable 且两轮所有 reconcile 页面均为 200、总差异为零，故障注入恢复后再次全量对账
+   仍一致，才独立开启 Realtime list canary；无 snapshot checkpoint 返回 unavailable，分页 version 变化要求
+   从第一页重启。canary 期间继续抽样与 Server HTTP 权威列表逐项对照，任一失败立即关闭读取开关。
+4. Shared/Gateway/Client 再统一 list/catch-up/reset wire，固定 version/watermark、partial/reset、
+   unavailable/version-changed/gap 和游标失效语义；Sync 超限不得静默丢段，mutation 永久走 Server HTTP。
 
-Gateway 侧 Push 闭环已全部完成（配置 Fail-fast、Disposition、Token Retry、幂等、DLQ、
-Provider 并发限制、无效 Token 注销、PushWorker 拆出、AES-GCM Token 加密）。
-以下为跨仓库待补项：
+## P1：TCP 长连接 CPU/内存
 
-2. **真实 FCM/APNs/WebPush Provider**
-   - ~~跨仓库实现 Provider client 与 payload builder。~~
-     **已完成（2026-08-03）**：`FcmPushProvider` / `ApnsPushProvider` / `WebPushPushProvider`
-     + payload builder + `PushProviderOptions` + DI 注册（`AddRealPushProviders`）已实现于
-     `PushWorker/Providers/`，构建通过、381/381 测试无回归。详见 `roadmap-changelog.md` 2026-08-03 条目。
-   - ~~`IPushTokenStore` / `PushTokenRecord` 当前位于 `ChatApp.TcpGateway.Core.Push`，
-     RealtimeServices 无法引用——需提取到 `ChatApp.Realtime.Abstractions` 或发布独立 NuGet 包
-     （见 `AGENTS.md` "Long-term: publish shared Realtime contracts as a versioned package"）。~~
-     **已完成（2026-08-03）**：`PushPlatform` / `PushTokenLimits` / `PushTokenRecord` / `IPushTokenStore`
-     已提取到 `ChatApp.Realtime.Abstractions.Push`，Core.csproj 引用 Realtime.Abstractions（BCL-only 契约层）。
-   - Publisher 侧 Push 触发：`GetOnlineGatewaysWithStatusAsync` 返回 `UserOffline` 时入队 Push 任务。
+已完成 executor 惰性队列、发送泵唯一清理、LazySegmented writer admission、接收缓冲安全降级和
+90 秒 lease/presence 刷新。下一步不再凭对象估算继续改代码，先做 10–15 分钟可归因画像：
 
-## 主线二：Resume 真正事务化（已完成）
+1. 分别运行 10k authenticated 静默、heartbeat-only、1% active + 1% slow-reader；固定源码、
+   Release 二进制、连接 ramp、配置和运行目录，每个候选至少三轮短样本。
+2. 同时采集 gcdump 类型计数、PSS/smaps、fd、`ss -tinm`、cgroup sock、GC/分配、线程、句柄、
+   heartbeat counter 与 p95/p99；区分 managed retained、GC committed、ArrayPool、native cache 和内核 socket。
+3. 只有新热点能带来至少约 15% PSS/retained 改善，或单个已有开关能稳定节省至少约 0.5 KiB/连接，
+   才继续 linked CTS、send waiter、deadline callback 或 socket buffer 优化。
+4. 验收必须保持零漏帧、零重复、零预算/retained 泄漏，吞吐和 p95/p99 不回退超过 5%，并覆盖
+   connection-id 复用、Stop/Dispose、慢读者公平、resume/fencing 和 10k shutdown。
 
-全部 8 项已实现：Token Claim/Commit/Abort、AdmissionState 三态、TakeOver 顺序与回滚、
-DependencyUnavailable 可重试、同设备 fencing、旧 Socket 关闭验证、SessionRevokedPayload 结构化。
-见 `roadmap-changelog.md` 2026-08-01 条目。
+## P1：消息链路与数据库性能
 
-## 主线三：Group 后端分页和稳定指纹（已完成）
+1. 用 trace、`pg_stat_statements`、WAL/消息、DB ops/消息和 allocation/消息先确认 Top 路径；
+   每轮只改一个 SQL、批处理、索引或调度因素，以同构重复 A/B 中位数判断。
+2. Outbox hint 合并默认保持 `0 ms`。`2 ms` 只作为显式资源优先模式；未证明尾延迟风险可接受前，
+   不改变默认值。
+3. 短时 80/320/640 msg/s admission/capacity 必须验证 ACK/跨 Gateway 投递、重复/漏投、
+   Outbox/JetStream/死信、CPU、GC、SQL、WAL 和 p95/p99；30 分钟仅冻结候选，8 小时仅用于发布门禁。
+4. Linux 仍需补慢速 header/payload、全局入站预算、连接风暴、依赖断开/恢复和跨 Gateway 重连；
+   每轮使用独立目录、manifest、源码/二进制 hash，禁止从历史运行拼接结论。
 
-经核验，跨仓库待补项均已实现，详见 `roadmap-changelog.md` 2026-08-03 条目：
+## P1：Push 与附件闭环
 
-- **Realtime DB Ledger 作为唯一权威**：`NpgsqlRealtimeGroupStore`（约 2000 行）承担全部
-  权限矩阵（Owner/Admin/Member）、群主转让（仅 Owner 可变更角色、不能转让给自己、
-  Owner 不能自降级）、最后 Owner 退群拒绝（"Owner 退群前须先转让所有权"）、审计 Outbox
-  （事务内 `RecordInTransactionAsync`）、幂等账本（`group_mutation_requests`）、
-  软删除（`left_at_ms`/`dissolved_at_ms`）、membership periods、audience_version 递增。
-- **DB keyset pagination**：设计决策为 Realtime 侧返回全量成员（按 role/joined_at_ms/user_id 升序），
-  Gateway 本地执行 keyset 分页（`PaginateMembers`），避免改动 RealtimeServices 协议；
-  幂等缓存保存全量结果，不同分页参数命中同一缓存后各自切片。
-- **不可变 Cursor 顺序**：cursor 编码 `(role, joined_at_ms, user_id)` 元组（base64），
-  Realtime 排序保证 keyset 稳定，不遗漏/不重复；cursor 非法时退化为首页。
-- **权限和审计由 RealtimeServices 承担**：`NpgsqlGroupOperationAuditStore` 双路径
-  （事务外 best-effort + 事务内 Outbox），`group_operation_audit` 表（Migration028）已就绪。
+### Push
 
-## 主线四：附件和 Relationship（Gateway 侧协议层已完成，跨仓库待补）
-
-Gateway 侧协议命令、DTO、Handler、端口 + Stub 已全部实现。
-以下为跨仓库待补项：
+1. 实现真实 FCM/APNs/WebPush provider、凭据轮换和 provider 级限流；Gateway 继续只负责路由，
+   网络资源由 PushWorker 隔离。
+2. Realtime publisher 在可靠判断 `UserOffline` 后入队；区分用户离线和目录查询失败，后者必须重试，
+   不能误判为离线。
+3. Client 完成 token 注册、轮换、撤销、退出登录和通知偏好；覆盖多设备、无效 token、部分成功、
+   DLQ 重放和幂等。
 
 ### 附件
 
-1. **Attachment Finalize 后端**
-   - ~~Gateway `AttachmentCommandHandler` + `IAttachmentBackend` 端口已就绪（当前 Stub）。~~
-     ~~Realtime 侧需实现 `FinalizeUploadAsync`（Ticketed→Uploaded 转换）并接入
-     `IRealtimeMessageBus`（新增 `FinalizeAttachmentUploadAsync` 方法）。~~
-     **已完成（2026-08-03）**：`RealtimeAttachmentBackend` 替换 stub，端到端打通
-     `AttachmentFinalizeRequest` → `IRealtimeMessageBus.FinalizeAttachmentUploadAsync` →
-     Realtime 侧 `FinalizeUploadAsync`（Ticketed→Uploaded）。详见 `roadmap-changelog.md`。
+1. 补所有权校验、扫描/审核触发、过期 sweep、下载授权和保留策略；Gateway 不签发下载 token，
+   只转发稳定 wire 状态。
+2. 用新 migration 对齐数据库状态约束与 wire/domain 枚举，保留显式 mapper，禁止跨层强制转换未知值。
+3. 覆盖重复 finalize、消息绑定竞态、扫描失败、过期、下载越权和恢复；语音消息复用同一附件生命周期，
+   音频内容不进入 TCP frame、Postgres Outbox 或 JetStream。
 
-2. **所有权校验**
-   - `MessagingCommandHandler` 当前不校验 `AttachmentIds` 归属，由 Realtime `BindToMessageAsync` 拒绝。
-   - 如需 Gateway 前置校验，新增 `IRealtimeMessageBus.VerifyAttachmentOwnershipAsync`。
+## P1：二进制 payload 接入
 
-3. **扫描/审核**
-   - `Scanning`/`Rejected` 状态下游推送已就绪，但扫描触发与发布者在两仓库之外（独立 worker / Server）。
+Shared 已完成默认不可协商的 `chatapp-tagged-v1` runtime/generator；生产 JSON 和 10-byte 帧头不变。
 
-4. **过期清理**
-   - `ix_attachments_unbound_age` 索引已存在（Migration012），但无 sweep worker。
-   - 需 RealtimeServices 或独立服务定期扫描并发布 `Expired` 事件。
+1. 先完成全部握手后 payload 命令的 schema、reserved field、old/new golden、fuzz 和 source-generated codec；
+   不能只给 ChatMessage 开 binary，因为当前帧头没有逐帧格式位。
+2. `ClientHello/ServerHello` 始终 JSON；完整握手后把格式固化到 session，首版 Resume 强制 JSON。
+   入站不 sniff，连接中途不切换；回滚关闭选择，让已协商连接排空或 GoAway 重连。
+3. 混合灰度按格式分组，每个事件每种格式最多编码一次并复用共享帧；不得退化为逐 session 序列化。
+   鉴权、resume 等敏感 buffer 在成功、异常、扩容和引用归零路径都由所有者清零。
+4. 只有 payload 至少下降 30%、序列化 CPU 或分配至少下降 20%，且 80/320/640 msg/s 短测
+   ACK/投递零漏零重、p95/p99 无显著回退，才进入 canary；否则继续 JSON 默认。
 
-5. **下载授权**
-   - wire DTO 有 `DownloadApiHint`/`DownloadToken` 字段，但 Token 签发与校验在 Server HTTP API，
-     Gateway 不参与。
+## P2：语音、媒体与 QUIC
 
-6. **Migration012 / 枚举对齐**
-   - Migration012 CHECK 约束 `status IN (0,1,2,3)` 过期，需新增 migration 放宽
-     （含 `Uploaded=4` / `Scanning=5` / `Rejected=6`）。
-   - Gateway `AttachmentWireStatus` 6 状态 vs Realtime Abstractions 2 状态（Scanning/Available）
-     前 2 值已对齐，扩展状态（UploadConfirmed/Rejected/Expired/ThumbnailUpdated）仅由
-     `AttachmentLifecycleHandler` 下游推送使用，不参与 `AttachmentWireMapper` 映射。
+1. 语音消息复用附件上传；1:1 通话使用 WebRTC/SRTP + ICE/STUN/TURN，TCP 只承载可靠信令。
+   裸 UDP 不进入聊天、鉴权、同步、ACK 或媒体业务层。
+2. 群通话在 1:1 稳定后使用独立 SFU；TURN/SFU 的 CPU、带宽和成本进入独立容量模型，
+   不能把“媒体未进入 Gateway”写成当前 TCP 资源下降。
+3. QUIC stream 仅在共享契约和 binary 灰度稳定后做可关闭 A/B，覆盖 UDP 阻断、0/1/3/5% 丢包、
+   20/80/200 ms RTT、网络切换和 NAT rebinding；TCP 始终保留回退。
 
-### Relationship
+## 工程治理
 
-1. **Relationship 后端**
-   - ~~Gateway `RelationshipCommandHandler` + `IRelationshipBackend` 端口已就绪（当前 Stub）。~~
-     ~~`IRealtimeMessageBus` 需新增 `MutateRelationshipAsync` / `QueryRelationshipListAsync` 方法。~~
-     **已完成（2026-08-03）**：`RealtimeRelationshipBackend` 替换 stub，端到端打通
-     `RelationshipCommandRequest` / `RelationshipListRequest` →
-     `IRealtimeMessageBus.MutateRelationshipAsync` / `QueryRelationshipListAsync` →
-     Realtime 侧 `NatsRelationshipCommandConsumer` / `NatsRelationshipListQueryConsumer` →
-     `RelationshipCommandWorker` / `RelationshipListQueryWorker` →
-     `DefaultRelationshipCommandProcessor` / `DefaultRelationshipListQueryProcessor` →
-     `NpgsqlRelationshipStore`（好友请求/友谊/黑名单 DB 操作）。
-     Gateway 与 Realtime 两侧 byte 枚举（`RelationshipOperation` / `RelationshipListType`）
-     数值一一对应，通过强制转换映射。440/440 测试无回归。
-   - ~~RealtimeServices 侧域业务逻辑仍待补：`IRelationshipStore` / Postgres migration /
-     `IRelationshipCommandProcessor` / `IRelationshipListQueryProcessor` 真实实现。~~
-     **已完成（2026-08-03）**：
-     - `IRelationshipStore` 接口 + `NoopRelationshipStore` 默认实现。
-     - `NpgsqlRelationshipStore`：好友请求状态机（Pending/Accepted/Declined）、
-       友谊规范化存储（`user_id_low/user_id_high`）、黑名单复用 `T_BlockRecords`、
-       幂等账本（`relationship_mutation_requests`）、游标分页。
-     - `Migration052_Relationships`：`friend_requests` + `friendships` +
-       `relationship_mutation_requests` 三表 + 索引。
-     - `DefaultRelationshipCommandProcessor` / `DefaultRelationshipListQueryProcessor`。
-     - 三处 DI 注册（Core/Postgres/Host）+ NATS consumer 注册。
-     - 修复预存在的 `CapturingAttachmentStore` 缺少 `FinalizeUploadAsync` 测试问题。
-     - RealtimeServices.slnx 构建 0 错误；TcpGateway 440/440 测试通过。
-     三个事件类型（`FriendRequestListChanged=1` / `FriendListChanged=2` / `BlockedListChanged=3`）
-     已由 `NpgsqlRelationshipStore` 在 6 个 mutation 操作中发布（经 `OutboxInsertHelper`
-     写入 outbox → `OutboxPublisherWorker` 走 NATS/JetStream），Gateway `RelationshipListHandler`
-     消费并失效 Typing/Presence 授权缓存 + 推送 `RelationshipListChanged`。
+1. 注册 Linux 自托管 runner，接入 locked restore、Release build、完整测试、数据库契约、真实依赖探针、
+   定时短门禁和发布 soak；保存报告并与冻结基线比较。
+2. 配置 OTLP Collector 与 Alertmanager 实际通知通道，校准告警阈值；日志只保留结构化故障信息，
+   不在热路径恢复高频 Information，也不记录 token 或消息正文。
+3. 继续拆分 oversized 类型并补确定性竞态测试；当前 Windows 默认并行全套仍有 DirectSocket/Persistent
+   loopback 握手 abort 的测试隔离债，串行全量与隔离重复通过，但 CI 应消除该时序噪声。
 
-2. ~~**Relationship Watermark**~~
-   - ~~`ConversationSyncWatermark` 仅限会话维度，需扩展为 Relationship 级别版本/水位用于增量同步。~~
-     **已完成（2026-08-03）**：`RelationshipSyncWatermark` / `RelationshipCatchUp` 抽象类型
-     + `IRelationshipSyncCursorStore` 设备级游标存储 + `NpgsqlRelationshipSyncCursorStore`
-     + `Migration053`。详见 `roadmap-changelog.md` 2026-08-03 条目。
+## 验证顺序
 
-3. ~~**增量同步**~~
-   - ~~好友列表分页、好友请求列表、接受/拒绝流程的客户端增量同步。~~
-     **已完成（2026-08-03）**：`DefaultSyncBootstrapQueryProcessor` 集成
-     `BuildRelationshipCatchUpsAsync`（水位优先级 client > 设备游标），
-     `EnforceByteBudget` 阶段 2.5/2.6 关系条目纳入字节预算，
-     `BuildRelationshipCursorsToPersist` 仅推进非 reset 水位。
-     Gateway wire 类型 `RelationshipSyncWatermark` / `RelationshipCatchUp` 已注册。
-     详见 `roadmap-changelog.md` 2026-08-03 条目。
-
-## 其他待办（非主线，按优先级评估）
-
-### 性能长测（Linux 测试机）
-
-执行规范见 `AGENTS.md` "Linux test environment" 与 `scratch/Run-RuntimeV2-Soak-Linux.ps1`。
-
-- 10,000 空闲连接
-- 512 B Chat
-- 64 KiB Chat
-- 慢速发送攻击
-- 全局入站预算耗尽
-- 连接风暴（如 1k/s 持续 10s）
-- 8～24 小时浸泡（覆盖内存泄漏、ThreadPool 饱和、Redis 连接池、NATS 重连、Actor IdleSweep）
-- allocation/sec、GC、每连接内存稳定窗口对比
-- Runtime V2 8h 首轮在 PersistentSendLoop 阶段退出（负载进程 code 137），未形成有效结论；
-  重跑前先修复长测进程存活/资源限制与失败取证，再决定默认发送模式。
-
-### 故障与恢复测试
-
-- 滚动重启网关和 RealtimeServices，确认 durable consumer、Outbox、客户端去重。
-- 短暂断开 JetStream、PostgreSQL、Garnet，验证超时、退避、重投、积压收敛、恢复后无静默丢失。
-- 注入慢客户端和超大历史页，确认有界队列、字节预算、连接隔离。
-- 校验同毫秒消息游标翻页不遗漏/不重复，重复请求结果稳定。
-- 跨 Gateway 重连风暴 Linux soak（依赖真实 Redis 故障注入）。
-
-### 性能基线复跑
-
-- 用 `Run-ConversationCombo.ps1` 在 Linux 正式机复跑：会话历史翻页 + 列表/SyncBootstrap
-  与 TCP chat 扇出/慢消费者并行；校准会话阶段 p95 阈值。须避开 Runtime V2 soak 时间窗。
-- 用生产近似数据规模与资源限制复跑 8-24 小时浸泡，校准告警阈值。
-- 版本化 JSON 短期门禁接入定时 CI（依赖 P1 CI Linux 自托管 runner）。
-
-### 可观测性收尾
-
-- OTLP Collector 统一转发 Prometheus/Trace，校验跨进程 Trace 查询体验。
-- Alertmanager 选择并配置实际通知通道（当前告警规则仅暴露触发状态）。
-- 日志只保留结构化故障信息，避免聊天热路径恢复高频 Info 日志。
-
-### CI 与发布门禁
-
-- 注册 Linux 自托管 CI runner。
-- 接入 Release 构建、全部测试、数据库契约检查、真实 NATS/PostgreSQL 探针、定时浸泡、性能门禁。
-- 保存基准/门禁结果并比较历史版本，性能退化须明确说明。
-- .NET 11 稳定版发布后与 Server/RealtimeServices **同步**升级 SDK/依赖并重跑基线。
-
-### 代码质量（非阻塞）
-
-- 继续拆分 oversized Gateway 类型（`TcpGatewayService` 869 行、`GatewayMetrics` 871 行，
-  均超 600 行警戒线，但非阻塞）。
-- 补充已迁移模块独立单测：`SessionRuntime` / `SessionControlHandler` / `TcpClientSession`
-  仍缺独立单测（与传输/codec 耦合，需抽象测试边界）。
-
-## 二进制协议时机
-
-开发阶段继续使用 JSON。只有全链路基准证明 JSON 是主要 CPU 或分配瓶颈后，再实现二进制编码；
-升级必须通过协议版本或能力协商保留旧 JSON 客户端兼容性。
+聚焦单测/契约测试 → Release 构建 → 5–20 分钟短时 A/B → 必要时 30 分钟冻结候选 →
+仅发布候选执行 8 小时或更长 soak。任何正确性、兼容性、资源所有权或 p95/p99 门禁失败都先回退候选，
+不靠延长测试时间掩盖问题。

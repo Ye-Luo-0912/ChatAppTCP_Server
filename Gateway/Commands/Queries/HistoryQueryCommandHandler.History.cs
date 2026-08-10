@@ -36,6 +36,12 @@ internal sealed partial class HistoryQueryCommandHandler
         var requestId = string.IsNullOrWhiteSpace(request.RequestId)
             ? Guid.CreateVersion7().ToString("N")
             : request.RequestId;
+        // Keep the response envelope correlatable even when the request is
+        // rejected before Realtime is called. Do not reflect an over-limit
+        // value into the response payload.
+        var responseConversationId = request.ConversationId?.Length <= 64
+            ? request.ConversationId ?? string.Empty
+            : string.Empty;
         var hasBeforeTime = request.BeforeReceivedAtMs.HasValue;
         var hasBeforeMessage = !string.IsNullOrWhiteSpace(
             request.BeforeMessageId);
@@ -63,6 +69,7 @@ internal sealed partial class HistoryQueryCommandHandler
                     RequestId = requestId.Length <= 64
                         ? requestId
                         : string.Empty,
+                    ConversationId = responseConversationId,
                     Succeeded = false,
                     ErrorCode = "invalid_history_request",
                     ErrorMessage = "历史消息请求参数无效。"
@@ -108,14 +115,16 @@ internal sealed partial class HistoryQueryCommandHandler
                     EditVersion = item.EditVersion,
                     EditedAtMs = item.EditedAtMs,
                     ChangedAtMs = item.ChangedAtMs,
-                    Attachments = AttachmentWireMapper.Map(item.Attachments),
-                    Reactions = item.Reactions,
+                    Attachments = HistoryWireMapper.MapAttachments(item.Attachments),
+                    Reactions = HistoryWireMapper.MapReactions(item.Reactions),
                     ReplyToMessageId = item.ReplyToMessageId,
                     ReplyToSenderUserId = item.ReplyToSenderUserId,
                     ReplyToPreview = item.ReplyToPreview,
                     ForwardedFromMessageId = item.ForwardedFromMessageId,
                     ForwardedFromSenderUserId = item.ForwardedFromSenderUserId,
-                    ForwardedFromPreview = item.ForwardedFromPreview
+                    ForwardedFromPreview = item.ForwardedFromPreview,
+                    MentionedUserIds = item.MentionedUserIds,
+                    MentionedRoles = item.MentionedRoles
                 })
                 .ToArray();
 
@@ -124,6 +133,7 @@ internal sealed partial class HistoryQueryCommandHandler
                 : new MessageHistoryCursor
                 {
                     ReceivedAtMs = page.NextCursor.ReceivedAtMs,
+                    ChangedAtMs = page.NextCursor.ChangedAtMs,
                     MessageId = page.NextCursor.MessageId
                 };
 
@@ -133,7 +143,8 @@ internal sealed partial class HistoryQueryCommandHandler
             var response = ResponseByteBudget.Truncate(
                 new MessageHistoryResponse
                 {
-                    RequestId = page.RequestId,
+                    RequestId = requestId,
+                    ConversationId = responseConversationId,
                     Succeeded = page.Succeeded,
                     ErrorCode = page.ErrorCode,
                     ErrorMessage = page.ErrorMessage,
@@ -159,6 +170,9 @@ internal sealed partial class HistoryQueryCommandHandler
                         ? new MessageHistoryCursor
                         {
                             ReceivedAtMs = prefix[k - 1].ReceivedAtMs,
+                            ChangedAtMs = prefix[k - 1].ChangedAtMs > 0
+                                ? prefix[k - 1].ChangedAtMs
+                                : null,
                             MessageId = prefix[k - 1].MessageId
                         }
                         : null;
@@ -178,7 +192,8 @@ internal sealed partial class HistoryQueryCommandHandler
                     session,
                     new MessageHistoryResponse
                     {
-                        RequestId = page.RequestId,
+                        RequestId = requestId,
+                        ConversationId = responseConversationId,
                         Succeeded = false,
                         ErrorCode = "item_too_large",
                         ErrorMessage = "单条消息超出单帧 Payload 硬上限，无法通过分页返回。"
@@ -193,7 +208,8 @@ internal sealed partial class HistoryQueryCommandHandler
                     session,
                     new MessageHistoryResponse
                     {
-                        RequestId = page.RequestId,
+                        RequestId = requestId,
+                        ConversationId = responseConversationId,
                         Succeeded = false,
                         ErrorCode = "response_too_large",
                         ErrorMessage = "响应信封超过单帧 Payload 硬上限。"
@@ -222,6 +238,7 @@ internal sealed partial class HistoryQueryCommandHandler
                 new MessageHistoryResponse
                 {
                     RequestId = requestId,
+                    ConversationId = responseConversationId,
                     Succeeded = false,
                     ErrorCode = "history_service_unavailable",
                     ErrorMessage = "历史消息服务暂时不可用，请稍后重试。"

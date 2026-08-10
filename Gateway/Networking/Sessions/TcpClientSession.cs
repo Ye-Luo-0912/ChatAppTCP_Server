@@ -38,19 +38,23 @@ internal sealed partial class TcpClientSession : IAsyncDisposable
     // OnDemandSendPump 模式专用：共享出站 pump 协调器。
     // PersistentSendLoop/PerSessionDrain 模式下为 null。
     private readonly OutboundPumpCoordinator? _outboundPump;
-    // 八.1：PerSessionDrain 状态机——packed state (bit 32) + generation (bits 0-31) 到单个 long，
-    // 单次 CAS 原子完成 Idle→Running 转换 + 代次发布，消除每次 enqueue 的 DrainOperation 分配。
+    // 八.1：PerSessionDrain 状态机——packed phase (bits 32-34) + generation (bits 0-31) 到单个 long，
+    // Publishing 将状态代次声明与 MRVTSC Reset 完成分离；Finalizing 保证旧代 Complete 先于下一代 Reset。
     // <para>
-    // 状态：0=Idle，1=Running（bit 32）。代次：每次 Idle→Running 转换递增，区分不同 drain 实例。
-    // drain 释放/重夺所有权时 CAS 完整 64 位值（含代次），防止 ABA（旧 drain 重夺已被新 drain 接管的代次）。
+    // phase：Idle / Publishing / Running / Finalizing / FinalizingPending。
+    // 代次：每次 Idle→Publishing 转换递增，区分不同 drain 实例。CAS 始终比较完整 64 位值防 ABA。
     // </para>
     // <para>
-    // P1-6 不变量保留：状态转换与代次发布在单次 CAS 中原子完成。Dispose 读 _drainStateGen：
-    // Running 则 <c>await _drainOp.WaitAsync()</c>；Idle 则无活跃 drain。
+    // 不变量：Running 只在 Reset 完整发布后可见；Idle 只在该代 Complete 完成后可见。
+    // FinalizingPending 是 producer-safe 的丢失唤醒信号，finalizer 不会在释放所有权后调用 TryPeek。
     // </para>
     // PersistentSendLoop/OnDemandSendPump 模式下永远为 0（Idle, gen 0）。
     private long _drainStateGen;
-    private const long DrainStateRunningBit = 1L << 32;
+    private const long DrainStatePhaseMask = 7L << 32;
+    private const long DrainStatePublishing = 1L << 32;
+    private const long DrainStateRunning = 2L << 32;
+    private const long DrainStateFinalizing = 3L << 32;
+    private const long DrainStateFinalizingPending = 4L << 32;
     // 八.1：可复用 drain 句柄——惰性初始化一次，跨代次通过 <see cref="DrainOperation.Reset"/> 重用。
     // 旧实现每次 <c>TryScheduleSend</c> 都 <c>new DrainOperation(含 TCS)</c>，CAS 失败时立即成为垃圾。
     // PersistentSendLoop/OnDemandSendPump 模式下永远为 null。
@@ -71,7 +75,7 @@ internal sealed partial class TcpClientSession : IAsyncDisposable
     /// 且仅在 drain 启动/退出时执行，不在每次 enqueue 热路径上。
     /// </para>
     /// </summary>
-    internal sealed class DrainOperation : IValueTaskSource
+    internal class DrainOperation : IValueTaskSource
     {
         private ManualResetValueTaskSourceCore<bool> _core;
         private int _completed;          // 1 if Complete() was called for the current generation
@@ -85,15 +89,17 @@ internal sealed partial class TcpClientSession : IAsyncDisposable
         }
 
         /// <summary>绑定到新 drain 代次。重置 MRVTSC 以跨代次重用。</summary>
-        public void Reset(int generation)
+        public virtual void Reset(int generation)
         {
             var lockTaken = false;
             _lock.Enter(ref lockTaken);
             try
             {
-                _activeGeneration = generation;
                 _core.Reset();
                 Volatile.Write(ref _completed, 0);
+                // ActiveGeneration 是 publication marker，必须最后写。Dispose 观察到匹配
+                // generation 时，MRVTSC Version/Pending 状态已经属于本代。
+                Volatile.Write(ref _activeGeneration, generation);
             }
             finally
             {
@@ -105,7 +111,7 @@ internal sealed partial class TcpClientSession : IAsyncDisposable
         /// 通知等待方 drain 已完成。仅当代次匹配时生效——防止旧代次的 Complete
         /// 误完成新代次的 MRVTSC（跨代次 SetResult 竞态）。
         /// </summary>
-        public void Complete(int generation)
+        public virtual void Complete(int generation)
         {
             var lockTaken = false;
             _lock.Enter(ref lockTaken);
@@ -124,22 +130,21 @@ internal sealed partial class TcpClientSession : IAsyncDisposable
             }
         }
 
-        /// <summary>获取可等待的 <see cref="ValueTask"/>。Version 随 Reset 递增，使旧 token 失效。</summary>
         /// <summary>
-    /// 当前绑定的代次。DisposeAsync 据此判断 op 是否已发布到当前 generation。
-    /// </summary>
-    public int ActiveGeneration => Volatile.Read(ref _activeGeneration);
+        /// 当前绑定的代次。DisposeAsync 据此判断 op 是否已完整发布到当前 generation。
+        /// </summary>
+        public int ActiveGeneration => Volatile.Read(ref _activeGeneration);
 
-    /// <summary>
-    /// P0-2：Generation-aware 等待。代次不匹配时同步完成（让调用方重新检查状态），
-    /// 避免读到上一代 op 的已完成 Version 导致 busy-loop 或 InvalidOperationException。
-    /// </summary>
-    public ValueTask WaitAsync(int expectedGeneration)
-    {
-        if (Volatile.Read(ref _activeGeneration) != expectedGeneration)
-            return ValueTask.CompletedTask;
-        return new(this, _core.Version);
-    }
+        /// <summary>
+        /// Generation-aware 等待。代次不匹配时同步完成（让调用方重新检查状态），
+        /// 避免读到上一代 op 的已完成 Version 导致 busy-loop 或 InvalidOperationException。
+        /// </summary>
+        public ValueTask WaitAsync(int expectedGeneration)
+        {
+            if (Volatile.Read(ref _activeGeneration) != expectedGeneration)
+                return ValueTask.CompletedTask;
+            return new(this, _core.Version);
+        }
 
         ValueTaskSourceStatus IValueTaskSource.GetStatus(short token) =>
             _core.GetStatus(token);
@@ -154,18 +159,19 @@ internal sealed partial class TcpClientSession : IAsyncDisposable
         void IValueTaskSource.GetResult(short token) => _core.GetResult(token);
     }
 
-    // OnDemandSendPump 三态调度状态机，CAS 驱动：
+    // OnDemandSendPump 五态调度状态机，CAS 驱动：
     //   Idle(0)    → Queued(1)：enqueuer CAS 成功后 TrySchedule 入 ready queue
     //   Queued(1)   → Running(2)：worker 出队后 CAS 取得发送所有权
-    //   Running(2)  → Queued(1)：pump 结束但仍有 pending work，重新入队（不经过 Idle）
-    //   Running(2)  → Idle(0)：pump 结束且无 pending work，转空闲后重检防丢失唤醒
-    // PerSessionDrain 二态调度状态机（复用 Idle/Running，跳过 Queued）：
-    //   Idle(0)    → Running(2)：enqueuer CAS 成功后启动自有 drain Task
-    //   Running(2)  → Idle(0)：drain 队列空后 CAS 退出，重检防丢失唤醒
+    //   Running(2)  → Finalizing(3)：保留单消费者所有权完成最后一次 readable 检查
+    //   Finalizing(3) → FinalizingPending(4)：finalize 窗口到达的新工作（producer-safe 信号）
+    //   Finalizing/Pending → Queued 或 Idle：释放 Tracker 后发布完整 handoff
+    // PerSessionDrain 使用上方独立的 packed phase+generation 状态机。
     // 关键规则：任意时刻最多一个 worker/drain 持有发送所有权。
     private const int SendStateIdle = 0;
     private const int SendStateQueued = 1;
     private const int SendStateRunning = 2;
+    private const int SendStateFinalizing = 3;
+    private const int SendStateFinalizingPending = 4;
     private int _sendState;
 
     // Ephemeral latest-state mailbox：按 EphemeralKey 分槽，同 key 覆盖旧帧保留最新状态。
@@ -234,7 +240,9 @@ internal sealed partial class TcpClientSession : IAsyncDisposable
         SendTimeoutTracker? sendTimeoutTracker = null,
         FrameAssemblyTimeoutTracker? frameAssemblyTracker = null,
         bool usePerSessionDrain = false,
-        OutboundQueueMode outboundQueueMode = OutboundQueueMode.BoundedChannel)
+        OutboundQueueMode outboundQueueMode = OutboundQueueMode.BoundedChannel,
+        IOutboundQueue? outboundQueue = null,
+        DrainOperation? drainOperation = null)
     {
         _socket = socket;
         ConnectionId = connectionId;
@@ -249,6 +257,7 @@ internal sealed partial class TcpClientSession : IAsyncDisposable
         _idleTimeout = idleTimeout;
         _outboundPump = outboundPump;
         _usePerSessionDrain = usePerSessionDrain;
+        _drainOp = drainOperation;
         _outboundBudget = new OutboundQueueBudget(
             maxOutboundQueuedBytes);
 
@@ -262,7 +271,8 @@ internal sealed partial class TcpClientSession : IAsyncDisposable
         // - LazySegmented：自定义 MPSC 队列，空闲连接零段分配（首次 TryWrite 才分配 16 槽段），
         //   较 Channel 节省约 87% 每连接出站队列内存（见 OutboundChannel.Benchmarks）。
         // 多生产者 CAS 保留槽位 + 位掩码发布；单消费者按 _tail 顺序读取。
-        _outbound = CreateOutboundQueue(outboundQueueCapacity, outboundQueueMode);
+        _outbound = outboundQueue ??
+            CreateOutboundQueue(outboundQueueCapacity, outboundQueueMode);
 
         // 鉴权超时：通过全局 DeadlineWheel 注册一次性 deadline，认证成功后取消。
         // deadlineWheel=null 时（测试场景）退化为不启用 deadline，由 HeartbeatCoordinator 兜底扫描。
@@ -292,7 +302,7 @@ internal sealed partial class TcpClientSession : IAsyncDisposable
         // - OnDemandSendPump（_outboundPump≠null, _usePerSessionDrain=false）：不启动 Task，
         //   由 TryQueue/TryQueueEphemeral 入队后 CAS 唤醒共享 worker 池（PumpOutboundAsync）。
         // - PerSessionDrain（_outboundPump=null, _usePerSessionDrain=true）：不启动 Task，
-        //   由 TryQueue/TryQueueEphemeral 入队后 CAS Idle→Running 启动自有 drain Task。
+        //   由 TryQueue/TryQueueEphemeral 入队后发布 Idle→Publishing，Reset 完成再进入 Running。
         _sendLoop = (_outboundPump is null && !_usePerSessionDrain) ? SendLoopAsync() : null;
     }
 
@@ -599,5 +609,8 @@ internal sealed partial class TcpClientSession : IAsyncDisposable
     /// EphemeralMailbox 是否非空（有未排空的 ephemeral 条目）。
     /// mailbox 未创建（null）时返回 false，避免 null-check 散落。
     /// </summary>
-    private bool HasEphemeralEntries => _ephemeralMailbox is not null && !_ephemeralMailbox.IsEmpty;
+    internal bool HasEphemeralEntries =>
+        _ephemeralMailbox is not null && !_ephemeralMailbox.IsEmpty;
+
+    internal long OutboundQueuedBytes => _outboundBudget.CurrentBytes;
 }

@@ -73,7 +73,13 @@ internal sealed class HeartbeatBucketRegistry
     public void Unregister(TcpClientSession session)
     {
         var connBucket = (int)(session.ConnectionId % (uint)_bucketCount);
-        _connectionBuckets[connBucket].TryRemove(session.ConnectionId, out _);
+        // connectionId 可复用。旧 session 的延迟 finally 只能移除自身引用，
+        // 不能按裸 ID 删除已覆盖到同一 bucket 的后继 session。
+        ((ICollection<KeyValuePair<uint, TcpClientSession>>)
+                _connectionBuckets[connBucket])
+            .Remove(new KeyValuePair<uint, TcpClientSession>(
+                session.ConnectionId,
+                session));
 
         if (session.UserId > 0)
         {

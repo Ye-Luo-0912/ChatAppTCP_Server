@@ -104,6 +104,7 @@ internal sealed partial class SessionRuntime
     public async Task RunAsync(
         TcpClientSession session,
         string remoteIp,
+        SessionCommandRegistrationSet registrations,
         CancellationToken cancellationToken)
     {
         // 链接 Session lifetime token 与宿主 stopping token。
@@ -124,6 +125,7 @@ internal sealed partial class SessionRuntime
                 await RunDirectSocketAsync(
                         session,
                         remoteIp,
+                        registrations,
                         sessionToken)
                     .ConfigureAwait(false);
             }
@@ -132,6 +134,7 @@ internal sealed partial class SessionRuntime
                 await RunPipelinesAsync(
                         session,
                         remoteIp,
+                        registrations,
                         sessionToken)
                     .ConfigureAwait(false);
             }
@@ -175,6 +178,7 @@ internal sealed partial class SessionRuntime
     private async Task RunPipelinesAsync(
         TcpClientSession session,
         string remoteIp,
+        SessionCommandRegistrationSet registrations,
         CancellationToken cancellationToken)
     {
         var pipe = new Pipe(_pipeOptions);
@@ -189,6 +193,7 @@ internal sealed partial class SessionRuntime
             pipe.Reader,
             session,
             remoteIp,
+            registrations,
             pipeLease,
             cancellationToken);
 
@@ -260,6 +265,7 @@ internal sealed partial class SessionRuntime
         PipeReader reader,
         TcpClientSession session,
         string remoteIp,
+        SessionCommandRegistrationSet registrations,
         SessionInboundPipeLease pipeLease,
         CancellationToken cancellationToken)
     {
@@ -311,6 +317,7 @@ internal sealed partial class SessionRuntime
                             frame,
                             session,
                             remoteIp,
+                            registrations,
                             cancellationToken)
                         .ConfigureAwait(false))
                     {

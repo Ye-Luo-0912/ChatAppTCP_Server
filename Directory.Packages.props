@@ -17,8 +17,8 @@
     <PackageVersion Include="StackExchange.Redis" Version="3.0.17" />
     <PackageVersion Include="xunit.v3" Version="3.2.2" />
     <PackageVersion Include="ChatApp.Auth.Contracts" Version="0.2.0" />
-    <PackageVersion Include="ChatApp.Protocol.Tcp" Version="0.3.0" />
-    <PackageVersion Include="ChatApp.Protocol.Tcp.Json" Version="0.3.0" />
+    <PackageVersion Include="ChatApp.Protocol.Tcp" Version="0.4.1" />
+    <PackageVersion Include="ChatApp.Protocol.Tcp.Json" Version="0.4.1" />
     <!-- P1-1：版本化 Contract Package 本地 feed 契约包（见 NuGet.config 中 packages/ 源）。 -->
     <PackageVersion Include="ChatApp.Realtime.Contracts" Version="2.3.0" />
     <PackageVersion Include="ChatApp.Realtime.Integration" Version="3.0.0" />

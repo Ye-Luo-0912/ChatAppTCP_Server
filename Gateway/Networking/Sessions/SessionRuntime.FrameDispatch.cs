@@ -73,6 +73,7 @@ internal sealed partial class SessionRuntime
         PacketFrame frame,
         TcpClientSession session,
         string remoteIp,
+        SessionCommandRegistrationSet registrations,
         CancellationToken cancellationToken,
         byte[]? ownedPayloadBuffer = null,
         bool ownedPayloadBudgetReserved = false)
@@ -251,21 +252,7 @@ internal sealed partial class SessionRuntime
             bool enqueued;
             try
             {
-                enqueued = lane switch
-                {
-                    CommandLane.Query =>
-                        _queryExecutor.TryEnqueue(
-                            session.ConnectionId,
-                            in command),
-                    CommandLane.Ephemeral =>
-                        _ephemeralPipeline.TryEnqueue(
-                            session.ConnectionId,
-                            in command),
-                    _ =>
-                        _orderedWriteExecutor.TryEnqueue(
-                            session.ConnectionId,
-                            in command)
-                };
+                enqueued = registrations.TryEnqueue(lane, in command);
             }
             catch
             {

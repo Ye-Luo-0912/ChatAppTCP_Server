@@ -54,6 +54,10 @@ internal readonly record struct EphemeralKey(byte Kind, long Id1, long Id2)
 
 /// <summary>
 /// Ephemeral mailbox 中的条目：持有帧引用与字节预算占用。
-/// 被 newer 帧覆盖时需 Dispose 帧 + 释放预算。
+/// 被 newer 帧覆盖时需 Dispose 帧 + 释放预算；Version 由 mailbox 在 lock 内赋值，
+/// 用于关闭竞态下精确条件移除，防止相同 Frame 重复入槽时发生 ABA。
 /// </summary>
-internal readonly record struct EphemeralEntry(SharedOutboundFrame Frame, int ByteCount);
+internal readonly record struct EphemeralEntry(
+    SharedOutboundFrame Frame,
+    int ByteCount,
+    long Version = 0);

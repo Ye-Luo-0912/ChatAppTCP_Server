@@ -46,13 +46,26 @@ internal static class LinuxProcessMetrics
                 }
             }
 
-            if (vmRssKb is null && vmHwmKb is null)
-                return null;
+            long? pssKb = null;
+            var smapsRollupPath = $"/proc/{processId}/smaps_rollup";
+            if (File.Exists(smapsRollupPath))
+            {
+                foreach (var line in File.ReadLines(smapsRollupPath))
+                {
+                    if (line.StartsWith("Pss:", StringComparison.Ordinal))
+                    {
+                        pssKb = ParseKb(line);
+                        break;
+                    }
+                }
+            }
 
             var cgroup = ReadCgroupMemory(processId);
             return new LinuxProcessSample(
                 VmRssBytes: vmRssKb is null ? null : vmRssKb * 1_024,
                 VmHwmBytes: vmHwmKb is null ? null : vmHwmKb * 1_024,
+                PssBytes: pssKb is null ? null : pssKb * 1_024,
+                FileDescriptorCount: ReadFileDescriptorCount(processId),
                 CgroupMemoryCurrentBytes: cgroup?.MemoryCurrentBytes,
                 CgroupMemoryPeakBytes: cgroup?.MemoryPeakBytes,
                 CgroupOomEvents: cgroup?.OomEvents,
@@ -171,11 +184,39 @@ internal static class LinuxProcessMetrics
         long? MemoryPeakBytes,
         long? OomEvents,
         long? OomKillEvents);
+
+    /// <summary>
+    /// TCP-MEM-1：统计进程打开的文件描述符数量。Linux 上 socket 与
+    /// epoll/eventfd/pipe 都占 fd，是区分内核 socket 归属与 managed 对象
+    /// retained 的直接证据之一。枚举 /proc/&lt;pid&gt;/fd 目录条目计数。
+    /// </summary>
+    private static int? ReadFileDescriptorCount(int processId)
+    {
+        var fdPath = $"/proc/{processId}/fd";
+        if (!Directory.Exists(fdPath))
+            return null;
+        try
+        {
+            return Directory.EnumerateFileSystemEntries(fdPath)
+                .Count();
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+            return null;
+        }
+    }
 }
 
+/// <summary>
+/// TCP-MEM-1：单次 Linux 进程内存归因样本。PssBytes 来自 smaps_rollup，
+/// FileDescriptorCount 来自 /proc/&lt;pid&gt;/fd；配合 cgroup 信号一起把
+/// managed retained、GC committed、native cache 与内核 socket 区分开。
+/// </summary>
 internal sealed record LinuxProcessSample(
     long? VmRssBytes,
     long? VmHwmBytes,
+    long? PssBytes,
+    int? FileDescriptorCount,
     long? CgroupMemoryCurrentBytes,
     long? CgroupMemoryPeakBytes,
     long? CgroupOomEvents,

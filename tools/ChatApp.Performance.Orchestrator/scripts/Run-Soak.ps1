@@ -68,6 +68,7 @@
     .\Run-Soak.ps1 -DurationSeconds 86400 -MemoryGrowthThresholdPercent 15 -FinalSlopeMiBPerHour 20
 #>
 param(
+    [ValidateSet('Formal')] [string] $ValidationProfile = 'Formal',
     [ValidateRange(300, 86400)] [int] $DurationSeconds = 28800,
     [ValidateRange(0, 3600)] [int] $WarmupSeconds = 300,
     [ValidateSet('connection', 'heartbeat', 'chat')] [string] $TcpMode = 'connection',
@@ -95,6 +96,9 @@ param(
     [ValidateSet('BoundedChannel','LazySegmented')] [string] $OutboundQueueMode = 'BoundedChannel',
     [int] $OnDemandSendWorkerCount = 0,
     [int] $OnDemandSendBurstLimit = 16,
+    [ValidateSet('off','pglz','lz4','zstd')] [string] $PostgresWalCompression = 'lz4',
+    [ValidateRange(30, 86400)] [int] $PostgresCheckpointTimeoutSeconds = 900,
+    [ValidateRange(64, 1048576)] [int] $PostgresMaxWalSizeMb = 4096,
     [string] $ReportDirectory,
     [switch] $SkipBuild
 )
@@ -179,6 +183,7 @@ Write-Host "Starting soak run: duration=$DurationSeconds s; mode=$TcpMode; conns
 Write-Host 'The generated benchmark report includes process, Docker, GC/heap, Npgsql connection, JetStream and Outbox trends.'
 
 $arguments = @{
+    ValidationProfile = $ValidationProfile
     Rates = @(1)
     DurationSeconds = $DurationSeconds
     WarmupSeconds = $WarmupSeconds
@@ -204,6 +209,9 @@ $arguments = @{
     OutboundQueueMode = $OutboundQueueMode
     OnDemandSendWorkerCount = $OnDemandSendWorkerCount
     OnDemandSendBurstLimit = $OnDemandSendBurstLimit
+    PostgresWalCompression = $PostgresWalCompression
+    PostgresCheckpointTimeoutSeconds = $PostgresCheckpointTimeoutSeconds
+    PostgresMaxWalSizeMb = $PostgresMaxWalSizeMb
     ReportDirectory = $ReportDirectory
     NoPipeline = $true
     # Soak 的 TcpMessagesPerSecond 是“每个 active sender 的速率”；Rates 仅是单点标签。
@@ -450,6 +458,7 @@ $verdictObj = [pscustomobject]@{
     StartedAtUtc = if ($null -ne $report) { $report.StartedAtUtc } else { $invocationManifest.StartedAtUtc }
     CompletedAtUtc = if ($null -ne $report) { $report.CompletedAtUtc } else { [DateTimeOffset]::UtcNow }
     OverallStatus = $overallStatus
+    ValidationProfile = $ValidationProfile
     OverallSucceeded = $overallSucceeded
     RunValid = $runValid
     RunValidityGates = $runValidityGates
@@ -473,6 +482,9 @@ $verdictObj = [pscustomobject]@{
     TcpInactiveHeartbeatSeconds = $TcpInactiveHeartbeatSeconds
     TcpConnectionsPerSecond = $TcpConnectionsPerSecond
     RealtimeProcessingConcurrency = $RealtimeProcessingConcurrency
+    PostgresWalCompression = $PostgresWalCompression
+    PostgresCheckpointTimeoutSeconds = $PostgresCheckpointTimeoutSeconds
+    PostgresMaxWalSizeMb = $PostgresMaxWalSizeMb
     RestartDetected = $restartDetected
     RestartReasons = $restartReasons.ToArray()
     GrowthThresholdPercent = $MemoryGrowthThresholdPercent
@@ -494,6 +506,8 @@ $tee = [Collections.Generic.List[string]]::new()
 $tee.Add('# TCP soak verdict')
 $tee.Add('')
 $tee.Add("Overall: **$overallStatus**; run validity: **$(if ($runValid) { 'VALID' } else { 'INVALID' })**; memory: **$memoryStatus**.")
+$tee.Add('')
+$tee.Add("Validation profile: **$ValidationProfile**")
 $tee.Add('')
 $tee.Add("Requested measurement=$DurationSeconds s; actual measurement=$measurementSeconds s; post-ramp stabilization=$WarmupSeconds s; delivery drain=$TcpDeliveryDrainSeconds s; inactive heartbeat=$TcpInactiveHeartbeatSeconds s; mode=$TcpMode; active senders=$effectiveTcpActiveSenders/$TcpConnections at $TcpMessagesPerSecond msg/s each; connection ramp=$TcpConnectionsPerSecond/s.")
 $tee.Add('')

@@ -79,6 +79,44 @@ function Start-PerformanceDockerContainer {
     }
 }
 
+function Wait-PerformancePostgres {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string] $Container,
+        [string] $Database = 'ChatAppDatabase',
+        [ValidateRange(1, 300)] [int] $TimeoutSeconds = 60
+    )
+
+    $deadline = [DateTimeOffset]::UtcNow.AddSeconds($TimeoutSeconds)
+    while ([DateTimeOffset]::UtcNow -lt $deadline) {
+        # The official image starts a temporary postmaster during initdb and then
+        # shuts it down before exec'ing the final postgres process as PID 1.
+        # pg_isready alone can therefore return a short-lived false positive.
+        $pidOneCommand = & docker exec $Container sh -c 'cat /proc/1/comm' 2>$null
+        $pidOneIsPostgres = $LASTEXITCODE -eq 0 -and
+            [string]::Equals(
+                ([string]::Join('', @($pidOneCommand))).Trim(),
+                'postgres',
+                [StringComparison]::Ordinal)
+        if ($pidOneIsPostgres) {
+            & docker exec $Container pg_isready -U postgres -d $Database *> $null
+            if ($LASTEXITCODE -eq 0) {
+                # Require a second successful probe after a short scheduling gap,
+                # so a process transition cannot be mistaken for steady readiness.
+                Start-Sleep -Milliseconds 250
+                & docker exec $Container pg_isready -U postgres -d $Database *> $null
+                if ($LASTEXITCODE -eq 0) {
+                    return
+                }
+            }
+        }
+
+        Start-Sleep -Milliseconds 250
+    }
+
+    throw "PostgreSQL did not reach steady readiness: $Container"
+}
+
 function Remove-PerformanceDockerContainers {
     [CmdletBinding()]
     param(

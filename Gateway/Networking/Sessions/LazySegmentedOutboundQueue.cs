@@ -40,6 +40,11 @@ internal sealed class LazySegmentedOutboundQueue : IOutboundQueue, IValueTaskSou
     private Segment? _tail;
     private Segment? _head;
     private int _count;
+    // 高位表示 Write admission 已关闭，低 31 位记录已准入但尚未完成发布/回滚的 producer。
+    // TryComplete 先关闭准入，再等待低位归零，保证返回后不会再有 item 发布在 close drain 之后。
+    private int _writerAdmissionState;
+    private const int WriterAdmissionClosedBit = int.MinValue;
+    private const int ActiveWriterMask = int.MaxValue;
     private int _completed;
 
     // 单消费者异步信号：MRVTSC 复用，零分配等待。非 readonly：Reset/SetResult 原地修改结构体。
@@ -67,9 +72,44 @@ internal sealed class LazySegmentedOutboundQueue : IOutboundQueue, IValueTaskSou
     /// </summary>
     public bool TryWrite(OutboundWrite item)
     {
-        if (Volatile.Read(ref _completed) != 0)
+        if (!TryAcquireWriterAdmission())
             return false;
 
+        try
+        {
+            return TryWriteAdmitted(item);
+        }
+        finally
+        {
+            ReleaseWriterAdmission();
+        }
+    }
+
+    /// <summary>
+    /// 测试专用确定性屏障：在 writer admission 成功、item 发布前暂停。
+    /// 生产路径不经过委托或条件分支。
+    /// </summary>
+    internal bool TryWriteWithAdmissionBarrier(
+        OutboundWrite item,
+        Action onAdmitted)
+    {
+        ArgumentNullException.ThrowIfNull(onAdmitted);
+        if (!TryAcquireWriterAdmission())
+            return false;
+
+        try
+        {
+            onAdmitted();
+            return TryWriteAdmitted(item);
+        }
+        finally
+        {
+            ReleaseWriterAdmission();
+        }
+    }
+
+    private bool TryWriteAdmitted(OutboundWrite item)
+    {
         // 有界容量：先递增再校验，CAS-safe 防止多生产者同时通过容量检查。
         if (Interlocked.Increment(ref _count) > _capacity)
         {
@@ -104,8 +144,66 @@ internal sealed class LazySegmentedOutboundQueue : IOutboundQueue, IValueTaskSou
     /// </summary>
     public void TryComplete()
     {
+        if (!TryCloseWriterAdmission())
+        {
+            // Close 通常只有一个 owner；并发调用仍需等首个 owner 完成 publication，
+            // 避免调用方返回后把 consumer cleanup 与尚未完成的 writer 交叉。
+            var completionWait = new SpinWait();
+            while (Volatile.Read(ref _completed) == 0)
+                completionWait.SpinOnce();
+            return;
+        }
+
+        // 已准入 producer 的临界区只包含容量预留、段定位和槽位发布，通常数十纳秒。
+        // completion 是每连接一次的关闭路径；SpinWait 后会自动 yield，不增加常驻 waiter/timer。
+        var writerWait = new SpinWait();
+        while ((Volatile.Read(ref _writerAdmissionState) & ActiveWriterMask) != 0)
+            writerWait.SpinOnce();
+
         Volatile.Write(ref _completed, 1);
         SignalWaiter();
+    }
+
+    internal bool IsWriterAdmissionClosed =>
+        Volatile.Read(ref _writerAdmissionState) < 0;
+
+    private bool TryAcquireWriterAdmission()
+    {
+        while (true)
+        {
+            var observed = Volatile.Read(ref _writerAdmissionState);
+            if (observed < 0)
+                return false;
+
+            if (Interlocked.CompareExchange(
+                    ref _writerAdmissionState,
+                    observed + 1,
+                    observed) == observed)
+            {
+                return true;
+            }
+        }
+    }
+
+    private void ReleaseWriterAdmission() =>
+        Interlocked.Decrement(ref _writerAdmissionState);
+
+    private bool TryCloseWriterAdmission()
+    {
+        while (true)
+        {
+            var observed = Volatile.Read(ref _writerAdmissionState);
+            if (observed < 0)
+                return false;
+
+            if (Interlocked.CompareExchange(
+                    ref _writerAdmissionState,
+                    observed | WriterAdmissionClosedBit,
+                    observed) == observed)
+            {
+                return true;
+            }
+        }
     }
 
     /// <summary>

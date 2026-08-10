@@ -133,6 +133,12 @@ internal sealed class HeartbeatCoordinator
             ? _options.HeartbeatScanInterval / bucketCount
             : _options.HeartbeatScanInterval;
         _tickInterval = tickInterval;
+        var leaseRefreshEveryCycles = GetRefreshEveryCycles(
+            _options.DeviceLeaseRefreshInterval,
+            _options.HeartbeatScanInterval);
+        var presenceRefreshEveryCycles = GetRefreshEveryCycles(
+            _options.GlobalPresenceRefreshInterval,
+            _options.HeartbeatScanInterval);
 
         var workerCount = Math.Max(1, _options.HeartbeatRefreshConcurrency);
         // Channel 容量 = Worker × 4：队列满时 tick 循环阻塞提供背压，
@@ -183,6 +189,14 @@ internal sealed class HeartbeatCoordinator
 
                 var currentBucket = tickCounter % bucketCount;
                 tickCounter++;
+                var refreshLease = IsRefreshCycleDue(
+                    tickCounter,
+                    bucketCount,
+                    leaseRefreshEveryCycles);
+                var refreshPresence = IsRefreshCycleDue(
+                    tickCounter,
+                    bucketCount,
+                    presenceRefreshEveryCycles);
 
                 _listenerHost.SweepAdmission();
 
@@ -201,7 +215,7 @@ internal sealed class HeartbeatCoordinator
 
                 // 设备租约刷新：每连接独立租约，按 connectionId 桶遍历。
                 // 产生 HeartbeatRefreshWork 值写入 Channel，无 lambda/Task 分配。
-                if (_options.ReplaceSameDeviceSession)
+                if (_options.ReplaceSameDeviceSession && refreshLease)
                 {
                     foreach (var session in sessionsInBucket)
                     {
@@ -229,21 +243,24 @@ internal sealed class HeartbeatCoordinator
                 }
 
                 // Presence 刷新：按 userId 桶遍历，同用户多连接只刷新一次。
-                foreach (var userId in usersInBucket)
+                if (refreshPresence)
                 {
-                    _metrics.HeartbeatRefreshAttempted("presence");
-                    var work = new HeartbeatRefreshWork(
-                        HeartbeatRefreshKind.Presence,
-                        userId,
-                        0,
-                        null,
-                        TimeSpan.Zero,
-                        actualTickStart);
+                    foreach (var userId in usersInBucket)
+                    {
+                        _metrics.HeartbeatRefreshAttempted("presence");
+                        var work = new HeartbeatRefreshWork(
+                            HeartbeatRefreshKind.Presence,
+                            userId,
+                            0,
+                            null,
+                            TimeSpan.Zero,
+                            actualTickStart);
 
-                    await channel.Writer.WriteAsync(work, cancellationToken)
-                        .ConfigureAwait(false);
-                    Interlocked.Increment(ref _currentQueueDepth);
-                    Interlocked.CompareExchange(ref _oldestEnqueueTimestamp, actualTickStart, 0);
+                        await channel.Writer.WriteAsync(work, cancellationToken)
+                            .ConfigureAwait(false);
+                        Interlocked.Increment(ref _currentQueueDepth);
+                        Interlocked.CompareExchange(ref _oldestEnqueueTimestamp, actualTickStart, 0);
+                    }
                 }
 
                 var tickDuration = _timeProvider.GetElapsedTime(actualTickStart);
@@ -364,6 +381,36 @@ internal sealed class HeartbeatCoordinator
     /// </para>
     /// </summary>
     internal int CurrentQueueDepth => _currentQueueDepth;
+
+    internal static int GetRefreshEveryCycles(
+        TimeSpan refreshInterval,
+        TimeSpan scanInterval)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(
+            refreshInterval,
+            TimeSpan.Zero);
+        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(
+            scanInterval,
+            TimeSpan.Zero);
+
+        var cycles = (refreshInterval.Ticks + scanInterval.Ticks - 1)
+            / scanInterval.Ticks;
+        return (int)Math.Clamp(cycles, 1, int.MaxValue);
+    }
+
+    internal static bool IsRefreshCycleDue(
+        int tickCounter,
+        int bucketCount,
+        int refreshEveryCycles)
+    {
+        if (tickCounter <= 0 || bucketCount <= 0 || refreshEveryCycles <= 0)
+        {
+            return false;
+        }
+
+        var cycleIndex = (tickCounter - 1) / bucketCount;
+        return cycleIndex % refreshEveryCycles == 0;
+    }
 
     /// <summary>
     /// 八.4：当前最老待处理项的排队年龄（ms）。队列空时返回 0。

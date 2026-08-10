@@ -50,6 +50,8 @@ internal sealed record BenchmarkOptions(
     string OutboundQueueMode,
     int OnDemandSendWorkerCount,
     int OnDemandSendBurstLimit,
+    TimeSpan GatewayDeviceLeaseRefreshInterval,
+    TimeSpan GatewayGlobalPresenceRefreshInterval,
     string ReportDirectory,
     IReadOnlyList<string> DockerContainers)
 {
@@ -81,6 +83,8 @@ internal sealed record BenchmarkOptions(
         "[--outbound-send-mode PersistentSendLoop|OnDemandSendPump|PerSessionDrain] " +
         "[--outbound-queue-mode BoundedChannel|LazySegmented] " +
         "[--on-demand-send-worker-count 0] [--on-demand-send-burst-limit 16] " +
+        "[--gateway-device-lease-refresh-seconds 90] " +
+        "[--gateway-global-presence-refresh-seconds 90] " +
         "[--docker-container NAME] " +
         "[--report-directory .artifacts/performance]";
 
@@ -135,6 +139,8 @@ internal sealed record BenchmarkOptions(
         var outboundQueueMode = "BoundedChannel";
         var onDemandSendWorkerCount = 0;
         var onDemandSendBurstLimit = 16;
+        var gatewayDeviceLeaseRefreshSeconds = 90;
+        var gatewayGlobalPresenceRefreshSeconds = 90;
         string? reportDirectory = null;
         var dockerContainers = new List<string>();
 
@@ -290,6 +296,12 @@ internal sealed record BenchmarkOptions(
                     break;
                 case "--on-demand-send-burst-limit":
                     onDemandSendBurstLimit = ParseInt(value, option);
+                    break;
+                case "--gateway-device-lease-refresh-seconds":
+                    gatewayDeviceLeaseRefreshSeconds = ParseInt(value, option);
+                    break;
+                case "--gateway-global-presence-refresh-seconds":
+                    gatewayGlobalPresenceRefreshSeconds = ParseInt(value, option);
                     break;
                 case "--docker-container":
                     dockerContainers.Add(value);
@@ -452,6 +464,8 @@ internal sealed record BenchmarkOptions(
                 "--outbound-queue-mode must be BoundedChannel or LazySegmented.");
         ArgumentOutOfRangeException.ThrowIfNegative(onDemandSendWorkerCount);
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(onDemandSendBurstLimit, 0);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(gatewayDeviceLeaseRefreshSeconds);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(gatewayGlobalPresenceRefreshSeconds);
 
         return new BenchmarkOptions(
             repositoryRoot,
@@ -501,6 +515,8 @@ internal sealed record BenchmarkOptions(
             outboundQueueMode,
             onDemandSendWorkerCount,
             onDemandSendBurstLimit,
+            TimeSpan.FromSeconds(gatewayDeviceLeaseRefreshSeconds),
+            TimeSpan.FromSeconds(gatewayGlobalPresenceRefreshSeconds),
             reportDirectory,
             dockerContainers.Distinct(StringComparer.Ordinal).ToArray());
     }
@@ -584,6 +600,21 @@ internal sealed record BenchmarkOptions(
             ? TimeSpan.Zero
             : TimeSpan.FromSeconds(
                 Math.Ceiling(TcpConnections / (double)TcpConnectionsPerSecond));
+
+    /// <summary>
+    /// Connection-only load deliberately does not authenticate. Keep the
+    /// benchmark-owned sockets alive for the complete ramp, stabilization and
+    /// measurement window instead of letting the production authentication
+    /// deadline turn a capacity run into an implicit timeout test.
+    /// </summary>
+    public TimeSpan? GetConnectionModeAuthenticationTimeout()
+    {
+        if (!TcpMode.Equals("connection", StringComparison.OrdinalIgnoreCase))
+            return null;
+
+        var runWindow = GetEstimatedTcpRamp() + Warmup + Duration;
+        return TimeSpan.FromSeconds(Math.Ceiling(runWindow.TotalSeconds) + 30);
+    }
 
     public TimeSpan GetBootstrapTokenLifetime()
     {

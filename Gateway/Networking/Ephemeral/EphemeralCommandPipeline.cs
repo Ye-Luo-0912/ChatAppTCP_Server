@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using ChatApp.ActorRuntime.Abstractions;
 using ChatApp.ActorRuntime.Runtime;
 using ChatApp.TcpGateway.Gateway.Configuration;
@@ -25,10 +26,17 @@ namespace ChatApp.TcpGateway.Gateway.Networking.Ephemeral;
 /// </summary>
 internal sealed class EphemeralCommandPipeline : IAsyncDisposable
 {
+    private const int ActorAdmissionLockCount = 256;
+
     private readonly EphemeralPipelineMode _mode;
     private readonly SessionCommandExecutor? _legacy;
-    private readonly ActorRuntime<uint, EphemeralActorState, EphemeralActorMessage>? _actor;
+    private readonly ActorRuntime<EphemeralActorKey, EphemeralActorState, EphemeralActorMessage>? _actor;
+    private readonly ConcurrentDictionary<uint, long>? _actorRegistrations;
+    private readonly SpinLock[]? _actorAdmissionLocks;
+    private readonly object? _actorRegistrationGate;
     private readonly TimeSpan _operationTimeout;
+    private long _nextActorRegistration;
+    private bool _acceptingActorRegistrations;
     private bool _disposed;
 
     public EphemeralCommandPipeline(
@@ -90,7 +98,7 @@ internal sealed class EphemeralCommandPipeline : IAsyncDisposable
             metrics,
             logger);
         var dropHandler = new EphemeralActorDropHandler(metrics);
-        _actor = new ActorRuntime<uint, EphemeralActorState, EphemeralActorMessage>(
+        _actor = new ActorRuntime<EphemeralActorKey, EphemeralActorState, EphemeralActorMessage>(
             behavior,
             ActorMailboxMode.Fifo,
             new ActorRuntimeOptions
@@ -114,6 +122,12 @@ internal sealed class EphemeralCommandPipeline : IAsyncDisposable
             },
             timeProvider,
             dropHandler);
+        _actorRegistrations = new ConcurrentDictionary<uint, long>();
+        _actorRegistrationGate = new object();
+        _acceptingActorRegistrations = true;
+        // 共享条带锁把 generation 校验 + Actor post 与注销线性化。
+        // 固定 256 个值类型锁（约 1 KiB/进程 pipeline），避免每连接 gate 对象。
+        _actorAdmissionLocks = new SpinLock[ActorAdmissionLockCount];
         behavior.Attach(_actor);
     }
 
@@ -129,55 +143,136 @@ internal sealed class EphemeralCommandPipeline : IAsyncDisposable
 
     /// <summary>
     /// 注册连接。Disabled 模式下为 no-op（返回 true 维持调用方契约）。
-    /// Legacy 模式下委托 SessionCommandExecutor；GenericActor 模式下为 no-op
-    /// （Actor Key 即 connectionId，无需预注册）。
+    /// Legacy 模式下委托 SessionCommandExecutor；GenericActor 模式下取得独立
+    /// generation lease，使 connectionId 复用时旧 session 不能投递或回收后继 Actor。
     /// </summary>
-    public bool TryRegisterConnection(uint connectionId, long userId)
+    public bool TryRegisterConnection(
+        uint connectionId,
+        long userId,
+        out Registration registration)
     {
         if (_mode == EphemeralPipelineMode.Disabled)
+        {
+            registration = Registration.CreateNoop(this);
             return true;
-        return _legacy?.TryRegisterConnection(connectionId, userId) ?? true;
+        }
+
+        if (_legacy is not null)
+        {
+            if (!_legacy.TryRegisterConnection(
+                    connectionId,
+                    userId,
+                    out var legacyRegistration))
+            {
+                registration = default;
+                return false;
+            }
+
+            registration = Registration.CreateLegacy(
+                this,
+                legacyRegistration);
+            return true;
+        }
+
+        lock (_actorRegistrationGate!)
+        {
+            if (!_acceptingActorRegistrations)
+            {
+                registration = default;
+                return false;
+            }
+
+            var generation = Interlocked.Increment(
+                ref _nextActorRegistration);
+            if (!_actorRegistrations!.TryAdd(connectionId, generation))
+            {
+                registration = default;
+                return false;
+            }
+
+            registration = Registration.CreateActor(
+                this,
+                connectionId,
+                generation);
+            return true;
+        }
     }
 
     /// <summary>
     /// 注销连接。Disabled 模式下为 no-op。
     /// Legacy 模式下排空队列；GenericActor 模式下立即 Deactivate 对应 Actor。
     /// </summary>
-    public void UnregisterConnection(uint connectionId)
+    private void UnregisterActorConnection(
+        uint connectionId,
+        long generation)
     {
-        if (_mode == EphemeralPipelineMode.Disabled)
-            return;
-
-        if (_legacy is not null)
+        var locks = _actorAdmissionLocks!;
+        ref var admissionLock = ref locks[
+            connectionId & (ActorAdmissionLockCount - 1)];
+        var lockTaken = false;
+        try
         {
-            _legacy.UnregisterConnection(connectionId);
-            return;
+            admissionLock.Enter(ref lockTaken);
+            if (!_actorRegistrations!.TryRemove(
+                    new KeyValuePair<uint, long>(
+                        connectionId,
+                        generation)))
+            {
+                return;
+            }
+
+            // 锁内删除 admission，保证返回后旧 lease 不会再成功发布消息。
+        }
+        finally
+        {
+            if (lockTaken)
+                admissionLock.Exit(useMemoryBarrier: true);
         }
 
-        // 连接断开立即回收对应 Ephemeral Actor，不等待 Idle Sweep（P0-6）。
-        // ActivationId.None 匹配当前任意激活；Shard Ingress 满时退回 Idle 回收兜底。
-        _actor!.TryDeactivate(
-            in connectionId,
-            ActorDeactivateReason.Explicit);
+        // 只有仍持有当前 generation 的 lease 才能回收 Actor；旧 session finally
+        // 不会按裸 connectionId 关闭后继 session 的 Actor。
+        var key = new EphemeralActorKey(
+            connectionId,
+            generation);
+        _actor!.TryDeactivate(in key, ActorDeactivateReason.Explicit);
     }
 
     /// <summary>
     /// 入队命令。Disabled 模式下返回 false——调用方不应到达此路径
     /// （Specialized Typing 模式下 TypingNotify 已被快路径截获）。
     /// </summary>
-    public bool TryEnqueue(
+    private bool TryEnqueueActor(
         uint connectionId,
+        long generation,
         in SessionCommand command)
     {
-        if (_mode == EphemeralPipelineMode.Disabled)
-            return false;
+        var locks = _actorAdmissionLocks!;
+        ref var admissionLock = ref locks[
+            connectionId & (ActorAdmissionLockCount - 1)];
+        var lockTaken = false;
+        try
+        {
+            admissionLock.Enter(ref lockTaken);
+            if (!_actorRegistrations!.TryGetValue(
+                    connectionId,
+                    out var currentGeneration) ||
+                currentGeneration != generation)
+            {
+                return false;
+            }
 
-        if (_legacy is not null)
-            return _legacy.TryEnqueue(connectionId, in command);
-
-        var message = EphemeralActorMessage.FromCommand(in command);
-        return _actor!.TryTellEphemeral(in connectionId, in message) ==
-               ActorPostStatus.Accepted;
+            var key = new EphemeralActorKey(
+                connectionId,
+                generation);
+            var message = EphemeralActorMessage.FromCommand(in command);
+            return _actor!.TryTellEphemeral(in key, in message) ==
+                   ActorPostStatus.Accepted;
+        }
+        finally
+        {
+            if (lockTaken)
+                admissionLock.Exit(useMemoryBarrier: true);
+        }
     }
 
     public Task StartAsync(CancellationToken cancellationToken)
@@ -200,12 +295,20 @@ internal sealed class EphemeralCommandPipeline : IAsyncDisposable
             return;
         }
 
-        using var drainCts = CancellationTokenSource.CreateLinkedTokenSource(
-            cancellationToken);
-        drainCts.CancelAfter(_operationTimeout + TimeSpan.FromSeconds(2));
-        await _actor!
-            .StopAsync(ActorStopMode.Drain, drainCts.Token)
-            .ConfigureAwait(false);
+        CloseActorRegistrationAdmission();
+        try
+        {
+            using var drainCts = CancellationTokenSource.CreateLinkedTokenSource(
+                cancellationToken);
+            drainCts.CancelAfter(_operationTimeout + TimeSpan.FromSeconds(2));
+            await _actor!
+                .StopAsync(ActorStopMode.Drain, drainCts.Token)
+                .ConfigureAwait(false);
+        }
+        finally
+        {
+            _actorRegistrations!.Clear();
+        }
     }
 
     public async ValueTask DisposeAsync()
@@ -217,8 +320,127 @@ internal sealed class EphemeralCommandPipeline : IAsyncDisposable
         if (_legacy is not null)
             await _legacy.DisposeAsync().ConfigureAwait(false);
         if (_actor is not null)
-            await _actor.DisposeAsync().ConfigureAwait(false);
+        {
+            CloseActorRegistrationAdmission();
+            try
+            {
+                await _actor.DisposeAsync().ConfigureAwait(false);
+            }
+            finally
+            {
+                _actorRegistrations!.Clear();
+            }
+        }
     }
+
+    private void CloseActorRegistrationAdmission()
+    {
+        lock (_actorRegistrationGate!)
+        {
+            _acceptingActorRegistrations = false;
+        }
+    }
+
+    internal int RegisteredConnectionCount =>
+        _legacy?.RegisteredConnectionCount ??
+        _actorRegistrations?.Count ??
+        0;
+
+    internal readonly struct Registration
+    {
+        private readonly EphemeralCommandPipeline? _owner;
+        private readonly RegistrationKind _kind;
+        private readonly SessionCommandExecutor.Registration _legacy;
+        private readonly uint _connectionId;
+        private readonly long _generation;
+
+        private Registration(
+            EphemeralCommandPipeline owner,
+            RegistrationKind kind,
+            in SessionCommandExecutor.Registration legacy,
+            uint connectionId,
+            long generation)
+        {
+            _owner = owner;
+            _kind = kind;
+            _legacy = legacy;
+            _connectionId = connectionId;
+            _generation = generation;
+        }
+
+        public bool IsValid => _owner is not null;
+
+        public bool TryEnqueue(in SessionCommand command)
+        {
+            return _kind switch
+            {
+                RegistrationKind.Legacy => _legacy.TryEnqueue(in command),
+                RegistrationKind.Actor when _owner is { } owner =>
+                    owner.TryEnqueueActor(
+                        _connectionId,
+                        _generation,
+                        in command),
+                _ => false
+            };
+        }
+
+        public void Unregister()
+        {
+            switch (_kind)
+            {
+                case RegistrationKind.Legacy:
+                    _legacy.Unregister();
+                    break;
+                case RegistrationKind.Actor when _owner is { } owner:
+                    owner.UnregisterActorConnection(
+                        _connectionId,
+                        _generation);
+                    break;
+            }
+        }
+
+        internal static Registration CreateNoop(
+            EphemeralCommandPipeline owner)
+            => new(
+                owner,
+                RegistrationKind.Noop,
+                default,
+                connectionId: 0,
+                generation: 0);
+
+        internal static Registration CreateLegacy(
+            EphemeralCommandPipeline owner,
+            in SessionCommandExecutor.Registration legacy)
+            => new(
+                owner,
+                RegistrationKind.Legacy,
+                in legacy,
+                connectionId: 0,
+                generation: 0);
+
+        internal static Registration CreateActor(
+            EphemeralCommandPipeline owner,
+            uint connectionId,
+            long generation)
+            => new(
+                owner,
+                RegistrationKind.Actor,
+                default,
+                connectionId,
+                generation);
+    }
+
+    private enum RegistrationKind : byte
+    {
+        None = 0,
+        Noop = 1,
+        Legacy = 2,
+        Actor = 3
+    }
+
+    private readonly record struct EphemeralActorKey(
+        uint ConnectionId,
+        long Generation);
 
     private static int NextPowerOfTwo(int value)
     {
@@ -264,12 +486,12 @@ internal sealed class EphemeralCommandPipeline : IAsyncDisposable
     }
 
     private sealed class EphemeralActorBehavior :
-        IActorBehavior<uint, EphemeralActorState, EphemeralActorMessage>
+        IActorBehavior<EphemeralActorKey, EphemeralActorState, EphemeralActorMessage>
     {
         private readonly Func<SessionCommand, CancellationToken, ValueTask> _processor;
         private readonly GatewayMetrics _metrics;
         private readonly ILogger _logger;
-        private IActorRuntime<uint, EphemeralActorState, EphemeralActorMessage>? _runtime;
+        private IActorRuntime<EphemeralActorKey, EphemeralActorState, EphemeralActorMessage>? _runtime;
 
         public EphemeralActorBehavior(
             Func<SessionCommand, CancellationToken, ValueTask> processor,
@@ -282,22 +504,22 @@ internal sealed class EphemeralCommandPipeline : IAsyncDisposable
         }
 
         public void Attach(
-            IActorRuntime<uint, EphemeralActorState, EphemeralActorMessage> runtime)
+            IActorRuntime<EphemeralActorKey, EphemeralActorState, EphemeralActorMessage> runtime)
             => _runtime = runtime;
 
         public void Activate(
-            in uint key,
+            in EphemeralActorKey key,
             ref EphemeralActorState state,
-            ref ActorContext<uint, EphemeralActorState, EphemeralActorMessage> context)
+            ref ActorContext<EphemeralActorKey, EphemeralActorState, EphemeralActorMessage> context)
         {
             state.Reserved = 0;
         }
 
         public ActorTurnResult Receive(
-            in uint key,
+            in EphemeralActorKey key,
             ref EphemeralActorState state,
             in EphemeralActorMessage message,
-            ref ActorContext<uint, EphemeralActorState, EphemeralActorMessage> context)
+            ref ActorContext<EphemeralActorKey, EphemeralActorState, EphemeralActorMessage> context)
         {
             if (message.Kind == EphemeralActorMessageKind.Completion)
                 return ActorTurnResult.ResumeMailbox;
@@ -319,18 +541,18 @@ internal sealed class EphemeralCommandPipeline : IAsyncDisposable
         }
 
         public void Deactivate(
-            in uint key,
+            in EphemeralActorKey key,
             ref EphemeralActorState state,
             ActorDeactivateReason reason,
-            ref ActorContext<uint, EphemeralActorState, EphemeralActorMessage> context)
+            ref ActorContext<EphemeralActorKey, EphemeralActorState, EphemeralActorMessage> context)
         {
         }
     }
 
     private sealed class EphemeralCommandOperation : IAsyncOperation
     {
-        private readonly IActorRuntime<uint, EphemeralActorState, EphemeralActorMessage> _runtime;
-        private readonly uint _key;
+        private readonly IActorRuntime<EphemeralActorKey, EphemeralActorState, EphemeralActorMessage> _runtime;
+        private readonly EphemeralActorKey _key;
         private readonly ActivationId _activation;
         private readonly SessionCommand _command;
         private readonly Func<SessionCommand, CancellationToken, ValueTask> _processor;
@@ -339,8 +561,8 @@ internal sealed class EphemeralCommandPipeline : IAsyncDisposable
         private int _finished;
 
         public EphemeralCommandOperation(
-            IActorRuntime<uint, EphemeralActorState, EphemeralActorMessage> runtime,
-            uint key,
+            IActorRuntime<EphemeralActorKey, EphemeralActorState, EphemeralActorMessage> runtime,
+            EphemeralActorKey key,
             ActivationId activation,
             in SessionCommand command,
             Func<SessionCommand, CancellationToken, ValueTask> processor,

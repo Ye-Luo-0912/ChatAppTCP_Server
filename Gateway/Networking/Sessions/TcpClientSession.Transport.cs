@@ -72,57 +72,23 @@ internal sealed partial class TcpClientSession
         try
         {
             // PersistentSendLoop 模式：等待 SendLoop 退出（其 finally 会排空 FIFO + mailbox）。
-            // OnDemandSendPump 模式：无永久 Task，直接排空残留（in-flight pump 会因
-            // _lifetime 取消而快速退出，其 PumpOutboundAsync 的 finally 也会排空）。
-            // PerSessionDrain 模式：等待活跃 drain 退出（其 finally 会排空 FIFO + mailbox）。
+            // OnDemandSendPump 模式：无永久 Task；先撤销 Queued 或等待 Running pump
+            // 释放单消费者所有权，再由 Dispose 唯一排空。禁止与 pump 并发 Drain。
+            // PerSessionDrain 模式：等待活跃 drain 完整退出，再由 Dispose 唯一排空。
             if (_sendLoop is not null)
             {
                 await _sendLoop.ConfigureAwait(false);
             }
             else if (_usePerSessionDrain)
             {
-                // 八.1：等待 PerSessionDrain 活跃 drain 退出。
-                // _drainStateGen packed state+gen 单次 CAS 原子发布，消除旧实现窗口。
-                // Close 已设置 IsConnected=false，新 TryQueue 会失败，故最多一个活跃 drain 需等待。
-                // Close 后无新 drain 启动 → MRVTSC Version 稳定 → ValueTask 不会因 Reset 失效。
-                // drain 的 finally 在 Complete(gen) 前已排空 FIFO + 归位 _drainStateGen + 释放 Tracker，
-                // 故 await 返回后可直接进入 _lifetime.Dispose()。
-                while (true)
-                {
-                    var stateGen = Interlocked.Read(ref _drainStateGen);
-                    if ((stateGen & DrainStateRunningBit) == 0)
-                        break; // Idle：无活跃 drain。
-
-                    var currentGen = (int)(stateGen & 0xFFFFFFFF);
-                    var op = Volatile.Read(ref _drainOp);
-
-                    // P0-2：op 尚未发布或属上一代时，SpinWait 等待当前代次 op 发布。
-                    // 修复窗口 A（op==null 提前退出）和窗口 B（上一代 op busy-loop）。
-                    if (op is null || op.ActiveGeneration != currentGen)
-                    {
-                        var spin = new SpinWait();
-                        for (var i = 0; i < 1000; i++)
-                        {
-                            op = Volatile.Read(ref _drainOp);
-                            if (op is not null && op.ActiveGeneration == currentGen)
-                                break;
-                            spin.SpinOnce();
-                        }
-                        if (op is null || op.ActiveGeneration != currentGen)
-                            continue; // 重新检查状态（可能已 Idle 或换代）。
-                    }
-
-                    try
-                    {
-                        await op.WaitAsync(currentGen).ConfigureAwait(false);
-                    }
-                    catch
-                    {
-                        // drain 内部已处理异常并记录日志；此处仅等待其退出。
-                    }
-                }
-                // 防御性排空：覆盖 Close→Read 窗口内入队但 drain 未消费的残留帧。
-                // 幂等，与 drain finally 的 DrainOutboundOnClose 安全并发。
+                await WaitForPerSessionDrainOwnershipReleaseAsync().ConfigureAwait(false);
+                // 防御性串行排空：覆盖 Close→Read 窗口内入队但 drain 未消费的残留帧。
+                // Idle 是 Complete 后发布的稳定 handoff，不会与 drain/Reset 并发。
+                DrainOutboundOnClose();
+            }
+            else if (_outboundPump is not null)
+            {
+                await WaitForOutboundPumpOwnershipReleaseAsync().ConfigureAwait(false);
                 DrainOutboundOnClose();
             }
             else
@@ -142,6 +108,98 @@ internal sealed partial class TcpClientSession
                     _deadlineWheel.Cancel(_idleDeadlineRegistration);
             }
             _lifetime.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Close 后等待 PerSessionDrain 当前代次完整交还单消费者所有权。
+    /// Publishing 阶段不能读取 MRVTSC（Reset 尚未完成）；Running/Finalizing 则等待
+    /// matching generation Complete，并继续重读 phase，直到 Complete→Idle 的稳定 handoff。
+    /// </summary>
+    private async ValueTask WaitForPerSessionDrainOwnershipReleaseAsync()
+    {
+        var hasAwaitedGeneration = false;
+        var awaitedGeneration = 0;
+
+        while (true)
+        {
+            var stateGen = Interlocked.Read(ref _drainStateGen);
+            var phase = stateGen & DrainStatePhaseMask;
+            if (phase == 0)
+                return;
+
+            var generation = (int)(stateGen & uint.MaxValue);
+            if (phase == DrainStatePublishing)
+            {
+                // Publisher 会在 Reset 完成后发布 Running，或在 Close 竞态下自行
+                // Complete/撤销本代。shutdown-only 等待，不增加 per-session waiter。
+                await Task.Yield();
+                continue;
+            }
+
+            if (!hasAwaitedGeneration || awaitedGeneration != generation)
+            {
+                var op = Volatile.Read(ref _drainOp);
+                if (op is null || op.ActiveGeneration != generation)
+                {
+                    // Running 仅应在 ActiveGeneration 最后发布后可见；保留防御性重读。
+                    await Task.Yield();
+                    continue;
+                }
+
+                try
+                {
+                    await op.WaitAsync(generation).ConfigureAwait(false);
+                }
+                catch
+                {
+                    // drain 内部已处理异常并记录日志；此处仅等待其退出。
+                }
+
+                hasAwaitedGeneration = true;
+                awaitedGeneration = generation;
+            }
+
+            // Complete 先于 Idle；不能在 ValueTask 完成后立刻 Drain，必须等 finalizer
+            // 发布稳定 Idle，避免与 phase handoff 或下一代 publication 交叉。
+            await Task.Yield();
+        }
+    }
+
+    /// <summary>
+    /// Close 后等待 OnDemandSendPump 的单消费者所有权释放。
+    /// <para>
+    /// Queued 尚未被 worker 获取时 CAS 回 Idle，使 ready queue 中的旧引用在未来 Pump CAS 时
+    /// 直接 no-op；Running/Finalizing 时异步让出线程，直到 pump 完成 consumer re-check、
+    /// 释放 Tracker 并回到 Idle。
+    /// Close 后 TryScheduleSend 的双重 IsConnected 检查保证不会再发布新的所有权，
+    /// 因而一旦观察到 Idle 即稳定，可由 Dispose 唯一执行关闭排空。
+    /// </para>
+    /// </summary>
+    private async ValueTask WaitForOutboundPumpOwnershipReleaseAsync()
+    {
+        while (true)
+        {
+            var state = Volatile.Read(ref _sendState);
+            if (state == SendStateIdle)
+                return;
+
+            if (state == SendStateQueued)
+            {
+                if (Interlocked.CompareExchange(
+                        ref _sendState,
+                        SendStateIdle,
+                        SendStateQueued) == SendStateQueued)
+                {
+                    return;
+                }
+
+                continue;
+            }
+
+            // Running/Finalizing pump 持有 FIFO/mailbox 单消费者所有权。Close 已取消 socket send，
+            // 正常只需极少数 continuation；不分配 per-session waiter/timer 常驻对象。
+            await Task.Yield();
         }
     }
 

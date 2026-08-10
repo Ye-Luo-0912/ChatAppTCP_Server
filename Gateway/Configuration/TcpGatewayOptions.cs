@@ -15,8 +15,8 @@ public sealed class TcpGatewayOptions
     /// <summary>
     /// DirectSocket 动态接收缓冲区：新连接的初始缓冲区大小（字节）。
     /// <para>
-    /// 心跳/小帧连接使用小缓冲区减少内存占用；检测到连续大帧时自动升级到
-    /// <see cref="ReceiveBufferMaxSize"/>，长期空闲后降级回此值。
+    /// 心跳/小帧连接使用小缓冲区减少内存占用；检测到无法容纳的大帧时自动升级到
+    /// <see cref="ReceiveBufferMaxSize"/>，大帧保留窗口到期后的下一安全点降级回此值。
     /// 仅在 <see cref="InboundTransportMode.DirectSocket"/> 模式下生效。
     /// </para>
     /// </summary>
@@ -32,13 +32,26 @@ public sealed class TcpGatewayOptions
     public int ReceiveBufferMaxSize { get; set; } = 4 * 1024;
 
     /// <summary>
-    /// DirectSocket 动态接收缓冲区：空闲多少秒后降级到 <see cref="ReceiveBufferInitialSize"/>。
+    /// DirectSocket 动态接收缓冲区：完整大帧之后保留升级缓冲区的时间窗口。
     /// <para>
-    /// 长连接在空闲期后释放大缓冲区槽位，减少 ArrayPool 压力。
+    /// 该值按“距最近完整大帧”计算，并非距最近任意网络字节；持续小帧不会刷新窗口。
+    /// 窗口到期后，仅在一个完整帧处理完且接收缓存为空、没有半帧时降级到
+    /// <see cref="ReceiveBufferInitialSize"/>。因此无需 per-session timer，同时避免大帧 burst 内抖动。
     /// 设为 <see cref="TimeSpan.Zero"/> 禁用降级。
     /// </para>
     /// </summary>
-    public TimeSpan ReceiveBufferDowngradeIdleTimeout { get; set; } = TimeSpan.FromSeconds(60);
+    public TimeSpan ReceiveBufferLargeFrameRetention { get; set; } = TimeSpan.FromSeconds(60);
+
+    /// <summary>
+    /// 旧配置键兼容别名。语义从未是真正的连接 idle timeout；新配置应使用
+    /// <see cref="ReceiveBufferLargeFrameRetention"/>。
+    /// </summary>
+    [Obsolete($"Use {nameof(ReceiveBufferLargeFrameRetention)} instead.")]
+    public TimeSpan ReceiveBufferDowngradeIdleTimeout
+    {
+        get => ReceiveBufferLargeFrameRetention;
+        set => ReceiveBufferLargeFrameRetention = value;
+    }
 
     /// <summary>
     /// DirectSocket 帧装配 deadline：不完整 Header 超时后关闭连接（秒）。
@@ -83,6 +96,21 @@ public sealed class TcpGatewayOptions
     public TimeSpan AuthenticationTimeout { get; set; } = TimeSpan.FromSeconds(10);
     public TimeSpan IdleTimeout { get; set; } = TimeSpan.FromSeconds(90);
     public TimeSpan HeartbeatScanInterval { get; set; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>
+    /// Device lease refresh cadence. The coordinator rounds this up to a whole
+    /// scan cycle and keeps the existing bucket distribution; no per-session
+    /// timer or timestamp is added. Three missed refreshes must still fit inside
+    /// the lease TTL.
+    /// </summary>
+    public TimeSpan DeviceLeaseRefreshInterval { get; set; } = TimeSpan.FromSeconds(90);
+
+    /// <summary>
+    /// Global presence/routing refresh cadence. The 90-second default cuts Redis
+    /// refresh traffic by two thirds while allowing two failed refreshes before
+    /// the five-minute presence TTL expires.
+    /// </summary>
+    public TimeSpan GlobalPresenceRefreshInterval { get; set; } = TimeSpan.FromSeconds(90);
     public TimeSpan SendTimeout { get; set; } = TimeSpan.FromSeconds(5);
     public int MaxPacketsPerSecond { get; set; } = 200;
 
@@ -403,6 +431,22 @@ public sealed class TcpGatewayOptions
     /// </summary>
     public TimeSpan GoAwayDrainTimeout { get; set; } = TimeSpan.FromSeconds(5);
 
+    private static bool IsRefreshCadenceSafe(
+        TimeSpan requested,
+        TimeSpan scanInterval,
+        TimeSpan ttl)
+    {
+        if (requested <= TimeSpan.Zero || scanInterval <= TimeSpan.Zero)
+        {
+            return false;
+        }
+
+        var cycles = Math.Max(
+            1L,
+            (requested.Ticks + scanInterval.Ticks - 1) / scanInterval.Ticks);
+        return cycles <= ttl.Ticks / scanInterval.Ticks / 3;
+    }
+
     public bool IsValid() =>
         System.Net.IPAddress.TryParse(ListenAddress, out _) &&
         Port is > 0 and <= ushort.MaxValue &&
@@ -418,6 +462,14 @@ public sealed class TcpGatewayOptions
         AuthenticationTimeout > TimeSpan.Zero &&
         IdleTimeout > AuthenticationTimeout &&
         HeartbeatScanInterval > TimeSpan.Zero &&
+        IsRefreshCadenceSafe(
+            DeviceLeaseRefreshInterval,
+            HeartbeatScanInterval,
+            IdleTimeout + TimeSpan.FromMinutes(5)) &&
+        IsRefreshCadenceSafe(
+            GlobalPresenceRefreshInterval,
+            HeartbeatScanInterval,
+            TimeSpan.FromMinutes(5)) &&
         HeartbeatBucketCount > 0 &&
         HeartbeatRefreshConcurrency > 0 &&
         HeartbeatRefreshJitterRatio is >= 0 and <= 1 &&
@@ -447,7 +499,7 @@ public sealed class TcpGatewayOptions
         OnDemandSendBurstLimit > 0 &&
         ReceiveBufferInitialSize >= 512 &&
         ReceiveBufferMaxSize >= ReceiveBufferInitialSize &&
-        ReceiveBufferDowngradeIdleTimeout >= TimeSpan.Zero &&
+        ReceiveBufferLargeFrameRetention >= TimeSpan.Zero &&
         HeaderAssemblyTimeout >= TimeSpan.Zero &&
         PayloadAssemblyTimeout >= TimeSpan.Zero &&
         MinimumClientProtocolVersion >= PacketProtocol.MinProtocolVersion &&

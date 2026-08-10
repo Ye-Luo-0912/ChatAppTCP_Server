@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Text;
 using System.Text.Json;
+using ChatApp.Performance.Orchestrator.Runtime;
 
 namespace ChatApp.Performance.Orchestrator.Diagnostics;
 
@@ -243,12 +244,34 @@ internal static class BenchmarkReportWriter
             text.AppendLine();
             text.AppendLine("### TCP message semantics");
             text.AppendLine();
-            text.AppendLine("| Load | Sent messages | Expected recipient deliveries | MQ ACK | Received deliveries | Rejected |");
-            text.AppendLine("|---|---:|---:|---:|---:|---:|");
+            text.AppendLine("| Load | Sent messages | Expected recipient deliveries | MQ ACK | Received deliveries | Delivery samples | Delivery p95 | Rejected |");
+            text.AppendLine("|---|---:|---:|---:|---:|---:|---:|---:|");
             foreach (var load in tcpMessageLoads)
             {
+                var deliveryP95 = load.DeliveryLatencySamples == 0
+                    ? "n/a"
+                    : FormattableString.Invariant($"{load.DeliveryP95Milliseconds:F3} ms");
                 text.AppendLine(FormattableString.Invariant(
-                    $"| {load.Name} | {load.MessagesSent} | {load.MessagesExpectedDeliveries} | {load.MessagesAcknowledged} | {load.MessagesReceived} | {load.MessagesRejected} |"));
+                    $"| {load.Name} | {load.MessagesSent} | {load.MessagesExpectedDeliveries} | {load.MessagesAcknowledged} | {load.MessagesReceived} | {load.DeliveryLatencySamples} | {deliveryP95} | {load.MessagesRejected} |"));
+            }
+
+            if (report.Configuration.TcpCrossGateway)
+            {
+                var correlation = CrossGatewayMessageCorrelation.Evaluate(
+                    tcpMessageLoads
+                        .Where(static load => load.Kind == "tcp-chat")
+                        .ToArray());
+                text.AppendLine();
+                text.Append("Cross-child message-id correlation: **")
+                    .Append(correlation.Passed ? "PASSED" : "FAILED")
+                    .Append("** — ")
+                    .AppendLine(correlation.Detail);
+                text.AppendLine();
+                text.AppendLine(
+                    "Cross-child delivery histograms are calculated by each receiving " +
+                    "child from the monotonic send timestamp encoded in ClientMessageId. " +
+                    "They are valid only while all load children run on the same host; " +
+                    "cross-host latency is intentionally unsupported.");
             }
         }
 
@@ -291,18 +314,55 @@ internal static class BenchmarkReportWriter
                 resource.MaximumHandleCount));
         }
 
+        // TCP-MEM-1：Linux 内存归因。区分 managed retained（需要 gcdump 叠加）、
+        // PSS/committed（VmRSS/VmHWM/cgroup）与内核 socket（fd 数）。非 Linux 上值为 0。
+        var linuxAttribution = report.ProcessResources
+            .Where(static resource =>
+                resource.MaximumPssBytes != 0 ||
+                resource.MaximumVmRssBytes != 0 ||
+                resource.MaximumVmHwmBytes != 0 ||
+                resource.MaximumCgroupMemoryPeakBytes != 0 ||
+                resource.MaximumFileDescriptorCount != 0)
+            .ToArray();
+        if (linuxAttribution.Length != 0)
+        {
+            text.AppendLine();
+            text.AppendLine("## Linux memory attribution");
+            text.AppendLine();
+            text.AppendLine(
+                "PSS from smaps_rollup, committed RSS (VmRSS/VmHWM) and peak fd count. " +
+                "Managed retained requires a gcdump; PSS/fd alone separate committed, " +
+                "native cache and kernel socket growth.");
+            text.AppendLine();
+            text.AppendLine("| Process | Max PSS | Max VmRSS | Max VmHWM | Max cgroup current | Max cgroup peak | Max fd |");
+            text.AppendLine("|---|---:|---:|---:|---:|---:|---:|");
+            foreach (var resource in linuxAttribution)
+            {
+                text.AppendLine(string.Format(
+                    CultureInfo.InvariantCulture,
+                    "| {0} | {1:F2} MiB | {2:F2} MiB | {3:F2} MiB | {4:F2} MiB | {5:F2} MiB | {6} |",
+                    resource.Label,
+                    resource.MaximumPssBytes / 1_048_576d,
+                    resource.MaximumVmRssBytes / 1_048_576d,
+                    resource.MaximumVmHwmBytes / 1_048_576d,
+                    resource.MaximumCgroupMemoryCurrentBytes / 1_048_576d,
+                    resource.MaximumCgroupMemoryPeakBytes / 1_048_576d,
+                    resource.MaximumFileDescriptorCount));
+            }
+        }
+
         if (report.DockerResources.Count != 0)
         {
             text.AppendLine();
             text.AppendLine("## Docker resources");
             text.AppendLine();
-            text.AppendLine("| Container | Avg CPU | Max CPU | Start memory | End memory | Memory change | Avg memory | Max memory | Last net I/O |");
-            text.AppendLine("|---|---:|---:|---:|---:|---:|---:|---:|---|");
+            text.AppendLine("| Container | Avg CPU | Max CPU | Start memory | End memory | Memory change | Avg memory | Max memory | Last net I/O | Last block I/O |");
+            text.AppendLine("|---|---:|---:|---:|---:|---:|---:|---:|---|---|");
             foreach (var resource in report.DockerResources)
             {
                 text.AppendLine(string.Format(
                     CultureInfo.InvariantCulture,
-                    "| {0} | {1:F2}% | {2:F2}% | {3:F2} MiB | {4:F2} MiB | {5:+0.00;-0.00;0.00} MiB | {6:F2} MiB | {7:F2} MiB | {8} |",
+                    "| {0} | {1:F2}% | {2:F2}% | {3:F2} MiB | {4:F2} MiB | {5:+0.00;-0.00;0.00} MiB | {6:F2} MiB | {7:F2} MiB | {8} | {9} |",
                     resource.Container,
                     resource.AverageCpuPercent,
                     resource.MaximumCpuPercent,
@@ -311,7 +371,114 @@ internal static class BenchmarkReportWriter
                     (resource.LastMemoryBytes - resource.FirstMemoryBytes) / 1_048_576d,
                     resource.AverageMemoryBytes / 1_048_576d,
                     resource.MaximumMemoryBytes / 1_048_576d,
-                    resource.LastNetworkIo ?? string.Empty));
+                    resource.LastNetworkIo ?? string.Empty,
+                    resource.LastBlockIo ?? string.Empty));
+            }
+        }
+
+        var postgresDiagnostics = report.PostgresDiagnostics;
+        if (postgresDiagnostics.Available || postgresDiagnostics.Error is not null)
+        {
+            text.AppendLine();
+            text.AppendLine("## PostgreSQL write attribution");
+            text.AppendLine();
+            text.AppendLine(
+                "Docker block I/O is an aggregate device counter. The native counters below separate WAL, " +
+                "checkpoints, tuple churn, table/index growth and statement-level writes.");
+            if (postgresDiagnostics.Error is not null)
+            {
+                text.AppendLine();
+                text.Append("Diagnostics warning: ")
+                    .AppendLine(EscapeMarkdown(postgresDiagnostics.Error));
+            }
+
+            var messagesSent = report.LoadResults.Sum(static result => result.MessagesSent);
+            var walBytes = postgresDiagnostics.MetricDeltas.GetValueOrDefault("wal.bytes");
+            var tuplesInserted = postgresDiagnostics.MetricDeltas
+                .GetValueOrDefault("database.tup_inserted");
+            var tuplesUpdated = postgresDiagnostics.MetricDeltas
+                .GetValueOrDefault("database.tup_updated");
+            var tuplesDeleted = postgresDiagnostics.MetricDeltas
+                .GetValueOrDefault("database.tup_deleted");
+            var outboxUpdates = postgresDiagnostics.MetricDeltas
+                .GetValueOrDefault("table.realtime.outbox.tuples_updated");
+            var outboxHotUpdates = postgresDiagnostics.MetricDeltas
+                .GetValueOrDefault("table.realtime.outbox.tuples_hot_updated");
+            if (messagesSent > 0 && postgresDiagnostics.Available)
+            {
+                text.AppendLine();
+                text.AppendLine("| Derived database cost | Value |");
+                text.AppendLine("|---|---:|");
+                text.AppendLine(string.Format(
+                    CultureInfo.InvariantCulture,
+                    "| Messages sent | {0} |",
+                    messagesSent));
+                text.AppendLine(string.Format(
+                    CultureInfo.InvariantCulture,
+                    "| WAL / message | {0:F1} B |",
+                    walBytes / messagesSent));
+                text.AppendLine(string.Format(
+                    CultureInfo.InvariantCulture,
+                    "| Tuples inserted / message | {0:F4} |",
+                    tuplesInserted / messagesSent));
+                text.AppendLine(string.Format(
+                    CultureInfo.InvariantCulture,
+                    "| Tuples updated / message | {0:F4} |",
+                    tuplesUpdated / messagesSent));
+                text.AppendLine(string.Format(
+                    CultureInfo.InvariantCulture,
+                    "| Tuples deleted / message | {0:F4} |",
+                    tuplesDeleted / messagesSent));
+                text.AppendLine(string.Format(
+                    CultureInfo.InvariantCulture,
+                    "| Outbox HOT update ratio | {0:F2}% |",
+                    outboxUpdates <= 0 ? 0 : outboxHotUpdates / outboxUpdates * 100));
+            }
+
+            var postgresDeltas = postgresDiagnostics.MetricDeltas
+                .Where(static pair => Math.Abs(pair.Value) > double.Epsilon)
+                .OrderBy(static pair => PostgresMetricPriority(pair.Key))
+                .ThenByDescending(static pair => Math.Abs(pair.Value))
+                .Take(60)
+                .ToArray();
+            if (postgresDeltas.Length != 0)
+            {
+                text.AppendLine();
+                text.AppendLine("| PostgreSQL metric | Measurement delta |");
+                text.AppendLine("|---|---:|");
+                foreach (var metric in postgresDeltas)
+                {
+                    text.AppendLine(string.Format(
+                        CultureInfo.InvariantCulture,
+                        "| `{0}` | {1:G12} |",
+                        metric.Key,
+                        metric.Value));
+                }
+            }
+
+            if (postgresDiagnostics.TopStatements.Count != 0)
+            {
+                text.AppendLine();
+                text.AppendLine("### Top PostgreSQL statements by WAL bytes");
+                text.AppendLine();
+                text.AppendLine("| Query ID | Calls | WAL | WAL/call | Exec time | Dirtied blocks | Query |");
+                text.AppendLine("|---|---:|---:|---:|---:|---:|---|");
+                foreach (var statement in postgresDiagnostics.TopStatements.Take(20))
+                {
+                    var walPerCall = statement.Calls == 0
+                        ? 0
+                        : statement.WalBytes / statement.Calls;
+                    text.AppendLine(string.Format(
+                        CultureInfo.InvariantCulture,
+                        "| `{0}` | {1} | {2:F2} MiB | {3:F1} B | {4:F2} s | {5} | {6} |",
+                        statement.QueryId,
+                        statement.Calls,
+                        statement.WalBytes / 1_048_576d,
+                        walPerCall,
+                        statement.TotalExecutionMilliseconds / 1000d,
+                        statement.SharedBlocksDirtied,
+                        EscapeMarkdown(statement.Query)));
+                }
             }
         }
 
@@ -422,6 +589,24 @@ internal static class BenchmarkReportWriter
             OomClassification.SIGKILLUnknown => "SIGKILLUnknown",
             _ => classification.ToString()
         };
+
+    private static int PostgresMetricPriority(string metric) => metric switch
+    {
+        "wal.bytes" => 0,
+        "wal.records" => 1,
+        "wal.full_page_images" => 2,
+        _ when metric.StartsWith("bgwriter.", StringComparison.Ordinal) => 3,
+        _ when metric.StartsWith("database.tup_", StringComparison.Ordinal) => 4,
+        _ when metric.StartsWith("table.", StringComparison.Ordinal) => 5,
+        _ when metric.StartsWith("index.", StringComparison.Ordinal) => 6,
+        _ => 7
+    };
+
+    private static string EscapeMarkdown(string value) => value
+        .Replace("|", "\\|", StringComparison.Ordinal)
+        .Replace("`", "&#96;", StringComparison.Ordinal)
+        .Replace("\r", string.Empty, StringComparison.Ordinal)
+        .Replace("\n", " ", StringComparison.Ordinal);
 }
 
 internal sealed record BenchmarkReportPaths(string JsonPath, string MarkdownPath);

@@ -42,7 +42,7 @@ public sealed class SessionRuntimeTests
         var frame = new PacketFrame(PacketCommand.Heartbeat, payload);
 
         var keepReading = await runtime.DispatchFrameAsync(
-            frame, session, "1.2.3.4", CancellationToken.None);
+            frame, session, "1.2.3.4", default, CancellationToken.None);
 
         Assert.False(keepReading);
         Assert.False(session.IsConnected);
@@ -65,7 +65,7 @@ public sealed class SessionRuntimeTests
         var frame = new PacketFrame(unknown, ReadOnlySequence<byte>.Empty);
 
         var keepReading = await runtime.DispatchFrameAsync(
-            frame, session, "1.2.3.4", CancellationToken.None);
+            frame, session, "1.2.3.4", default, CancellationToken.None);
 
         Assert.False(keepReading);
         Assert.False(session.IsConnected);
@@ -92,13 +92,13 @@ public sealed class SessionRuntimeTests
 
         // 第一次：放行（满桶初始化）。
         var first = await runtime.DispatchFrameAsync(
-            frame, session, "1.2.3.4", CancellationToken.None);
+            frame, session, "1.2.3.4", default, CancellationToken.None);
         Assert.True(first);
         Assert.Null(captured.LastProtocolError);
 
         // 第二次：超出 1 包/秒桶容量 → RateLimited，但 keepReading=true（连接保持）。
         var second = await runtime.DispatchFrameAsync(
-            frame, session, "1.2.3.4", CancellationToken.None);
+            frame, session, "1.2.3.4", default, CancellationToken.None);
 
         Assert.True(second);
         Assert.True(session.IsConnected);
@@ -125,7 +125,7 @@ public sealed class SessionRuntimeTests
             PacketCommand.TypingNotify, ReadOnlySequence<byte>.Empty);
 
         var keepReading = await runtime.DispatchFrameAsync(
-            frame, session, "1.2.3.4", CancellationToken.None);
+            frame, session, "1.2.3.4", default, CancellationToken.None);
 
         Assert.True(keepReading);
         Assert.True(session.IsConnected);
@@ -157,7 +157,7 @@ public sealed class SessionRuntimeTests
             PacketCommand.Heartbeat, ReadOnlySequence<byte>.Empty);
 
         var keepReading = await runtime.DispatchFrameAsync(
-            frame, session, "1.2.3.4", CancellationToken.None);
+            frame, session, "1.2.3.4", default, CancellationToken.None);
 
         Assert.True(keepReading);
         Assert.True(session.IsConnected);
@@ -185,7 +185,7 @@ public sealed class SessionRuntimeTests
             PacketCommand.Heartbeat, ReadOnlySequence<byte>.Empty);
 
         var keepReading = await runtime.DispatchFrameAsync(
-            frame, session, "1.2.3.4", CancellationToken.None);
+            frame, session, "1.2.3.4", default, CancellationToken.None);
 
         Assert.True(keepReading);
         Assert.True(invoked);
@@ -207,7 +207,7 @@ public sealed class SessionRuntimeTests
             PacketCommand.Heartbeat, ReadOnlySequence<byte>.Empty);
 
         var keepReading = await runtime.DispatchFrameAsync(
-            frame, session, "1.2.3.4", CancellationToken.None);
+            frame, session, "1.2.3.4", default, CancellationToken.None);
 
         Assert.False(keepReading);
         Assert.False(session.IsConnected);
@@ -223,7 +223,13 @@ public sealed class SessionRuntimeTests
         session.CompleteHandshake(protocolVersion: 1, featureBits: 0);
         session.Authenticate(userId: 1, sessionId: "s", deviceIdHash: null);
 
-        Assert.True(captured.QueryExecutor!.TryRegisterConnection(77u, userId: 1));
+        Assert.True(SessionCommandRegistrationSet.TryRegister(
+            77u,
+            userId: 1,
+            captured.OrderedWriteExecutor!,
+            captured.QueryExecutor!,
+            captured.EphemeralPipeline!,
+            out var registrations));
 
         var payloadBytes = new byte[8];
         var frame = new PacketFrame(
@@ -231,16 +237,17 @@ public sealed class SessionRuntimeTests
             new ReadOnlySequence<byte>(payloadBytes));
 
         var keepReading = await runtime.DispatchFrameAsync(
-            frame, session, "1.2.3.4", CancellationToken.None);
+            frame, session, "1.2.3.4", registrations, CancellationToken.None);
 
         Assert.True(keepReading);
         Assert.True(session.IsConnected);
         Assert.Null(captured.LastProtocolError);
         // 启动 executor 处理入队命令并验证 processor 收到。
-        await captured.QueryExecutor.StartAsync(CancellationToken.None);
+        await captured.QueryExecutor!.StartAsync(CancellationToken.None);
         var processed = await captured.QueryProcessed.Reader.ReadAsync(
             TestContext.Current.CancellationToken);
         Assert.Equal(PacketCommand.MessageHistoryRequest, processed.Command);
+        registrations.Unregister();
     }
 
     [Fact]
@@ -252,7 +259,13 @@ public sealed class SessionRuntimeTests
         session.CompleteHandshake(protocolVersion: 1, featureBits: 0);
         session.Authenticate(userId: 1, sessionId: "s", deviceIdHash: null);
 
-        Assert.True(captured.OrderedWriteExecutor!.TryRegisterConnection(88u, userId: 1));
+        Assert.True(SessionCommandRegistrationSet.TryRegister(
+            88u,
+            userId: 1,
+            captured.OrderedWriteExecutor!,
+            captured.QueryExecutor!,
+            captured.EphemeralPipeline!,
+            out var registrations));
 
         var payloadBytes = new byte[8];
         var frame = new PacketFrame(
@@ -260,14 +273,15 @@ public sealed class SessionRuntimeTests
             new ReadOnlySequence<byte>(payloadBytes));
 
         var keepReading = await runtime.DispatchFrameAsync(
-            frame, session, "1.2.3.4", CancellationToken.None);
+            frame, session, "1.2.3.4", registrations, CancellationToken.None);
 
         Assert.True(keepReading);
         Assert.True(session.IsConnected);
-        await captured.OrderedWriteExecutor.StartAsync(CancellationToken.None);
+        await captured.OrderedWriteExecutor!.StartAsync(CancellationToken.None);
         var processed = await captured.OrderedWriteProcessed.Reader.ReadAsync(
             TestContext.Current.CancellationToken);
         Assert.Equal(PacketCommand.MessageReceipt, processed.Command);
+        registrations.Unregister();
     }
 
     [Fact]
@@ -283,9 +297,14 @@ public sealed class SessionRuntimeTests
                          (uint)GatewayFeature.PresenceAndTyping);
         session.Authenticate(userId: 1, sessionId: "s", deviceIdHash: null);
 
-        // Legacy 模式需先注册连接；GenericActor 模式 TryRegisterConnection 为 no-op。
-        Assert.True(captured.EphemeralPipeline!.TryRegisterConnection(99u, userId: 1));
-        await captured.EphemeralPipeline.StartAsync(CancellationToken.None);
+        Assert.True(SessionCommandRegistrationSet.TryRegister(
+            99u,
+            userId: 1,
+            captured.OrderedWriteExecutor!,
+            captured.QueryExecutor!,
+            captured.EphemeralPipeline!,
+            out var registrations));
+        await captured.EphemeralPipeline!.StartAsync(CancellationToken.None);
 
         var payloadBytes = new byte[8];
         var frame = new PacketFrame(
@@ -293,13 +312,14 @@ public sealed class SessionRuntimeTests
             new ReadOnlySequence<byte>(payloadBytes));
 
         var keepReading = await runtime.DispatchFrameAsync(
-            frame, session, "1.2.3.4", CancellationToken.None);
+            frame, session, "1.2.3.4", registrations, CancellationToken.None);
 
         Assert.True(keepReading);
         Assert.True(session.IsConnected);
         var processed = await captured.EphemeralProcessed.Reader.ReadAsync(
             TestContext.Current.CancellationToken);
         Assert.Equal(PacketCommand.TypingNotify, processed.Command);
+        registrations.Unregister();
     }
 
     [Fact]
@@ -322,7 +342,7 @@ public sealed class SessionRuntimeTests
             new ReadOnlySequence<byte>(new byte[8]));
 
         var keepReading = await runtime.DispatchFrameAsync(
-            frame, session, "1.2.3.4", CancellationToken.None);
+            frame, session, "1.2.3.4", default, CancellationToken.None);
 
         Assert.True(keepReading);
         Assert.True(session.IsConnected);
@@ -344,7 +364,7 @@ public sealed class SessionRuntimeTests
             new ReadOnlySequence<byte>(new byte[8]));
 
         var keepReading = await runtime.DispatchFrameAsync(
-            frame, session, "1.2.3.4", CancellationToken.None);
+            frame, session, "1.2.3.4", default, CancellationToken.None);
 
         Assert.False(keepReading);
         Assert.False(session.IsConnected);
@@ -368,7 +388,7 @@ public sealed class SessionRuntimeTests
             new ReadOnlySequence<byte>(new byte[32]));
 
         var keepReading = await runtime.DispatchFrameAsync(
-            frame, session, "1.2.3.4", CancellationToken.None);
+            frame, session, "1.2.3.4", default, CancellationToken.None);
 
         Assert.False(keepReading);
         Assert.False(session.IsConnected);
@@ -392,7 +412,7 @@ public sealed class SessionRuntimeTests
         // ownedPayloadBudgetReserved=false 但 ownedPayloadBuffer 非空 → 抛 InvalidOperationException。
         await Assert.ThrowsAsync<InvalidOperationException>(() =>
             runtime.DispatchFrameAsync(
-                frame, session, "1.2.3.4", CancellationToken.None,
+                frame, session, "1.2.3.4", default, CancellationToken.None,
                 ownedPayloadBuffer: ownedBuffer,
                 ownedPayloadBudgetReserved: false).AsTask());
     }
@@ -416,7 +436,7 @@ public sealed class SessionRuntimeTests
             new ReadOnlySequence<byte>(ownedBuffer, 0, 8));
 
         var keepReading = await runtime.DispatchFrameAsync(
-            frame, session, "1.2.3.4", CancellationToken.None,
+            frame, session, "1.2.3.4", default, CancellationToken.None,
             ownedPayloadBuffer: ownedBuffer,
             ownedPayloadBudgetReserved: true);
 
@@ -441,7 +461,7 @@ public sealed class SessionRuntimeTests
             PacketCommand.Heartbeat, ReadOnlySequence<byte>.Empty);
 
         await runtime.DispatchFrameAsync(
-            frame, session, "1.2.3.4", CancellationToken.None);
+            frame, session, "1.2.3.4", default, CancellationToken.None);
 
         Assert.True(listener.WaitForIncrement(TimeSpan.FromSeconds(2)),
             "gateway.packets.received was not incremented");
@@ -665,4 +685,3 @@ public sealed class SessionRuntimeTests
         public void Dispose() => _listener.Dispose();
     }
 }
-

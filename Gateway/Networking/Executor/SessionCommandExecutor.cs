@@ -11,7 +11,8 @@ namespace ChatApp.TcpGateway.Gateway.Networking.Executor;
 /// <para>
 /// 核心设计：
 /// <list type="bullet">
-/// <item>每连接保留轻量 <see cref="ConcurrentQueue{T}"/>，不再保留专属消费者 Task；</item>
+/// <item>每连接仅保留轻量 holder，首次入队时才惰性创建
+/// <see cref="ConcurrentQueue{T}"/>，不再保留专属消费者 Task；</item>
 /// <item>全局 ready channel 通知 worker 有连接待处理；</item>
 /// <item>同连接通过原子 <c>_active</c> 标志 CAS 保证同时只有一个 worker 处理；</item>
 /// <item>每次处理固定 burst，避免单连接独占 worker；</item>
@@ -34,12 +35,14 @@ internal sealed class SessionCommandExecutor : IAsyncDisposable
     private readonly Action<Exception>? _onFatalError;
     private readonly ILogger _logger;
 
-    private readonly Channel<uint> _ready;
+    private readonly Channel<ConnectionQueue> _ready;
     private readonly ConcurrentDictionary<uint, ConnectionQueue> _queues = new();
+    private readonly object _registrationGate = new();
     private readonly SemaphoreSlim? _perUserGate;
     private readonly CancellationTokenSource _cts;
     private CancellationTokenSource? _linkedCts;
     private Task[] _workers = Array.Empty<Task>();
+    private bool _acceptingRegistrations = true;
     private bool _disposed;
 
     /// <summary>
@@ -78,11 +81,12 @@ internal sealed class SessionCommandExecutor : IAsyncDisposable
         _onFatalError = onFatalError;
         _logger = logger ?? NullLogger.Instance;
 
-        // Ready channel 使用无界：每连接通过 CAS Active 保证最多一个节点在 ready queue 中，
-        // 因此 ready queue 实际大小 ≤ 已注册连接数，不会无限制增长。
+        // Ready channel 使用无界：每个 holder 通过 CAS Active 保证最多一个节点在
+        // ready queue 中。直接传 holder 而非 connectionId，避免注销后复用同一 ID 时
+        // 旧 ready 通知错误驱动新连接（ABA）。
         // 这避免了 BoundedChannel 满时 TryWrite 失败导致的丢失唤醒问题。
         // globalCapacity 参数保留用于未来限流策略，当前不应用。
-        _ready = Channel.CreateUnbounded<uint>(
+        _ready = Channel.CreateUnbounded<ConnectionQueue>(
             new UnboundedChannelOptions
             {
                 SingleReader = false,
@@ -101,23 +105,42 @@ internal sealed class SessionCommandExecutor : IAsyncDisposable
     /// 注册一个连接。必须在第一次 <see cref="TryEnqueue"/> 前调用。
     /// 重复注册同一 connectionId 是幂等的（返回 false）。
     /// </summary>
-    public bool TryRegisterConnection(uint connectionId, long userId)
+    public bool TryRegisterConnection(
+        uint connectionId,
+        long userId,
+        out Registration registration)
     {
-        return _queues.TryAdd(connectionId, new ConnectionQueue(connectionId, userId));
+        registration = default;
+
+        // 注册不在命令热路径上。与停机关闭准入共用此锁，保证 Stop/Dispose
+        // 返回前不存在“枚举之后才加入”的 holder。
+        lock (_registrationGate)
+        {
+            if (!_acceptingRegistrations)
+                return false;
+
+            var queue = new ConnectionQueue(connectionId, userId);
+            if (!_queues.TryAdd(connectionId, queue))
+                return false;
+
+            registration = Registration.Create(this, queue);
+            return true;
+        }
     }
 
     /// <summary>
     /// 注销连接并丢弃队列中残留命令（释放缓冲区与入站预算）。
     /// </summary>
-    public void UnregisterConnection(uint connectionId)
+    private void UnregisterConnection(ConnectionQueue queue)
     {
-        if (_queues.TryRemove(connectionId, out var queue))
+        // Lease 同时绑定 executor 与 holder 引用。旧 session 的 finally 或失败回滚
+        // 只能删除自己注册的 holder，不会按裸 connectionId 误删后继连接。
+        if (_queues.TryRemove(
+                new KeyValuePair<uint, ConnectionQueue>(
+                    queue.ConnectionId,
+                    queue)))
         {
-            while (queue.Commands.TryDequeue(out var command))
-            {
-                Interlocked.Decrement(ref queue.Count);
-                SessionCommandResources.Release(in command);
-            }
+            queue.CloseAndDrain();
         }
     }
 
@@ -125,21 +148,14 @@ internal sealed class SessionCommandExecutor : IAsyncDisposable
     /// 入队命令。队列满时返回 false（调用方负责释放资源）。
     /// 入队成功后会通知 ready channel 唤醒一个 worker。
     /// </summary>
-    public bool TryEnqueue(uint connectionId, in SessionCommand command)
+    private bool TryEnqueue(
+        ConnectionQueue queue,
+        in SessionCommand command)
     {
-        if (!_queues.TryGetValue(connectionId, out var queue))
+        // holder 内部把“仍开放 + 容量预留 + 首次队列创建 + Enqueue”作为一个
+        // admission 临界区。这样 TryGetValue 后并发注销也不会把命令留在已移除 holder。
+        if (!queue.TryEnqueue(in command, _perConnectionCapacity))
             return false;
-
-        // 容量检查与 Enqueue 之间用 Interlocked 维护 Count 保证线程安全。
-        // 多生产者可能并发入队同一连接，Count 必须原子操作避免 lost update。
-        // 允许轻微超限（Check-then-Act 非原子），但不会严重偏离容量。
-        if (Interlocked.Increment(ref queue.Count) > _perConnectionCapacity)
-        {
-            Interlocked.Decrement(ref queue.Count);
-            return false;
-        }
-
-        queue.Commands.Enqueue(command);
 
         // CAS _active: 0→1。成功表示此前无 worker 处理该连接，需通知 ready channel。
         // 失败表示已有 worker 在处理，它会在 burst 循环中 drain 到空，无需额外唤醒。
@@ -155,7 +171,7 @@ internal sealed class SessionCommandExecutor : IAsyncDisposable
 
         // 无界 ready channel：TryWrite 不会因容量满而失败。
         // 仅在 channel 已关闭（停机）时返回 false，此时回退 Active 即可。
-        if (!_ready.Writer.TryWrite(queue.ConnectionId))
+        if (!_ready.Writer.TryWrite(queue))
         {
             Interlocked.Exchange(ref queue.Active, 0);
         }
@@ -190,6 +206,7 @@ internal sealed class SessionCommandExecutor : IAsyncDisposable
     {
         // 不 early-return：即使 StartAsync 未调用（_workers 为空），也必须排空队列
         // 释放缓冲区与入站预算，否则调用方依赖 StopAsync 释放资源的契约会被破坏。
+        CloseRegistrationAndDrainConnections();
         _cts.Cancel();
         _ready.Writer.TryComplete();
 
@@ -207,28 +224,17 @@ internal sealed class SessionCommandExecutor : IAsyncDisposable
             }
         }
 
-        // 排空所有连接队列，释放缓冲区与入站预算。
-        foreach (var queue in _queues.Values)
-        {
-            while (queue.Commands.TryDequeue(out var command))
-            {
-                Interlocked.Decrement(ref queue.Count);
-                SessionCommandResources.Release(in command);
-            }
-        }
-        _queues.Clear();
+        DrainReadyNotifications();
+        // CloseRegistrationAndDrainConnections 已关闭 admission 并排空所有 holder。
     }
 
     private async Task RunWorkerAsync(CancellationToken cancellationToken)
     {
         try
         {
-            await foreach (var connectionId in _ready.Reader.ReadAllAsync(cancellationToken)
+            await foreach (var queue in _ready.Reader.ReadAllAsync(cancellationToken)
                                .ConfigureAwait(false))
             {
-                if (!_queues.TryGetValue(connectionId, out var queue))
-                    continue;
-
                 try
                 {
                     await ProcessBurstAsync(queue, cancellationToken)
@@ -261,10 +267,8 @@ internal sealed class SessionCommandExecutor : IAsyncDisposable
         var processed = 0;
         while (processed < _burstLimit)
         {
-            if (!queue.Commands.TryDequeue(out var command))
+            if (!queue.TryDequeue(out var command))
                 break;
-
-            Interlocked.Decrement(ref queue.Count);
 
             try
             {
@@ -298,15 +302,21 @@ internal sealed class SessionCommandExecutor : IAsyncDisposable
                 // 单条命令失败不能让 ConnectionQueue 永久保持 Active=1。
                 _onFatalError?.Invoke(exception);
             }
+            finally
+            {
+                // dequeue 即转移资源所有权给当前 worker。无论在 per-user gate、
+                // timeout 包装还是 processor 的哪一步失败，都必须恰好释放一次。
+                SessionCommandResources.Release(in command);
+            }
 
             processed++;
         }
 
         // burst 结束：如果队列还有命令（达到 burstLimit），重新入 ready channel 继续处理。
         // 无界 ready channel 不会 TryWrite 失败（除非 channel 已关闭，此时连接也在停机）。
-        if (!queue.Commands.IsEmpty)
+        if (queue.HasCommands)
         {
-            _ready.Writer.TryWrite(queue.ConnectionId);
+            _ready.Writer.TryWrite(queue);
             return;
         }
 
@@ -317,10 +327,10 @@ internal sealed class SessionCommandExecutor : IAsyncDisposable
         Interlocked.Exchange(ref queue.Active, 0);
 
         // 清除后重检：若队列非空，重新 CAS + TryWrite。
-        if (!queue.Commands.IsEmpty
+        if (queue.HasCommands
             && Interlocked.CompareExchange(ref queue.Active, 1, 0) == 0)
         {
-            _ready.Writer.TryWrite(queue.ConnectionId);
+            _ready.Writer.TryWrite(queue);
         }
     }
 
@@ -331,27 +341,13 @@ internal sealed class SessionCommandExecutor : IAsyncDisposable
         // 命令超时：为每条命令创建独立 CTS。Zero 表示不启用。
         if (_commandTimeout <= TimeSpan.Zero)
         {
-            try
-            {
-                await _processor(command, cancellationToken).ConfigureAwait(false);
-            }
-            finally
-            {
-                SessionCommandResources.Release(in command);
-            }
+            await _processor(command, cancellationToken).ConfigureAwait(false);
             return;
         }
 
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         cts.CancelAfter(_commandTimeout);
-        try
-        {
-            await _processor(command, cts.Token).ConfigureAwait(false);
-        }
-        finally
-        {
-            SessionCommandResources.Release(in command);
-        }
+        await _processor(command, cts.Token).ConfigureAwait(false);
     }
 
     public async ValueTask DisposeAsync()
@@ -360,6 +356,7 @@ internal sealed class SessionCommandExecutor : IAsyncDisposable
             return;
         _disposed = true;
 
+        CloseRegistrationAndDrainConnections();
         _cts.Cancel();
         _ready.Writer.TryComplete();
 
@@ -377,35 +374,215 @@ internal sealed class SessionCommandExecutor : IAsyncDisposable
             }
         }
 
-        // 排空所有连接队列，释放缓冲区与入站预算。
-        foreach (var queue in _queues.Values)
-        {
-            while (queue.Commands.TryDequeue(out var command))
-            {
-                Interlocked.Decrement(ref queue.Count);
-                SessionCommandResources.Release(in command);
-            }
-        }
-        _queues.Clear();
-
+        DrainReadyNotifications();
         _cts.Dispose();
         _linkedCts?.Dispose();
         _linkedCts = null;
         _perUserGate?.Dispose();
     }
 
+    /// <summary>
+    /// 当前已注册 holder 数，仅用于诊断和结构测试。
+    /// </summary>
+    internal int RegisteredConnectionCount => _queues.Count;
+
+    /// <summary>
+    /// 已实际创建命令队列的 holder 数。空闲且从未收到此 lane 命令的连接不计入。
+    /// </summary>
+    internal int AllocatedCommandQueueCount
+    {
+        get
+        {
+            var count = 0;
+            foreach (var queue in _queues.Values)
+            {
+                if (queue.HasAllocatedCommandQueue)
+                    count++;
+            }
+
+            return count;
+        }
+    }
+
+    /// <summary>
+    /// 一次成功注册返回的不透明租约。租约以 holder 对象身份而非可复用的
+    /// connectionId 作为释放凭据；default/其他 executor 的租约均为安全 no-op。
+    /// </summary>
+    internal readonly struct Registration
+    {
+        private readonly SessionCommandExecutor? _owner;
+        private readonly ConnectionQueue? _queue;
+
+        private Registration(
+            SessionCommandExecutor owner,
+            ConnectionQueue queue)
+        {
+            _owner = owner;
+            _queue = queue;
+        }
+
+        public bool IsValid => _owner is not null && _queue is not null;
+
+        public bool TryEnqueue(in SessionCommand command)
+        {
+            var owner = _owner;
+            var queue = _queue;
+            return owner is not null &&
+                   queue is not null &&
+                   owner.TryEnqueue(queue, in command);
+        }
+
+        public void Unregister()
+        {
+            var owner = _owner;
+            var queue = _queue;
+            if (owner is not null && queue is not null)
+                owner.UnregisterConnection(queue);
+        }
+
+        // C# 不允许 enclosing type 调用 nested type 的 private constructor。
+        // object 只用于冷路径工厂边界；热路径仍直接持有强类型 holder 引用。
+        internal static Registration Create(
+            SessionCommandExecutor owner,
+            object queue)
+            => new(owner, (ConnectionQueue)queue);
+    }
+
+    private void CloseRegistrationAndDrainConnections()
+    {
+        lock (_registrationGate)
+        {
+            _acceptingRegistrations = false;
+        }
+
+        // 关闭注册准入后不会再有新 holder。循环删除而非 Clear，确保每个被移除
+        // holder 都先关闭命令 admission，再释放其拥有的 payload 与全局预算。
+        while (!_queues.IsEmpty)
+        {
+            foreach (var entry in _queues)
+            {
+                if (_queues.TryRemove(entry.Key, out var queue))
+                    queue.CloseAndDrain();
+            }
+        }
+    }
+
+    private void DrainReadyNotifications()
+    {
+        // Ready 项直接持有 holder 以规避 connectionId 复用 ABA。worker 已退出且
+        // writer 已关闭后清空残留通知，避免已注销 holder 被 executor 长时间保留。
+        while (_ready.Reader.TryRead(out _))
+        {
+        }
+    }
+
     private sealed class ConnectionQueue
     {
-        public readonly ConcurrentQueue<SessionCommand> Commands = new();
+        private ConcurrentQueue<SessionCommand>? _commands;
+        private SpinLock _admissionLock = new(enableThreadOwnerTracking: false);
+        private int _count;
+        private bool _acceptingCommands = true;
+
         public readonly uint ConnectionId;
         public readonly long UserId;
         public int Active; // 0 = idle, 1 = worker processing
-        public int Count; // 入队计数，与 Commands.Count 等价但避免遍历
+
+        public bool HasAllocatedCommandQueue =>
+            Volatile.Read(ref _commands) is not null;
+
+        public bool HasCommands
+        {
+            get
+            {
+                var commands = Volatile.Read(ref _commands);
+                return commands is not null && !commands.IsEmpty;
+            }
+        }
 
         public ConnectionQueue(uint connectionId, long userId)
         {
             ConnectionId = connectionId;
             UserId = userId;
+        }
+
+        public bool TryEnqueue(
+            in SessionCommand command,
+            int capacity)
+        {
+            // 单连接通常只有读循环这一个生产者；不额外分配 gate 对象的短时
+            // SpinLock 将注销竞态与容量上限做成精确、易审计的原子 admission。
+            var lockTaken = false;
+            try
+            {
+                _admissionLock.Enter(ref lockTaken);
+                if (!_acceptingCommands ||
+                    Volatile.Read(ref _count) >= capacity)
+                {
+                    return false;
+                }
+
+                var commands = _commands;
+                if (commands is null)
+                {
+                    commands = new ConcurrentQueue<SessionCommand>();
+                    Volatile.Write(ref _commands, commands);
+                }
+
+                // 先预留计数再发布命令。已有 worker 可在生产者持锁期间消费，
+                // 因而必须使用 Interlocked，不能用普通 read/modify/write。
+                Interlocked.Increment(ref _count);
+                commands.Enqueue(command);
+                return true;
+            }
+            finally
+            {
+                if (lockTaken)
+                    _admissionLock.Exit(useMemoryBarrier: true);
+            }
+        }
+
+        public bool TryDequeue(out SessionCommand command)
+        {
+            var commands = Volatile.Read(ref _commands);
+            if (commands is null || !commands.TryDequeue(out command))
+            {
+                command = default;
+                return false;
+            }
+
+            Interlocked.Decrement(ref _count);
+            return true;
+        }
+
+        public void CloseAndDrain()
+        {
+            ConcurrentQueue<SessionCommand>? commands;
+            var lockTaken = false;
+            try
+            {
+                _admissionLock.Enter(ref lockTaken);
+                // 与 TryEnqueue 的 admission 临界区互斥：返回后不会再有新命令
+                // 发布到此 holder。重复关闭安全，ConcurrentQueue 保证每条只取一次。
+                _acceptingCommands = false;
+                commands = _commands;
+                // Ready channel 可能短暂保留已注销 holder。立即断开空队列 segment，
+                // 仅由当前关闭调用的局部引用完成 drain，避免 stale ready 延长其寿命。
+                _commands = null;
+            }
+            finally
+            {
+                if (lockTaken)
+                    _admissionLock.Exit(useMemoryBarrier: true);
+            }
+
+            if (commands is null)
+                return;
+
+            while (commands.TryDequeue(out var command))
+            {
+                Interlocked.Decrement(ref _count);
+                SessionCommandResources.Release(in command);
+            }
         }
     }
 }

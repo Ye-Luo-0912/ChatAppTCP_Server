@@ -15,6 +15,7 @@ public sealed partial class GatewayMetrics : IDisposable
     private readonly Meter _meter = new(MeterName, "1.0.0");
     private readonly Counter<long> _connectionsAccepted;
     private readonly Counter<long> _connectionsRejected;
+    private readonly Counter<long> _connectionsClosed;
     private readonly UpDownCounter<long> _connectionsActive;
     private readonly Counter<long> _packetsReceived;
     private readonly Counter<long> _framesSent;
@@ -124,6 +125,8 @@ public sealed partial class GatewayMetrics : IDisposable
             "gateway.connections.accepted");
         _connectionsRejected = _meter.CreateCounter<long>(
             "gateway.connections.rejected");
+        _connectionsClosed = _meter.CreateCounter<long>(
+            "gateway.connections.closed");
         _connectionsActive = _meter.CreateUpDownCounter<long>(
             "gateway.connections.active");
         _packetsReceived = _meter.CreateCounter<long>(
@@ -276,7 +279,11 @@ public sealed partial class GatewayMetrics : IDisposable
     public void UnauthenticatedConnectionClosed() =>
         _connectionsUnauthenticated.Add(-1);
 
-    public void ConnectionClosed() => _connectionsActive.Add(-1);
+    public void ConnectionClosed(string reason)
+    {
+        _connectionsClosed.Add(1, new KeyValuePair<string, object?>("reason", reason));
+        _connectionsActive.Add(-1);
+    }
 
     public void PacketReceived() => _packetsReceived.Add(1);
 

@@ -15,6 +15,8 @@ internal sealed class LoadRunState
     private readonly ConcurrentDictionary<int, byte> _completedChatSenders = new();
     private readonly ConcurrentDictionary<string, InflightMessageState> _inflight = new();
     private readonly ConcurrentDictionary<string, long> _externalDeliveries = new();
+    private readonly MessageIdFingerprintAccumulator _acknowledgementIds = new();
+    private readonly MessageIdFingerprintAccumulator _deliveryIds = new();
     private readonly TaskCompletionSource _allPreparationCompleted =
         new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly TaskCompletionSource<MeasurementContext> _measurementStarted =
@@ -101,6 +103,12 @@ internal sealed class LoadRunState
             Volatile.Read(ref _duplicateAcknowledgements),
             Volatile.Read(ref _duplicateDeliveries));
 
+    public MessageIdFingerprintSnapshot SnapshotAcknowledgementIds() =>
+        _acknowledgementIds.Snapshot();
+
+    public MessageIdFingerprintSnapshot SnapshotDeliveryIds() =>
+        _deliveryIds.Snapshot();
+
     public void RecordSent() => Interlocked.Increment(ref _sent);
 
     public void RecordAcknowledged()
@@ -146,7 +154,8 @@ internal sealed class LoadRunState
             {
                 return RecordExternalDelivery(
                     clientMessageId,
-                    recipientClientIndex);
+                    recipientClientIndex,
+                    isSlowReader);
             }
 
             return RecordDuplicateDelivery(clientMessageId, recipientClientIndex);
@@ -719,6 +728,10 @@ internal sealed class LoadRunState
             .GetElapsedTime(state.StartedAt, signalAt)
             .TotalMilliseconds;
         Interlocked.Increment(ref uniqueCounter);
+        if (isDelivery)
+            _deliveryIds.Add(state.ClientMessageId);
+        else
+            _acknowledgementIds.Add(state.ClientMessageId);
         histogram.Record(elapsedMilliseconds);
         if (isDelivery)
         {
@@ -769,17 +782,33 @@ internal sealed class LoadRunState
 
     private MessageSignalRecordResult RecordExternalDelivery(
         string clientMessageId,
-        int recipientClientIndex)
+        int recipientClientIndex,
+        bool isSlowReader)
     {
         var now = Stopwatch.GetTimestamp();
+        if (!LoadMessageCorrelation.TryMeasureElapsedMilliseconds(
+                clientMessageId,
+                now,
+                out var elapsedMilliseconds))
+        {
+            return RecordDuplicateDelivery(clientMessageId, recipientClientIndex);
+        }
+
         PruneExternalDeliveries(now);
         if (!_externalDeliveries.TryAdd(clientMessageId, now))
             return RecordDuplicateDelivery(clientMessageId, recipientClientIndex);
 
         Interlocked.Increment(ref _received);
+        _deliveryIds.Add(clientMessageId);
+        DeliveryLatency.Record(elapsedMilliseconds);
+        Latency.Record(elapsedMilliseconds);
+        if (isSlowReader)
+            SlowLatency.Record(elapsedMilliseconds);
+        else
+            HealthyLatency.Record(elapsedMilliseconds);
         return new MessageSignalRecordResult(
             MessageSignalRecordKind.Recorded,
-            0d);
+            elapsedMilliseconds);
     }
 
     private void PruneExternalDeliveries(long now)

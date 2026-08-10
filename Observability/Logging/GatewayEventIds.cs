@@ -14,6 +14,7 @@ public static class GatewayEventIds
 
     // Connection & transport: 1100–1199
     public const int TransportFailed = 1100;
+    public const int SessionCloseSummary = 1101;
 
     // TCP commands: 1200–1299
     public const int CommandFailed = 1200;

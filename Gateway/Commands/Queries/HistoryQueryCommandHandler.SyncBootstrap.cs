@@ -16,6 +16,8 @@ using RealtimeSyncBootstrapQuery =
     ChatApp.Realtime.Abstractions.Sync.SyncBootstrapQuery;
 using RealtimeConversationSyncWatermark =
     ChatApp.Realtime.Abstractions.Sync.ConversationSyncWatermark;
+using RealtimeRelationshipSyncWatermark =
+    ChatApp.Realtime.Abstractions.Sync.RelationshipSyncWatermark;
 
 namespace ChatApp.TcpGateway.Gateway.Commands.Queries;
 
@@ -95,7 +97,13 @@ internal sealed partial class HistoryQueryCommandHandler
                     AfterMessageId = watermark.AfterMessageId
                 })
                 .ToArray(),
-            RelationshipWatermarks = request.RelationshipWatermarks,
+            RelationshipWatermarks = request.RelationshipWatermarks?
+                .Select(static watermark => new RealtimeRelationshipSyncWatermark
+                {
+                    ListType = (RelationshipListType)watermark.ListType,
+                    AfterSequence = watermark.AfterSequence
+                })
+                .ToArray(),
             RelationshipListLimit = request.RelationshipListLimit
         };
 
@@ -130,14 +138,16 @@ internal sealed partial class HistoryQueryCommandHandler
                             EditVersion = item.EditVersion,
                             EditedAtMs = item.EditedAtMs,
                             ChangedAtMs = item.ChangedAtMs,
-                            Attachments = AttachmentWireMapper.Map(item.Attachments),
-                            Reactions = item.Reactions,
+                            Attachments = HistoryWireMapper.MapAttachments(item.Attachments),
+                            Reactions = HistoryWireMapper.MapReactions(item.Reactions),
                             ReplyToMessageId = item.ReplyToMessageId,
                             ReplyToSenderUserId = item.ReplyToSenderUserId,
                             ReplyToPreview = item.ReplyToPreview,
                             ForwardedFromMessageId = item.ForwardedFromMessageId,
                             ForwardedFromSenderUserId = item.ForwardedFromSenderUserId,
-                            ForwardedFromPreview = item.ForwardedFromPreview
+                            ForwardedFromPreview = item.ForwardedFromPreview,
+                            MentionedUserIds = item.MentionedUserIds,
+                            MentionedRoles = item.MentionedRoles
                         })
                         .ToArray(),
                     HasMore = catchUp.HasMore,
@@ -146,6 +156,7 @@ internal sealed partial class HistoryQueryCommandHandler
                         : new MessageHistoryCursor
                         {
                             ReceivedAtMs = catchUp.NextCursor.ReceivedAtMs,
+                            ChangedAtMs = catchUp.NextCursor.ChangedAtMs,
                             MessageId = catchUp.NextCursor.MessageId
                         }
                 })
@@ -155,7 +166,7 @@ internal sealed partial class HistoryQueryCommandHandler
                 .Select(static reset => new SyncCursorResetRequired
                 {
                     ConversationId = reset.ConversationId,
-                    Reason = reset.Reason,
+                    Reason = (ChatApp.Shared.Protocol.Tcp.TcpSyncCursorResetReason)reset.Reason,
                     TipMessageId = reset.TipMessageId,
                     // 保持 v1 JSON 字段兼容；值的语义已经升级为 changed_at_ms。
                     TipReceivedAtMs = reset.TipChangedAtMs,
@@ -187,7 +198,7 @@ internal sealed partial class HistoryQueryCommandHandler
                     session,
                     new SyncBootstrapResponse
                     {
-                        RequestId = page.RequestId,
+                        RequestId = requestId,
                         Succeeded = false,
                         ErrorCode = "item_too_large",
                         ErrorMessage = "单条会话超出单帧 Payload 硬上限，无法通过分页返回。"
@@ -202,7 +213,7 @@ internal sealed partial class HistoryQueryCommandHandler
                     session,
                     new SyncBootstrapResponse
                     {
-                        RequestId = page.RequestId,
+                        RequestId = requestId,
                         Succeeded = false,
                         ErrorCode = "response_too_large",
                         ErrorMessage = "响应信封超过单帧 Payload 硬上限。"
@@ -243,7 +254,7 @@ internal sealed partial class HistoryQueryCommandHandler
                         session,
                         new SyncBootstrapResponse
                         {
-                            RequestId = page.RequestId,
+                            RequestId = requestId,
                             Succeeded = false,
                             ErrorCode = "item_too_large",
                             ErrorMessage = "单条消息超出单帧 Payload 硬上限，无法通过分页返回。"
@@ -258,7 +269,7 @@ internal sealed partial class HistoryQueryCommandHandler
                         session,
                         new SyncBootstrapResponse
                         {
-                            RequestId = page.RequestId,
+                            RequestId = requestId,
                             Succeeded = false,
                             ErrorCode = "response_too_large",
                             ErrorMessage = "响应信封超过单帧 Payload 硬上限。"
@@ -272,6 +283,9 @@ internal sealed partial class HistoryQueryCommandHandler
                         ? new MessageHistoryCursor
                         {
                             ReceivedAtMs = truncatedItems[^1].ReceivedAtMs,
+                            ChangedAtMs = truncatedItems[^1].ChangedAtMs > 0
+                                ? truncatedItems[^1].ChangedAtMs
+                                : null,
                             MessageId = truncatedItems[^1].MessageId
                         }
                         : null)
@@ -287,33 +301,38 @@ internal sealed partial class HistoryQueryCommandHandler
 
             var response = new SyncBootstrapResponse
             {
-                RequestId = page.RequestId,
+                RequestId = requestId,
                 Succeeded = page.Succeeded,
                 ErrorCode = page.ErrorCode,
                 ErrorMessage = page.ErrorMessage,
                 ServerTimeMs = page.ServerTimeMs,
-                Conversations = truncatedConversations,
-                ConversationsNextCursor = conversationsCursor,
+                Conversations = HistoryWireMapper.MapConversations(truncatedConversations),
+                ConversationsNextCursor = HistoryWireMapper.MapConversationCursor(conversationsCursor),
                 ConversationsHasMore = conversationsHasMore,
                 CatchUps = truncatedCatchUps,
                 ResetsRequired = mappedResets,
-                RelationshipCatchUps = page.RelationshipCatchUps is null || page.RelationshipCatchUps.Count == 0
-                    ? null
-                    : page.RelationshipCatchUps
+                RelationshipCatchUps = HistoryWireMapper.MapRelationshipCatchUps(page.RelationshipCatchUps)
             };
 
             var totalSize = ResponseByteBudget.MeasurePayload(
                 _syncBootstrapResponseCodec,
                 response,
                 PacketProtocol.WireResponseHardLimit);
-            while (totalSize < 0 && truncatedCatchUps.Length > 0)
+            if (totalSize < 0)
             {
-                truncatedCatchUps = truncatedCatchUps[..^1];
-                response = response with { CatchUps = truncatedCatchUps };
-                totalSize = ResponseByteBudget.MeasurePayload(
-                    _syncBootstrapResponseCodec,
-                    response,
-                    PacketProtocol.WireResponseHardLimit);
+                // Catch-up 没有独立的聚合分页游标，静默丢弃尾部会话会让客户端
+                // 误判同步完成。显式失败，让客户端缩小请求或稍后重试。
+                _metrics.CommandFailed(PacketCommand.SyncBootstrapRequest);
+                SendSyncBootstrapResponse(
+                    session,
+                    new SyncBootstrapResponse
+                    {
+                        RequestId = requestId,
+                        Succeeded = false,
+                        ErrorCode = "response_too_large",
+                        ErrorMessage = "同步响应超过单帧 Payload 硬上限，请缩小同步范围。"
+                    });
+                return;
             }
 
             SendSyncBootstrapResponse(session, response);

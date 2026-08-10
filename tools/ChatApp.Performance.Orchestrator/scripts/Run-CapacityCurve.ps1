@@ -1,4 +1,6 @@
 param(
+    [ValidateSet('Custom','Smoke','Change','Capacity','Candidate','Formal')]
+    [string] $ValidationProfile = 'Custom',
     [int[]] $Rates = @(40, 80, 120, 160, 200),
     [ValidateRange(1, 86400)] [int] $DurationSeconds = 60,
     [ValidateRange(0, 3600)] [int] $WarmupSeconds = 10,
@@ -26,12 +28,17 @@ param(
     [int] $GarnetPort = 16379,
     [string] $NatsImage = 'nats:2.10.26-alpine',
     [string] $PostgresImage = 'postgres:16.8',
+    [ValidateSet('off','pglz','lz4','zstd')] [string] $PostgresWalCompression = 'lz4',
+    [ValidateRange(30, 86400)] [int] $PostgresCheckpointTimeoutSeconds = 900,
+    [ValidateRange(64, 1048576)] [int] $PostgresMaxWalSizeMb = 4096,
     [string] $GarnetImage = 'ghcr.io/microsoft/garnet:1.0.84',
     [ValidateSet('Pipelines','DirectSocket')] [string] $InboundTransportMode = 'DirectSocket',
     [ValidateSet('PersistentSendLoop','OnDemandSendPump','PerSessionDrain')] [string] $OutboundSendMode = 'PersistentSendLoop',
     [ValidateSet('BoundedChannel','LazySegmented')] [string] $OutboundQueueMode = 'BoundedChannel',
     [int] $OnDemandSendWorkerCount = 0,
     [int] $OnDemandSendBurstLimit = 16,
+    [ValidateRange(1, 3600)] [int] $GatewayDeviceLeaseRefreshSeconds = 90,
+    [ValidateRange(1, 3600)] [int] $GatewayGlobalPresenceRefreshSeconds = 90,
     [ValidateRange(1, 300)] [int] $DependencyStartupTimeoutSeconds = 60,
     [ValidateRange(0, 100)] [double] $MinimumConnectionSuccessPercent = 99,
     [ValidateRange(0, 100)] [double] $MinimumPeakConnectionPercent = 99,
@@ -101,6 +108,21 @@ if (-not (Test-Path -LiteralPath $orchestratorProject -PathType Container)) {
 if (-not (Test-Path -LiteralPath $realtimeRoot -PathType Container)) {
     throw "Realtime repository was not found: $realtimeRoot"
 }
+$hintWindowEnvironment = 'Outbox__HintCoalescingWindowMs'
+$hintWindowRaw = [Environment]::GetEnvironmentVariable($hintWindowEnvironment, 'Process')
+if ([string]::IsNullOrWhiteSpace($hintWindowRaw)) {
+    $realtimeSettingsPath = Join-Path $realtimeRoot 'ChatApp.RealtimeServices\appsettings.json'
+    $realtimeSettings = Get-Content -LiteralPath $realtimeSettingsPath -Raw | ConvertFrom-Json
+    $effectiveHintCoalescingWindowMs = [int]$realtimeSettings.Outbox.HintCoalescingWindowMs
+}
+else {
+    $effectiveHintCoalescingWindowMs = 0
+    if (-not [int]::TryParse($hintWindowRaw, [ref]$effectiveHintCoalescingWindowMs) `
+        -or $effectiveHintCoalescingWindowMs -lt 0 `
+        -or $effectiveHintCoalescingWindowMs -gt 50) {
+        throw "$hintWindowEnvironment must be an integer from 0 through 50."
+    }
+}
 if ([string]::IsNullOrWhiteSpace($ReportDirectory)) {
     $ReportDirectory = Join-Path $repositoryRoot '.artifacts\performance'
 }
@@ -147,6 +169,7 @@ function Write-CapacityManifest {
         ExitCode = $ExitCode
         RunValid = $RunValid
         Configuration = [pscustomobject]@{
+            ValidationProfile = $ValidationProfile
             Rates = $Rates
             DurationSeconds = $DurationSeconds
             WarmupSeconds = $WarmupSeconds
@@ -161,6 +184,10 @@ function Write-CapacityManifest {
             TcpDeliveryDrainSeconds = $TcpDeliveryDrainSeconds
             TcpInactiveHeartbeatSeconds = $TcpInactiveHeartbeatSeconds
             RealtimeProcessingConcurrency = $RealtimeProcessingConcurrency
+            OutboxHintCoalescingWindowMs = $effectiveHintCoalescingWindowMs
+            PostgresWalCompression = $PostgresWalCompression
+            PostgresCheckpointTimeoutSeconds = $PostgresCheckpointTimeoutSeconds
+            PostgresMaxWalSizeMb = $PostgresMaxWalSizeMb
             TcpPayloadBytes = $TcpPayloadBytes
             DependencyStartupTimeoutSeconds = $DependencyStartupTimeoutSeconds
         }
@@ -235,6 +262,7 @@ function Stop-CapacityRunEarly {
         RunValid = $false
         AbortedEarly = $true
         Configuration = [pscustomobject]@{
+            ValidationProfile = $ValidationProfile
             Rates = $Rates
             DurationSeconds = $DurationSeconds
             WarmupSeconds = $WarmupSeconds
@@ -299,21 +327,39 @@ $password = 'capacity-' + [Guid]::NewGuid().ToString('N')
 [Environment]::SetEnvironmentVariable(
     $garnetEnvName, "127.0.0.1:$GarnetPort,abortConnect=false", 'Process')
 
-function Wait-Postgres([string] $Container) {
-    for ($attempt = 1; $attempt -le 30; $attempt++) {
-        & docker exec $Container pg_isready -U postgres -d ChatAppDatabase *> $null
-        if ($LASTEXITCODE -eq 0) { return }
-        Start-Sleep -Seconds 1
-    }
-    throw "PostgreSQL did not become ready: $Container"
-}
-
 function Get-MetricSum($Metrics, [string] $Prefix) {
+    if ($null -eq $Metrics) { return 0.0 }
     $sum = 0.0
     foreach ($property in $Metrics.psobject.Properties) {
         if ($property.Name.StartsWith($Prefix, [StringComparison]::Ordinal)) {
             $sum += [double]$property.Value
         }
+    }
+    return $sum
+}
+
+function Get-NumericProperty {
+    param(
+        [AllowNull()] [object] $InputObject,
+        [Parameter(Mandatory)] [string] $Name
+    )
+    if ($null -eq $InputObject) { return 0.0 }
+    $property = $InputObject.psobject.Properties[$Name]
+    if ($null -eq $property -or $null -eq $property.Value) { return 0.0 }
+    return [double]$property.Value
+}
+
+function Get-TopStatementSum {
+    param(
+        [AllowEmptyCollection()] [object[]] $Statements,
+        [Parameter(Mandatory)] [string] $QueryPattern,
+        [Parameter(Mandatory)] [string] $Property
+    )
+    $sum = 0.0
+    foreach ($statement in @($Statements)) {
+        $query = [string](Get-OptionalProperty $statement 'Query' '')
+        if ($query -notmatch $QueryPattern) { continue }
+        $sum += [double](Get-OptionalProperty $statement $Property 0)
     }
     return $sum
 }
@@ -351,12 +397,26 @@ try {
                 -CreateArguments @(
                 '-e',"POSTGRES_PASSWORD=$password",
                 '-e','POSTGRES_DB=ChatAppDatabase',
-                '-p',"127.0.0.1:$($PostgresPort):5432",$PostgresImage)
+                '-p',"127.0.0.1:$($PostgresPort):5432",$PostgresImage,
+                '-c','shared_preload_libraries=pg_stat_statements',
+                '-c','compute_query_id=on',
+                '-c','track_io_timing=on',
+                '-c','track_wal_io_timing=on',
+                '-c',"wal_compression=$PostgresWalCompression",
+                '-c',"checkpoint_timeout=$($PostgresCheckpointTimeoutSeconds)s",
+                '-c',"max_wal_size=$($PostgresMaxWalSizeMb)MB",
+                '-c','pg_stat_statements.track=all')
             Start-PerformanceDockerContainer `
                 -Name $garnet -RunId $dockerRunId -CreatedContainers $created `
                 -CreateArguments @(
                 '-p',"127.0.0.1:$($GarnetPort):6379",$GarnetImage,'--lua')
-            Wait-Postgres $postgres
+            Wait-PerformancePostgres -Container $postgres `
+                -TimeoutSeconds $DependencyStartupTimeoutSeconds
+            & docker exec $postgres psql -U postgres -d ChatAppDatabase -v ON_ERROR_STOP=1 `
+                -c 'CREATE EXTENSION IF NOT EXISTS pg_stat_statements;'
+            if ($LASTEXITCODE -ne 0) {
+                throw "Failed to enable pg_stat_statements in $postgres."
+            }
             try {
                 $preflightPath = Join-Path $rateDirectory 'dependency-preflight.json'
                 [void](Wait-PerformanceDependencies `
@@ -400,6 +460,8 @@ try {
                 '--outbound-queue-mode',"$OutboundQueueMode",
                 '--on-demand-send-worker-count',"$OnDemandSendWorkerCount",
                 '--on-demand-send-burst-limit',"$OnDemandSendBurstLimit",
+                '--gateway-device-lease-refresh-seconds',"$GatewayDeviceLeaseRefreshSeconds",
+                '--gateway-global-presence-refresh-seconds',"$GatewayGlobalPresenceRefreshSeconds",
                 '--realtime-database-environment',$dbEnvName,
                 '--garnet-environment',$garnetEnvName,
                 '--docker-container',$nats,
@@ -541,7 +603,12 @@ try {
                     [double](($measurementCandidates | Measure-Object -Maximum).Maximum)
                 } else { 0.0 }
                 $minimumExpectedMeasurement = 0.995 * $DurationSeconds
-                $maximumExpectedMeasurement = 1.01 * $DurationSeconds
+                # The load process stops on a wall-clock timer. Windows timer scheduling can
+                # overshoot a short window by more than one percent even though the measured
+                # interval and all counters remain valid. Keep the lower bound strict, but
+                # allow one scheduler tick worth of bounded positive skew.
+                $maximumExpectedMeasurement = $DurationSeconds +
+                    [Math]::Max(1.0, 0.01 * $DurationSeconds)
                 $measurementDurationPassed = $measurementCandidates.Count -eq $tcpLoads.Count -and
                     $minimumMeasurementSeconds -ge $minimumExpectedMeasurement -and
                     $maximumMeasurementSeconds -le $maximumExpectedMeasurement
@@ -807,6 +874,36 @@ try {
                 -Expected ">= $MinimumResourceSampleCoveragePercent percent for >= $expectedSeriesCount process/container series" `
                 -Details "Observed $($criticalResourceCoverage.Count) series; each percentage is capped at 100 and counts only samples inside the coordinated measurement phase"))
 
+            $messageDenominator = [Math]::Max(1.0, [double]$messageTotal)
+            $postgresDiagnostics = Get-OptionalProperty $report 'PostgresDiagnostics' $null
+            $postgresMetricDeltas = Get-OptionalProperty $postgresDiagnostics 'MetricDeltas' $null
+            $topStatements = @(Get-OptionalProperty $postgresDiagnostics 'TopStatements' @())
+            $walBytes = Get-NumericProperty $postgresMetricDeltas 'wal.bytes'
+            $walSyncs = Get-NumericProperty $postgresMetricDeltas 'wal.syncs'
+            $databaseOperations = Get-MetricSum `
+                $report.MetricDeltas 'db_client_operation_duration_seconds_count{'
+            $managedAllocationBytes = Get-MetricSum `
+                $report.MetricDeltas 'dotnet_gc_heap_total_allocated_bytes_total{'
+            $outboxPendingIndexTupleReads = Get-NumericProperty `
+                $postgresMetricDeltas 'index.realtime.outbox.ix_outbox_pending.tuples_read'
+            $outboxPrimaryKeyTupleReads = Get-NumericProperty `
+                $postgresMetricDeltas 'index.realtime.outbox.outbox_pkey.tuples_read'
+            $conversationUpdates = Get-NumericProperty `
+                $postgresMetricDeltas 'table.realtime.conversations.tuples_updated'
+            $conversationHotUpdates = Get-NumericProperty `
+                $postgresMetricDeltas 'table.realtime.conversations.tuples_hot_updated'
+            $conversationHotUpdatePercent = if ($conversationUpdates -gt 0) {
+                100.0 * $conversationHotUpdates / $conversationUpdates
+            } else { 100.0 }
+            $outboxExactClaimCalls = Get-TopStatementSum `
+                $topStatements 'requested\(event_id\).*outbox' 'Calls'
+            $outboxPreclaimedReadCalls = Get-TopStatementSum `
+                $topStatements '^WITH preclaimed AS MATERIALIZED' 'Calls'
+            $outboxRecoveryClaimCalls = Get-TopStatementSum `
+                $topStatements 'outbox.*ORDER BY item\.created_at_ms.*SKIP LOCKED' 'Calls'
+            $outboxCompletionCalls = Get-TopStatementSum `
+                $topStatements '^DELETE FROM .*outbox' 'Calls'
+
             $runValid = @($validityGates | Where-Object -Property Passed -eq $false).Count -eq 0
             $results.Add([pscustomobject]@{
                 TargetPerSecond = $targetPerSecond
@@ -850,6 +947,28 @@ try {
                 PostgresMaximumCpuPercent = [double]$pgResource.MaximumCpuPercent
                 NatsAverageCpuPercent = [double]$natsResource.AverageCpuPercent
                 RealtimeAverageCpuPercent = [double]$rtResource.AverageCpuPercent
+                WalBytes = $walBytes
+                WalBytesPerMessage = $walBytes / $messageDenominator
+                WalSyncs = $walSyncs
+                WalSyncsPerMessage = $walSyncs / $messageDenominator
+                DatabaseOperations = $databaseOperations
+                DatabaseOperationsPerMessage = $databaseOperations / $messageDenominator
+                ManagedAllocationBytes = $managedAllocationBytes
+                ManagedAllocationBytesPerMessage = $managedAllocationBytes / $messageDenominator
+                OutboxHintsRequested = Get-MetricSum $report.MetricDeltas 'realtime_outbox_hints_requested_total{'
+                OutboxHintsClaimed = Get-MetricSum $report.MetricDeltas 'realtime_outbox_hints_claimed_total{'
+                OutboxRecoveryScans = Get-MetricSum $report.MetricDeltas 'realtime_outbox_recovery_scans_total{'
+                OutboxExactClaimCalls = $outboxExactClaimCalls
+                OutboxPreclaimedReadCalls = $outboxPreclaimedReadCalls
+                OutboxRecoveryClaimCalls = $outboxRecoveryClaimCalls
+                OutboxCompletionCalls = $outboxCompletionCalls
+                OutboxPendingIndexTupleReads = $outboxPendingIndexTupleReads
+                OutboxPendingIndexTupleReadsPerMessage = $outboxPendingIndexTupleReads / $messageDenominator
+                OutboxPrimaryKeyTupleReads = $outboxPrimaryKeyTupleReads
+                OutboxPrimaryKeyTupleReadsPerMessage = $outboxPrimaryKeyTupleReads / $messageDenominator
+                ConversationUpdates = $conversationUpdates
+                ConversationHotUpdates = $conversationHotUpdates
+                ConversationHotUpdatePercent = $conversationHotUpdatePercent
                 Report = $reportFile.FullName
             })
         }
@@ -902,6 +1021,7 @@ $summary = [pscustomobject]@{
     RunValid = $runValid
     AbortedAfterDependencyPreflight = $abortCurve
     Configuration = [pscustomobject]@{
+        ValidationProfile = $ValidationProfile
         Rates = $Rates
         DurationSeconds = $DurationSeconds
         WarmupSeconds = $WarmupSeconds
@@ -909,6 +1029,7 @@ $summary = [pscustomobject]@{
         PipelineConcurrency = $PipelineConcurrency
         PipelinePayloadBytes = $PipelinePayloadBytes
         RealtimeProcessingConcurrency = $RealtimeProcessingConcurrency
+        OutboxHintCoalescingWindowMs = $effectiveHintCoalescingWindowMs
         TcpConnections = $TcpConnections
         TcpActiveSenders = $effectiveTcpActiveSenders
         TcpCrossGateway = [bool]$TcpCrossGateway
@@ -929,8 +1050,13 @@ $summary = [pscustomobject]@{
         OutboundSendMode = $OutboundSendMode
         OnDemandSendWorkerCount = $OnDemandSendWorkerCount
         OnDemandSendBurstLimit = $OnDemandSendBurstLimit
+        GatewayDeviceLeaseRefreshSeconds = $GatewayDeviceLeaseRefreshSeconds
+        GatewayGlobalPresenceRefreshSeconds = $GatewayGlobalPresenceRefreshSeconds
         NatsImage = $NatsImage
         PostgresImage = $PostgresImage
+        PostgresWalCompression = $PostgresWalCompression
+        PostgresCheckpointTimeoutSeconds = $PostgresCheckpointTimeoutSeconds
+        PostgresMaxWalSizeMb = $PostgresMaxWalSizeMb
         GarnetImage = $GarnetImage
         GarnetLuaEnabled = $true
         DependencyStartupTimeoutSeconds = $DependencyStartupTimeoutSeconds
@@ -958,6 +1084,10 @@ $lines.Add('')
 $lines.Add("Window: $($startedAt.ToString('O')) - $($completedAt.ToString('O'))")
 $lines.Add('')
 $lines.Add("Run validity: **$(if ($runValid) { 'VALID' } else { 'INVALID' })**")
+$lines.Add('')
+$lines.Add("Validation profile: **$ValidationProfile**")
+$lines.Add('')
+$lines.Add("Outbox hint coalescing window: **$effectiveHintCoalescingWindowMs ms**")
 $lines.Add('')
 $peerRouting = if ($TcpCrossGateway) { 'cross-gateway' } else { 'same-gateway' }
 $rateModelText = if ($tcpRateDrivenByRates) {
@@ -988,6 +1118,26 @@ foreach ($result in $results) {
     $failedGates = @($result.ValidityGates | Where-Object -Property Passed -eq $false)
     foreach ($gate in $failedGates) {
         $lines.Add("- Failed gate ``$($gate.Name)``: actual=$($gate.Actual); expected=$($gate.Expected). $($gate.Details)")
+    }
+}
+$successfulResults = @($results | Where-Object { $null -eq $_.psobject.Properties['Error'] })
+if ($successfulResults.Count -gt 0) {
+    $lines.Add('')
+    $lines.Add('## Database and allocation efficiency')
+    $lines.Add('')
+    $lines.Add('| Target | WAL/msg | WAL sync/msg | DB ops/msg | Managed alloc/msg | Pending-index reads/msg | Outbox exact/preclaimed/recovery/complete calls | Conversation HOT |')
+    $lines.Add('|---:|---:|---:|---:|---:|---:|---:|---:|')
+    foreach ($result in $successfulResults) {
+        $lines.Add([string]::Format(
+            [Globalization.CultureInfo]::InvariantCulture,
+            '| {0} | {1:F1} B | {2:F3} | {3:F3} | {4:F1} B | {5:F3} | {6:F0}/{7:F0}/{8:F0}/{9:F0} | {10:F1}% |',
+            $result.TargetPerSecond,$result.WalBytesPerMessage,
+            $result.WalSyncsPerMessage,$result.DatabaseOperationsPerMessage,
+            $result.ManagedAllocationBytesPerMessage,
+            $result.OutboxPendingIndexTupleReadsPerMessage,
+            $result.OutboxExactClaimCalls,$result.OutboxPreclaimedReadCalls,
+            $result.OutboxRecoveryClaimCalls,$result.OutboxCompletionCalls,
+            $result.ConversationHotUpdatePercent))
     }
 }
 $lines.Add('')

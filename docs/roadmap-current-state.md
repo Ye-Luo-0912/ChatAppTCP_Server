@@ -12,14 +12,17 @@
   StackExchange.Redis 等依赖仍存在 trim/AOT 警告，未重新启用。
 - **JSON 序列化**：协议/存储 JSON 全部走源生成 `GatewayJsonSerializerContext`，
   不使用反射 `JsonSerializerOptions`，为未来重新启用 AOT 保留可能。
-- 构建/测试：`dotnet build` 0 警告 0 错误；Gateway 全量测试 **517** 项中
-  **516** 通过、**1** 项外部 Redis 环境测试跳过；RealtimeServices 全量测试 **285/285** 通过。
+- 构建/测试：`dotnet build` 0 警告 0 错误；Gateway 串行全量 **566** 项中
+  **565** 通过、**1** 项外部 Redis 环境测试跳过；RealtimeServices 单元 **315/315**、
+  PostgreSQL integration **70/70** 通过。关系投影 Ops 已提供 privacy-minimized digest/reconcile：
+  只比较 owner/list 的 version、count、hash、checkpoint 与连续性，不读取或返回好友明细。
 
 ## 架构边界
 
 依赖方向：**Gateway → Infrastructure → Core**，**Observability** 为叶依赖被
 Infrastructure 和 Gateway 共享，且只依赖协议包与 Logging。跨进程消息通过仓库本地
-feed 中的 `ChatApp.Realtime.Contracts 2.3.0` / `ChatApp.Realtime.Integration 3.0.0`
+feed 中的 `ChatApp.Protocol.Tcp 0.4.1`、`ChatApp.Realtime.Contracts 2.5.2` /
+`ChatApp.Realtime.Integration 3.1.3`
 版本化包引用；所有项目有锁文件，独立克隆可以 locked restore/build。
 完整边界表见 `AGENTS.md`。
 
@@ -151,33 +154,19 @@ feed 中的 `ChatApp.Realtime.Contracts 2.3.0` / `ChatApp.Realtime.Integration 3
 - 权限矩阵/群主转让/最后 Owner 退群/审计事件仍由 RealtimeServices 承担。
 - **仍待补**：稳定指纹强化、DB keyset pagination、不可变 Cursor，见 `roadmap-todo.md` 主线三。
 
-### Relationship（Gateway 侧协议层 + Realtime 后端 + 增量同步已完成）
+### Relationship（Server 单一写权威；Realtime 在线入口 fail-closed）
 
-- `RelationshipListChanged=153`（S2C）+ `RelationshipListHandler`：消费
-  `FriendRequestListChanged` / `FriendListChanged` / `BlockedListChanged` 事件。
-- **事件发布者已闭环**：`NpgsqlRelationshipStore` 6 个 mutation 操作（Send/Accept/Decline
-  FriendRequest、RemoveFriend、Block/Unblock）经 `OutboxInsertHelper` 写入 outbox →
-  `OutboxPublisherWorker` 走 NATS/JetStream；`RelationshipListHandler` 消费后失效
-  Typing/Presence 授权缓存并推送 `RelationshipListChanged`。
-- `IDirectConversationAuthorizer` 缓存主动失效：friendship/blocked-user 变更双向失效。
-- **Gateway 协议层已完成**：`RelationshipCommandHandler` + `IRelationshipBackend` 端口
-  （`RealtimeRelationshipBackend` 生产实现，`StubRelationshipBackend` 保留供单测注入），
-  C2S 命令路由已接入 `CommandDispatcher`。
-- **跨仓库业务逻辑已完成（2026-08-03）**：RealtimeServices 侧域
-  （`IRelationshipStore` / `NpgsqlRelationshipStore` / Migration052 /
-  `DefaultRelationshipCommandProcessor` / `DefaultRelationshipListQueryProcessor` /
-  NATS consumer）。详见 `roadmap-changelog.md` 2026-08-03 条目。
-- **增量同步已完成（2026-08-03）**：
-  - `IRelationshipStore.List*` 支持 `afterChangedAtMs` 服务端水位过滤。
-  - `IRelationshipSyncCursorStore` + `NpgsqlRelationshipSyncCursorStore` +
-    `Migration053` 设备级游标存储（单调推进）。
-  - `SyncBootstrapQuery.RelationshipWatermarks` / `RelationshipListLimit` +
-    `SyncBootstrapPage.RelationshipCatchUps` 字段。
-  - `DefaultSyncBootstrapQueryProcessor.BuildRelationshipCatchUpsAsync`：
-    水位优先级 client > 设备游标；查询失败降级为空 catch-up。
-  - `EnforceByteBudget` 阶段 2.5/2.6 关系条目纳入字节预算硬约束。
-  - Gateway wire 类型 `RelationshipSyncWatermark` / `RelationshipCatchUp` 已注册。
-  - 详见 `roadmap-changelog.md` 2026-08-03 条目。
+- Client 的关系读写继续走 ChatApp.Server HTTP；Server 的 public `T_*` 表是当前唯一在线权威。
+- Realtime 默认 `IRelationshipCommandProcessor` 和 list processor 返回明确迁移错误；携带
+  relationship watermark 的 SyncBootstrap 同样 fail-closed，不再读取或写入 legacy realtime 表。
+- 私聊授权仍由 Realtime 的 authorization store 读取 Server public 权威表，不因关闭旧关系
+  command/list/sync 而放松权限。
+- 旧 `NpgsqlRelationshipStore`/default processor 只保留为显式迁移或应急工具，不在默认 DI 中；
+  重新启用会恢复双权威，只能短期回滚使用。
+- Server 已在关系事务内分配 owner/list 连续版本并发布 `RelationshipProjectionDelta v1`；Realtime
+  在 JetStream ACK 前原子应用 inbox/item/version，只接受 `current+1`，并能从 Server stream 快照
+  回填和按 count/hash 修复单流。自动 Rebuilder 与 snapshot-gated list processor 已实现但默认关闭；
+  隔离环境完成持久化 cursor/checkpoint/gap/version 对账和 HTTP 授权对照后，才开放 TCP 只读入口。
 
 ### 附件（Gateway 侧协议层 + Finalize 后端已完成，跨仓库部分待补）
 
@@ -213,8 +202,16 @@ feed 中的 `ChatApp.Realtime.Contracts 2.3.0` / `ChatApp.Realtime.Integration 3
 - DirectSocket vs Pipelines Linux A/B：1000 连接，吞吐持平（-0.019%），
   p99 -4.99%，CPU -17.96%，工作集 -3.34%。
 - 故障注入短测：Garnet 568/568、PostgreSQL 575/575、NATS pause/unpause 513/513。
-- **未完成**：8-24 小时 soak、连接风暴、慢速发送攻击、全局入站预算耗尽等长测，
-  见 `roadmap-todo.md`。
+- 2026-08-05/07/08 已完成多轮正式 8 小时 soak；这些报告只证明各自冻结快照。当前新候选先走
+  10–15 分钟诊断和 30 分钟冻结，只有发布候选才重新执行 8 小时 soak。连接风暴、慢速发送攻击、
+  全局入站预算耗尽仍见 `roadmap-todo.md`。
+- **`TCP-MEM-1` 测量工具已交付（2026-08-10）**：编排器新增 Linux 内存归因（PSS/smaps_rollup、
+  `/proc/{pid}/fd` 峰值、cgroup sock/oom），`scripts/Run-MemoryProfile.ps1` 编排 10k 静默 /
+  heartbeat-only / 1% active+slow-reader 三类画像 × 每轮 10–15 分钟，测量中段并行采集
+  gcdump 与 `ss -tinm`/sockstat 证据；相关脚本全部通过 PowerShell AST 解析，orchestrator
+  Release 构建 `0 warning / 0 error`。已修复归因 Markdown 汇总里 `-f` 逗号/除法优先级导致的
+  "Index (zero based)..." 格式化报错（改为先算标量再格式化），smoke 报告生成链路可用。
+  待 Linux 真机执行并核验报告聚合后回填证据。
 
 ## CI 与发布门禁
 

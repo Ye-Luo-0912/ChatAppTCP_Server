@@ -90,7 +90,8 @@ public sealed class TcpGatewayServiceTests
             IdleTimeout = TimeSpan.FromSeconds(5),
             HeartbeatScanInterval = TimeSpan.FromMilliseconds(100),
             SendTimeout = TimeSpan.FromSeconds(1),
-            MaxPacketsPerSecond = 20,
+            // 本测试在一个短连接内覆盖完整命令面；避免协议速率成本掩盖功能断言。
+            MaxPacketsPerSecond = 100,
             MaxInboundBytesPerSecond = 256 * 1024,
             MaxInboundPayloadBytes = PacketProtocol.MaxPayloadSize,
             MaxChatAttachments = 32,
@@ -657,6 +658,7 @@ public sealed class TcpGatewayServiceTests
                 new MessageHistoryRequest
                 {
                     RequestId = historyRequestId,
+                    ConversationId = "dm:42:777",
                     Limit = 20
                 },
                 timeout.Token);
@@ -664,23 +666,105 @@ public sealed class TcpGatewayServiceTests
             var historyFrame = await ReadFrameAsync(
                 stream,
                 timeout.Token);
-            Assert.Equal(
-                PacketCommand.MessageHistoryPage,
-                historyFrame.Command);
+            Assert.True(
+                historyFrame.Command == PacketCommand.MessageHistoryPage,
+                $"Unexpected history frame {historyFrame.Command}: {System.Text.Encoding.UTF8.GetString(historyFrame.Payload)}");
             var historyPage = historyResponseCodec.Deserialize(
                 new ReadOnlySequence<byte>(historyFrame.Payload));
             Assert.NotNull(historyPage);
             Assert.True(historyPage.Succeeded);
             Assert.Equal(historyRequestId, historyPage.RequestId);
+            Assert.Equal("dm:42:777", historyPage.ConversationId);
             var historyItem = Assert.Single(historyPage.Items);
             Assert.Equal(command.CommandId, historyItem.MessageId);
             Assert.NotNull(historyItem.DeliveredAtMs);
             Assert.NotNull(historyItem.ReadAtMs);
+            Assert.Equal(historyItem.ReceivedAtMs + 100, historyItem.ChangedAtMs);
+            Assert.NotNull(historyPage.NextCursor);
+            Assert.Equal(historyItem.ReceivedAtMs, historyPage.NextCursor!.ReceivedAtMs);
+            Assert.Equal(historyItem.ChangedAtMs, historyPage.NextCursor.ChangedAtMs);
+            Assert.Equal(historyItem.MessageId, historyPage.NextCursor.MessageId);
 
             var historyQuery = Assert.IsType<RealtimeHistory.MessageHistoryQuery>(
                 messageBus.LastHistoryQuery);
             Assert.Equal(42, historyQuery.UserId);
+            Assert.Equal("dm:42:777", historyQuery.ConversationId);
             Assert.Equal(20, historyQuery.Limit);
+
+            var syncRequestId = Guid.CreateVersion7().ToString("N");
+            await WriteFrameAsync(
+                stream,
+                PacketCommand.SyncBootstrapRequest,
+                syncBootstrapRequestCodec,
+                new SyncBootstrapRequest
+                {
+                    RequestId = syncRequestId,
+                    ListLimit = 20
+                },
+                timeout.Token);
+
+            var syncFrame = await ReadFrameAsync(stream, timeout.Token);
+            Assert.True(
+                syncFrame.Command == PacketCommand.SyncBootstrapResponse,
+                $"Unexpected sync frame {syncFrame.Command}: {System.Text.Encoding.UTF8.GetString(syncFrame.Payload)}");
+            var syncJson = System.Text.Encoding.UTF8.GetString(syncFrame.Payload);
+            Assert.Contains("\"conversationId\":\"dm:42:777\"", syncJson, StringComparison.Ordinal);
+            var syncPage = syncBootstrapResponseCodec.Deserialize(
+                new ReadOnlySequence<byte>(syncFrame.Payload));
+            Assert.NotNull(syncPage);
+            Assert.True(syncPage.Succeeded);
+            Assert.Equal(syncRequestId, syncPage.RequestId);
+            var catchUp = Assert.Single(syncPage.CatchUps);
+            Assert.NotNull(catchUp.NextCursor);
+            var syncItem = Assert.Single(catchUp.Items);
+            Assert.Equal(syncItem.ReceivedAtMs, catchUp.NextCursor!.ReceivedAtMs);
+            Assert.Equal(syncItem.ChangedAtMs, catchUp.NextCursor.ChangedAtMs);
+            Assert.Equal(syncItem.MessageId, catchUp.NextCursor.MessageId);
+
+            var oversizedSyncRequestId = Guid.CreateVersion7().ToString("N");
+            await WriteFrameAsync(
+                stream,
+                PacketCommand.SyncBootstrapRequest,
+                syncBootstrapRequestCodec,
+                new SyncBootstrapRequest
+                {
+                    RequestId = oversizedSyncRequestId,
+                    ListLimit = 1,
+                    MaxConversationsWithHistory = 5
+                },
+                timeout.Token);
+
+            var oversizedSyncFrame = await ReadFrameAsync(stream, timeout.Token);
+            Assert.Equal(PacketCommand.SyncBootstrapResponse, oversizedSyncFrame.Command);
+            var oversizedSyncPage = syncBootstrapResponseCodec.Deserialize(
+                new ReadOnlySequence<byte>(oversizedSyncFrame.Payload));
+            Assert.NotNull(oversizedSyncPage);
+            Assert.False(oversizedSyncPage.Succeeded);
+            Assert.Equal(oversizedSyncRequestId, oversizedSyncPage.RequestId);
+            Assert.Equal("response_too_large", oversizedSyncPage.ErrorCode);
+
+            var invalidHistoryRequestId = Guid.CreateVersion7().ToString("N");
+            await WriteFrameAsync(
+                stream,
+                PacketCommand.MessageHistoryRequest,
+                historyRequestCodec,
+                new MessageHistoryRequest
+                {
+                    RequestId = invalidHistoryRequestId,
+                    ConversationId = "dm:42:777",
+                    Limit = PacketProtocol.HistoryPageMaxItems + 1
+                },
+                timeout.Token);
+
+            var invalidHistoryFrame = await ReadFrameAsync(stream, timeout.Token);
+            Assert.Equal(PacketCommand.MessageHistoryPage, invalidHistoryFrame.Command);
+            var invalidHistoryPage = historyResponseCodec.Deserialize(
+                new ReadOnlySequence<byte>(invalidHistoryFrame.Payload));
+            Assert.NotNull(invalidHistoryPage);
+            Assert.False(invalidHistoryPage.Succeeded);
+            Assert.Equal(invalidHistoryRequestId, invalidHistoryPage.RequestId);
+            Assert.Equal("dm:42:777", invalidHistoryPage.ConversationId);
+            Assert.Equal("invalid_history_request", invalidHistoryPage.ErrorCode);
         }
         finally
         {
@@ -742,6 +826,7 @@ public sealed class TcpGatewayServiceTests
                            GatewayFeature.BinaryPayload |
                            GatewayFeature.Compression |
                            GatewayFeature.StreamingChat |
+                           GatewayFeature.ConversationSync |
                            GatewayFeature.PresenceAndTyping),
                 InstallationId = "tcp-integration-test"
             },
@@ -760,7 +845,7 @@ public sealed class TcpGatewayServiceTests
             PacketProtocol.CurrentProtocolVersion,
             serverHello.ProtocolVersion);
         Assert.Equal(
-            (uint)GatewayFeature.CommandCapabilities,
+            (uint)(GatewayFeature.CommandCapabilities | GatewayFeature.ConversationSync),
             serverHello.FeatureBits);
         Assert.False(serverHello.ResumeSupported);
         Assert.Equal(ProtocolPayloadFormat.Json, serverHello.PayloadFormat);
@@ -962,9 +1047,10 @@ public sealed class TcpGatewayServiceTests
         {
             LastHistoryQuery = query;
             var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            var changedAtMs = LastIncomingMessage!.ReceivedAtMs + 100;
             return Task.FromResult(
                 RealtimeHistory.MessageHistoryPage.Success(
-                    query.RequestId,
+                    "downstream-history-request",
                     [
                         new RealtimeHistory.RealtimeHistoryMessage
                         {
@@ -972,14 +1058,19 @@ public sealed class TcpGatewayServiceTests
                             ClientMessageId = LastIncomingMessage.ClientMessageId,
                             SenderUserId = LastIncomingMessage.SenderUserId,
                             ReceiverUserId = LastIncomingMessage.ReceiverUserId,
+                            ConversationId = "dm:42:777",
                             Content = LastIncomingMessage.Content,
                             ReceivedAtMs = LastIncomingMessage.ReceivedAtMs,
+                            ChangedAtMs = changedAtMs,
                             DeliveredAtMs = now,
                             ReadAtMs = now
                         }
                     ],
-                    nextCursor: null,
-                    hasMore: false));
+                    nextCursor: new RealtimeHistory.MessageHistoryCursor(
+                        LastIncomingMessage.ReceivedAtMs,
+                        LastIncomingMessage.CommandId,
+                        changedAtMs),
+                    hasMore: true));
         }
 
         public Task<ConversationListPage> QueryConversationListAsync(
@@ -1096,14 +1187,84 @@ public sealed class TcpGatewayServiceTests
             CancellationToken ct = default)
         {
             LastSyncBootstrapQuery = query;
+            var message = LastIncomingMessage!;
+            var changedAtMs = message.ReceivedAtMs + 200;
+            if (query.ListLimit == 1)
+            {
+                var oversizedCatchUps = Enumerable.Range(0, 5)
+                    .Select(index =>
+                    {
+                        var conversationId = $"dm:42:80{index}";
+                        var messageId = $"{message.CommandId}-{index}";
+                        var itemChangedAtMs = changedAtMs + index;
+                        return new ChatApp.Realtime.Abstractions.Sync.ConversationHistoryCatchUp
+                        {
+                            ConversationId = conversationId,
+                            Items =
+                            [
+                                new RealtimeHistory.RealtimeHistoryMessage
+                                {
+                                    MessageId = messageId,
+                                    ClientMessageId = message.ClientMessageId,
+                                    SenderUserId = message.SenderUserId,
+                                    ReceiverUserId = message.ReceiverUserId,
+                                    ConversationId = conversationId,
+                                    Content = new string('z', 20 * 1024),
+                                    ReceivedAtMs = message.ReceivedAtMs,
+                                    ChangedAtMs = itemChangedAtMs
+                                }
+                            ],
+                            HasMore = true,
+                            NextCursor = new RealtimeHistory.MessageHistoryCursor(
+                                message.ReceivedAtMs,
+                                messageId,
+                                itemChangedAtMs)
+                        };
+                    })
+                    .ToArray();
+                return Task.FromResult(
+                    SyncBootstrapPage.Success(
+                        "downstream-oversized-sync-request",
+                        DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                        [],
+                        conversationsNextCursor: null,
+                        conversationsHasMore: false,
+                        catchUps: oversizedCatchUps));
+            }
+
             return Task.FromResult(
                 SyncBootstrapPage.Success(
-                    query.RequestId,
+                    "downstream-sync-request",
                     DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
                     [],
                     conversationsNextCursor: null,
                     conversationsHasMore: false,
-                    catchUps: []));
+                    catchUps:
+                    [
+                        new ChatApp.Realtime.Abstractions.Sync.ConversationHistoryCatchUp
+                        {
+                            ConversationId = "dm:42:777",
+                            Items =
+                            [
+                                new RealtimeHistory.RealtimeHistoryMessage
+                                {
+                                    MessageId = message.CommandId,
+                                    ClientMessageId = message.ClientMessageId,
+                                    SenderUserId = message.SenderUserId,
+                                    ReceiverUserId = message.ReceiverUserId,
+                                    ConversationId = "dm:42:777",
+                                    Content = message.Content,
+                                    ReceivedAtMs = message.ReceivedAtMs,
+                                    ChangedAtMs = changedAtMs
+                                }
+                            ],
+                            HasMore = true,
+                            NextCursor = new RealtimeHistory.MessageHistoryCursor(
+                                message.ReceivedAtMs,
+                                message.CommandId,
+                                changedAtMs)
+                        }
+                    ]));
         }
 
         public Task<RealtimeHistory.RealtimeHistoryMessage?> TryGetMessageByIdAsync(

@@ -26,6 +26,14 @@ internal sealed class BenchmarkRunner(BenchmarkOptions options)
         var errors = new List<string>();
         var metricsBefore = new Dictionary<string, double>(StringComparer.Ordinal);
         var metricsAfter = new Dictionary<string, double>(StringComparer.Ordinal);
+        var postgresMetricsBefore = new Dictionary<string, double>(StringComparer.Ordinal);
+        var postgresMetricsAfter = new Dictionary<string, double>(StringComparer.Ordinal);
+        IReadOnlyList<PostgresStatementSummary> postgresTopStatements =
+            Array.Empty<PostgresStatementSummary>();
+        string? postgresDiagnosticsError = null;
+        var postgresConnectionString = options.RealtimeDatabaseEnvironmentVariable is null
+            ? null
+            : Environment.GetEnvironmentVariable(options.RealtimeDatabaseEnvironmentVariable);
         var resourceSampler = new ResourceSampler();
         var prometheusTrendSampler = new PrometheusTrendSampler();
         TcpAuthenticationBootstrap? tcpAuthenticationBootstrap = null;
@@ -274,6 +282,23 @@ Console.WriteLine("Starting RealtimeServices...");
                     new Uri(realtimeBaseUri, "/metrics"),
                     ct)
                 .ConfigureAwait(false);
+            if (!string.IsNullOrWhiteSpace(postgresConnectionString))
+            {
+                try
+                {
+                    postgresMetricsBefore = await PostgresDiagnosticSampler
+                        .CaptureMetricsAsync(postgresConnectionString, ct)
+                        .ConfigureAwait(false);
+                    await PostgresDiagnosticSampler
+                        .ResetStatementStatisticsAsync(postgresConnectionString, ct)
+                        .ConfigureAwait(false);
+                }
+                catch (Exception exception) when (exception is not OperationCanceledException)
+                {
+                    postgresDiagnosticsError =
+                        $"PostgreSQL diagnostics start capture failed: {exception.Message}";
+                }
+            }
 
             var monitoring = await LoadMonitoringCoordinator.WaitForCompletionAsync(
                     exitTasks,
@@ -319,6 +344,28 @@ Console.WriteLine("Starting RealtimeServices...");
                         new Uri(realtimeBaseUri, "/metrics"),
                         ct)
                     .ConfigureAwait(false);
+            }
+            if (!string.IsNullOrWhiteSpace(postgresConnectionString))
+            {
+                try
+                {
+                    postgresMetricsAfter = await PostgresDiagnosticSampler
+                        .CaptureMetricsAsync(postgresConnectionString, ct)
+                        .ConfigureAwait(false);
+                    postgresTopStatements = await PostgresDiagnosticSampler
+                        .CaptureTopStatementsAsync(postgresConnectionString, ct)
+                        .ConfigureAwait(false);
+                }
+                catch (Exception exception) when (exception is not OperationCanceledException)
+                {
+                    postgresDiagnosticsError = string.Join(
+                        " | ",
+                        new[]
+                        {
+                            postgresDiagnosticsError,
+                            $"PostgreSQL diagnostics end capture failed: {exception.Message}"
+                        }.Where(static value => !string.IsNullOrWhiteSpace(value)));
+                }
             }
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -481,6 +528,10 @@ Console.WriteLine("Starting RealtimeServices...");
                     $"Cross-Gateway receivers observed more unique deliveries than " +
                     $"messages sent ({received}/{sent}).");
             }
+
+            var correlation = CrossGatewayMessageCorrelation.Evaluate(crossGatewayLoads);
+            if (!correlation.Passed)
+                errors.Add(correlation.Detail);
         }
         var expectedLoadReports = options.GatewayCount + (options.PipelineEnabled ? 1 : 0);
         if (loadReadResult.Summaries.Count != expectedLoadReports)
@@ -507,6 +558,19 @@ Console.WriteLine("Starting RealtimeServices...");
             static pair => pair.Key,
             pair => pair.Value - metricsBefore.GetValueOrDefault(pair.Key),
             StringComparer.Ordinal);
+        var postgresMetricDeltas = postgresMetricsAfter.ToDictionary(
+            static pair => pair.Key,
+            pair => pair.Value - postgresMetricsBefore.GetValueOrDefault(pair.Key),
+            StringComparer.Ordinal);
+        var postgresDiagnostics = new PostgresDiagnosticsReport
+        {
+            Available = postgresMetricsBefore.Count != 0 && postgresMetricsAfter.Count != 0,
+            Error = postgresDiagnosticsError,
+            MetricsBefore = postgresMetricsBefore,
+            MetricsAfter = postgresMetricsAfter,
+            MetricDeltas = postgresMetricDeltas,
+            TopStatements = postgresTopStatements
+        };
         var distinctErrors = errors
             .Where(static error => !string.IsNullOrWhiteSpace(error))
             .Distinct(StringComparer.Ordinal)
@@ -527,6 +591,7 @@ Console.WriteLine("Starting RealtimeServices...");
             LoadResults = loadReadResult.Summaries,
             ProcessResources = processResources,
             DockerResources = dockerResources,
+            PostgresDiagnostics = postgresDiagnostics,
             MetricsBefore = metricsBefore,
             MetricsAfter = metricsAfter,
             MetricDeltas = metricDeltas,
@@ -718,12 +783,15 @@ Console.WriteLine("Starting RealtimeServices...");
             $"--TcpGateway:OutboundQueueMode={options.OutboundQueueMode}",
             $"--TcpGateway:OnDemandSendWorkerCount={options.OnDemandSendWorkerCount}",
             $"--TcpGateway:OnDemandSendBurstLimit={options.OnDemandSendBurstLimit}",
+            $"--TcpGateway:DeviceLeaseRefreshInterval={options.GatewayDeviceLeaseRefreshInterval:c}",
+            $"--TcpGateway:GlobalPresenceRefreshInterval={options.GatewayGlobalPresenceRefreshInterval:c}",
             // 负载生成器直接发 AuthenticationRequest，不做 ClientHello 握手；
             // 关闭 RequireClientHello 以避免握手前置导致的 ProtocolViolation 关闭连接。
             "--TcpGateway:RequireClientHello=false",
             "--Observability:OtlpEnabled=false",
             "--Logging:LogLevel:Default=Warning"
         };
+        AddConnectionModeDeadlineArguments(arguments, options);
         if (options.ShouldUseShardedRealtimeRouting())
         {
             arguments.Add("--RealtimeIntegration:RoutingMode=Sharded");
@@ -744,6 +812,26 @@ Console.WriteLine("Starting RealtimeServices...");
             options.RepositoryRoot,
             logDirectory,
             environment);
+    }
+
+    internal static void AddConnectionModeDeadlineArguments(
+        ICollection<string> arguments,
+        BenchmarkOptions benchmarkOptions)
+    {
+        var connectionModeAuthenticationTimeout =
+            benchmarkOptions.GetConnectionModeAuthenticationTimeout();
+        if (connectionModeAuthenticationTimeout is not TimeSpan authenticationTimeout)
+            return;
+
+        // Connection mode measures socket/session admission and deliberately
+        // sends no authentication frame. Its test-owned deadlines must cover
+        // the full ramp + stabilization + measurement lifecycle. Authenticated
+        // heartbeat/chat profiles retain the production timeout defaults.
+        var idleTimeout = authenticationTimeout + TimeSpan.FromSeconds(30);
+        arguments.Add(
+            $"--TcpGateway:AuthenticationTimeout={authenticationTimeout.ToString("c", System.Globalization.CultureInfo.InvariantCulture)}");
+        arguments.Add(
+            $"--TcpGateway:IdleTimeout={idleTimeout.ToString("c", System.Globalization.CultureInfo.InvariantCulture)}");
     }
 
     private ManagedProcess StartPipelineLoad(
@@ -977,6 +1065,9 @@ Console.WriteLine("Starting RealtimeServices...");
                         : succeeded;
                     var hasHealthy = root.TryGetProperty("Healthy", out var healthy);
                     var hasSlow = root.TryGetProperty("Slow", out var slow);
+                    var hasDeliveryLatency = root.TryGetProperty(
+                        "DeliveryLatency",
+                        out var deliveryLatency);
                     var throughput = mode.Equals("Chat", StringComparison.Ordinal)
                         ? root.GetProperty("SentPerSecond").GetDouble()
                         : latencyCount > 0 && elapsed > 0
@@ -1020,6 +1111,24 @@ Console.WriteLine("Starting RealtimeServices...");
                         MessagesAcknowledged = GetInt64OrDefault(root, "Acknowledged"),
                         MessagesRejected = GetInt64OrDefault(root, "Rejected"),
                         MessagesReceived = GetInt64OrDefault(root, "Received"),
+                        DeliveryLatencySamples = hasDeliveryLatency
+                            ? GetInt64OrDefault(deliveryLatency, "Count")
+                            : 0,
+                        DeliveryP50Milliseconds = hasDeliveryLatency
+                            ? GetDoubleOrDefault(deliveryLatency, "P50Ms")
+                            : 0,
+                        DeliveryP95Milliseconds = hasDeliveryLatency
+                            ? GetDoubleOrDefault(deliveryLatency, "P95Ms")
+                            : 0,
+                        DeliveryP99Milliseconds = hasDeliveryLatency
+                            ? GetDoubleOrDefault(deliveryLatency, "P99Ms")
+                            : 0,
+                        AcknowledgementIdFingerprint = ReadFingerprint(
+                            root,
+                            "AcknowledgementIdFingerprint"),
+                        DeliveryIdFingerprint = ReadFingerprint(
+                            root,
+                            "DeliveryIdFingerprint"),
                         RampSeconds = GetDoubleOrDefault(root, "RampSeconds"),
                         StabilizationSeconds = GetDoubleOrDefault(root, "StabilizationSeconds"),
                         MeasurementSeconds = root.TryGetProperty("MeasurementSeconds", out var measurement)
@@ -1057,6 +1166,32 @@ Console.WriteLine("Starting RealtimeServices...");
         element.TryGetProperty(propertyName, out var property) && property.TryGetDouble(out var value)
             ? value
             : 0;
+
+    private static MessageIdFingerprintSummary? ReadFingerprint(
+        JsonElement root,
+        string propertyName)
+    {
+        if (!root.TryGetProperty(propertyName, out var fingerprint) ||
+            !fingerprint.TryGetProperty("Count", out var countProperty) ||
+            !countProperty.TryGetInt64(out var count) ||
+            !fingerprint.TryGetProperty("SumHex", out var sumProperty) ||
+            !fingerprint.TryGetProperty("XorHex", out var xorProperty) ||
+            !ulong.TryParse(
+                sumProperty.GetString(),
+                System.Globalization.NumberStyles.AllowHexSpecifier,
+                System.Globalization.CultureInfo.InvariantCulture,
+                out var sum) ||
+            !ulong.TryParse(
+                xorProperty.GetString(),
+                System.Globalization.NumberStyles.AllowHexSpecifier,
+                System.Globalization.CultureInfo.InvariantCulture,
+                out var xor))
+        {
+            return null;
+        }
+
+        return new MessageIdFingerprintSummary(count, sum, xor);
+    }
 
     private TimeSpan GetEstimatedTcpRamp(int gatewayIndex)
     {
@@ -1216,6 +1351,15 @@ Console.WriteLine("Starting RealtimeServices...");
                 !string.Equals(summary.TargetStrategy, "peer-ring", StringComparison.Ordinal)))
         {
             reasons.Add("A TCP chat child did not report peer-ring non-self targeting.");
+        }
+        if (options.TcpCrossGateway)
+        {
+            var correlation = CrossGatewayMessageCorrelation.Evaluate(
+                loadSummaries
+                    .Where(static summary => summary.Kind == "tcp-chat")
+                    .ToArray());
+            if (!correlation.Passed)
+                reasons.Add(correlation.Detail);
         }
         if (processCoverage < minimumCoveragePercent)
             reasons.Add($"Process sampling coverage was {processCoverage:F1}%, below {minimumCoveragePercent:F0}%.");

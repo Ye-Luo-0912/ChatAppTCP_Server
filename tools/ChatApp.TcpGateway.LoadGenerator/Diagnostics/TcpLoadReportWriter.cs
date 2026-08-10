@@ -75,6 +75,8 @@ internal static class TcpLoadReportWriter
         text.AppendLine(FormattableString.Invariant($"| Rejected | {report.Rejected} |"));
         text.AppendLine(FormattableString.Invariant($"| Duplicate/untracked MQ ACK | {report.DuplicateAcknowledgements} |"));
         text.AppendLine(FormattableString.Invariant($"| Duplicate/untracked peer delivery | {report.DuplicateDeliveries} |"));
+        text.AppendLine(FormattableString.Invariant($"| ACK message-id fingerprint | {report.AcknowledgementIdFingerprint.Count} samples, sum={report.AcknowledgementIdFingerprint.SumHex}, xor={report.AcknowledgementIdFingerprint.XorHex} |"));
+        text.AppendLine(FormattableString.Invariant($"| Delivery message-id fingerprint | {report.DeliveryIdFingerprint.Count} samples, sum={report.DeliveryIdFingerprint.SumHex}, xor={report.DeliveryIdFingerprint.XorHex} |"));
         text.AppendLine(FormattableString.Invariant($"| Outstanding | {report.Outstanding} |"));
         text.AppendLine(FormattableString.Invariant($"| Tracking TTL-expired | {report.TrackingExpired} |"));
         text.AppendLine(FormattableString.Invariant($"| Tracking dropped | {report.TrackingDropped} |"));
@@ -82,11 +84,13 @@ internal static class TcpLoadReportWriter
         text.AppendLine(FormattableString.Invariant($"| Sent/s | {report.SentPerSecond:F2} |"));
         text.AppendLine(FormattableString.Invariant($"| Received/s | {report.ReceivedPerSecond:F2} |"));
         text.AppendLine(FormattableString.Invariant($"| Primary latency kind | {report.PrimaryLatencyKind} |"));
+        text.AppendLine(FormattableString.Invariant($"| Delivery latency source | {report.DeliveryLatencySource} |"));
+        text.AppendLine(FormattableString.Invariant($"| Message-id correlation evidence | {report.MessageIdCorrelationEvidence} |"));
         text.AppendLine(FormattableString.Invariant($"| Primary latency p50 | {report.Latency.P50Ms:F3} ms |"));
         text.AppendLine(FormattableString.Invariant($"| Primary latency p95 | {report.Latency.P95Ms:F3} ms |"));
         text.AppendLine(FormattableString.Invariant($"| Primary latency p99 | {report.Latency.P99Ms:F3} ms |"));
-        text.AppendLine(FormattableString.Invariant($"| MQ ACK latency p50/p95/p99 | {report.AcknowledgementLatency.P50Ms:F3} / {report.AcknowledgementLatency.P95Ms:F3} / {report.AcknowledgementLatency.P99Ms:F3} ms |"));
-        text.AppendLine(FormattableString.Invariant($"| Peer delivery latency p50/p95/p99 | {report.DeliveryLatency.P50Ms:F3} / {report.DeliveryLatency.P95Ms:F3} / {report.DeliveryLatency.P99Ms:F3} ms |"));
+        text.AppendLine(FormattableString.Invariant($"| MQ ACK latency | {FormatLatency(report.AcknowledgementLatency)} |"));
+        text.AppendLine(FormattableString.Invariant($"| Peer delivery latency | {FormatLatency(report.DeliveryLatency)} |"));
         text.AppendLine(FormattableString.Invariant($"| Semantic gate | {(report.Gate.Passed ? "PASSED" : "FAILED")} |"));
         text.AppendLine();
         text.AppendLine("```text");
@@ -118,6 +122,14 @@ internal static class TcpLoadReportWriter
 
         return text.ToString();
     }
+
+    private static string FormatLatency(TcpLatencySnapshot latency) =>
+        latency.Count == 0
+            ? "unavailable (0 correlated samples)"
+            : string.Create(
+                CultureInfo.InvariantCulture,
+                $"{latency.Count} samples; p50/p95/p99={latency.P50Ms:F3} / " +
+                $"{latency.P95Ms:F3} / {latency.P99Ms:F3} ms");
 }
 
 internal sealed record TcpLoadReportPaths(string JsonPath, string MarkdownPath);

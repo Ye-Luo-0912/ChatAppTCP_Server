@@ -2,6 +2,8 @@
 
 Guidance for humans and coding agents working in this repository.
 
+接手时先读相关实现、调用方、上下游契约和测试，确认命令语义、兼容窗口与资源所有权后再改。优先级是正确/安全、可维护、可测量的性能、真实复用；只共享稳定、线程安全且生命周期匹配的资源，禁止共享 `DbContext`、事务、流和连接级可变会话。验证按聚焦单测/契约测试 → Release 构建 → 短时 smoke 推进，阶段长测和发布 soak 只用于功能冻结后的候选版本。当前路线见 `docs/NEXT-STAGE.md`。
+
 ## Architecture boundaries
 
 | Layer | Path | May depend on | Must not |
@@ -62,22 +64,6 @@ Do not commit:
 
 Use `scratch/` for temporary scripts (gitignored).
 
-## Linux test environment
+## Performance runs
 
-长期性能测试（soak / capacity curve）在专用 Linux 机器上执行。
-
-- **SSH**: `ssh chatapp-linux`（已在本机 `~/.ssh/config` 配置别名，密钥认证免密）
-- **IP**: 192.168.5.49（内网）
-- **用户**: yeluo
-- **仓库路径**:
-  - `/home/yeluo/chatapp-perf/ChatAppTCP_Server`（本仓库）
-  - `/home/yeluo/chatapp-perf/ChatApp.RealtimeServices`（同级 RealtimeServices 仓库）
-- **环境**: .NET SDK 11.0 preview + PowerShell 7.4.7 (`/home/yeluo/.local/bin/pwsh`) + Docker 29.6.2
-- **Shell**: 默认 fish，远程脚本须用 `bash -c '...'` 或 `pwsh -c '...'` 执行
-- **注意**: `global.json` 要求 SDK 10.0.301（`allowPrerelease: false`），连接后先确认 10.x SDK 可用；若仅有 11.0 preview 需先安装 10.0.301
-
-执行长时间 soak 测试的标准流程：
-1. SSH 连接后 `cd /home/yeluo/chatapp-perf/ChatAppTCP_Server`
-2. `git pull` 同步最新代码（含 Runtime V2 改动）
-3. `dotnet build ChatApp.TcpGateway.sln -c Release`
-4. 运行 `pwsh tools/ChatApp.Performance.Orchestrator/scripts/Run-Soak.ps1` 并指定 `-OutboundSendMode`（两种模式各跑一次对比）
+按 `tools/ChatApp.Performance.Orchestrator/README.md` 执行：每轮使用独立 run 目录，记录 invocation manifest、源码/工具 hash 与报告路径；开发阶段优先短测，长测只用于冻结后的候选版本，禁止用 `git pull` 改写已声明的测试快照。

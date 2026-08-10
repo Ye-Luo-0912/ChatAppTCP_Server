@@ -15,8 +15,8 @@ internal sealed partial class SessionRuntime
     /// <list type="bullet">
     /// <item>初始 <see cref="TcpGatewayOptions.ReceiveBufferInitialSize"/>（默认 1 KiB）；</item>
     /// <item>帧无法容纳但可容纳在 <see cref="TcpGatewayOptions.ReceiveBufferMaxSize"/> 时自动升级；</item>
-    /// <item>升级后采用滞后策略：至少 N 帧完成且最近一帧可容纳在初始缓冲区时才降级，
-    ///   防止 burst 大帧场景下 flapping；</item>
+    /// <item>升级后按最近大帧时间保留；保留窗口到期且下一帧完成、缓存为空时才降级，
+    ///   无 per-session timer，并防止 burst 大帧场景下 flapping；</item>
     /// <item>帧装配 deadline：<see cref="TcpGatewayOptions.HeaderAssemblyTimeout"/> 与
     ///   <see cref="TcpGatewayOptions.PayloadAssemblyTimeout"/> 防御慢速攻击。</item>
     /// </list>
@@ -25,9 +25,10 @@ internal sealed partial class SessionRuntime
     private async Task RunDirectSocketAsync(
         TcpClientSession session,
         string remoteIp,
+        SessionCommandRegistrationSet registrations,
         CancellationToken cancellationToken)
     {
-        // 动态缓冲区：初始小，按需升级，空闲降级。
+        // 动态缓冲区：初始小，按需升级，大帧保留窗口到期后的安全点降级。
         var currentBufferSize = Math.Max(
             _options.ReceiveBufferInitialSize,
             PacketProtocol.HeaderSize);
@@ -39,13 +40,12 @@ internal sealed partial class SessionRuntime
         var end = 0;
         var bufferedReservedBytes = 0;
 
-        // 动态接收缓冲区滞后策略（P1-2）：升级到大缓冲区后，至少保留 N 帧完成才允许降级。
-        // 防止 burst 大帧场景下重复 ArrayPool Rent/Return 和缓冲区复制。
-        // 大帧（超过基础缓冲区）完成时重置计数器以保持大缓冲区；
-        // 小帧完成时递减计数器；计数器归零且最近一帧可容纳在基础缓冲区时才降级。
-        const int LargeBufferHysteresisFrames = 8;
-        var largeBufferFramesRemaining = 0;
-        var lastFrameFitInBaseBuffer = true;
+        // 动态接收缓冲区滞后策略（P1-2）：记录最近一帧大帧完成时间。
+        // ReceiveBufferLargeFrameRetention 本身就是时间滞后窗口，避免再叠加固定帧数，
+        // 否则保留窗口到期后仍需额外完成 N 个小帧才能释放大缓冲区。
+        // 仅在 currentBufferSize > base 且帧已完整时读取；该状态必然先完成过大帧，
+        // 因而 0 只是 definite-assignment 初值，不作为 TimeProvider 时间戳哨兵。
+        var lastLargeFrameTimestamp = 0L;
         var baseBufferSize = Math.Max(
             _options.ReceiveBufferInitialSize,
             PacketProtocol.HeaderSize);
@@ -61,9 +61,6 @@ internal sealed partial class SessionRuntime
         // 当前注册对应的装配阶段（true=Header 装配，false=Payload 装配）。
         // 用于检测 header→payload 阶段切换并重新注册（Payload timeout 通常不同）。
         var assemblyRegForHeaderPhase = false;
-
-        // 上次 Receive 的时间戳，用于空闲降级判断。
-        var lastReceiveTimestamp = _timeProvider.GetTimestamp();
 
         // 注销当前帧装配注册（如有）。
         // 在帧完成、进入 ReceivePayloadRemainderAsync、方法退出时调用。
@@ -134,6 +131,7 @@ internal sealed partial class SessionRuntime
                                 frame,
                                 session,
                                 remoteIp,
+                                registrations,
                                 cancellationToken)
                             .ConfigureAwait(false);
 
@@ -141,13 +139,9 @@ internal sealed partial class SessionRuntime
                         bufferedReservedBytes -= frameLength;
                         _globalInboundBudget.Release(frameLength);
 
-                        // 帧完成：更新滞后计数器。
-                        // 大帧（超过基础缓冲区）重置计数器，小帧递减。
+                        // 大帧完成后从当前时刻开始计算保留窗口。
                         if (frameLength > baseBufferSize)
-                            largeBufferFramesRemaining = LargeBufferHysteresisFrames;
-                        else if (largeBufferFramesRemaining > 0)
-                            largeBufferFramesRemaining--;
-                        lastFrameFitInBaseBuffer = frameLength <= baseBufferSize;
+                            lastLargeFrameTimestamp = _timeProvider.GetTimestamp();
 
                         if (!keepReading)
                             return;
@@ -179,8 +173,6 @@ internal sealed partial class SessionRuntime
                             end,
                             maxBufferSize);
                         currentBufferSize = maxBufferSize;
-                        // 升级后启动滞后计数器：保持大缓冲区至少 N 帧完成。
-                        largeBufferFramesRemaining = LargeBufferHysteresisFrames;
                         start = 0;
                         end = remaining;
                         // 不 break：重新进入 while 循环，frameLength <= receiveBuffer.Length 时走上面路径。
@@ -261,6 +253,7 @@ internal sealed partial class SessionRuntime
                                 frame,
                                 session,
                                 remoteIp,
+                                registrations,
                                 cancellationToken,
                                 payloadBuffer,
                                 ownedPayloadBudgetReserved: true)
@@ -268,6 +261,11 @@ internal sealed partial class SessionRuntime
                         {
                             return;
                         }
+
+                        // 超过 maxBufferSize 的帧走独立 payload buffer，也属于大帧活动。
+                        // 若当前连接此前已升级，必须刷新其保留窗口，避免刚完成大帧就降级。
+                        if (frameLength > baseBufferSize)
+                            lastLargeFrameTimestamp = _timeProvider.GetTimestamp();
                     }
                     finally
                     {
@@ -316,18 +314,24 @@ internal sealed partial class SessionRuntime
                     }
                 }
 
-                // 空闲降级（带滞后）：完成一帧后（无残留数据且无进行中的帧装配），
-                // 仅当滞后计数器归零且最近一帧可容纳在基础缓冲区时，才降级。
-                // 滞后策略防止 burst 大帧场景下重复 Rent/Return 和缓冲区复制（P1-2）。
-                if (end - start == 0 &&
-                    partialFrameStartTimestamp == 0 &&
-                    largeBufferFramesRemaining == 0 &&
-                    lastFrameFitInBaseBuffer &&
-                    receiveBuffer.Length > baseBufferSize)
+                // 仅在 buffer 为空且没有半帧的安全点降级。无 per-session timer：
+                // 网络静默时不唤醒连接；下一帧完成后若距最近大帧已超过保留窗口，立即释放大 buffer。
+                if (ShouldDowngradeReceiveBuffer(
+                        currentBufferSize,
+                        baseBufferSize,
+                        end - start,
+                        partialFrameStartTimestamp,
+                        lastLargeFrameTimestamp,
+                        _options.ReceiveBufferLargeFrameRetention,
+                        _timeProvider))
                 {
-                    ArrayPool<byte>.Shared.Return(receiveBuffer);
+                    // 先 Rent，再交换所有权，最后归还旧 buffer。若 Rent 抛异常，
+                    // receiveBuffer 仍指向旧 owner，外层 finally 只会归还它一次。
+                    ReplaceEmptyReceiveBuffer(
+                        ref receiveBuffer,
+                        baseBufferSize,
+                        ArrayPool<byte>.Shared);
                     currentBufferSize = baseBufferSize;
-                    receiveBuffer = ArrayPool<byte>.Shared.Rent(currentBufferSize);
                     start = 0;
                     end = 0;
                 }
@@ -403,7 +407,6 @@ internal sealed partial class SessionRuntime
 
                 bufferedReservedBytes += bytesRead;
                 end += bytesRead;
-                lastReceiveTimestamp = _timeProvider.GetTimestamp();
             }
         }
         finally
@@ -420,6 +423,42 @@ internal sealed partial class SessionRuntime
             ArrayPool<byte>.Shared.Return(receiveBuffer);
         }
     }
+
+    internal static bool ShouldDowngradeReceiveBuffer(
+        int currentBufferSize,
+        int baseBufferSize,
+        int bufferedByteCount,
+        long partialFrameStartTimestamp,
+        long lastLargeFrameTimestamp,
+        TimeSpan largeFrameRetention,
+        TimeProvider timeProvider)
+    {
+        if (currentBufferSize <= baseBufferSize ||
+            bufferedByteCount != 0 ||
+            partialFrameStartTimestamp != 0 ||
+            largeFrameRetention <= TimeSpan.Zero)
+        {
+            return false;
+        }
+
+        return timeProvider.GetElapsedTime(lastLargeFrameTimestamp) >= largeFrameRetention;
+    }
+
+    /// <summary>
+    /// 在缓存为空的安全点替换接收 buffer。先成功租到 replacement，再交换 owner，
+    /// 最后归还旧 buffer，保证 Rent 异常时调用方仍持有且只持有旧 owner。
+    /// </summary>
+    internal static void ReplaceEmptyReceiveBuffer(
+        ref byte[] buffer,
+        int newSize,
+        ArrayPool<byte> pool)
+    {
+        var replacement = pool.Rent(newSize);
+        var previous = buffer;
+        buffer = replacement;
+        pool.Return(previous);
+    }
+
     /// <summary>
     /// 升级接收缓冲区：租更大 buffer，复制残留数据，归还旧 buffer。
     /// </summary>

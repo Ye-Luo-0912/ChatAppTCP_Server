@@ -116,22 +116,52 @@ public sealed class TcpLoadRunStateTests
             allowAckOnlyTracking: true);
         state.AttachLifecycle(lifecycleCancellation);
 
+        var externalMessageId = LoadMessageCorrelation.Create(
+            Stopwatch.GetTimestamp() - Stopwatch.Frequency / 20);
         var first = state.RecordChatDelivered(
-            "external-message-1",
+            externalMessageId,
             recipientClientIndex: 0,
             isSlowReader: false);
 
         Assert.Equal(MessageSignalRecordKind.Recorded, first.Kind);
+        Assert.True(first.ElapsedMilliseconds > 0);
         Assert.Equal(1, state.SnapshotCounters().Received);
+        Assert.Equal(1, state.DeliveryLatency.Snapshot().Count);
+        Assert.Equal(1, state.SnapshotDeliveryIds().Count);
         Assert.Null(state.RuntimeFailure);
 
         var duplicate = state.RecordChatDelivered(
-            "external-message-1",
+            externalMessageId,
             recipientClientIndex: 0,
             isSlowReader: false);
 
         Assert.Equal(MessageSignalRecordKind.DuplicateOrUntracked, duplicate.Kind);
         Assert.Equal(1, state.SnapshotCounters().Received);
+        Assert.Equal(1, state.SnapshotCounters().DuplicateDeliveries);
+        Assert.NotNull(state.RuntimeFailure);
+        Assert.True(lifecycleCancellation.IsCancellationRequested);
+    }
+
+    [Fact]
+    public void CrossGatewayDeliveryWithoutCorrelatableTimestampFailsInsteadOfRecordingZeroLatency()
+    {
+        using var lifecycleCancellation = new CancellationTokenSource();
+        var state = new LoadRunState(
+            expectedClients: 1,
+            maxInflight: 16,
+            inflightTtl: TimeSpan.FromMinutes(1),
+            expectedChatSenders: 0,
+            allowAckOnlyTracking: true);
+        state.AttachLifecycle(lifecycleCancellation);
+
+        var result = state.RecordChatDelivered(
+            "not-a-load-correlation-id",
+            recipientClientIndex: 0,
+            isSlowReader: false);
+
+        Assert.Equal(MessageSignalRecordKind.DuplicateOrUntracked, result.Kind);
+        Assert.Equal(0, state.DeliveryLatency.Snapshot().Count);
+        Assert.Equal(0, state.SnapshotDeliveryIds().Count);
         Assert.Equal(1, state.SnapshotCounters().DuplicateDeliveries);
         Assert.NotNull(state.RuntimeFailure);
         Assert.True(lifecycleCancellation.IsCancellationRequested);

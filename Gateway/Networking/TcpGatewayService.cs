@@ -51,6 +51,8 @@ internal sealed partial class TcpGatewayService : BackgroundService
     private readonly ILogger<TcpClientSession> _sessionLogger;
     private readonly PipeOptions _pipeOptions;
     private readonly ConcurrentDictionary<uint, TcpClientSession> _sessions = new();
+    private readonly long[] _sessionCloseCounts =
+        new long[Enum.GetValues<SessionCloseReason>().Length];
     // 全局内存预算与过载保护（Listener 生命周期、Accept 循环、连接准入与 drain 已抽取至 TcpListenerHost）
     private readonly TcpListenerHost _listenerHost;
     private readonly GlobalOutboundBudget _globalOutboundBudget;
@@ -580,6 +582,8 @@ internal sealed partial class TcpGatewayService : BackgroundService
             await _listenerHost.WaitForClientTasksAsync()
                 .ConfigureAwait(false);
 
+            _logger.SessionCloseSummary(BuildSessionCloseSummary());
+
             await heartbeatTask.ConfigureAwait(false);
             await typingFanoutTask.ConfigureAwait(false);
 
@@ -655,6 +659,10 @@ internal sealed partial class TcpGatewayService : BackgroundService
         string remoteIp,
         CancellationToken stoppingToken)
     {
+        TcpClientSession? session = null;
+        var registrations = default(SessionCommandRegistrationSet);
+        var registrationsOwned = false;
+        var heartbeatRegistered = false;
         try
         {
             socket.NoDelay = true;
@@ -663,7 +671,7 @@ internal sealed partial class TcpGatewayService : BackgroundService
                 SocketOptionName.KeepAlive,
                 optionValue: true);
 
-            var session = new TcpClientSession(
+            session = new TcpClientSession(
                 socket,
                 connectionId,
                 _options.OutboundQueueCapacity,
@@ -682,24 +690,35 @@ internal sealed partial class TcpGatewayService : BackgroundService
                 usePerSessionDrain: _usePerSessionDrain,
                 outboundQueueMode: _options.OutboundQueueMode);
 
-            // 注册连接到全局执行器（OrderedWrite/Query/Ephemeral 共享 worker 池）。
-            // 未认证会话 UserId=0，认证成功后执行器不依赖此字段重新路由（按 connectionId 串行）。
-            _orderedWriteExecutor.TryRegisterConnection(connectionId, session.UserId);
-            _queryExecutor.TryRegisterConnection(connectionId, session.UserId);
-            _ephemeralPipeline.TryRegisterConnection(connectionId, session.UserId);
+            // 三条 lane 必须全部取得本 session 的 opaque lease 后才能暴露连接。
+            // 任一 lane 冲突时 helper 只回滚本次已成功的租约，不会按裸 ID 删除旧连接。
+            if (!SessionCommandRegistrationSet.TryRegister(
+                    connectionId,
+                    session.UserId,
+                    _orderedWriteExecutor,
+                    _queryExecutor,
+                    _ephemeralPipeline,
+                    out registrations))
+            {
+                session.Close(SessionCloseReason.TransportError);
+                await session.DisposeAsync().ConfigureAwait(false);
+                return null;
+            }
+            registrationsOwned = true;
 
             // 注册到心跳分桶注册表（连接桶，按 connectionId 分桶用于租约刷新）。
             // 用户桶在认证成功后由 ProcessPacketAsync 的 auth 转换钩子注册。
             _heartbeatBuckets.RegisterConnection(session);
+            heartbeatRegistered = true;
 
             if (!_sessions.TryAdd(connectionId, session))
             {
                 // 注册表冲突（极罕见的 connectionId 碰撞）：注销执行器连接与心跳桶，
                 // 丢弃队列中残留命令并释放缓冲区与入站预算。
-                _orderedWriteExecutor.UnregisterConnection(connectionId);
-                _queryExecutor.UnregisterConnection(connectionId);
-                _ephemeralPipeline.UnregisterConnection(connectionId);
+                registrations.Unregister();
+                registrationsOwned = false;
                 _heartbeatBuckets.Unregister(session);
+                heartbeatRegistered = false;
                 session.Close(SessionCloseReason.TransportError);
                 await session.DisposeAsync().ConfigureAwait(false);
                 return null;
@@ -707,11 +726,37 @@ internal sealed partial class TcpGatewayService : BackgroundService
 
             _metrics.ConnectionAccepted();
 
-            return HandleClientAsync(session, remoteIp, stoppingToken);
+            var clientTask = HandleClientAsync(
+                session,
+                remoteIp,
+                registrations,
+                stoppingToken);
+            registrationsOwned = false;
+            return clientTask;
         }
         catch
         {
-            socket.Dispose();
+            if (registrationsOwned)
+                registrations.Unregister();
+            if (heartbeatRegistered && session is not null)
+                _heartbeatBuckets.Unregister(session);
+
+            if (session is not null)
+            {
+                session.Close(SessionCloseReason.TransportError);
+                try
+                {
+                    await session.DisposeAsync().ConfigureAwait(false);
+                }
+                catch
+                {
+                    // Preserve the original connection-accept exception.
+                }
+            }
+            else
+            {
+                socket.Dispose();
+            }
             throw;
         }
     }
@@ -719,6 +764,7 @@ internal sealed partial class TcpGatewayService : BackgroundService
     private async Task HandleClientAsync(
         TcpClientSession session,
         string remoteIp,
+        SessionCommandRegistrationSet registrations,
         CancellationToken cancellationToken)
     {
         // 每连接数据面（Pipe + 调度器 + fill/read 双任务）委托 SessionRuntime。
@@ -727,7 +773,11 @@ internal sealed partial class TcpGatewayService : BackgroundService
         try
         {
             await _sessionRuntime
-                .RunAsync(session, remoteIp, cancellationToken)
+                .RunAsync(
+                    session,
+                    remoteIp,
+                    registrations,
+                    cancellationToken)
                 .ConfigureAwait(false);
         }
         finally
@@ -762,22 +812,37 @@ internal sealed partial class TcpGatewayService : BackgroundService
                 if (!wasAuthenticated)
                     _metrics.UnauthenticatedConnectionClosed();
 
-                if (_sessions.TryRemove(session.ConnectionId, out _))
+                if (_sessions.TryRemove(
+                        new KeyValuePair<uint, TcpClientSession>(
+                            session.ConnectionId,
+                            session)))
                 {
-                    _metrics.ConnectionClosed();
+                    var closeReason = session.CloseReason;
+                    Interlocked.Increment(
+                        ref _sessionCloseCounts[(int)closeReason]);
+                    // CloseReason is a fixed enum, so this remains a bounded
+                    // cardinality diagnostic and exposes timeout/transport causes
+                    // without logging per-connection identifiers.
+                    _metrics.ConnectionClosed(closeReason.ToString());
                     _listenerHost.ReleaseConnectionSlot();
                 }
 
                 // 注销执行器连接：丢弃队列中残留命令并释放缓冲区与入站预算。
                 // 必须在 session.DisposeAsync 之后执行，确保 in-flight 命令已完成或取消。
-                _orderedWriteExecutor.UnregisterConnection(session.ConnectionId);
-                _queryExecutor.UnregisterConnection(session.ConnectionId);
-                _ephemeralPipeline.UnregisterConnection(session.ConnectionId);
+                registrations.Unregister();
 
                 // 注销心跳分桶注册表（连接桶 + 用户桶引用计数递减）。
                 _heartbeatBuckets.Unregister(session);
             }
         }
     }
-}
 
+    private string BuildSessionCloseSummary()
+    {
+        var reasons = Enum.GetValues<SessionCloseReason>();
+        return string.Join(
+            ", ",
+            reasons.Select(
+                reason => $"{reason}={Volatile.Read(ref _sessionCloseCounts[(int)reason])}"));
+    }
+}

@@ -1,5 +1,9 @@
 # R3 TCP + Realtime 8 小时浸泡复跑记录
 
+> 本文是按轮次追加的审计记录；早期“下一步”不代表当前计划。当前代码/配置结论见第 18–19 节、
+> [`perf-optimization-rerun-20260807.md`](perf-optimization-rerun-20260807.md) 第 19–20 节和
+> [`NEXT-STAGE`](NEXT-STAGE.md)。
+
 > 新轮启动时间：2026-08-06 02:16:49（UTC+08:00）  
 > 当前状态：**FORMAL 8H PASSED**；00:30 首轮已主动中止，绝不计入本 verdict  
 > 新轮运行目录：`/home/yeluo/chatapp-perf/runs/codex-tcp-soak-20260805T180247Z`  
@@ -260,3 +264,185 @@ Gateway-1 基线/最终 RSS 中位数为 `305.92 → 264.48 MiB`，最终斜率
 完整报告已归档至
 [`.artifacts/remote-reports/soak-8h-cross-gateway-shared-v1`](../.artifacts/remote-reports/soak-8h-cross-gateway-shared-v1)，
 详细分析见[优化复测报告](perf-optimization-rerun-20260807.md)。
+
+## 11. 后续数据库归因说明（2026-08-09）
+
+本历史报告中的 Docker PostgreSQL block I/O 不能解释为业务数据或 WAL。最新代码已在容量
+报告中加入 PostgreSQL 原生 WAL、checkpoint、表/索引、tuple churn 和 SQL 级 `wal_bytes`
+采集，并完成事务授权合并、Outbox HOT claim 与发布成功紧凑完成。实现、安全语义和短时
+指示性 A/B 见[优化复测报告第 11 节](perf-optimization-rerun-20260807.md)。在新的正式轮完成前，
+不得用短时结果回写本节历史 8 小时 verdict，也不得把旧 `644 GB` 继续当作真实数据量。
+
+## 12. 第三轮数据库容量门禁（2026-08-09）
+
+新的 PostgreSQL 原生诊断已用 1,000 连接、1,000 active sender、跨 Gateway 负载完成
+并发 4/8/16 对照。固定 100 active sender 的首轮曲线会在 160 msg/s 起触发
+生产单用户 `30 秒 / 30 条` 限流，已明确排除，没有把反滥用上限误报为数据库容量。
+
+正确负载下，并发 4 可完整通过 320 msg/s，640 msg/s 时 JetStream 末段积压约
+`22.9k`，仅投递 `54,417/76,810`；并发 8 将投递提升到 `71,490/76,818`，
+仍低于 95% 门禁。并发 16 的 640 msg/s 单档为 **PASSED / VALID**：
+发送、ACK、跨 Gateway 实际投递均为 `76,813`，JetStream pending 首值/尾值/峰值均为
+`0`，Outbox pending 峰值 `144`、尾值 `0`，无 checkpoint、temp file、deadlock。
+
+该通过档 WAL 为 `536,066,702 bytes = 6,978.9 B/msg`，`52,468` 次 WAL sync 平均
+`1.334 ms`；PostgreSQL 平均/峰值 CPU `87.39%/196.40%`，数据库操作
+`5.269 ops/msg`，managed allocation `74,356 B/msg`。详细 SQL WAL 归因、失败档的
+fsync 证据、一次无效重复投递轮与 `644 GB` 的 block I/O / allocation 区分，见
+[优化复测报告第 12 节](perf-optimization-rerun-20260807.md)。下一个正式 8 小时轮将以
+可配置并发 16 运行，不通过关闭 `synchronous_commit` 换取性能。
+
+## 13. 第三轮数据库优化后正式 soak 最终结论（2026-08-09）
+
+第三轮组合源码归档
+`13787B6A3B10E87CB6B3DD1BD5BBA67C65C7861914B503796F275915D1F33B89`
+已在 `/home/yeluo/chatapp-perf/runs/codex-tcp-soak-dbopt-20260808T193632Z` 完成。退出码为
+`0`，最终 verdict 为 **PASSED**：`RunValid=true`、`MemoryConclusive=true`、
+`MemoryStable=true`。
+
+- 10,000/10,000 连接成功；两个 child 合计发送、ACK、跨 Gateway 预期投递和实际收到
+  均为 `2,304,000`，拒绝、重复 ACK/投递、漏投、outstanding、tracking 丢失、runtime
+  failure 和死信全部为 `0`；总吞吐约 `80 msg/s`。
+- ACK P50/P95/P99：gateway-1 `1.024/1.280/1.600 ms`，gateway-2
+  `0.992/1.280/1.536 ms`。跨 child delivery latency histogram/同 ID 相关性仍未采集，
+  `DeliveryLatency.Count=0` 不代表零延迟。
+- JetStream delivery/ACK 均为 `2,304,000`，pending 尾值 `0`、峰值 `1`；Outbox
+  persisted/published 均为 `2,304,000`，pending 尾值 `0`、峰值 `25`，dead 为 `0`。
+  五个 stderr 为空，`TaskCanceledException`、`SemaphoreFullException` 均未出现。
+- 8 条资源 series 覆盖率均为 `99.243%`，Prometheus 为 `100%`。Gateway-1 RSS
+  中位数 `313.58 → 273.60 MiB`、末段斜率 `-5.96 MiB/h`；Gateway-2
+  `307.49 → 279.95 MiB`、`-3.05 MiB/h`，均稳定且无 OOM/重启。
+- 数据库操作为 `7.253158 ops/msg`，较第二轮正式轮再降 `11.58%`；managed allocation
+  为 `90,269.52 B/msg`，较第二轮波动 `+0.42%`、基本持平，较最初 `262,842 B/msg`
+  已下降 `65.66%`。
+
+PostgreSQL Docker Block I/O 仍显示 `2.09 GB / 606 GB`，但原生统计已完成归因：实际 WAL
+为 `21,976,258,655 bytes = 9,538.3 B/msg`（约 `20.47 GiB`），checkpoint/bgwriter/backend
+逻辑页写合计约 `29.27 GiB`，核心表实际增长约 `6.09 GiB`；`temp_bytes=0`、deadlock=0。
+因此 `606 GB` 不是业务数据、WAL 或 .NET 常驻内存。PGDATA 实际使用 Docker local volume，
+差额应归为 cgroup/块设备聚合口径、文件系统 journal、WAL 段初始化和高频 fsync 的存储栈
+写放大，不能把 OverlayFS 当作已证实主因。其数值较旧 `644 GB` 仅下降约 `5.9%`，后续
+不能再把它当容量指标，并应补采原始 `io.stat`、进程 I/O 与宿主设备扇区作闭环。
+
+SQL WAL 的主要来源是 messages INSERT `62.64%`、Outbox INSERT `16.28%`、会话投影
+`9.33%`、幂等账本 `6.80%`、Outbox claim `2.50%`。当前 Outbox 已只写 `payload_utf8`，
+`payload_json` 为 `NULL`，不存在双份 payload 落盘。下一步按“修复两个 Pending 索引合计
+约 `16.936` 亿 tuple 的全局热扫，并增加提交后 event-id 有界队列快路径 → 合并 claim/完成
+批次与 worker-local 连接复用 → 验证 conversations 全局列表索引并恢复 HOT →
+审计 messages 索引/幂等账本生命周期 →
+`wal_compression` 和 checkpoint 周期 A/B”推进；继续保持
+`synchronous_commit=on`、`full_page_writes=on`，不以降低可靠性换性能。
+
+完整报告已复制到
+[`soak-8h-cross-gateway-dbopt-v1`](../.artifacts/remote-reports/soak-8h-cross-gateway-dbopt-v1)，
+详细原生 WAL、fsync、Top SQL、表/索引和后续安全边界见
+[优化复测报告第 13 节](perf-optimization-rerun-20260807.md)。
+
+## 14. 第四阶段优化已实现、等待正式测量（2026-08-09）
+
+针对第三轮的 Pending 索引热扫、`2.75 wal_sync/msg`、Conversation 非 HOT 和 FPI/checkpoint
+写放大，代码已加入事务提交后有界 event-id 提示、按 ID 精确认领、worker-local 串行预编译
+Npgsql session、100 行/100 ms 发布完成批处理、5 秒可靠恢复扫描，以及 Migration 058/059
+的 HOT/冗余索引治理。正式脚本同时记录并默认使用 `wal_compression=lz4`、
+`checkpoint_timeout=900s`、`max_wal_size=4096MB`，继续保持 `synchronous_commit=on`、
+`full_page_writes=on`。
+
+安全边界没有改变：数据库 Outbox、租约和 claim token 仍是权威；有界队列只用于加速，丢失
+提示由恢复扫描接管；连接仅由单个 worker 串行拥有；NATS 发布成功后才进入数据库完成批次，
+失败或崩溃仍以相同 EventId 重试。保留 retry/recovery、Dead、Published 清理和业务查询所需
+索引，没有按写入型报告的零扫描盲删 messages 可靠性索引。
+
+本地门禁：Realtime 构建 0 warning/0 error、单元 `296/296`、PostgreSQL 集成 `42/42`；
+TCP 构建 0 warning/0 error、测试 `519 passed / 1 environment-skipped`。上述结果只证明代码与
+可靠性契约通过，真实 WAL、fsync、DB ops、allocation、CPU、块写和 8 小时内存趋势仍需新的
+冻结快照正式 soak 给出。详细实现和复测指标见
+[优化复测报告第 14 节](perf-optimization-rerun-20260807.md)。
+
+## 15. 后续验证改为分层执行（2026-08-09）
+
+第四阶段不再为每个 SQL/资源改动重复运行 8 小时。新的统一入口按
+`Smoke → Change → Capacity → Candidate → Formal` 分层：日常反馈约 1–5 分钟，容量筛查约
+6–10 分钟，30 分钟 Candidate 只在准备合并/发布时执行，8 小时 Formal 仅用于最终长期内存、
+WAL/checkpoint 和发布证据。Candidate/Formal 必须显式 `-ConfirmLongRun`。
+
+最终分钟级 Smoke 已验证精确认领按主键锁定、物化资格校验的实现：1,600 条消息 ACK 与跨
+Gateway 投递均为 100%，P95/P99 `2.688/2.944 ms`，无重复、漏投、死信、deadlock 或 temp
+落盘；Pending index tuple read 从低速 Change 基线的约 `1,135.3/msg` 降到 `6.067/msg`
+（约 `99.47%`），Conversation HOT 为 `100%`。完整单元/集成/TCP 回归也已通过。该短测只
+作为修改反馈，不改写本文件已有三轮正式 8 小时 verdict，也不产生新的 `MemoryStable` 结论。
+详细 A/B 与停止边界见[优化复测报告第 16 节](perf-optimization-rerun-20260807.md)。
+
+## 16. Outbox 预领取轻量验证（2026-08-09）
+
+在第 15 节分层反馈流程下，单聊 Outbox 热路径进一步改为业务事务内预写租约，提交后仅发送
+owner/token 提示，Publisher 用主键只读校验后发布。队列满、回滚、冲突、提示丢失、进程崩溃
+和租约过期仍由数据库 Outbox 与恢复扫描处理；共享层不缓存 payload、不跨 worker 共享数据库
+连接，并复用 publisher generation token，避免每消息创建 GUID/string。
+
+最终 Smoke 为 **PASSED / VALID**：1,000 连接、两个 Gateway、发送/ACK/跨 Gateway 投递
+`1,599/1,599/1,599`，P95/P99 `2.944/5.632 ms`，最终 JetStream/Outbox pending 和 dead
+均为 `0`。WAL 为 `6,078.4 B/msg`、WAL sync `1.117/msg`、DB ops `6.115/msg`、Pending
+索引读 `6.375/msg`；Outbox exact/preclaimed/recovery/complete 调用为
+`0/1,578/6/169`。相对上一版精确认领，额外 claim UPDATE 已完全消失，WAL 约降 `3.9%`、
+sync 约降 `46.6%`。详细实现、安全边界和报告见
+[优化复测报告第 17 节](perf-optimization-rerun-20260807.md)。该结果仍是分钟级反馈，不改写历史
+8 小时 verdict，也不声明新的 `MemoryStable`。
+
+## 17. Realtime 分配热点轻量闭环（2026-08-09）
+
+当前实现使用 20 秒 `gc-verbose` trace 定位到 admission、单聊序号分配、messages INSERT 和
+幂等账本的固定 SQL 被每消息重复插值。新增按 `RealtimeDatabaseSchema` 实例隔离的不可变
+`Lazy<string>` 命令文本缓存；只共享 SQL，不共享 command、parameter、connection 或 transaction。
+幂等账本成功路径也由无用的 `INSERT ... RETURNING` DataReader 改为受影响行数判定，冲突时
+仍读取 canonical，可靠性语义不变。
+
+同配置 Change 的 allocation 在 80/320 msg/s 从 `82,533.3/81,489.9 B/msg` 降至
+`70,357.0/68,972.3 B/msg`（`-14.75%/-15.36%`），WAL 基本不变；trace 的
+allocation-tick `1,247 → 1,026`、`String.Ctor` `173 → 14`，两个目标读取路径的重复 SQL
+字符串样本 `160 → 0`。最终 Smoke 发送/ACK/跨 Gateway 投递 `1,600/1,600/1,600`，P99
+`3.20 ms`，allocation `70,185.6 B/msg`、WAL `6,068.4 B/msg`、sync `1.119/msg`，所有
+pending/dead/DLQ/重复/漏投为 `0`。全量单元 `300/300`、PostgreSQL 集成 `43/43`。
+
+详细 trace、A/B、并发安全边界和停止条件见
+[优化复测报告第 18 节](perf-optimization-rerun-20260807.md)。该结果仍是分钟级反馈，不声明
+长期内存稳定性；下一次长测只在发布候选冻结后执行。
+
+## 18. 单聊数据库往返合并轻量验证（2026-08-09）
+
+根据 Top SQL 归因，无附件单聊的 messages、Outbox 和可选幂等账本已合并为同一事务内的一条
+数据修改 CTE；生命周期/授权/幂等 admission 与 Conversation 序号分配再合并为另一条命令。
+共享层仅缓存不可变、按 schema
+实例隔离的 SQL，不共享 Npgsql connection、transaction、command 或 parameter。附件消息继续
+走原有分步绑定路径，冲突、回滚和幂等 canonical 语义不变。
+
+相同 Change A/B 中，80/320 msg/s 的 DB ops 从 `6.101/5.557` 降至 `4.090/3.773`
+（约 `-33.0%/-32.1%`），managed allocation 从 `70,357.0/68,972.3 B/msg` 降至
+`64,575.7/63,316.3 B/msg`（均约 `-8.2%`）；320 档 ACK P99 从 `17.408 ms` 降至
+`4.352 ms`，WAL 基本持平。两个档位 ACK/跨 Gateway 投递均为 `100%`，最终 pending、dead、
+DLQ、重复、漏投、deadlock 和 temp bytes 均为 `0`。
+
+预领取 Outbox 的 `next_attempt_at_ms` 同时改为 lease expiry，减少有效租约行参与 ownerless
+recovery 热扫；预领取主键读取仍校验 owner、token、Pending 和有效 lease，租约到期恢复契约由
+集成测试覆盖。最终 320 msg/s Smoke 发送/ACK/投递 `6,395/6,395/6,395`，DB ops
+`3.710/msg`、allocation `63,920.3 B/msg`、WAL `5,688.7 B/msg`、sync `0.775/msg`，
+Pending index read `55.664/msg`，最终队列清空。全量单元 `300/300`、PostgreSQL 集成
+`44/44`。
+
+最终 admission+sequence 合并后的 320 msg/s Smoke 继续 **PASSED / VALID**：发送/ACK/跨
+Gateway 投递 `6,400/6,400/6,400`。DB ops 由上一轮 `3.710` 再降至 `2.622/msg`
+（`-29.3%`），allocation 降至 `62,571.2 B/msg`，WAL/sync 为 `5,680.5 B/msg` 和
+`0.688/msg`，Pending index read 为 `55.015/msg`。相对第 17 节 SQL cache 后的 320 Change
+基线 `5.557 DB ops/msg`，累计下降 `52.8%`。Top SQL 只剩 admission+sequence 与
+message+Outbox+ledger 两条固定业务命令；没有跨并发消息共享数据库连接，也没有降低 PostgreSQL
+durability。
+
+详细实现、无效诊断轮排除、安全边界和报告见
+[优化复测报告第 19 节](perf-optimization-rerun-20260807.md)。本阶段继续执行分钟级反馈；只有发布
+候选冻结后才运行 30 分钟 Candidate，最终发布前再运行一次 8 小时 Formal。
+
+## 19. Outbox hint 窗口默认值门禁（2026-08-09）
+
+`0 ms` 与 `2 ms` 各三轮同构轻量跨 Gateway A/B 已完成。`2 ms` 可减少约 `20%` DB ops/msg，
+但 Delivery P95/P99 中位数和尖峰频率均更差，因此默认保持 `0 ms`；`2 ms` 仅保留为显式资源优先
+配置。本结论只决定配置默认值，不改写前三轮正式 8 小时 verdict，也不声明新的长期内存稳定性。
+数据、排除样本和报告见[优化复测报告第 20 节](perf-optimization-rerun-20260807.md)。

@@ -71,6 +71,49 @@ public sealed class LazySegmentedOutboundQueueTests
         Assert.Equal(1, r.ByteCount);
     }
 
+    [Fact(Timeout = 5_000)]
+    public async Task TryComplete_WaitsForAdmittedWriter_BeforePublishingCompletion()
+    {
+        var q = new LazySegmentedOutboundQueue(16);
+        using var admitted = new ManualResetEventSlim(false);
+        using var releaseWriter = new ManualResetEventSlim(false);
+
+        var writer = Task.Run(
+            () => q.TryWriteWithAdmissionBarrier(
+                Write(42),
+                () =>
+                {
+                    admitted.Set();
+                    releaseWriter.Wait(TestContext.Current.CancellationToken);
+                }),
+            TestContext.Current.CancellationToken);
+
+        Assert.True(admitted.Wait(
+            TimeSpan.FromSeconds(2),
+            TestContext.Current.CancellationToken));
+
+        var completer = Task.Run(
+            q.TryComplete,
+            TestContext.Current.CancellationToken);
+        Assert.True(SpinWait.SpinUntil(
+            () => q.IsWriterAdmissionClosed,
+            TimeSpan.FromSeconds(2)));
+
+        // Complete 已关闭新 writer admission，但必须等待已准入 writer 发布；
+        // Dispose-style cleanup 不能在这个窗口提前观察完成并 Drain 空队列。
+        Assert.False(completer.IsCompleted);
+        Assert.False(q.TryWrite(Write(43)));
+
+        releaseWriter.Set();
+        Assert.True(await writer);
+        await completer;
+
+        Assert.True(q.TryRead(out var item));
+        Assert.Equal(42, item.ByteCount);
+        Assert.False(q.TryRead(out _));
+        Assert.False(await q.WaitToReadAsync(TestContext.Current.CancellationToken));
+    }
+
     [Fact]
     public void TryPeek_ReturnsItem_WithoutConsuming()
     {

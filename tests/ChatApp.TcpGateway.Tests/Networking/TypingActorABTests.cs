@@ -503,7 +503,10 @@ public sealed class TypingActorABTests
         // FIFO 模式下 TryEnqueue 会检查 per-connection mailbox 容量，
         // Consumer 未启动时消息无法消费，容量耗尽即拒绝。
         await pipeline.StartAsync(ct);
-        Assert.True(pipeline.TryRegisterConnection(9001, 0));
+        Assert.True(pipeline.TryRegisterConnection(
+            9001,
+            0,
+            out var registration));
 
         var budget = new GlobalInboundBudget(64 * 1024);
 
@@ -526,7 +529,7 @@ public sealed class TypingActorABTests
                 Session = session,
                 RemoteIp = "127.0.0.1"
             };
-            Assert.True(pipeline.TryEnqueue(9001, in command));
+            Assert.True(registration.TryEnqueue(in command));
         }
 
         // 等待全部处理完成 + 预算归零。
@@ -584,7 +587,10 @@ public sealed class TypingActorABTests
         var legacyBudget = new GlobalInboundBudget(1024 * 1024);
 
         await legacyPipeline.StartAsync(ct);
-        Assert.True(legacyPipeline.TryRegisterConnection(1, 0));
+        Assert.True(legacyPipeline.TryRegisterConnection(
+            1,
+            0,
+            out var legacyRegistration));
 
         for (var i = 0; i < workload; i++)
         {
@@ -602,7 +608,7 @@ public sealed class TypingActorABTests
                 RemoteIp = "127.0.0.1"
             };
             // 队列满时短暂等待消费者排空，避免丢命令。
-            while (!legacyPipeline.TryEnqueue(1, in cmd))
+            while (!legacyRegistration.TryEnqueue(in cmd))
                 await Task.Delay(1, ct);
         }
         await WaitUntilAsync(

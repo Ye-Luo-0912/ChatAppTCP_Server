@@ -109,6 +109,7 @@ public sealed class ResponseByteBudgetTests
         Assert.NotNull(result.NextCursor);
         var lastItem = result.Items[^1];
         Assert.Equal(lastItem.ReceivedAtMs, result.NextCursor!.ReceivedAtMs);
+        Assert.Equal(lastItem.ChangedAtMs, result.NextCursor.ChangedAtMs);
         Assert.Equal(lastItem.MessageId, result.NextCursor.MessageId);
     }
 
@@ -118,6 +119,7 @@ public sealed class ResponseByteBudgetTests
         var response = new MessageHistoryResponse
         {
             RequestId = "test-request-id",
+            ConversationId = "dm:1:2",
             Succeeded = true,
             ErrorCode = null,
             ErrorMessage = null,
@@ -138,6 +140,7 @@ public sealed class ResponseByteBudgetTests
             out _);
 
         Assert.Equal("test-request-id", result.RequestId);
+        Assert.Equal("dm:1:2", result.ConversationId);
         Assert.True(result.Succeeded);
     }
 
@@ -197,6 +200,7 @@ public sealed class ResponseByteBudgetTests
         var response = new MessageHistoryResponse
         {
             RequestId = "req-huge",
+            ConversationId = "dm:1:2",
             Succeeded = true,
             Items = new[] { hugeItem },
             HasMore = false
@@ -319,6 +323,7 @@ public sealed class ResponseByteBudgetTests
         return new MessageHistoryResponse
         {
             RequestId = "req-" + Guid.NewGuid().ToString("N"),
+            ConversationId = "dm:1:2",
             Succeeded = true,
             Items = items,
             HasMore = false
@@ -356,6 +361,7 @@ public sealed class ResponseByteBudgetTests
             ? new MessageHistoryCursor
             {
                 ReceivedAtMs = prefix[k - 1].ReceivedAtMs,
+                ChangedAtMs = prefix[k - 1].ChangedAtMs,
                 MessageId = prefix[k - 1].MessageId
             }
             : null;

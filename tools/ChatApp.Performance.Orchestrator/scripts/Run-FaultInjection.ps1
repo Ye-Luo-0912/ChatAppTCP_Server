@@ -75,15 +75,6 @@ function Invoke-Docker([string[]] $Arguments) {
     }
 }
 
-function Wait-Postgres([string] $Container) {
-    for ($attempt = 1; $attempt -le 30; $attempt++) {
-        & docker exec $Container pg_isready -U postgres -d ChatAppDatabase *> $null
-        if ($LASTEXITCODE -eq 0) { return }
-        Start-Sleep -Seconds 1
-    }
-    throw "PostgreSQL did not become ready: $Container"
-}
-
 function Wait-LoadStarted([Diagnostics.Process] $Process, [string] $OutputPath) {
     $deadline = [DateTimeOffset]::UtcNow.AddSeconds(120)
     while ([DateTimeOffset]::UtcNow -lt $deadline) {
@@ -197,7 +188,7 @@ try {
                 -Name $garnet -RunId $dockerRunId -CreatedContainers $created `
                 -CreateArguments @(
                 '-p',"127.0.0.1:$($GarnetPort):6379",$GarnetImage)
-            Wait-Postgres $postgres
+            Wait-PerformancePostgres -Container $postgres
 
             $durationSeconds = $FaultAfterSeconds + $FaultDurationSeconds + $RecoveryWindowSeconds
             $arguments = @(
@@ -252,7 +243,9 @@ try {
             else {
                 Invoke-Docker @('start',$containers[$target])
             }
-            if ($target -eq 'Postgres') { Wait-Postgres $postgres }
+            if ($target -eq 'Postgres') {
+                Wait-PerformancePostgres -Container $postgres
+            }
 
             $readyRecoveredAt = $null
             $convergedAt = $null
