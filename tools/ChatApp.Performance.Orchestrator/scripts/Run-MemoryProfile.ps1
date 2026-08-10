@@ -279,7 +279,10 @@ $collectorScript = {
         # 注意：$PID 是 PowerShell 只读自动变量（大小写不敏感），不能用作循环变量；
         # 否则赋值会抛 "Cannot overwrite variable PID because it is read-only or constant"。
         foreach ($gatewayPid in $Pids) {
-            $matching = @($ssRaw | Where-Object { $_ -match "(^|\s)pid=$gatewayPid," })
+            # ss -tinm -p 的进程归属形如 users:(("dotnet",pid=2446643,fd=199))，
+            # pid= 前是逗号而非空白，故不能用 (^|\s) 前缀；直接用 pid=<pid>, 精确匹配，
+            # 尾随逗号确保不会误配更长数字（如 pid=24466430,）。
+            $matching = @($ssRaw | Where-Object { $_ -match "pid=$gatewayPid," })
             $snapshot.SocketCountByPid["$gatewayPid"] = $matching.Count
         }
 
