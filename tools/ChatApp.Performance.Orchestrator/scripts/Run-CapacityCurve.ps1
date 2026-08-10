@@ -12,6 +12,7 @@ param(
     [switch] $TcpCrossGateway,
     [ValidateRange(0.001, 100000)] [double] $TcpMessagesPerSecond = 10,
     [ValidateRange(0, 3600)] [int] $TcpDeliveryDrainSeconds = 30,
+    [ValidateRange(1, 86400)] [int] $TcpInflightTtlSeconds = 120,
     [ValidateRange(0, 3600)] [int] $TcpInactiveHeartbeatSeconds = 30,
     [ValidateRange(1, 1048576)] [int] $TcpPayloadBytes = 128,
     [int] $TcpSlowReaders = 0,
@@ -446,6 +447,7 @@ try {
                 '--tcp-active-senders',"$TcpActiveSenders",
                 '--tcp-messages-per-second',$rateTcpMessagesPerSecond.ToString('G17', [Globalization.CultureInfo]::InvariantCulture),
                 '--tcp-delivery-drain-seconds',"$TcpDeliveryDrainSeconds",
+                '--tcp-inflight-ttl-seconds',"$TcpInflightTtlSeconds",
                 '--tcp-inactive-heartbeat-seconds',"$TcpInactiveHeartbeatSeconds",
                 '--tcp-min-ack-ratio',($MinimumAcknowledgementPercent / 100.0).ToString('G17', [Globalization.CultureInfo]::InvariantCulture),
                 '--tcp-min-delivery-ratio',($MinimumDeliveryPercent / 100.0).ToString('G17', [Globalization.CultureInfo]::InvariantCulture),
@@ -1037,6 +1039,7 @@ $summary = [pscustomobject]@{
         TcpMessagesPerSecond = $TcpMessagesPerSecond
         TcpRateDrivenByRates = [bool]$tcpRateDrivenByRates
         TcpDeliveryDrainSeconds = $TcpDeliveryDrainSeconds
+        TcpInflightTtlSeconds = $TcpInflightTtlSeconds
         TcpInactiveHeartbeatSeconds = $TcpInactiveHeartbeatSeconds
         TcpPayloadBytes = $TcpPayloadBytes
         TcpConnectionsPerSecond = $TcpConnectionsPerSecond

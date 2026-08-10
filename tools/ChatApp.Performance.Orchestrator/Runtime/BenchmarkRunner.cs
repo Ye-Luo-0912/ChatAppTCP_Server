@@ -885,6 +885,7 @@ Console.WriteLine("Starting RealtimeServices...");
             "--stabilization-seconds", FormatNonNegativeSeconds(options.Warmup),
             "--messages-per-second", options.TcpMessagesPerSecond.ToString("G17", System.Globalization.CultureInfo.InvariantCulture),
             "--delivery-drain-seconds", FormatNonNegativeSeconds(options.TcpDeliveryDrain),
+            "--inflight-ttl-seconds", options.TcpInflightTtlSeconds.ToString(System.Globalization.CultureInfo.InvariantCulture),
             "--inactive-heartbeat-seconds", FormatNonNegativeSeconds(options.TcpInactiveHeartbeatInterval),
             "--min-ack-ratio", options.TcpMinimumAcknowledgementRatio.ToString("G17", System.Globalization.CultureInfo.InvariantCulture),
             "--min-delivery-ratio", options.TcpMinimumDeliveryRatio.ToString("G17", System.Globalization.CultureInfo.InvariantCulture),
