@@ -25,6 +25,7 @@ internal sealed record BenchmarkOptions(
     int TcpActiveSenders,
     double TcpMessagesPerSecond,
     TimeSpan TcpDeliveryDrain,
+    int TcpInflightTtlSeconds,
     TimeSpan TcpInactiveHeartbeatInterval,
     double TcpMinimumAcknowledgementRatio,
     double TcpMinimumDeliveryRatio,
@@ -67,7 +68,8 @@ internal sealed record BenchmarkOptions(
         "[--tcp-mode connection|heartbeat|chat] [--tcp-connections 100] " +
         "[--tcp-active-senders N] " +
         "[--tcp-messages-per-second 10] [--tcp-payload-bytes 128] " +
-        "[--tcp-delivery-drain-seconds 30] [--tcp-min-ack-ratio 0.95] " +
+        "[--tcp-delivery-drain-seconds 30] [--tcp-inflight-ttl-seconds 120] " +
+        "[--tcp-min-ack-ratio 0.95] " +
         "[--tcp-inactive-heartbeat-seconds 30] " +
         "[--tcp-min-delivery-ratio 0.90] " +
         "[--tcp-slow-readers 0] [--tcp-connections-per-second N] " +
@@ -112,6 +114,7 @@ internal sealed record BenchmarkOptions(
         var tcpActiveSenders = 0;
         var tcpMessagesPerSecond = 10d;
         var tcpDeliveryDrainSeconds = 30;
+        var tcpInflightTtlSeconds = 120;
         var tcpInactiveHeartbeatSeconds = 30;
         var tcpMinimumAcknowledgementRatio = 0.95d;
         var tcpMinimumDeliveryRatio = 0.90d;
@@ -230,6 +233,9 @@ internal sealed record BenchmarkOptions(
                     break;
                 case "--tcp-delivery-drain-seconds":
                     tcpDeliveryDrainSeconds = ParseInt(value, option);
+                    break;
+                case "--tcp-inflight-ttl-seconds":
+                    tcpInflightTtlSeconds = ParseInt(value, option);
                     break;
                 case "--tcp-inactive-heartbeat-seconds":
                     tcpInactiveHeartbeatSeconds = ParseInt(value, option);
@@ -359,6 +365,7 @@ internal sealed record BenchmarkOptions(
         ArgumentOutOfRangeException.ThrowIfNegative(tcpActiveSenders);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(tcpMessagesPerSecond);
         ArgumentOutOfRangeException.ThrowIfNegative(tcpDeliveryDrainSeconds);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(tcpInflightTtlSeconds);
         ArgumentOutOfRangeException.ThrowIfNegative(tcpInactiveHeartbeatSeconds);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(tcpPayloadBytes);
         ArgumentOutOfRangeException.ThrowIfNegative(tcpSlowReaders);
@@ -490,6 +497,7 @@ internal sealed record BenchmarkOptions(
             tcpActiveSenders,
             tcpMessagesPerSecond,
             TimeSpan.FromSeconds(tcpDeliveryDrainSeconds),
+            tcpInflightTtlSeconds,
             TimeSpan.FromSeconds(tcpInactiveHeartbeatSeconds),
             tcpMinimumAcknowledgementRatio,
             tcpMinimumDeliveryRatio,
