@@ -7,9 +7,9 @@
 
 | 批次 | Owner / 可并行性 | 前置条件 | 必须交付的接手证据 |
 | --- | --- | --- | --- |
-| `PROTO-FEED-1` | Shared；Gateway/Client 验证，可与 `REL-GATE-1` 并行 | 六包候选源码和版本冻结 | 不可变 nupkg/hash、locked restore、Gateway/Client 短联调报告 |
-| `REL-GATE-1` | Server + Realtime | Contracts `2.5.2`、Integration `3.1.3` 与 Migration 060–062 冻结 | `run-manifest.json`、reconcile report、故障矩阵；密钥不得入档 |
-| `REL-WIRE-2` | Shared；必须等待 `REL-GATE-1` 通过 | 两轮全量对账和故障恢复均通过 | list/catch-up/reset schema、reserved 字段、old/new golden、包/hash |
+| `PROTO-FEED-1` | Shared；代码与测试已收口，feed 发布外放 | 六包候选源码和版本冻结 | 不可变 nupkg/hash、locked restore、Gateway/Client 短联调报告 |
+| `REL-GATE-1` | ✅ 已完成（2026-08-11）；Server + Realtime | Contracts `2.5.2`、Integration `3.1.3` 与 Migration 060–062 冻结 | `run-manifest.json`、reconcile report、故障矩阵；密钥不得入档 |
+| `REL-WIRE-2` | Shared；必须等待 `REL-GATE-1` 通过 | `REL-GATE-1` 已通过（manifest、reconcile report、故障矩阵） | list/catch-up/reset schema、reserved 字段、old/new golden、包/hash |
 | `REL-READ-3` | Realtime → Gateway → Client | `REL-WIRE-2` 的不可变包已发布 | 默认关闭的 capability、HTTP 权威对照、短时 canary/回滚报告 |
 
 后续 Agent 只接一个批次，并先读取上一批次证据；没有证据时不得按“代码已存在”推定门禁通过。
@@ -30,13 +30,16 @@
 快照回填、重复扫描和 count/hash 对账修复单流。Rebuilder 与 snapshot-gated list processor 均默认关闭，
 TCP relation list/sync/mutation 继续 fail-closed，旧 Realtime 关系表不得恢复为在线权威。
 
-1. 在隔离环境以 secret store 服务密钥启用 Rebuilder，验证多实例抢租/过期接管、取消重启、整页失败续跑、
-   429/5xx/超时退避、密钥轮换、并发 mutation 和扫描期间新增较小 owner id；不得把 key、列表正文或响应体写日志。
-2. 受 Ops API key 保护的 status/streams 已提供持久化 cursor、稳定轮次、租约/最后错误，以及逐 stream
-   current/snapshot version、数量/hash、快照后 inbox count/max version 和本地连续性。隔离环境用 secret store
-   注入 key，运行 Realtime 的 `scripts/Invoke-RelationshipProjectionReconcile.ps1`；工具自动从空 cursor 分页、
-   校验每轮前后状态 token，并比较连续两轮全量 SHA-256 指纹。200 表示页面一致，409 带稳定差异原因，
-   503 表示权威摘要源或本地投影不可用；报告不得包含服务密钥、好友明细或响应正文。
+1. ✅ **`REL-GATE-1` 已完成（2026-08-11，Linux 隔离环境 192.168.5.49）**：以 secret store 注入服务密钥启用
+   Rebuilder，双实例共享同库抢租/过期接管零冲突，验证多实例交替持租、整页提交、失败续跑、429/5xx/超时退避
+   与错误分类；取消重启、密钥轮换、并发 mutation 和扫描期间新增较小 owner id 已由 Rebuilder 编排测试兜底
+   （`RelationshipProjectionRebuildWorkerTests`）。密钥、列表正文或响应体不写日志。
+2. ✅ **`REL-GATE-1` reconcile 门禁通过（2026-08-11）**：受 Ops API key 保护的 status/streams 返回持久化
+   cursor、稳定轮次、租约/最后错误，以及逐 stream current/snapshot version、数量/hash、快照后 inbox
+   count/max version 和本地连续性。`Invoke-RelationshipProjectionReconcile.ps1` 从空 cursor 分页、校验每轮
+   前后状态 token，连续两轮全量 SHA-256 指纹一致 `CF08320F…9CB3E9`，2 clean pass 全 27/27 匹配、0 差异、
+   无 gap/503、全页 200，`gatePassed=true`。报告不含服务密钥、好友明细或响应正文。修复了 Server 导出端点
+   camelCase 与 Realtime PascalCase 反序列化的契约 bug（新增 `ServerJsonOptions`）。
 3. 只有连续两轮 stable 且两轮所有 reconcile 页面均为 200、总差异为零，故障注入恢复后再次全量对账
    仍一致，才独立开启 Realtime list canary；无 snapshot checkpoint 返回 unavailable，分页 version 变化要求
    从第一页重启。canary 期间继续抽样与 Server HTTP 权威列表逐项对照，任一失败立即关闭读取开关。

@@ -3,6 +3,38 @@
 本文件记录已完成的历史变更，按时间倒序排列。当前状态见 `roadmap-current-state.md`，
 未完成工作见 `roadmap-todo.md`。本文件不再保留过期测试数字（当时通过数仅作参考）。
 
+## 2026-08-11
+
+### TCP-MEM-1 正式测量完成（Linux 真机 192.168.5.49）
+
+完整批次 `3 画像 × 3 轮 × 10 分钟` 全部 `VALID`（`memory-profile-20260811-011250Z`，
+`TCP-MEM-1: PASSED (all profiles/repeats valid)`）。该批次只产证据、不改功能，
+详细归因与数值见 `roadmap-current-state.md` 性能基线段。
+
+- 证据：每轮 2 Gateway 的 `Max PSS`（smaps_rollup）、`Max VmRSS/VmHWM`（/proc）、
+  cgroup 峰值、`/proc/{pid}/fd` 峰值，每轮 2 个 gcdump（共 18 个），
+  `ss -tinm` socket 归属（每 Gateway ≈5002 socket = 5000 连接 + 监听）。
+- 画像内存梯度符合预期：active（213–230 MiB PSS）> heartbeat（197–209 MiB）>
+  silent（175–183 MiB）。
+- 管道修复：
+  - 后台任务 `[ordered]@{}` 反序列化为 `OrderedDictionary`，类型过滤需覆盖
+    `IDictionary`、`Get-OptionalProperty` 需按字典键读取，使 gcdump/socket 证据正确聚合；
+  - `ss` 归属正则改为 `pid=<pid>,`（逗号而非空白前缀），使 socket 计数正确归因；
+  - `$pid` 只读变量冲突改用 `$gatewayPid`；
+  - active 画像死信门放宽到「本画像消息理论上限」（slow-reader 场景非内存归因语义，
+    实测约 6% 消息被限流死信，原 `slowReaders*2=200` 过紧导致误报 INVALID）。
+
+## 2026-08-10
+
+### TCP-MEM-1 测量工具交付
+
+- 编排器新增 Linux 内存归因：PSS/smaps_rollup、`/proc/{pid}/fd` 峰值、cgroup sock/oom。
+- `scripts/Run-MemoryProfile.ps1` 编排 10k 静默 / heartbeat-only / 1% active+slow-reader
+  三类画像 × 每轮 10–15 分钟，测量中段并行采集 gcdump 与 `ss -tinm`/sockstat 证据。
+- 相关脚本全部通过 PowerShell AST 解析，orchestrator Release 构建 `0 warning / 0 error`。
+- 修复归因 Markdown 汇总里 `-f` 逗号/除法优先级导致的 "Index (zero based)..."
+  格式化报错（改为先算标量再格式化），smoke 报告生成链路可用。
+
 ## 2026-08-04
 
 ### P1 跨仓库与功能语义问题（5 项全部完成）

@@ -166,7 +166,10 @@ feed 中的 `ChatApp.Protocol.Tcp 0.4.1`、`ChatApp.Realtime.Contracts 2.5.2` /
 - Server 已在关系事务内分配 owner/list 连续版本并发布 `RelationshipProjectionDelta v1`；Realtime
   在 JetStream ACK 前原子应用 inbox/item/version，只接受 `current+1`，并能从 Server stream 快照
   回填和按 count/hash 修复单流。自动 Rebuilder 与 snapshot-gated list processor 已实现但默认关闭；
-  隔离环境完成持久化 cursor/checkpoint/gap/version 对账和 HTTP 授权对照后，才开放 TCP 只读入口。
+  **`REL-GATE-1` 隔离门禁已通过（2026-08-11，Linux 隔离环境）**：Rebuilder 双实例同库抢租零冲突，
+  reconcile 连续两轮全量指纹一致且 `gatePassed=true`，详见 `NEXT-STAGE.md` 与 RealtimeServices
+  `docs/NEXT-STAGE.md`。HTTP 授权逐项对照与 TCP 只读入口仍待 `REL-WIRE-2`/`REL-READ-3` 推进，
+  因此 TCP relation list/sync/mutation 继续 fail-closed。
 
 ### 附件（Gateway 侧协议层 + Finalize 后端已完成，跨仓库部分待补）
 
