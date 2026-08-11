@@ -11,7 +11,6 @@
 | `REL-GATE-1` | Server + Realtime | Contracts `2.5.2`、Integration `3.1.3` 与 Migration 060–062 冻结 | `run-manifest.json`、reconcile report、故障矩阵；密钥不得入档 |
 | `REL-WIRE-2` | Shared；必须等待 `REL-GATE-1` 通过 | 两轮全量对账和故障恢复均通过 | list/catch-up/reset schema、reserved 字段、old/new golden、包/hash |
 | `REL-READ-3` | Realtime → Gateway → Client | `REL-WIRE-2` 的不可变包已发布 | 默认关闭的 capability、HTTP 权威对照、短时 canary/回滚报告 |
-| `TCP-MEM-1` | Gateway，只测量，可与前三项并行 | 单独冻结源码、二进制和负载 | 三类 10k 短画像及 gcdump/PSS/socket 归因；不得夹带功能改动 |
 
 后续 Agent 只接一个批次，并先读取上一批次证据；没有证据时不得按“代码已存在”推定门禁通过。
 `REL-READ-3` 完成前，关系 mutation 永久走 Server HTTP，TCP 入口继续 fail-closed。二进制生产协商、

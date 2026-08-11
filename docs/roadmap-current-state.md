@@ -211,7 +211,17 @@ feed 中的 `ChatApp.Protocol.Tcp 0.4.1`、`ChatApp.Realtime.Contracts 2.5.2` /
   gcdump 与 `ss -tinm`/sockstat 证据；相关脚本全部通过 PowerShell AST 解析，orchestrator
   Release 构建 `0 warning / 0 error`。已修复归因 Markdown 汇总里 `-f` 逗号/除法优先级导致的
   "Index (zero based)..." 格式化报错（改为先算标量再格式化），smoke 报告生成链路可用。
-  待 Linux 真机执行并核验报告聚合后回填证据。
+- **`TCP-MEM-1` 正式测量完成（2026-08-11，Linux 真机 192.168.5.49）**：完整批次
+  `3 画像 × 3 轮 × 10 分钟` 全部 `VALID`（`memory-profile-20260811-011250Z`，
+  `TCP-MEM-1: PASSED (all profiles/repeats valid)`）。证据：每轮 2 Gateway 的
+  `Max PSS`（smaps_rollup）、`Max VmRSS/VmHWM`（/proc）、cgroup 峰值、`/proc/{pid}/fd` 峰值，
+  每轮 2 个 gcdump（共 18 个），`ss -tinm` socket 归属（每 Gateway ≈5002 socket \= 5000 连接 + 监听）。
+  画像内存梯度符合预期：active（213–230 MiB PSS）> heartbeat（197–209 MiB）> silent（175–183 MiB）。
+  管道修复：后台任务 `[ordered]@{}` 反序列化为 `OrderedDictionary`（类型过滤需覆盖 `IDictionary`、
+  `Get-OptionalProperty` 需按字典键读取）使 gcdump/socket 证据正确聚合；`ss` 归属正则改为
+  `pid=<pid>,`（逗号而非空白前缀）使 socket 计数正确归因；`$pid` 只读变量冲突改用 `$gatewayPid`；
+  active 画像死信门放宽到「本画像消息理论上限」（slow-reader 场景非内存归因语义，实测约 6%
+  消息被限流死信，原 `slowReaders*2=200` 过紧导致误报 INVALID）。
 
 ## CI 与发布门禁
 

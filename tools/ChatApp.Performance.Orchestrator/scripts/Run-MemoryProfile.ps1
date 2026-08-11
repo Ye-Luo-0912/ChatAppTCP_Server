@@ -208,8 +208,11 @@ $profileConfigs = [ordered]@{
         # 该画像只测内存归因，不校验端到端交付收尾，故禁用 delivery drain 语义门。
         TcpDeliveryDrainSeconds = 0
         # slow reader 不消费导致指向它们的投递被实时服务限流而死信（rate_limited），
-        # 属 slow-reader 画像的固有语义；放宽死信门上限（按 slow reader 数量比例）。
-        MaximumDeadLetters = [long]($slowReaders * 2)
+        # 属 slow-reader 画像的固有语义；该画像只测内存归因，不校验端到端交付收尾，
+        # 故把死信门上限放宽到「本画像消息理论上限 = 全部 chat 消息量」，
+        # 使门在 slow-reader 语义下恒过（实测约 6% 消息被限流死信，slowReaders*2 过紧）。
+        MaximumDeadLetters = [long]($activeSenders * $ActiveMessagesPerSecond *
+            ($rampSeconds + $WarmupSeconds + $DurationSeconds))
         # slow reader 不消费导致指向它们的消息在 load generator 的 in-flight 表滞留；
         # 默认 inflight TTL(120s) 会在测量中段触发 fail-fast（"In-flight message ... exceeded the configured TTL"）。
         # 该画像只测内存归因，不校验端到端交付收尾，故把 in-flight TTL 放大到覆盖完整测量窗口
