@@ -10,17 +10,17 @@
       },
       "ChatApp.Protocol.Tcp": {
         "type": "Direct",
-        "requested": "[0.4.1, )",
-        "resolved": "0.4.1",
-        "contentHash": "gzy/T+fKmELp1OH7jUaATnWXfyBzsxfDtFl688gSBBMxzosN++zMY8dfx+2pnBNz0NrAdWs8TRIRn1MZg5StHQ=="
+        "requested": "[0.4.2, )",
+        "resolved": "0.4.2",
+        "contentHash": "ePcrEj9qds9dsKD0GQPMwVCuS6UFhoZKl5WezYGf9ZUpVMjK2oCG3quaWQD31JYpP6Pqj5JwLCK5X5hkPRdkgA=="
       },
       "ChatApp.Protocol.Tcp.Json": {
         "type": "Direct",
-        "requested": "[0.4.1, )",
-        "resolved": "0.4.1",
-        "contentHash": "vU3DzT3SzpE3lWT7DZb8Iz8UIzwRTRCjHJg6K/5ljYgIP9AdJdG0yms4cHQHnCRYKrgvWPP8pCOiK9MYix2CWg==",
+        "requested": "[0.4.2, )",
+        "resolved": "0.4.2",
+        "contentHash": "G7420wDlmsXOgKO5ToDMEWx6EW9415k+bwlfu6insF5oNWyFNsvie2TRwOoa4qc+HH6935n1VEHFgFr3Stxoog==",
         "dependencies": {
-          "ChatApp.Protocol.Tcp": "0.4.1"
+          "ChatApp.Protocol.Tcp": "0.4.2"
         }
       },
       "xunit.v3": {
@@ -454,7 +454,7 @@
       "ChatApp.TcpGateway.Core": {
         "type": "Project",
         "dependencies": {
-          "ChatApp.Protocol.Tcp": "[0.4.1, )",
+          "ChatApp.Protocol.Tcp": "[0.4.2, )",
           "ChatApp.Realtime.Contracts": "[2.3.0, )"
         }
       },
@@ -482,7 +482,7 @@
       "chatapp.tcpgateway.observability": {
         "type": "Project",
         "dependencies": {
-          "ChatApp.Protocol.Tcp": "[0.4.1, )",
+          "ChatApp.Protocol.Tcp": "[0.4.2, )",
           "Microsoft.Extensions.Logging.Abstractions": "[10.0.5, )"
         }
       },

@@ -130,15 +130,13 @@ internal static class HistoryWireMapper
                 var change = catchUp.Changes[j];
                 changes[j] = new SharedRelationshipChange
                 {
-                    ChangeSequence = change.ChangeSequence,
                     Operation = (ChatApp.Shared.Protocol.Tcp.TcpRelationshipChangeOperation)change.Operation,
                     ResourceId = change.ResourceId,
                     UserId = change.UserId,
                     Status = change.Status,
                     Message = change.Message,
                     CreatedAtMs = change.CreatedAtMs,
-                    OccurredAtMs = change.OccurredAtMs,
-                    RequestId = change.RequestId
+                    OccurredAtMs = change.OccurredAtMs
                 };
             }
 
@@ -149,9 +147,7 @@ internal static class HistoryWireMapper
                 HasMore = catchUp.HasMore,
                 NextCursor = catchUp.NextCursor,
                 NextSequence = catchUp.NextSequence,
-                RetentionFloorSequence = catchUp.RetentionFloorSequence,
-                ResetRequired = catchUp.ResetRequired,
-                ResetReason = catchUp.ResetReason
+                ResetRequired = catchUp.ResetRequired
             };
         }
 
