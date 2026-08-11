@@ -12,7 +12,8 @@ Gateway 当前有一条等待型功能主线和一条可并行测量主线：
 2. **接手 `REL-READ-3`。** 先增加显式 wire mapper 和默认关闭的 capability，再覆盖响应硬预算、partial/reset、版本变化、断线续页和 HTTP 权威对照。Realtime list canary 先通过，Gateway 才给小比例新连接协商能力；旧连接不在线改变语义。
 3. **交给 Client。** 提供 producer fixture、包/二进制 hash、短时跨 Gateway 报告、开关和回滚步骤。失败时关闭 capability，让新连接恢复 Server HTTP；mutation 永久不迁到 TCP。
 4. **并行 `TCP-MEM-1`。** 只在冻结快照上执行 10–15 分钟 10k 静默、heartbeat-only、1% active+slow-reader 三类画像，采 gcdump/PSS/socket；该批次只产证据，不夹带功能或默认值修改。
-   - **测量脚本已交付（2026-08-10）**：编排器新增 Linux 内存归因（PSS/smaps_rollup、`/proc/{pid}/fd` 峰值、cgroup sock/oom），`scripts/Run-MemoryProfile.ps1` 编排三类画像 × 每轮 10–15 分钟，`scripts/Performance-Gcdump.ps1` 与内嵌 socket/`ss -tinm` 采集在测量中段并行取证；`Run-MemoryProfile.ps1`/`Performance-Gcdump.ps1` 等全部性能脚本通过 PowerShell AST 解析，orchestrator Release 构建 `0 warning / 0 error`。已修复归因 Markdown 汇总 `-f` 逗号/除法优先级导致的格式化报错，smoke 报告生成链路可用。仍待 Linux 真机执行并核验报告聚合。
+   - **测量脚本已交付（2026-08-10）**：编排器新增 Linux 内存归因（PSS/smaps_rollup、`/proc/{pid}/fd` 峰值、cgroup sock/oom），`scripts/Run-MemoryProfile.ps1` 编排三类画像 × 每轮 10–15 分钟，`scripts/Performance-Gcdump.ps1` 与内嵌 socket/`ss -tinm` 采集在测量中段并行取证；`Run-MemoryProfile.ps1`/`Performance-Gcdump.ps1` 等全部性能脚本通过 PowerShell AST 解析，orchestrator Release 构建 `0 warning / 0 error`。已修复归因 Markdown 汇总 `-f` 逗号/除法优先级导致的格式化报错。
+   - **`TCP-MEM-1` 正式测量完成（2026-08-11，Linux 真机 192.168.5.49）**：完整批次 `3 画像 × 3 轮 × 10 分钟` 全部 `VALID`（`memory-profile-20260811-011250Z`，`TCP-MEM-1: PASSED`）。每轮 2 Gateway 采 PSS/VmRSS/VmHWM/cgroup 峰值、fd 峰值、2 个 gcdump（共 18）与 `ss -tinm` socket 归属。画像内存梯度符合预期：active（213–230 MiB PSS）> heartbeat（197–209）> silent（175–183）。管道修复：后台任务 `[ordered]@{}` 反序列化为 `OrderedDictionary` 使证据正确聚合、`ss` 归属正则改为 `pid=<pid>,`、`$pid` 只读变量冲突改用 `$gatewayPid`、active 死信门放宽到本画像消息理论上限（slow-reader 场景非交付语义）。
 5. **后续顺序。** 关系只读 canary 稳定后才进入 binary 双 codec；语音附件/通话信令随后独立批次，QUIC 最后做可回滚实验。
 
 下一位 Agent 必须在报告中写明接手的批次号；未拿到上一批次证据时只允许补测试/测量，不允许提前开放 capability。
