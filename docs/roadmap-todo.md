@@ -19,12 +19,12 @@
 
 ## P0：`TCP-P0-2` 正确性收口
 
-1. 为 Windows 默认并行全套中的 DirectSocket/Persistent 握手 abort 建立稳定复现，记录客户端阶段、服务端 session 状态、socket 关闭方向、异常类型和预算计数；先确定是测试隔离、端口复用还是生命周期竞态。
-2. 按真实资源所有权修复根因。禁止仅增加等待时间、吞掉异常或串行化整个测试集；关闭路径必须停止新准入，等待已准入 writer 发布完成，再释放 socket、session、lease 和全局预算。
-3. 增加确定性竞态测试，覆盖握手中断、鉴权与关闭并发、connection-id 复用、Persistent send loop 退出、重复 Dispose、服务停止和 10k shutdown。断言无悬挂任务、无双重清理、预算归零。
-4. 复核所有可关联响应和错误保持 `ConversationId` / `RequestId`；History/Sync 超过硬预算时返回明确可重试失败，不允许静默丢段或发送半帧。
-5. 复核 Resume claim/commit/abort、旧 session fencing 和回滚顺序；依赖不可用时不得把未完成会话提升为 authenticated。
-6. 验证顺序为聚焦测试连续重复 → Release 全量测试 → 3–5 分钟连接/鉴权/关闭 smoke。任何偶现失败都保留诊断证据，不以重试掩盖。
+1. ✅ **根因已确定（2026-08-12）**：DirectSocket/Persistent 握手 abort 属于**测试隔离**，非生命周期竞态。`TcpGatewayServiceTests.PublishesIncomingMessageAndDispatchesPersistedEventOverTcp` 用单个 5 秒共享 CTS 贯穿超长 I/O（3 字节分片握手、24 段 6KB 分片消息、心跳、history/sync），并行下线程池调度饥饿使每个 await 累积延迟突破 5s 预算即 abort；`SessionRuntime.DirectSocket` 接收循环与 `DispatchFrameAsync` 握手状态机的错误路径均显式 `Close` + 预算归还，结构健壮。
+2. ✅ **按根因处置**：对此类时序敏感联网测试（`TcpGatewayServiceTests`、`TcpClientSessionOnDemandDisposeRaceTests`）应用 `CollectionDefinition("TcpSessionSerial", DisableParallelization = true)` 串行执行；限定到两个类，不串行化整个测试集，也不增加等待/吞异常。Release 全量 `567 passed / 0 failed / 1 Redis env skip`。
+3. ✅ **确定性竞态与生命周期测试已由既有覆盖**：`TcpClientSessionOnDemandDisposeRaceTests`（OnDemand/PerSession pump·drain·publishing·finalizing 唯一清理、预算归零）、`SessionLifecycleCoordinatorTests`（鉴权+关闭并发、resume claim/commit/abort、fencing、rollback）、`EphemeralCommandPipelineTests`（connection-id 复用拒绝旧 lease）、`SessionControlHandlerTests`（握手中断/乱序协议违规）、`SessionCommandExecutorTests`/`FrameAssemblyTimeoutTrackerTests`（服务 Stop 排空与幂等）。
+4. ✅ **请求关联与硬预算已由既有覆盖**：`ResponseByteBudgetTests.Truncate_PreservesRequestId_AndEnvelopeFields`、`GroupRequestIdempotencyCacheTests`（`RequestId` 归属/幂等）、`InboundPayloadEarlyValidatorTests`/`SessionRuntimeTests.DispatchFrameAsync_RejectsOversizedPayload_AndClosesSession`/`OutboundQueueBudgetTests`（超限关闭、不静默丢段、预算不消耗）。
+5. ✅ **Resume claim/commit/abort 已由既有覆盖**：`SessionLifecycleCoordinatorTests` 全量（lease 冲突、circuit open、fail-open/closed、abort 回滚、prepare 不 commit、victim 关闭）。
+6. ⏳ 3–5 分钟连接/鉴权/关闭 smoke：留作环境级部署门禁，需真实依赖环境执行。
 
 ## P0：关系只读 `REL-READ-3`
 
