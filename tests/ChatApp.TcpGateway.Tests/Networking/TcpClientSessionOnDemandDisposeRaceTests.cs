@@ -7,6 +7,7 @@ using Microsoft.Extensions.Logging.Abstractions;
 
 namespace ChatApp.TcpGateway.Tests.Networking;
 
+[Collection("TcpSessionSerial")]
 public sealed class TcpClientSessionOnDemandDisposeRaceTests
 {
     [Fact(Timeout = 5_000)]

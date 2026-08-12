@@ -49,6 +49,14 @@ using TcpGatewayService = ChatApp.TcpGateway.Gateway.Networking.TcpGatewayServic
 
 namespace ChatApp.TcpGateway.Tests.Networking;
 
+/// <summary>
+/// 时序敏感联网测试：并行下线程池调度饥饿会导致握手超时或连接中止，
+/// 需串行执行以消除并行资源竞争。
+/// </summary>
+[CollectionDefinition("TcpSessionSerial", DisableParallelization = true)]
+public sealed class TcpSessionSerialDefinition { }
+
+[Collection("TcpSessionSerial")]
 public sealed class TcpGatewayServiceTests
 {
     [Theory(Timeout = 10_000)]
