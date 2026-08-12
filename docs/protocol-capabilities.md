@@ -51,4 +51,6 @@
 3. 在 `CommandCatalog` 为相关客户端命令设置 `RequiredFeature`。
 4. 补充 catalog 完整性测试，以及 DirectSocket/Pipelines 的真实 TCP 握手测试。
 5. JSON 仍是当前 wire 格式。未来二进制 codec 必须通过 `BinaryPayload` 协商，
-   并保留 JSON 回退路径。
+   并保留 JSON 回退路径；格式、指针、生成器和零分配口径以
+   [`ChatApp.Shared/docs/BINARY-PROTOCOL.md`](https://github.com/Ye-Luo-0912/ChatApp.Shared/blob/main/docs/BINARY-PROTOCOL.md)
+   为唯一规范，现有 10-byte header 不变。

@@ -39,7 +39,8 @@ Gateway 当前有一条等待型功能主线和一条可并行测量主线：
 - P1：继续使用短时 admission/change/capacity 测试优化 CPU、分配、数据库操作和 WAL；30 分钟仅用于冻结候选，8 小时仅用于发布候选。
   - 每轮保存负载、连接数、配置、源码/二进制 hash 和资源采样；一次只改一个因素，以同构重复 A/B 的中位数判断收益，任何 ACK/投递/重复/漏投或 p95/p99 回退先阻断候选。
   - 优先优化已证实的热点；当前 Gateway 不是主要 CPU 瓶颈时，不以增加协议复杂度换取理论收益。
-- P1（二进制 payload，Shared runtime/generator 已完成且 feature 未启用）：保留现有 10-byte 帧头与 JSON 默认值，复用 `IPayloadCodec<T>` 的 `IBufferWriter`/`ReadOnlySequence` 路径；协商前仍用 JSON，完整握手成功后把 negotiated format 固化到 session，连接内不 sniff、不混用、不在线切换。首版带 ResumeToken 的连接强制 JSON，待协议保证先发 JSON ServerHello 后再单独开放 binary resume。
+- P1（二进制 payload，Shared `chatapp-bin-v1` 底座已完成但 feature 未启用）：保留现有 10-byte 帧头与 JSON 默认值；Gateway 从 frame owner 取得连续可提交 `Span<byte>`，调用普通源码的单遍 encoder，入站使用生成的连续/分段 decoder。不得把旧 `IBufferWriter` 两遍 measured adapter 重新放回热路径。协商前仍用 JSON，完整握手成功后把 negotiated format 固化到 session，连接内不 sniff、不混用、不在线切换。首版带 ResumeToken 的连接强制 JSON，待协议保证先发 JSON ServerHello 后再单独开放 binary resume。
+  - 唯一规范是 [`ChatApp.Shared/docs/BINARY-PROTOCOL.md`](https://github.com/Ye-Luo-0912/ChatApp.Shared/blob/main/docs/BINARY-PROTOCOL.md)。旧实验格式从未上线，已废弃且不保留兼容层；Gateway 不实现公共原语或复制 schema，只消费 Shared Core、format/schema 包和 decode-only generator。当前仍没有真实业务 DTO 接入、format 协商或默认值变化。
   - 实现前先对 ChatMessage、History、Sync 真实 payload 做 JSON/候选格式离线基准；进入 canary 前必须覆盖全部握手后有 payload 的命令，并提供配置 kill switch、JSON 降级和未知/恶意输入限制。
   - 混合灰度时按 payload format 最多分组编码一次并复用共享出站帧，禁止每 session 重新序列化；格式数设置硬上限，连接排空/重连后才能切回 JSON。
   - 推广门槛：相同语义 golden/兼容/fuzz 全过，payload 目标下降至少 30%，序列化 CPU 或分配至少下降 20%，80/320/640 msg/s 短测的 p95/p99 不显著回退且 ACK/投递零漏零重；否则保持 JSON 默认。
@@ -53,7 +54,7 @@ Gateway 当前有一条等待型功能主线和一条可并行测量主线：
 
 ## 共享与资源
 
-复用 source-generated codec、只读元数据、连接池和有界线程安全调度器；连接 session、payload buffer、取消源和事务对象必须由单一生命周期持有并可靠释放。
+复用只读 schema、共享 codec runtime、连接池和有界线程安全调度器；binary encoder 不依赖生成器，decoder 可源生成。连接 session、payload buffer、borrowed view、取消源和事务对象必须由单一生命周期持有并可靠释放。
 
 ## 验证顺序
 

@@ -46,19 +46,16 @@ chat.message-history.query 的 Core NATS request/reply 完成。
 
 ## 序列化扩展
 
-业务层只依赖 IPayloadCodec<T>。当前 JsonPayloadCodec<T> 使用
-JsonSerializerContext（源生成 JsonTypeInfo）。默认发布为 JIT + TieredPGO；
-Native AOT 可选，见 [AGENTS.md](AGENTS.md)。
+当前 JSON 业务路径依赖 `IPayloadCodec<T>`；`JsonPayloadCodec<T>` 使用
+`JsonSerializerContext`（源生成 `JsonTypeInfo`）。默认发布为 JIT + TieredPGO；
+Native AOT 可选，见 [AGENTS.md](AGENTS.md)。二进制接入不会强行套用该对象型接口：
+编码热路径由 frame owner 提供连续 `Span<byte>` 并在成功后提交，解码调用 Shared 的静态生成入口。
 
-增加二进制协议时：
-
-1. 在 Infrastructure/Serialization 下新增 Binary 目录。
-2. 为每个消息类型实现 IPayloadCodec<T>。
-3. 在 InfrastructureServiceCollectionExtensions 中替换对应注册。
-4. 保持 Core/Protocol 和 Gateway/Networking 不变。
-
-如果未来需要 JSON 与二进制客户端同时在线，再在包头中加入协议版本或通过
-登录握手协商格式；这属于协议版本升级，不能直接改变现有 10 字节包头。
+二进制 `chatapp-bin-v1` 的 wire、公共 runtime、无生成器单遍 encoder 与 decode-only generator 规则由
+[`ChatApp.Shared/docs/BINARY-PROTOCOL.md`](https://github.com/Ye-Luo-0912/ChatApp.Shared/blob/main/docs/BINARY-PROTOCOL.md)
+统一维护。Gateway 只消费 Shared 包并负责连接级协商、session 固化 codec、按格式共享出站帧、
+kill switch 与 JSON 回退；不在本仓复制 schema 或另建逐消息契约。现有 10 字节包头保持不变，
+协商前 `ClientHello/ServerHello` 使用 JSON，完整握手后一个连接只使用一种 payload format。
 
 ## 配置
 

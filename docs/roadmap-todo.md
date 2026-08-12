@@ -92,16 +92,21 @@ TCP relation list/sync/mutation 继续 fail-closed，旧 Realtime 关系表不�
 
 ## P1：二进制 payload 接入
 
-Shared 已完成默认不可协商的 `chatapp-tagged-v1` runtime/generator；生产 JSON 和 10-byte 帧头不变。
+Shared 已废弃从未上线的实验格式，并完成默认不可协商的首个候选 `chatapp-bin-v1` 底座；生产 JSON 和 10-byte 帧头不变。
 
-1. 先完成全部握手后 payload 命令的 schema、reserved field、old/new golden、fuzz 和 source-generated codec；
-   不能只给 ChatMessage 开 binary，因为当前帧头没有逐帧格式位。
+wire、公共 Core、无生成器单遍 encoder、decode-only generator、原生指针边界和分配口径统一见
+[`ChatApp.Shared/docs/BINARY-PROTOCOL.md`](https://github.com/Ye-Luo-0912/ChatApp.Shared/blob/main/docs/BINARY-PROTOCOL.md)。
+本节只列 Gateway 接入任务，不在本仓重新定义字段编码，也不恢复旧 reader/writer 或兼容 facade。
+
+1. 执行 Shared `BIN-SCHEMA-2`：全部握手后 payload 命令具备手写单遍 encoder、生成 decoder、reserved
+   manifest、当前格式 golden 与 fuzz；不能只给 ChatMessage 开 binary，因为当前帧头没有逐帧格式位。
 2. `ClientHello/ServerHello` 始终 JSON；完整握手后把格式固化到 session，首版 Resume 强制 JSON。
    入站不 sniff，连接中途不切换；回滚关闭选择，让已协商连接排空或 GoAway 重连。
 3. 混合灰度按格式分组，每个事件每种格式最多编码一次并复用共享帧；不得退化为逐 session 序列化。
    鉴权、resume 等敏感 buffer 在成功、异常、扩容和引用归零路径都由所有者清零。
-4. 只有 payload 至少下降 30%、序列化 CPU 或分配至少下降 20%，且 80/320/640 msg/s 短测
-   ACK/投递零漏零重、p95/p99 无显著回退，才进入 canary；否则继续 JSON 默认。
+4. 执行 Shared `BIN-INTEGRATION-3` 门禁：encoder/borrowed decode 分配口径、真实 payload 体积、CPU/message、
+   allocation/message 和 ACK/delivery p99 均达标，且 80/320/640 msg/s 短测零漏零重，才进入 canary；
+   否则继续 JSON 默认。
 
 ## P2：语音、媒体与 QUIC
 
