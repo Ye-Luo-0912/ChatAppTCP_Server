@@ -1,6 +1,7 @@
 using ChatApp.Realtime.Integration.Configuration;
 using ChatApp.Realtime.Integration.DependencyInjection;
 using ChatApp.TcpGateway.Gateway.Commands.Attachments;
+using ChatApp.TcpGateway.Gateway.Commands.Calls;
 using ChatApp.TcpGateway.Gateway.Commands.Conversations;
 using ChatApp.TcpGateway.Gateway.Commands.Groups;
 using ChatApp.TcpGateway.Gateway.Commands.Messaging;
@@ -132,6 +133,9 @@ builder.Services.AddSingleton<IAttachmentBackend, RealtimeAttachmentBackend>();
 builder.Services.AddSingleton<IRelationshipBackend, RealtimeRelationshipBackend>();
 builder.Services.AddSingleton<AttachmentCommandHandler>();
 builder.Services.AddSingleton<RelationshipCommandHandler>();
+// CALL-E2E-2：通话信令控制面（RealtimeCallBackend 经 IRealtimeMessageBus.SendCallCommandAsync 转发）。
+builder.Services.AddSingleton<ICallBackend, RealtimeCallBackend>();
+builder.Services.AddSingleton<CallCommandHandler>();
 builder.Services.AddSingleton<CommandDispatcher>();
 builder.Services.AddHostedService<RealtimeEventConsumerService>();
 

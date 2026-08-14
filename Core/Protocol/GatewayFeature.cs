@@ -15,7 +15,8 @@ public static class GatewayFeatureSet
         GatewayFeature.PresenceAndTyping |
         GatewayFeature.MessageReactions |
         GatewayFeature.GroupManagement |
-        GatewayFeature.PushTokenManagement;
+        GatewayFeature.PushTokenManagement |
+        GatewayFeature.CallSignaling;
 
     /// <summary>协议已经分配的全部能力位，包括尚未实现的预留位。</summary>
     public const GatewayFeature Known =

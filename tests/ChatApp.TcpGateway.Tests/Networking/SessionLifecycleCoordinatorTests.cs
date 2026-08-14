@@ -1014,6 +1014,11 @@ public sealed class SessionLifecycleCoordinatorTests
             CancellationToken ct = default) =>
             Task.FromResult<RealtimeHistory.RealtimeHistoryMessage?>(null);
 
+        public Task<CallProcessResult> SendCallCommandAsync(
+            CallCommand command,
+            CancellationToken ct = default) =>
+            Task.FromResult(CallProcessResult.Failed(CallErrorCode.StateStoreUnavailable, "unavailable"));
+
         public async IAsyncEnumerable<RealtimeEventDelivery> ConsumeEventsAsync(
             [EnumeratorCancellation] CancellationToken ct = default)
         {

@@ -1,36 +1,35 @@
 # 下一阶段与接手状态
 
-## 职责
+## 职责与优先级
 
 TCP Gateway 负责连接、鉴权、能力协商、限流和到 Realtime 的路由；不成为数据库、关系或媒体内容的业务权威。
 
+当前以功能链路完整为主：关系读取 → 语音消息 → 1:1 通话。性能和二进制是支撑轨，只有在不打断功能主线且有明确收益证据时推进。详细执行清单唯一维护在 [`roadmap-todo.md`](roadmap-todo.md)。
+
 ## 下一阶段顺序
 
-详细执行清单唯一维护在 `docs/roadmap-todo.md`；本文件只定义跨仓顺序和接手边界。
+1. **`REL-E2E-4`：关系读取端到端闭环。** 接入 Realtime 已完成的投影 list/catch-up，使用 Shared wire 做显式映射；覆盖分页、reset、gap、partial、权限变化和 Client 水位恢复。mutation 永久走 Server HTTP。
+2. **`VOICE-MSG-2`：语音附件消息。** 复用现有附件与聊天命令，只传有界元数据和对象引用；补齐历史、同步、错误映射与跨 Gateway 投递，不让音频正文进入 TCP frame。
+3. **`CALL-E2E-2`：1:1 通话控制面。** 接入 Server call grant 与 Realtime 临时信令状态机，完成 invite/accept/reject/end/reconnect 的鉴权、限流、幂等、TTL 和跨 Gateway 路由；媒体走 WebRTC/TURN。
+4. **`BIN-INTEGRATION-3`：二进制开发接入。** 待功能 payload 与命令目录稳定后再接双 codec；JSON 继续默认，格式按 session 固化，混合连接按格式共享编码。
+5. **`PERF-SUPPORT-1`：有证据的性能收口。** 优先修复新功能引入的 CPU、allocation、PSS 或 p99 回退；一次只优化一个已归因热点，不重跑已完成的整批画像。
 
-1. **`TCP-P0-2`：先收口正确性。** 修复 Windows 并行测试下 DirectSocket/Persistent 握手 abort 的生命周期竞态，并复核请求关联、Sync 硬预算、Resume fencing 与关闭后的资源归零。
-2. **`REL-READ-3`：完成关系只读链路。** Shared 的 list/sync DTO 与错误/预算语义已经收口；Realtime 完成投影 list/catch-up 同源读取后，Gateway 只做显式映射和默认关闭的 capability。Server HTTP 仍是权威，关系 mutation 继续走 HTTP。
-3. **`BIN-SCHEMA-2`：接入真实 payload schema。** Shared 覆盖全部握手后 payload；Gateway 不复制 schema，也不恢复旧二进制实现。
-4. **`TCP-PERF-2`：短测驱动 CPU/内存优化。** 基于既有内存画像只选择一个可归因热点，先做微基准与聚焦测试，再做短时同构 A/B。
-5. **`BIN-INTEGRATION-3`：接入双 codec。** JSON 仍为默认；握手完成后格式按 session 固化，全部 payload 覆盖且短测通过前不开放协商。
-6. **`VOICE-SIGNAL-1`：增加 1:1 语音通话信令。** TCP 只承载可靠的 offer/answer/ICE/结束信令；媒体使用 WebRTC/SRTP 与 TURN，不进入 Gateway 数据面。
-
-Realtime 的 `REL-READ-3`、Shared 的 `BIN-SCHEMA-2` 可在 `TCP-P0-2` 期间并行推进；Gateway 的关系、二进制和语音入口必须在 `TCP-P0-2` 收口后再接入。不得把多个 capability 合并成一次改动。
+关系、语音消息和通话必须分批接入、分开关闭。二进制或性能改动不得与新业务 capability 合并成同一变更。
 
 ## 当前接手事实
 
-- JSON 与固定 10-byte 帧头仍是唯一启用的生产路径。
-- TCP relation list/sync/mutation 当前继续 fail-closed；Server HTTP 是唯一在线关系权威。
-- `TCP-MEM-1` 已完成并有可用的 gcdump/PSS/socket 证据；下一阶段读取现有证据，不重复整批画像。
-- Shared 已完成 `chatapp-bin-v1` 公共底座，但真实业务 DTO、Gateway codec 与格式协商尚未接入。
-- 语音消息应复用附件生命周期；通话信令和媒体传输尚未实现。
+- DirectSocket/Persistent 并行握手 abort 已确认是测试隔离问题并完成定向串行化；连接生命周期、预算和资源清理已有确定性测试。
+- Server HTTP 是唯一关系权威；Realtime 投影 list/catch-up 已具备，Gateway 当前任务是把真实 backend 与 Shared wire 接通。
+- 语音附件元数据与 Realtime 通话状态机已有下游基础，但 Gateway/Shared/Client 的外部链路尚未闭环。
+- JSON 与固定 10-byte 帧头仍是当前运行路径。Shared binary 底座已存在，但 Gateway codec、协商和完整命令覆盖尚未接入。
+- `TCP-MEM-1` 已有 gcdump/PSS/socket 证据；后续直接读取证据选择热点，不重复全套长连接画像。
 
-其余已完成能力、基线数字和历史证据见 `docs/roadmap-current-state.md` 与 `docs/roadmap-changelog.md`，不要复制回待办。
+已完成能力和历史证据见 [`roadmap-current-state.md`](roadmap-current-state.md) 与 [`roadmap-changelog.md`](roadmap-changelog.md)，不要复制回待办。
 
 ## 接手约束
 
-接手时写明批次号，先理解现有命令语义、上下游契约和资源所有权。一次只推进一个 Gateway capability；缺少前置契约或正确性证据时，只补测试和诊断，不提前改变默认行为。
+接手时写明批次号，先理解现有命令语义、上下游契约和资源所有权。缺少真实契约或正确性证据时，先补 mapper、测试和诊断，不提前改变默认行为；不引入无界队列、连接级线程或第二套业务 DTO。
 
 ## 验证顺序
 
-聚焦单测/契约测试 → Release 构建 → 3–5 分钟 smoke 或同构 A/B。只有已经胜出的性能改动需要补充归因时，才增加一次 10–15 分钟 Linux 样本；本阶段不安排更长测试。
+聚焦单测/契约测试 → Release 构建 → 3–5 分钟 smoke；只有需要确认资源趋势时才补一次 10–15 分钟样本。当前阶段到功能联调验收为止。

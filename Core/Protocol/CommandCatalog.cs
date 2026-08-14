@@ -391,6 +391,20 @@ internal static class CommandCatalog
             PacketCommand.ConversationDissolvedUpdate, CommandDirection.ServerToClient,
             ConnectionPhase.Authenticated, CommandLane.Inline, -1, 1),
 
+        // 通话控制面
+        PacketCommand.CallCommandRequest => new(
+            PacketCommand.CallCommandRequest, CommandDirection.ClientToServer,
+            ConnectionPhase.Authenticated, CommandLane.OrderedWrite, 64 * 1024, 4)
+        {
+            RequiredFeature = GatewayFeature.CallSignaling
+        },
+        PacketCommand.CallCommandResponse => new(
+            PacketCommand.CallCommandResponse, CommandDirection.ServerToClient,
+            ConnectionPhase.Authenticated, CommandLane.Inline, -1, 1),
+        PacketCommand.CallSignal => new(
+            PacketCommand.CallSignal, CommandDirection.ServerToClient,
+            ConnectionPhase.Authenticated, CommandLane.Inline, -1, 1),
+
         // 离线推送
         PacketCommand.RegisterPushTokenRequest => new(
             PacketCommand.RegisterPushTokenRequest, CommandDirection.ClientToServer,

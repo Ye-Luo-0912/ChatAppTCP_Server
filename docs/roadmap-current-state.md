@@ -8,21 +8,21 @@
 
 - **SDK**：.NET 10 / SDK 10.0.301（`global.json` 锁定，`allowPrerelease: false`），
   与 RealtimeServices 对齐；见 `docs/sdk-baseline.md`。
-- **发布模式**：默认 **JIT + TieredPGO**（`PublishAot=false`）。Native AOT 为可选实验，
+- **运行模式**：默认 **JIT + TieredPGO**（`PublishAot=false`）。Native AOT 为可选实验，
   StackExchange.Redis 等依赖仍存在 trim/AOT 警告，未重新启用。
 - **JSON 序列化**：协议/存储 JSON 全部走源生成 `GatewayJsonSerializerContext`，
   不使用反射 `JsonSerializerOptions`，为未来重新启用 AOT 保留可能。
-- 构建/测试：`dotnet build` 0 警告 0 错误；Gateway 串行全量 **566** 项中
-  **565** 通过、**1** 项外部 Redis 环境测试跳过；RealtimeServices 单元 **315/315**、
-  PostgreSQL integration **70/70** 通过。关系投影 Ops 已提供 privacy-minimized digest/reconcile：
-  只比较 owner/list 的 version、count、hash、checkpoint 与连续性，不读取或返回好友明细。
+- 构建/测试：Gateway 保持 Release build、聚焦协议/生命周期测试和串行全量回归；依赖真实 Redis、
+  NATS 或 PostgreSQL 的用例必须明确环境前置，不把 skip 当通过。关系投影 Ops 提供
+  privacy-minimized digest/reconcile，只比较 owner/list 的 version、count、hash、checkpoint 与连续性，
+  不读取或返回好友明细。易变化的测试总数不在本文件固化。
 
 ## 架构边界
 
 依赖方向：**Gateway → Infrastructure → Core**，**Observability** 为叶依赖被
 Infrastructure 和 Gateway 共享，且只依赖协议包与 Logging。跨进程消息通过仓库本地
-feed 中的 `ChatApp.Protocol.Tcp 0.4.1`、`ChatApp.Realtime.Contracts 2.5.2` /
-`ChatApp.Realtime.Integration 3.1.3`
+feed 中的 `ChatApp.Protocol.Tcp 0.5.0` / `.Json 0.5.0`、`ChatApp.Realtime.Contracts 2.3.0` /
+`ChatApp.Realtime.Integration 3.0.0`
 版本化包引用；所有项目有锁文件，独立克隆可以 locked restore/build。
 完整边界表见 `AGENTS.md`。
 
@@ -141,8 +141,8 @@ feed 中的 `ChatApp.Protocol.Tcp 0.4.1`、`ChatApp.Realtime.Contracts 2.5.2` /
   Token Retry（仅重试失败 Token）、幂等（复合键 UserId+CommandKind+RequestId+CanonicalPayloadHash + Redis L2）、
   DLQ、Provider 并发限制、无效 Token 注销、PushWorker 拆出（独立服务隔离网络资源）、
   AES-GCM Token 加密、Push delivery payload 不在 Information 级别记录。
-- **跨仓库待补**：真实 FCM/APNs/WebPush Provider、`IPushTokenStore` 提取到共享 Abstractions、
-  Publisher 侧 Push 触发（`UserOffline` 入队），见 `roadmap-todo.md` 主线一。
+- **跨仓库待补**：真实 FCM/APNs/WebPush Provider、共享 token 边界和 Publisher 侧离线触发；
+  当前功能路线完成后再按真实客户端需求单独立项。
 ### 群组
 
 - 廉价结构校验（`GroupCommandHandler.Validation.cs`）：成员上限/正 ID/去重、Title 长度、
@@ -152,24 +152,22 @@ feed 中的 `ChatApp.Protocol.Tcp 0.4.1`、`ChatApp.Realtime.Contracts 2.5.2` /
 - 群组幂等指纹改用 **SHA-256** 稳定化（归一化二进制表示），Redis L2 条件写（Lua），
   消除跨进程不稳定 `System.HashCode`。
 - 权限矩阵/群主转让/最后 Owner 退群/审计事件仍由 RealtimeServices 承担。
-- **仍待补**：稳定指纹强化、DB keyset pagination、不可变 Cursor，见 `roadmap-todo.md` 主线三。
+- **仍待补**：稳定指纹强化、DB keyset pagination、不可变 Cursor；当前功能路线完成后按真实缺口立项。
 
 ### Relationship（Server 单一写权威；Realtime 在线入口 fail-closed）
 
 - Client 的关系读写继续走 ChatApp.Server HTTP；Server 的 public `T_*` 表是当前唯一在线权威。
-- Realtime 默认 `IRelationshipCommandProcessor` 和 list processor 返回明确迁移错误；携带
-  relationship watermark 的 SyncBootstrap 同样 fail-closed，不再读取或写入 legacy realtime 表。
+- Realtime 关系 mutation 继续返回明确迁移错误；投影 list/catch-up 已从同一套 Server 权威投影读取，
+  不再读取或写入 legacy realtime 表。Gateway/Client 的外部读取入口尚待 `REL-E2E-4` 接通。
 - 私聊授权仍由 Realtime 的 authorization store 读取 Server public 权威表，不因关闭旧关系
   command/list/sync 而放松权限。
 - 旧 `NpgsqlRelationshipStore`/default processor 只保留为显式迁移或应急工具，不在默认 DI 中；
   重新启用会恢复双权威，只能短期回滚使用。
 - Server 已在关系事务内分配 owner/list 连续版本并发布 `RelationshipProjectionDelta v1`；Realtime
-  在 JetStream ACK 前原子应用 inbox/item/version，只接受 `current+1`，并能从 Server stream 快照
-  回填和按 count/hash 修复单流。自动 Rebuilder 与 snapshot-gated list processor 已实现但默认关闭；
-  **`REL-GATE-1` 隔离门禁已通过（2026-08-11，Linux 隔离环境）**：Rebuilder 双实例同库抢租零冲突，
-  reconcile 连续两轮全量指纹一致且 `gatePassed=true`，详见 `NEXT-STAGE.md` 与 RealtimeServices
-  `docs/NEXT-STAGE.md`。HTTP 授权逐项对照与 TCP 只读入口仍待 `REL-WIRE-2`/`REL-READ-3` 推进，
-  因此 TCP relation list/sync/mutation 继续 fail-closed。
+  在 JetStream ACK 前原子应用 inbox/item/version/history，只接受连续版本，并能从 Server snapshot
+  回填和按 count/hash 修复。Rebuilder、reconcile、snapshot-gated list 与 catch-up 同源读取已有验证。
+  当前剩余工作是 Gateway 显式 mapper、Client 水位恢复和 HTTP 权威端到端对照；在 `REL-E2E-4`
+  完成前 TCP relation 读取仍保持关闭，mutation 始终走 HTTP。
 
 ### 附件（Gateway 侧协议层 + Finalize 后端已完成，跨仓库部分待补）
 
@@ -184,8 +182,8 @@ feed 中的 `ChatApp.Protocol.Tcp 0.4.1`、`ChatApp.Realtime.Contracts 2.5.2` /
   前 2 值已对齐，扩展状态（UploadConfirmed/Rejected/Expired/ThumbnailUpdated）仅由
   `AttachmentLifecycleHandler` 下游推送使用，不参与 `AttachmentWireMapper` 映射。
 - **Finalize 后端已完成（2026-08-03）**：详见 `roadmap-changelog.md`。
-- **跨仓库待补**：所有权校验、扫描/审核、过期清理（sweep worker）、下载授权，
-  见 `roadmap-todo.md` 主线四。
+- **跨仓库待补**：所有权校验、扫描/审核、过期清理（sweep worker）和下载授权；
+  语音消息批次复用并补齐这些附件能力。
 ### 可观测性
 
 - Gateway 与 RealtimeServices 接入 OpenTelemetry Metrics/Tracing，支持 OTLP 导出。
@@ -205,9 +203,8 @@ feed 中的 `ChatApp.Protocol.Tcp 0.4.1`、`ChatApp.Realtime.Contracts 2.5.2` /
 - DirectSocket vs Pipelines Linux A/B：1000 连接，吞吐持平（-0.019%），
   p99 -4.99%，CPU -17.96%，工作集 -3.34%。
 - 故障注入短测：Garnet 568/568、PostgreSQL 575/575、NATS pause/unpause 513/513。
-- 2026-08-05/07/08 已完成多轮正式 8 小时 soak；这些报告只证明各自冻结快照。当前新候选先走
-  10–15 分钟诊断和 30 分钟冻结，只有发布候选才重新执行 8 小时 soak。连接风暴、慢速发送攻击、
-  全局入站预算耗尽仍见 `roadmap-todo.md`。
+- 2026-08-05/07/08 已完成多轮 8 小时历史 soak；这些报告只证明各自冻结快照，不定义当前开发顺序。
+  当前功能与性能改动按 `roadmap-todo.md` 使用聚焦测试和短时联调验证。
 - **`TCP-MEM-1` 测量工具已交付（2026-08-10）**：编排器新增 Linux 内存归因（PSS/smaps_rollup、
   `/proc/{pid}/fd` 峰值、cgroup sock/oom），`scripts/Run-MemoryProfile.ps1` 编排 10k 静默 /
   heartbeat-only / 1% active+slow-reader 三类画像 × 每轮 10–15 分钟，测量中段并行采集
@@ -226,9 +223,9 @@ feed 中的 `ChatApp.Protocol.Tcp 0.4.1`、`ChatApp.Realtime.Contracts 2.5.2` /
   active 画像死信门放宽到「本画像消息理论上限」（slow-reader 场景非内存归因语义，实测约 6%
   消息被限流死信，原 `slowReaders*2=200` 过紧导致误报 INVALID）。
 
-## CI 与发布门禁
+## 开发验证基础
 
 - `ChatApp.Performance.Gate` 已实现：对编排器报告做失败闭环检查，
   支持 `--require-conversation-stages` 阶段 p95 闭环。
 - `.github/workflows/build.yml` 已配置 locked restore、Release build 与完整架构/行为测试门禁。
-- Linux 自托管 runner、真实依赖探针、定时浸泡和性能门禁仍属于运行环境治理，不影响独立构建。
+- Linux 自托管 runner、真实依赖探针和长时运行属于后续环境治理，不影响当前功能开发与独立构建。

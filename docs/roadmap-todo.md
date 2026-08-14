@@ -1,89 +1,71 @@
 # 待办路线图
 
-本文件是 TCP Gateway **唯一的详细执行清单**。当前事实见 `roadmap-current-state.md`，已完成事项见 `roadmap-changelog.md`，跨仓顺序摘要见 `NEXT-STAGE.md`。
+本文件是 TCP Gateway **唯一的详细执行清单**。当前事实见 [`roadmap-current-state.md`](roadmap-current-state.md)，完成记录见 [`roadmap-changelog.md`](roadmap-changelog.md)，跨仓摘要见 [`NEXT-STAGE.md`](NEXT-STAGE.md)。
 
-修改前先读相关实现、调用方、上下游契约和测试，确认命令语义与资源所有权。每个批次只解决一个问题，不复制 Shared DTO，不引入无界队列、连接级后台任务或隐式格式切换。
+修改前先读相关实现、调用方、上下游契约和测试，确认命令语义与资源所有权。每个批次只解决一个问题，不复制 Shared DTO，不引入无界队列、连接级后台线程或隐式格式切换。
 
-## 当前批次
+## 批次顺序
 
-| 批次 | Owner / 可并行性 | 前置条件 | 完成证据 |
+| 顺序 | 批次 | 主要 Owner | 完成证据 |
 | --- | --- | --- | --- |
-| `TCP-P0-2` | Gateway；立即执行 | 无 | 根因、聚焦回归、Release 全量测试、短时 smoke |
-| `REL-READ-3` | Realtime → Gateway → Client；可与 P0 部分并行 | Shared 关系契约已完成；Gateway 接入等待 `TCP-P0-2` | 投影 list/catch-up、显式 mapper、本地投影、HTTP 对照、关闭开关 |
-| `BIN-SCHEMA-2` | Shared；可与 P0 并行 | `chatapp-bin-v1` Core 已完成 | 全量真实 schema、encoder/decoder、golden、fuzz、真实 corpus 基准 |
-| `TCP-PERF-2` | Gateway；P0 后执行 | 读取既有 `TCP-MEM-1` 证据 | 单热点归因、微基准、短时 A/B、资源与正确性报告 |
-| `BIN-INTEGRATION-3` | Gateway + Client | `BIN-SCHEMA-2`、`TCP-P0-2` 完成 | 双 codec、session 协商、降级开关、短时跨 Gateway 报告 |
-| `VOICE-SIGNAL-1` | Shared → Realtime → Gateway → Client | `TCP-P0-2` 完成 | 信令契约、状态机、鉴权/限流、跨 Gateway 与故障测试 |
+| 1 | `REL-E2E-4` | Realtime → Gateway → Client | list/catch-up 真实联调、HTTP 对照、reset/gap/断线恢复 |
+| 2 | `VOICE-MSG-2` | Server → Realtime → Shared → Gateway → Client | 上传到播放的端到端链路与错误恢复 |
+| 3 | `CALL-E2E-2` | Server → Realtime → Shared → Gateway → Client | grant、信令状态机、跨 Gateway 与弱网恢复 |
+| 支撑 | `BIN-INTEGRATION-3` | Shared → Gateway + Client | 完整命令覆盖、双 codec、JSON fallback、短测 |
+| 支撑 | `PERF-SUPPORT-1` | 发生热点的仓库 | profiler 归因、微基准、同构短 A/B |
 
-后续 Agent 一次只接一个批次，并在交接中写明修改范围、未解决风险和验证结果。关系、二进制与语音 capability 分开接入、分开关闭。
+后续 Agent 一次只接一个批次，并在交接中写明修改范围、未解决风险和验证结果。
 
-## P0：`TCP-P0-2` 正确性收口
+## P0：`REL-E2E-4` 关系读取
 
-1. ✅ **根因已确定（2026-08-12）**：DirectSocket/Persistent 握手 abort 属于**测试隔离**，非生命周期竞态。`TcpGatewayServiceTests.PublishesIncomingMessageAndDispatchesPersistedEventOverTcp` 用单个 5 秒共享 CTS 贯穿超长 I/O（3 字节分片握手、24 段 6KB 分片消息、心跳、history/sync），并行下线程池调度饥饿使每个 await 累积延迟突破 5s 预算即 abort；`SessionRuntime.DirectSocket` 接收循环与 `DispatchFrameAsync` 握手状态机的错误路径均显式 `Close` + 预算归还，结构健壮。
-2. ✅ **按根因处置**：对此类时序敏感联网测试（`TcpGatewayServiceTests`、`TcpClientSessionOnDemandDisposeRaceTests`）应用 `CollectionDefinition("TcpSessionSerial", DisableParallelization = true)` 串行执行；限定到两个类，不串行化整个测试集，也不增加等待/吞异常。Release 全量 `567 passed / 0 failed / 1 Redis env skip`。
-3. ✅ **确定性竞态与生命周期测试已由既有覆盖**：`TcpClientSessionOnDemandDisposeRaceTests`（OnDemand/PerSession pump·drain·publishing·finalizing 唯一清理、预算归零）、`SessionLifecycleCoordinatorTests`（鉴权+关闭并发、resume claim/commit/abort、fencing、rollback）、`EphemeralCommandPipelineTests`（connection-id 复用拒绝旧 lease）、`SessionControlHandlerTests`（握手中断/乱序协议违规）、`SessionCommandExecutorTests`/`FrameAssemblyTimeoutTrackerTests`（服务 Stop 排空与幂等）。
-4. ✅ **请求关联与硬预算已由既有覆盖**：`ResponseByteBudgetTests.Truncate_PreservesRequestId_AndEnvelopeFields`、`GroupRequestIdempotencyCacheTests`（`RequestId` 归属/幂等）、`InboundPayloadEarlyValidatorTests`/`SessionRuntimeTests.DispatchFrameAsync_RejectsOversizedPayload_AndClosesSession`/`OutboundQueueBudgetTests`（超限关闭、不静默丢段、预算不消耗）。
-5. ✅ **Resume claim/commit/abort 已由既有覆盖**：`SessionLifecycleCoordinatorTests` 全量（lease 冲突、circuit open、fail-open/closed、abort 回滚、prepare 不 commit、victim 关闭）。
-6. ⏳ 3–5 分钟连接/鉴权/关闭 smoke：留作环境级部署门禁，需真实依赖环境执行。
+Server HTTP 与 public `T_*` 表继续作为唯一关系权威；Gateway 只提供读取映射，关系 mutation 不迁入 TCP。
 
-## P0：关系只读 `REL-READ-3`
+1. 将 Realtime 投影 list/catch-up backend 接入现有 handler，使用 Shared `TcpRelationship*` 与 sync 类型做唯一 wire 输入；禁止从 Realtime 数据库实体或内部 DTO 自动序列化客户端响应。
+2. 显式映射 owner/list/resource/version、opaque cursor/watermark、partial/reset 与稳定错误；响应预算裁剪后才能决定下一水位，不能返回伪空成功或 `HasMore` 缺 cursor。
+3. 覆盖 unavailable、projection changed、gap、retention exceeded、invalid cursor、重复请求、分页中权限变化、断线续页和 capability 关闭。失败必须保留旧有效状态且不推动 Client 水位。
+4. 以同一账户的 Server HTTP 好友、申请和黑名单列表逐项对照；出现差异时只修投影、mapper 或分页语义，禁止恢复 legacy Realtime 关系表或 Gateway 本地权威。
+5. 完成 Client 首次加载、增量、reset、账户切换和多设备变化联调；用 5–20 分钟短测覆盖断线与续页，不把性能基准混进正确性结论。
 
-Server HTTP 与 public `T_*` 表继续作为唯一关系权威；TCP relation list/sync/mutation 在本批次完成前保持 fail-closed，旧 Realtime 关系表不得恢复为在线权威。
+完成标准：Client 仅依赖 TCP read 即可从 snapshot 收敛并持续 catch-up；所有 gap 都显式 reset，mutation 仍由 HTTP 完成，关闭能力后安全 fail-closed。
 
-1. 以 Shared 已有 list/catch-up/reset DTO、字段预算、reserved 字段和错误语义为唯一 wire 输入；只有真实消费测试复现契约缺口时才回到 Shared 修正，不在 Gateway 创建本地同义 DTO。
-2. Realtime 完成 snapshot-gated list 与投影 change history/catch-up 同源读取：无 checkpoint 返回 unavailable；分页期间 version 变化要求重启；重复/乱序 delta、gap 修复和故障恢复后结果仍与 Server HTTP 一致。
-3. Gateway 增加 Realtime owner → TCP wire 的显式 mapper 和默认关闭 capability，不得从 Realtime 内部 DTO 或数据库形状推导 wire。
-4. 覆盖响应字节预算、断线续页、重复请求、旧 cursor、权限变化和 HTTP 权威逐项对照。任一差异关闭 capability，读取继续 fail-closed，已协商连接不在线改变语义。
-5. Client 可先用 fixture 完成本地投影与恢复，真实链路完成后再接 list/sync；mutation 永久走 Server HTTP。多设备合并、reset 可重入和离线恢复必须使用同一组 Shared 语义。
+## P1：`VOICE-MSG-2` 语音消息
 
-## P1：`TCP-PERF-2` 短测驱动的 CPU/内存优化
+1. Shared 固定语音附件的 codec/container、MIME、duration、sample rate、channels、size 与可选 waveform；Gateway 只映射这些有界字段和附件引用。
+2. 发送继续复用现有附件 ownership、finalize、扫描、绑定和消息幂等。只有 `Available` 附件可发送；扫描中、拒绝、过期、非本人和已绑定冲突返回稳定错误。
+3. 历史、同步、撤回、保留清理和跨 Gateway delivery 与普通附件消息共享语义；音频正文、临时本地路径和下载票不得进入日志、Outbox 或 TCP payload。
+4. 增加畸形元数据、超限、重复 client message id、断线重试和旧客户端未知字段测试；再联调录制 → 上传 → 发送 → 接收 → 播放。
 
-既有 `TCP-MEM-1` 已覆盖 10k 静默、heartbeat-only、active/slow-reader，并保存 gcdump、PSS、fd 与 socket 归因；不要重复整批测量。
+完成标准：语音消息不新增独立传输栈，正常与失败路径均可恢复，关闭语音能力不影响普通附件和文本消息。
 
-1. 先读取现有证据，按 retained bytes、allocation/message、CPU sample 或 kernel socket 占用选出一个 Top 热点；若证据不足，只补针对该热点的采样。
-2. 建立可重复的微基准或聚焦计数测试，再一次只修改一个因素。优先审查 per-session CTS/waiter、send-loop 状态、deadline callback、缓冲区保留和连接级集合；不得为了理论收益增加协议复杂度。
-3. 对原实现与候选执行至少两轮交错的 3–5 分钟同构 A/B，固定连接 ramp、负载、配置和依赖。已胜出的候选最多增加一次 10–15 分钟 Linux 样本确认 PSS/retained 趋势。
-4. 同时记录吞吐、ACK/跨 Gateway delivery、p95/p99、CPU、GC、allocation、PSS、fd、socket 和所有预算；必须零漏帧、零重复、零预算泄漏，p95/p99 不回退超过 5%。
-5. 只有归因证据显示约 15% 以上热点改善，或单个开关稳定节省约 0.5 KiB/连接，才保留实现；否则撤回复杂度并记录负结果。
+## P1：`CALL-E2E-2` 1:1 通话控制面
 
-## P1：消息链路与数据库短测
+1. Shared 固定 CallInvite/Accept/Reject/Cancel/End/Reconnect 及必要 SDP/ICE envelope，包含 call id、command id、revision、TTL 和明确预算。
+2. Gateway 校验 authenticated actor、Server 短期 call grant、好友/拉黑权限、并发通话上限和用户/连接速率；重复 command id 幂等，过期或乱序命令 fail-closed。
+3. 复用 Realtime 临时状态机与非持久化 signal 路径完成跨 Gateway 路由；结束、超时和断线后清理 route，不把 SDP/ICE 写入 PostgreSQL、Outbox 或聊天 JetStream。
+4. 覆盖双方同时发起/挂断、多设备竞争、Gateway 切换、依赖短暂中断、ICE restart 和旧 capability 客户端。控制面只决定状态，媒体使用 WebRTC/SRTP 与 ICE/STUN/TURN。
 
-1. 用 trace、`pg_stat_statements`、WAL/message、DB ops/message 和 allocation/message 确认 Top SQL 或调度路径；每轮只改变一个 SQL、索引、批处理或调度因素。
-2. Outbox hint 合并默认保持 `0 ms`；`2 ms` 仅作为显式资源优先模式，未证明尾延迟风险可接受前不改变默认值。
-3. 以 80/320/640 msg/s 每档 2–3 分钟做 admission/capacity 快筛，验证逐消息 ACK、跨 Gateway 投递、重复/漏投、Outbox/JetStream/死信、CPU、GC、SQL、WAL 与 p95/p99；较低档失败立即停止升档。
-4. 获胜候选只补一次 10–15 分钟同构样本。每轮使用独立目录并记录配置、commit、负载和资源采样，禁止拼接历史运行得出结论。
-5. 补慢速 header/payload、全局入站预算耗尽、连接风暴、依赖断开/恢复和跨 Gateway 重连的短时故障测试。
+完成标准：所有信令序列得到唯一终态，鉴权和预算可测试，TCP Gateway 不承载连续媒体包或自定义 UDP 可靠层。
 
-## P1：Shared 真实 DTO `BIN-SCHEMA-2`
+## 支撑：`BIN-INTEGRATION-3`
 
-唯一 wire 规范由 `ChatApp.Shared/docs/BINARY-PROTOCOL.md` 维护。Gateway 不重新定义字段编码、公共原语、reader/writer 或兼容 facade。
+1. 仅在 Shared 当前 schema 批次完成且功能命令目录稳定后接入。握手与协商前保持 JSON，首版 Resume 也保持 JSON；协商后 session 固定 exact format，不 sniff、不在线切换。
+2. 入站使用 Shared generated decoder，出站使用普通源码 encoder；Gateway 负责 buffer owner、池归还和敏感区清理，不复制 Core 指针实现或 schema。
+3. 混合连接按 format 分组，每个事件每种格式最多编码一次并共享只读 frame；不能退化为逐 session 序列化。
+4. 用真实 Chat/History/Sync/关系/语音/通话 corpus 比较 payload、CPU、allocation 和 p95/p99；完成 malformed/oversize/fuzz、fallback、GoAway/重连与 80/320/640 msg/s 短测。收益不足时继续使用 JSON。
 
-1. 盘点所有握手后带 payload 的命令，至少覆盖 ChatMessage、ACK、History、Sync、Receipt、Edit/Revoke、Presence、Typing、Group、Attachment 和错误响应；当前帧头没有逐帧格式位，因此不能只迁移部分命令。
-2. 为真实 DTO 固定字段号、wire type、required/optional、默认值、最大长度、集合上限、reserved 范围与未知字段行为。嵌套与集合规则先在 Shared 固定后再生成代码。
-3. encoder 保持普通源码单遍写入连续 `Span<byte>`；decoder 使用生成的连续/分段实现。运行时不使用反射、动态注册、旧两遍 measured adapter 或逐字段中间对象。
-4. 增加同语义 golden、截断、非 canonical varint、非法 UTF-8、重复/乱序字段、未知字段、深度/长度预算和 segmented input fuzz。失败必须 fail-closed，borrowed view 不得逃逸 owner 生命周期。
-5. 用真实消息 corpus 对 JSON 与二进制比较 payload bytes、encode/decode ns、allocation/message 和必要 DTO 所有权分配；单字段微探针不能替代真实结果。
+## 支撑：`PERF-SUPPORT-1`
 
-## P1：Gateway 双 codec `BIN-INTEGRATION-3`
+1. 先读取现有 `TCP-MEM-1`、数据库和 soak 证据，仅为当前功能回归或 profiler Top 热点补采样。
+2. 微基准或聚焦计数先证明原因，再一次修改一个因素；优先处理可测量的 per-session retained、allocation/message、CPU sample、DB ops/WAL 或 p99 问题。
+3. 原实现与候选至少做两轮交错的 3–5 分钟同构 A/B；保持连接 ramp、负载、配置和依赖一致。只有趋势不清时补一次 10–15 分钟样本。
+4. 必须保持零漏投、零重复、零预算泄漏和资源正确释放；复杂度增加但收益不稳定时撤回实现并记录负结论。
 
-1. `ClientHello` / `ServerHello` 与协商完成前的数据始终使用 JSON；完整握手后把 payload format 固化到 session。首版 Resume 强制 JSON，入站不 sniff，连接中途不切换格式。
-2. Gateway 从 frame owner 获取连续可提交 `Span<byte>` 调用 Shared encoder；入站按连续或分段 buffer 调用生成 decoder。成功、异常、扩容和引用归零路径都必须正确释放 owner，敏感 buffer 必须清零。
-3. 混合连接按 format 分组，每个事件每种格式最多编码一次并复用共享帧；格式数量设硬上限，禁止逐 session 重复序列化。
-4. capability 默认关闭并提供 JSON 降级开关。关闭选择后由旧连接自然排空或明确重连，不在线改变已有 session 的格式。
-5. 在真实 corpus 达到 payload 至少下降 30%，序列化 CPU 或分配至少下降 20%，且 80/320/640 msg/s 短测保持 ACK/delivery 零漏零重、p95/p99 无显著回退后，才允许小范围接入；否则保持 JSON 默认。
+## 后续但不在当前阶段
 
-## P2：`VOICE-SIGNAL-1` 语音通话信令
+- 群通话/SFU：1:1 通话稳定后再设计独立媒体服务与容量模型。
+- QUIC：只在真实移动网络问题无法由 TCP/WebRTC 解决时做可关闭对照；裸 UDP 不进入聊天控制面。
+- Push/更深可观测性：按真实客户端需求和故障缺口逐项接入，不先建设空壳平台。
 
-1. Shared 定义版本化 CallInvite/Offer/Answer/IceCandidate/Hangup/Reject 信令，字段至少包含 `CallId`、`RequestId`、参与者、序号、过期时间和 capability；为 SDP/ICE 数量、单项长度和整帧大小设置硬预算。
-2. Gateway 只允许 authenticated session 发送信令，复用关系/拉黑授权，增加用户级与连接级速率限制、并发通话上限、过期拒绝、幂等和重放保护。
-3. Realtime 负责跨 Gateway 在线路由和短 TTL 状态，不把音频、视频或连续媒体包写入 PostgreSQL、Outbox 或聊天 JetStream；离线与依赖失败返回明确状态。
-4. Client 实现显式状态机，覆盖重复/乱序信令、双方同时发起、拒绝、超时、断线、网络切换、多设备竞争和旧 capability 客户端。
-5. 语音消息复用附件 ownership、finalize、扫描和下载授权；TCP frame 只传附件引用。1:1 通话媒体使用 WebRTC/SRTP 与 ICE/STUN/TURN，裸 UDP 不进入聊天、鉴权、同步或 ACK。
-6. 先通过契约与状态机测试，再做 3–5 分钟跨 Gateway 信令 smoke。群通话 SFU 与 QUIC transport 留作后续独立评估，本阶段不执行。
+## 验证顺序
 
-## 可维护性与验证
-
-1. 只在本批次触达时拆分 oversized 类型；新 handler、mapper 和状态机保持单一职责，并为资源关闭和竞态补确定性测试。
-2. 日志只记录结构化故障信息，不记录 token、SDP、ICE 明文、消息正文或附件内容；新增指标保持低基数。
-3. 通用验证顺序：聚焦单测/契约测试 → Release 构建 → 3–5 分钟 smoke 或同构 A/B；只有已胜出的性能改动需要补充归因时，才增加一次 10–15 分钟 Linux 样本。
-4. 任一正确性、资源所有权、ACK/delivery 或 p95/p99 门禁失败都先修复或撤回候选，不靠延长测试掩盖问题。
+聚焦单测/契约测试 → Release 构建 → 3–5 分钟 smoke 或同构 A/B；必要时补一次 10–15 分钟样本。当前阶段到功能联调验收为止。

@@ -292,6 +292,11 @@ public sealed class RealtimeMessagingTests
                 CancellationToken ct = default) =>
             Task.FromResult<ChatApp.Realtime.Abstractions.Messaging.History.RealtimeHistoryMessage?>(null);
 
+        public Task<CallProcessResult> SendCallCommandAsync(
+            CallCommand command,
+            CancellationToken ct = default) =>
+            Task.FromResult(CallProcessResult.Failed(CallErrorCode.StateStoreUnavailable, "unavailable"));
+
         public Task PublishEventAsync(
             RealtimeEvent evt,
             CancellationToken ct = default) =>

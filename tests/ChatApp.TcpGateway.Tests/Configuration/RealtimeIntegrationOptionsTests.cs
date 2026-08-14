@@ -88,7 +88,7 @@ public sealed class RealtimeIntegrationOptionsTests
     {
         var options = new RealtimeIntegrationOptions();
 
-        Assert.Equal("chat.realtime-events.{0}", options.RealtimeEventsShardSubjectPattern);
+        Assert.Equal("chat.realtime-events.shards.{0}", options.RealtimeEventsShardSubjectPattern);
         Assert.Equal("chat.ephemeral.typing.{0}", options.EphemeralTypingShardSubjectPattern);
         Assert.Equal("chat.ephemeral.presence.{0}", options.EphemeralPresenceShardSubjectPattern);
     }

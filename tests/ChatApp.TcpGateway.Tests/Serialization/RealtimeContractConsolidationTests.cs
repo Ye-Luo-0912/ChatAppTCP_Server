@@ -167,7 +167,7 @@ public sealed class RealtimeContractConsolidationTests
             attachment,
             GatewayJsonSerializerContext.Default.AttachmentRef);
         Assert.Equal(
-            "{\"refVersion\":1,\"attachmentId\":\"att-1\",\"fileName\":\"photo.png\",\"contentType\":\"image/png\",\"sizeBytes\":42,\"status\":1,\"downloadApiHint\":\"att-1\"}",
+            "{\"refVersion\":1,\"attachmentId\":\"att-1\",\"fileName\":\"photo.png\",\"contentType\":\"image/png\",\"sizeBytes\":42,\"status\":1,\"downloadApiHint\":\"att-1\",\"isVoice\":false}",
             attachmentJson);
 
         var cursor = new SharedConversationListCursor(true, 120, 100, "conv-1");

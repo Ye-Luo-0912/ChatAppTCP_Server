@@ -47,7 +47,7 @@ chat.message-history.query 的 Core NATS request/reply 完成。
 ## 序列化扩展
 
 当前 JSON 业务路径依赖 `IPayloadCodec<T>`；`JsonPayloadCodec<T>` 使用
-`JsonSerializerContext`（源生成 `JsonTypeInfo`）。默认发布为 JIT + TieredPGO；
+`JsonSerializerContext`（源生成 `JsonTypeInfo`）。默认运行为 JIT + TieredPGO；
 Native AOT 可选，见 [AGENTS.md](AGENTS.md)。二进制接入不会强行套用该对象型接口：
 编码热路径由 frame owner 提供连续 `Span<byte>` 并在成功后提交，解码调用 Shared 的静态生成入口。
 
@@ -77,7 +77,7 @@ InstanceId 必须单实例唯一且重启稳定，网关的
 为主，采样率由 `TraceSampleRatio` 控制。
 
 Gateway 的独立 Prometheus HttpListener 仅保留给本地诊断，默认关闭；该 exporter 仍是
-预发布开发组件，不作为稳定性门禁。RealtimeServices 使用 Kestrel
+本地诊断组件，不作为稳定性门禁。RealtimeServices 使用 Kestrel
 提供 `GET /metrics` 的 Prometheus 文本端点，并把原 JSON 快照移动到
 `GET /diagnostics/runtime`。Outbox pending、最老待发布消息年龄、最大尝试次数、历史查询
 队列/执行中数量、NATS 连接/重连、JetStream pending/redelivery/ACK、运行时和 Npgsql
@@ -127,4 +127,4 @@ AccessToken 缓存键保持现有约定：
 跨项目消息语义见[消息链路说明](docs/realtime-message-flow.md)，性能测试方法见
 [性能基线说明](docs/performance-baseline.md)，一键组合基准见
 [多进程编排器](tools/ChatApp.Performance.Orchestrator/README.md)，后续功能与验收标准见
-[优化路线图](docs/optimization-roadmap.md)。
+[下一阶段摘要](docs/NEXT-STAGE.md)，详细待办见 [路线执行清单](docs/roadmap-todo.md)。

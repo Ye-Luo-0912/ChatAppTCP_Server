@@ -375,6 +375,16 @@ public static class InfrastructureServiceCollectionExtensions
         services.AddSingleton<IPayloadCodec<RelationshipListResponse>>(
             static _ => new JsonPayloadCodec<RelationshipListResponse>(
                 GatewayJsonSerializerContext.Default.RelationshipListResponse));
+        // CALL-E2E-2：通话信令控制面协议
+        services.AddSingleton<IPayloadCodec<TcpCallCommandRequest>>(
+            static _ => new JsonPayloadCodec<TcpCallCommandRequest>(
+                GatewayJsonSerializerContext.Default.TcpCallCommandRequest));
+        services.AddSingleton<IPayloadCodec<TcpCallCommandResponse>>(
+            static _ => new JsonPayloadCodec<TcpCallCommandResponse>(
+                GatewayJsonSerializerContext.Default.TcpCallCommandResponse));
+        services.AddSingleton<IPayloadCodec<TcpCallSignal>>(
+            static _ => new JsonPayloadCodec<TcpCallSignal>(
+                GatewayJsonSerializerContext.Default.TcpCallSignal));
         services.AddSingleton<IPayloadCodec<MembersAddedUpdate>>(
             static _ => new JsonPayloadCodec<MembersAddedUpdate>(
                 GatewayJsonSerializerContext.Default.MembersAddedUpdate));

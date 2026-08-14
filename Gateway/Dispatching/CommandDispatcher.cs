@@ -1,5 +1,6 @@
 using ChatApp.TcpGateway.Core.Protocol;
 using ChatApp.TcpGateway.Gateway.Commands.Attachments;
+using ChatApp.TcpGateway.Gateway.Commands.Calls;
 using ChatApp.TcpGateway.Gateway.Commands.Conversations;
 using ChatApp.TcpGateway.Gateway.Commands.Groups;
 using ChatApp.TcpGateway.Gateway.Commands.Messaging;
@@ -34,6 +35,7 @@ internal sealed class CommandDispatcher
     private readonly PresenceCommandHandler _presenceHandler;
     private readonly AttachmentCommandHandler _attachmentHandler;
     private readonly RelationshipCommandHandler _relationshipHandler;
+    private readonly CallCommandHandler _callHandler;
 
     public CommandDispatcher(
         PushTokenCommandHandler pushTokenHandler,
@@ -45,7 +47,8 @@ internal sealed class CommandDispatcher
         TypingCommandHandler typingHandler,
         PresenceCommandHandler presenceHandler,
         AttachmentCommandHandler attachmentHandler,
-        RelationshipCommandHandler relationshipHandler)
+        RelationshipCommandHandler relationshipHandler,
+        CallCommandHandler callHandler)
     {
         _pushTokenHandler = pushTokenHandler;
         _reactionHandler = reactionHandler;
@@ -57,6 +60,7 @@ internal sealed class CommandDispatcher
         _presenceHandler = presenceHandler;
         _attachmentHandler = attachmentHandler;
         _relationshipHandler = relationshipHandler;
+        _callHandler = callHandler;
     }
 
     /// <summary>
@@ -127,6 +131,10 @@ internal sealed class CommandDispatcher
         PacketCommand.RelationshipCommandRequest
         or PacketCommand.RelationshipListRequest =>
             InvokeAsync(_relationshipHandler, frame, context, cancellationToken),
+
+        // Calls (CALL-E2E-2)
+        PacketCommand.CallCommandRequest =>
+            InvokeAsync(_callHandler, frame, context, cancellationToken),
 
         _ => new ValueTask<bool>(false)
     };
