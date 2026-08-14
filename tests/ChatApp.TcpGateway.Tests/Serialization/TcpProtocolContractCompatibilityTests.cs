@@ -167,7 +167,8 @@ public sealed class TcpProtocolContractCompatibilityTests
                 ("MessageReactions", 1u << 9),
                 ("GroupManagement", 1u << 10),
                 ("PushTokenManagement", 1u << 11),
-                ("CallSignaling", 1u << 12)
+                ("CallSignaling", 1u << 12),
+                ("RelationshipRead", 1u << 13)
             },
             GetOrderedEnumSurface<SharedGatewayFeature>());
     }

@@ -380,7 +380,10 @@ internal static class CommandCatalog
             ConnectionPhase.Authenticated, CommandLane.Inline, -1, 1),
         PacketCommand.RelationshipListRequest => new(
             PacketCommand.RelationshipListRequest, CommandDirection.ClientToServer,
-            ConnectionPhase.Authenticated, CommandLane.Query, 4096, 1),
+            ConnectionPhase.Authenticated, CommandLane.Query, 4096, 1)
+        {
+            RequiredFeature = GatewayFeature.RelationshipRead
+        },
         PacketCommand.RelationshipListResponse => new(
             PacketCommand.RelationshipListResponse, CommandDirection.ServerToClient,
             ConnectionPhase.Authenticated, CommandLane.Inline, -1, 1),

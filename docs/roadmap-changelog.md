@@ -3,6 +3,31 @@
 本文件记录已完成的历史变更，按时间倒序排列。当前状态见 `roadmap-current-state.md`，
 未完成工作见 `roadmap-todo.md`。本文件不再保留过期测试数字（当时通过数仅作参考）。
 
+## 2026-08-14
+
+### REL-E2E-4 Gateway 关系读取端收口
+
+Gateway 关系读取 handler 从 Core/Realtime 内部 DTO 迁到 Shared `TcpRelationshipList*`
+wire 契约，作为 Client↔Gateway 之间关系只读列表的唯一 schema。
+
+- `RelationshipCommandHandler.HandleListAsync` 使用 Shared
+  `TcpRelationshipListRequest/Response`；内部经 `HistoryWireMapper.MapRelationshipItems`
+  显式把 Realtime `RelationshipListItem` 映射为 Shared `TcpRelationshipListItem`，
+  禁止把 Realtime 内部 DTO 直接序列化给客户端。
+- 稳定错误码落地：`ProjectionUnavailable` / `ProjectionChanged` / `GapDetected` /
+  `InvalidCursor` / `PageSizeOutOfRange` / `BadRequest`；`ResetRequired` 仅在
+  projection-changed / gap 时置位，失败不推动 Client 水位。
+- 命令级门控：`CommandCatalog.RelationshipListRequest` 增加
+  `RequiredFeature = GatewayFeature.RelationshipRead`（Shared 分配位 `1u<<13`），
+  加入 `GatewayFeatureSet.Implemented`；严格客户端需协商能力位，legacy 客户端向后兼容。
+- DI 与序列化：`GatewayJsonSerializerContext` 注册 Shared `TcpRelationshipList*` 类型，
+  `InfrastructureServiceCollectionExtensions` 改用 Shared list codec；5 个既有测试文件
+  更新 handler 构造参数。
+- 新增端到端集成测试 `RelationshipListReadIntegrationTests`（5 项）：item 映射、分页
+  （HasMore/NextCursor）、gap 触发 reset、unavailable fail-closed、page size 越界。
+  全部 574 项测试通过（1 项 Redis 用例按设计跳过）。
+- Server/Client 侧剩余工作（HTTP 权威逐项对照、Client 水位恢复）见 `roadmap-todo.md`。
+
 ## 2026-08-11
 
 ### TCP-MEM-1 正式测量完成（Linux 真机 192.168.5.49）

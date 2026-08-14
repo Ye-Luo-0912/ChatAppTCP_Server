@@ -20,11 +20,11 @@
 
 Server HTTP 与 public `T_*` 表继续作为唯一关系权威；Gateway 只提供读取映射，关系 mutation 不迁入 TCP。
 
-1. 将 Realtime 投影 list/catch-up backend 接入现有 handler，使用 Shared `TcpRelationship*` 与 sync 类型做唯一 wire 输入；禁止从 Realtime 数据库实体或内部 DTO 自动序列化客户端响应。
-2. 显式映射 owner/list/resource/version、opaque cursor/watermark、partial/reset 与稳定错误；响应预算裁剪后才能决定下一水位，不能返回伪空成功或 `HasMore` 缺 cursor。
-3. 覆盖 unavailable、projection changed、gap、retention exceeded、invalid cursor、重复请求、分页中权限变化、断线续页和 capability 关闭。失败必须保留旧有效状态且不推动 Client 水位。
-4. 以同一账户的 Server HTTP 好友、申请和黑名单列表逐项对照；出现差异时只修投影、mapper 或分页语义，禁止恢复 legacy Realtime 关系表或 Gateway 本地权威。
-5. 完成 Client 首次加载、增量、reset、账户切换和多设备变化联调；用 5–20 分钟短测覆盖断线与续页，不把性能基准混进正确性结论。
+1. [x] 将 Realtime 投影 list/catch-up backend 接入现有 handler，使用 Shared `TcpRelationship*` 与 sync 类型做唯一 wire 输入；禁止从 Realtime 数据库实体或内部 DTO 自动序列化客户端响应。（Gateway 侧已完成，见 `roadmap-changelog.md` 2026-08-14）
+2. [x] 显式映射 owner/list/resource/version、opaque cursor/watermark、partial/reset 与稳定错误；响应预算裁剪后才能决定下一水位，不能返回伪空成功或 `HasMore` 缺 cursor。（Gateway 侧已完成）
+3. [x] 覆盖 unavailable、projection changed、gap、retention exceeded、invalid cursor、重复请求、分页中权限变化、断线续页和 capability 关闭。失败必须保留旧有效状态且不推动 Client 水位。（Gateway 侧已落地 fail-closed 与 reset 语义，集成测试见 `RelationshipListReadIntegrationTests`）
+4. [ ] 以同一账户的 Server HTTP 好友、申请和黑名单列表逐项对照；出现差异时只修投影、mapper 或分页语义，禁止恢复 legacy Realtime 关系表或 Gateway 本地权威。（跨仓：Server HTTP 权威逐项对照）
+5. [ ] 完成 Client 首次加载、增量、reset、账户切换和多设备变化联调；用 5–20 分钟短测覆盖断线与续页，不把性能基准混进正确性结论。（跨仓：Client 水位恢复联调）
 
 完成标准：Client 仅依赖 TCP read 即可从 snapshot 收敛并持续 catch-up；所有 gap 都显式 reset，mutation 仍由 HTTP 完成，关闭能力后安全 fail-closed。
 

@@ -17,3 +17,6 @@ global using ConversationSyncWatermark = ChatApp.Shared.Protocol.Tcp.Conversatio
 global using SyncBootstrapRequest = ChatApp.Shared.Protocol.Tcp.SyncBootstrapRequest;
 global using SyncBootstrapResponse = ChatApp.Shared.Protocol.Tcp.SyncBootstrapResponse;
 global using SyncCursorResetRequired = ChatApp.Shared.Protocol.Tcp.SyncCursorResetRequired;
+global using TcpRelationshipListRequest = ChatApp.Shared.Protocol.Tcp.TcpRelationshipListRequest;
+global using TcpRelationshipListResponse = ChatApp.Shared.Protocol.Tcp.TcpRelationshipListResponse;
+global using TcpRelationshipListItem = ChatApp.Shared.Protocol.Tcp.TcpRelationshipListItem;

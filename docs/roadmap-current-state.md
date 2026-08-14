@@ -158,7 +158,11 @@ feed 中的 `ChatApp.Protocol.Tcp 0.5.0` / `.Json 0.5.0`、`ChatApp.Realtime.Con
 
 - Client 的关系读写继续走 ChatApp.Server HTTP；Server 的 public `T_*` 表是当前唯一在线权威。
 - Realtime 关系 mutation 继续返回明确迁移错误；投影 list/catch-up 已从同一套 Server 权威投影读取，
-  不再读取或写入 legacy realtime 表。Gateway/Client 的外部读取入口尚待 `REL-E2E-4` 接通。
+  不再读取或写入 legacy realtime 表。**Gateway 关系读取端已完成 `REL-E2E-4` 收口**：handler 使用
+  Shared `TcpRelationshipListRequest/Response` 作为唯一 wire 输入/输出，经显式 mapper
+  （`HistoryWireMapper.MapRelationshipItems`）把 Realtime 投影项映射为客户端项，稳定错误码
+  （unavailable / projection changed / gap / invalid cursor / page size）与 reset 语义已落地，
+  并以 `GatewayFeature.RelationshipRead` 命令级门控（严格客户端需协商能力位；legacy 客户端仍向后兼容）。
 - 私聊授权仍由 Realtime 的 authorization store 读取 Server public 权威表，不因关闭旧关系
   command/list/sync 而放松权限。
 - 旧 `NpgsqlRelationshipStore`/default processor 只保留为显式迁移或应急工具，不在默认 DI 中；
@@ -166,8 +170,8 @@ feed 中的 `ChatApp.Protocol.Tcp 0.5.0` / `.Json 0.5.0`、`ChatApp.Realtime.Con
 - Server 已在关系事务内分配 owner/list 连续版本并发布 `RelationshipProjectionDelta v1`；Realtime
   在 JetStream ACK 前原子应用 inbox/item/version/history，只接受连续版本，并能从 Server snapshot
   回填和按 count/hash 修复。Rebuilder、reconcile、snapshot-gated list 与 catch-up 同源读取已有验证。
-  当前剩余工作是 Gateway 显式 mapper、Client 水位恢复和 HTTP 权威端到端对照；在 `REL-E2E-4`
-  完成前 TCP relation 读取仍保持关闭，mutation 始终走 HTTP。
+  当前剩余工作聚焦 Client 水位恢复与 HTTP 权威端到端逐项对照（涉及 Client 与 Server 仓库），
+  Gateway 侧读取入口已接通；mutation 始终走 HTTP。
 
 ### 附件（Gateway 侧协议层 + Finalize 后端已完成，跨仓库部分待补）
 

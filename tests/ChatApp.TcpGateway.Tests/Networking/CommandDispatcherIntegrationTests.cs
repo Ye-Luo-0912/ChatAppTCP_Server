@@ -315,10 +315,10 @@ public sealed class CommandDispatcherIntegrationTests
                 GatewayJsonSerializerContext.Default.RelationshipCommandRequest),
             new JsonPayloadCodec<RelationshipCommandResponse>(
                 GatewayJsonSerializerContext.Default.RelationshipCommandResponse),
-            new JsonPayloadCodec<RelationshipListRequest>(
-                GatewayJsonSerializerContext.Default.RelationshipListRequest),
-            new JsonPayloadCodec<RelationshipListResponse>(
-                GatewayJsonSerializerContext.Default.RelationshipListResponse),
+            new JsonPayloadCodec<TcpRelationshipListRequest>(
+                GatewayJsonSerializerContext.Default.TcpRelationshipListRequest),
+            new JsonPayloadCodec<TcpRelationshipListResponse>(
+                GatewayJsonSerializerContext.Default.TcpRelationshipListResponse),
             metrics,
             NullLogger<RelationshipCommandHandler>.Instance);
 
