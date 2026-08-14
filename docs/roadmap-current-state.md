@@ -186,6 +186,12 @@ feed 中的 `ChatApp.Protocol.Tcp 0.5.0` / `.Json 0.5.0`、`ChatApp.Realtime.Con
   前 2 值已对齐，扩展状态（UploadConfirmed/Rejected/Expired/ThumbnailUpdated）仅由
   `AttachmentLifecycleHandler` 下游推送使用，不参与 `AttachmentWireMapper` 映射。
 - **Finalize 后端已完成（2026-08-03）**：详见 `roadmap-changelog.md`。
+- **语音元数据映射已完成（VOICE-MSG-2，Gateway 侧）**：`HistoryWireMapper.MapAttachments`
+  将 Realtime `AttachmentRef` 的 6 个语音字段（`IsVoice`/`VoiceCodec`/`VoiceContainer`/
+  `VoiceDurationMs`/`VoiceSampleRateHz`/`VoiceChannels`）完整映射到 Shared `TcpAttachmentRef`
+  线协议；非语音附件保持默认值，旧客户端忽略未知字段向后兼容。Gateway 已升到
+  `ChatApp.Protocol.Tcp`/`.Json 0.5.3`，并新增 `HistoryWireMapperAttachmentTests` 覆盖
+  语音字段映射、非语音默认值与 null/空输入。
 - **跨仓库待补**：所有权校验、扫描/审核、过期清理（sweep worker）和下载授权；
   语音消息批次复用并补齐这些附件能力。
 ### 可观测性

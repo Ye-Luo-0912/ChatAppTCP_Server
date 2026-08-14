@@ -43,7 +43,13 @@ internal static class HistoryWireMapper
                 Status = (short)item.Status,
                 DownloadApiHint = item.DownloadApiHint,
                 DownloadToken = item.DownloadToken,
-                ThumbnailApiHint = item.ThumbnailApiHint
+                ThumbnailApiHint = item.ThumbnailApiHint,
+                IsVoice = item.IsVoice,
+                VoiceCodec = item.VoiceCodec,
+                VoiceContainer = item.VoiceContainer,
+                VoiceDurationMs = item.VoiceDurationMs,
+                VoiceSampleRateHz = item.VoiceSampleRateHz,
+                VoiceChannels = item.VoiceChannels
             };
         }
 
