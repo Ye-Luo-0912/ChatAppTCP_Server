@@ -431,6 +431,19 @@
           "StackExchange.Redis": "[3.0.17, )"
         }
       },
+      "ChatApp.Realtime.Contracts": {
+        "type": "Project"
+      },
+      "chatapp.realtime.infrastructure.core": {
+        "type": "Project",
+        "dependencies": {
+          "ChatApp.Realtime.Contracts": "[2.5.2, )",
+          "Microsoft.Extensions.Configuration.Abstractions": "[10.0.5, )",
+          "Microsoft.Extensions.Configuration.Binder": "[10.0.5, )",
+          "Microsoft.Extensions.DependencyInjection.Abstractions": "[10.0.5, )",
+          "Microsoft.Extensions.Logging.Abstractions": "[10.0.5, )"
+        }
+      },
       "chatapp.realtime.pipelineloadgenerator": {
         "type": "Project",
         "dependencies": {
@@ -485,12 +498,6 @@
           "ChatApp.Protocol.Tcp": "[0.5.3, )",
           "Microsoft.Extensions.Logging.Abstractions": "[10.0.5, )"
         }
-      },
-      "ChatApp.Realtime.Contracts": {
-        "type": "CentralTransitive",
-        "requested": "[2.5.2, )",
-        "resolved": "2.5.2",
-        "contentHash": "+xJlypTWIZzVlI4swquPA9h2CpWMYf2fZeVclxbpVFUsu3NdN7NqdfdSPl8uqQRQjvFpC88DPyOAHVQMr3AK4Q=="
       },
       "ChatApp.Realtime.Integration": {
         "type": "CentralTransitive",

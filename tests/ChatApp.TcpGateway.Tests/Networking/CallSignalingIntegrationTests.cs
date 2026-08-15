@@ -251,7 +251,7 @@ public sealed class CallSignalingIntegrationTests
     }
 
     /// <summary>端到端 TCP 测试夹具：装配 TcpGatewayService 与全部 handler。</summary>
-    private sealed class CallHarness : IAsyncDisposable
+    internal sealed class CallHarness : IAsyncDisposable
     {
         private readonly TcpGatewayService _service;
 
@@ -265,7 +265,7 @@ public sealed class CallSignalingIntegrationTests
         public int Port { get; }
         public CancellationToken Token { get; }
 
-        public static async Task<CallHarness> StartAsync(ScriptedCallBackend backend)
+        public static async Task<CallHarness> StartAsync(ICallBackend backend)
         {
             var port = ReserveLoopbackPort();
             var options = new TcpGatewayOptions
@@ -651,7 +651,7 @@ public sealed class CallSignalingIntegrationTests
         }
     }
 
-    private sealed record ReceivedFrame(PacketCommand Command, byte[] Payload);
+    internal sealed record ReceivedFrame(PacketCommand Command, byte[] Payload);
 
     private sealed class NoopLeaseStore : IDeviceSessionLeaseStore
     {
@@ -674,7 +674,7 @@ public sealed class CallSignalingIntegrationTests
             ValueTask.FromResult<string?>(null);
     }
 
-    private sealed class NoopCallMessageBus : IRealtimeMessageBus
+    internal class NoopCallMessageBus : IRealtimeMessageBus
     {
         public Task PublishIncomingMessageAsync(IncomingMessageCommand command, CancellationToken ct = default) =>
             Task.CompletedTask;
@@ -710,7 +710,7 @@ public sealed class CallSignalingIntegrationTests
             Task.FromResult(SyncBootstrapPage.Failed(query.RequestId, "x", "x"));
         public Task<RealtimeHistoryMessage?> TryGetMessageByIdAsync(long userId, string messageId, CancellationToken ct = default) =>
             Task.FromResult<RealtimeHistoryMessage?>(null);
-        public Task<CallProcessResult> SendCallCommandAsync(CallCommand command, CancellationToken ct = default) =>
+        public virtual Task<CallProcessResult> SendCallCommandAsync(CallCommand command, CancellationToken ct = default) =>
             Task.FromResult(CallProcessResult.Failed(CallErrorCode.StateStoreUnavailable, "unavailable"));
         public Task PublishEventAsync(RealtimeEvent evt, CancellationToken ct = default) =>
             Task.CompletedTask;
