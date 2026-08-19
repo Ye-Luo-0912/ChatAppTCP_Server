@@ -92,14 +92,21 @@ internal sealed class RealtimeCallBackend : ICallBackend
         long clientOccurredAtMs,
         CancellationToken cancellationToken = default)
     {
-        // grant 是 Realtime 状态机的必需授权输入；缺失时 fail-closed，不猜测。
+        // grant 仅在建通话（Invite）时是必需授权输入；既有通话的后续命令（Accept/Reject/
+        // End/Reconnect 等）由 Realtime 以快照中的参与者身份授权（见 DefaultCallControlProcessor），
+        // Gateway 不在此预先要求 grant，否则被叫（从未持有 grant）永远无法应答。
         if (grant is null)
         {
-            return CallCommandBackendResult.Failed(
-                requestId,
-                callId,
-                TcpCallErrorCode.GrantInvalid,
-                "call grant 缺失。");
+            if (type == TcpCallCommandType.Invite)
+            {
+                return CallCommandBackendResult.Failed(
+                    requestId,
+                    callId,
+                    TcpCallErrorCode.GrantInvalid,
+                    "call grant 缺失。");
+            }
+            // 非建通话命令：不携带真实 grant，以空授权占位，交由 Realtime 按快照授权。
+            grant = new TcpCallGrant { CallId = callId };
         }
 
         var command = new RealtimeCallCommand
