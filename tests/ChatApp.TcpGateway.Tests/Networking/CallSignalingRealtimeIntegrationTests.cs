@@ -147,14 +147,13 @@ public sealed class CallSignalingRealtimeIntegrationTests
         Assert.Equal(TcpCallEndReason.HungUp, endResponse.EndReason);
         Assert.Equal(3L, endResponse.Revision);
 
-        // End 不携带 SDP（CarriesSdp 为 false），真实状态机不在临时信令路径转发 End；
-        // 只验证权威响应收敛到终态，不期待对端 End 信令。
-
-        // 状态机真实转发了 offer + answer（临时信令路径）。
+        // 非 silent 命令（Invite/Accept/Reconnect 携带 SDP；End/Reject/Cancel 为纯控制信号，
+        // Sdp 为空）一律经临时信令路径转发给对端，对端靠 Kind 驱动本端收敛终态。
         var forwarded = forwarder.Snapshot();
-        Assert.Equal(2, forwarded.Length);
+        Assert.Equal(3, forwarded.Length);
         Assert.Contains(forwarded, s => s.Kind == CallCommandType.Invite && s.Sdp == OfferSdp);
         Assert.Contains(forwarded, s => s.Kind == CallCommandType.Accept && s.Sdp == AnswerSdp);
+        Assert.Contains(forwarded, s => s.Kind == CallCommandType.End && s.ToUserId == CalleeUserId);
     }
 
     [Fact(Timeout = 15_000)]
