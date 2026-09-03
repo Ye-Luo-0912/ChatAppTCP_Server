@@ -163,17 +163,33 @@ internal sealed partial class MessagingCommandHandler
 
             // 接收方全局离线时触发离线推送（Push.Enabled 门控；
             // 触发失败内部吞掉，不影响已完成的 ack 与消息投递）。v1 仅单聊。
-            if (_offlinePushTrigger is not null && !isGroup)
+            if (_offlinePushTrigger is not null)
             {
-                await _offlinePushTrigger
-                    .TryTriggerForDirectMessageAsync(
-                        message.TargetUserId,
-                        message.ConversationId,
-                        clientMessageId,
-                        message.Content,
-                        hasAttachments,
-                        cancellationToken)
-                    .ConfigureAwait(false);
+                if (!isGroup)
+                {
+                    await _offlinePushTrigger
+                        .TryTriggerForDirectMessageAsync(
+                            message.TargetUserId,
+                            message.ConversationId,
+                            clientMessageId,
+                            message.Content,
+                            hasAttachments,
+                            cancellationToken)
+                        .ConfigureAwait(false);
+                }
+                else if (message.ConversationId is { Length: > 0 } groupConversationId)
+                {
+                    await _offlinePushTrigger
+                        .TryTriggerForGroupMessageAsync(
+                            sender.UserId,
+                            groupConversationId,
+                            clientMessageId,
+                            message.Content,
+                            hasAttachments,
+                            message.MentionedUserIds,
+                            cancellationToken)
+                        .ConfigureAwait(false);
+                }
             }
         }
         catch (OperationCanceledException)

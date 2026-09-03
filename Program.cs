@@ -118,6 +118,8 @@ builder.Services.AddSingleton<OfflinePushTrigger>(sp => new OfflinePushTrigger(
     sp.GetRequiredService<IGlobalPresenceStore>(),
     (command, ct) => sp.GetRequiredService<IRealtimeMessageBus>()
         .PublishPushDeliveryAsync(command, ct),
+    (conversationId, ct) => sp.GetRequiredService<RealtimeConversationAudienceCache>()
+        .GetOrResolveAsync(conversationId, null, ct).AsTask(),
     sp.GetRequiredService<IOptions<PushOptions>>(),
     sp.GetRequiredService<ILogger<OfflinePushTrigger>>()));
 builder.Services.AddSingleton<MessagingCommandHandler>();

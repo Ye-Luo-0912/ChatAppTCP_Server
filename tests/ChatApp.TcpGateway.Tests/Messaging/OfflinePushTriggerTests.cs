@@ -16,13 +16,19 @@ public sealed class OfflinePushTriggerTests
 {
     private const long ReceiverId = 20002;
 
+    private static readonly Dictionary<string, long[]> ResolvedAudiences = new();
+
     private static OfflinePushTrigger CreateTrigger(
         FakePresence presence,
         List<PushDeliveryCommand> published,
-        bool enabled = true)
+        bool enabled = true,
+        Action<PushOptions>? configureOptions = null)
     {
         published.Clear();
         presence.Reset();
+        ResolvedAudiences.Clear();
+        var options = new PushOptions { Enabled = enabled };
+        configureOptions?.Invoke(options);
         return new OfflinePushTrigger(
             presence,
             (command, _) =>
@@ -30,7 +36,12 @@ public sealed class OfflinePushTriggerTests
                 published.Add(command);
                 return Task.CompletedTask;
             },
-            Options.Create(new PushOptions { Enabled = enabled }),
+            (conversationId, _) =>
+            {
+                ResolvedAudiences.TryGetValue(conversationId, out var members);
+                return Task.FromResult(members ?? Array.Empty<long>());
+            },
+            Options.Create(options),
             NullLogger<OfflinePushTrigger>.Instance);
     }
 
@@ -122,12 +133,102 @@ public sealed class OfflinePushTriggerTests
         Assert.Empty(published);
     }
 
+    [Fact]
+    public async Task GroupMessage_OfflineMembers_Pushed_WithMentionFlags()
+    {
+        var presence = new FakePresence(isOnline: false, onlineUsers: [43]);
+        var published = new List<PushDeliveryCommand>();
+        // 受众：41=发送者（排除）、42/44 离线、43 在线。
+        var trigger = CreateTrigger(presence, published);
+        ResolvedAudiences["conv-group"] = [41, 42, 43, 44];
+
+        await trigger.TryTriggerForGroupMessageAsync(
+            senderUserId: 41,
+            conversationId: "conv-group",
+            messageId: "gm-1",
+            content: "group hello",
+            hasAttachments: false,
+            mentionedUserIds: [44],
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(2, published.Count);
+        // 提及优先：44（被提及）先发且 IsMention=true。
+        Assert.Equal(44, published[0].TargetUserId);
+        Assert.True(published[0].IsMention);
+        Assert.Equal(42, published[1].TargetUserId);
+        Assert.False(published[1].IsMention);
+        // 在线成员 43 未被推送；发送者 41 被排除。
+        Assert.DoesNotContain(published, p => p.TargetUserId is 43 or 41);
+        // Collapse Key：同一会话折叠。
+        Assert.All(published, p => Assert.Equal("conv-group", p.ConversationId));
+    }
+
+    [Fact]
+    public async Task GroupMessage_CapsPushes_MentionFirst()
+    {
+        var presence = new FakePresence(isOnline: false);
+        var published = new List<PushDeliveryCommand>();
+        ResolvedAudiences["conv-cap"] = [41, 42, 43, 44, 45, 46];
+        var options = new PushOptions { Enabled = true, MaxGroupOfflinePushesPerMessage = 1 };
+        var trigger = new OfflinePushTrigger(
+            presence,
+            (command, _) =>
+            {
+                published.Add(command);
+                return Task.CompletedTask;
+            },
+            (conversationId, _) =>
+            {
+                ResolvedAudiences.TryGetValue(conversationId, out var members);
+                var resolved = members ?? Array.Empty<long>();
+                Console.WriteLine($"[PROBE] resolve conv={conversationId} count={resolved.Length} cap={options.MaxGroupOfflinePushesPerMessage} enabled={options.Enabled}");
+                return Task.FromResult(resolved);
+            },
+            Microsoft.Extensions.Options.Options.Create(options),
+            NullLogger<OfflinePushTrigger>.Instance);
+
+        await trigger.TryTriggerForGroupMessageAsync(
+            senderUserId: 41,
+            conversationId: "conv-cap",
+            messageId: "gm-2",
+            content: "cap",
+            hasAttachments: false,
+            mentionedUserIds: [45],
+            TestContext.Current.CancellationToken);
+
+        // cap 1：仅提及的 45（提及优先）。
+        Assert.True(published.Count == 1,
+            $"DEBUG published={published.Count} cap={options.MaxGroupOfflinePushesPerMessage} enabled={options.Enabled} audience={ResolvedAudiences["conv-cap"].Length}");
+        Assert.Equal(45, published[0].TargetUserId);
+        Assert.True(published[0].IsMention);
+    }
+
+    [Fact]
+    public async Task GroupMessage_AudienceResolveFailure_IsSwallowed()
+    {
+        var presence = new FakePresence(isOnline: false);
+        var published = new List<PushDeliveryCommand>();
+        var trigger = CreateTrigger(presence, published);
+        // 未注册受众 → 解析返回空数组（仓内 fail-closed 惯例在缓存内部实现）。
+
+        await trigger.TryTriggerForGroupMessageAsync(
+            41, "conv-unknown", "gm-3", "hello", false, null,
+            TestContext.Current.CancellationToken);
+
+        Assert.Empty(published);
+    }
+
     internal sealed class FakePresence : IGlobalPresenceStore
     {
         private readonly bool _isOnline;
+        private readonly HashSet<long>? _onlineUsers;
         private int _isOnlineCalls;
 
-        public FakePresence(bool isOnline) => _isOnline = isOnline;
+        public FakePresence(bool isOnline, IEnumerable<long>? onlineUsers = null)
+        {
+            _isOnline = isOnline;
+            _onlineUsers = onlineUsers is null ? null : new HashSet<long>(onlineUsers);
+        }
 
         public int IsOnlineCalls => _isOnlineCalls;
 
@@ -155,9 +256,14 @@ public sealed class OfflinePushTriggerTests
         }
 
         public Task<IReadOnlyDictionary<long, bool>> GetOnlineManyAsync(
-            IReadOnlyList<long> userIds, CancellationToken ct = default) =>
-            Task.FromResult<IReadOnlyDictionary<long, bool>>(
-                userIds.ToDictionary(id => id, _ => _isOnline));
+            IReadOnlyList<long> userIds, CancellationToken ct = default)
+        {
+            Console.WriteLine($"[PROBE] getonline n={userIds.Count} users={string.Join(",", userIds)}");
+            return Task.FromResult<IReadOnlyDictionary<long, bool>>(
+                userIds.ToDictionary(
+                    id => id,
+                    id => _onlineUsers is not null && _onlineUsers.Contains(id)));
+        }
 
         public Task RunMaintenanceAsync(CancellationToken ct = default) => Task.CompletedTask;
     }

@@ -164,8 +164,11 @@ feed 中的 `ChatApp.Protocol.Tcp 0.5.0` / `.Json 0.5.0`、`ChatApp.Realtime.Con
   消费后走 FCM/APNs/WebPush Provider。`Push.Enabled` 门控（默认 false，零开销）；
   触发失败内部吞掉不影响消息主链路；v1 仅单聊。真实凭据联调（FCM 项目/APNs 证书/
   WebPush VAPID）为部署事项。
-- **仍待补**：通知偏好/免打扰过滤（ACCOUNT-OPS-1，偏好存储落地后在触发点接入）；
-  群聊离线推送（成员批量判定与去重，单独立项）。
+- **群聊离线推送已闭环（2026-09-02）**：`TryTriggerForGroupMessageAsync` 经
+  `ConversationAudienceCache` 解析受众 + `GetOnlineManyAsync` 批量离线判定，
+  提及成员优先且 `IsMention` 置位；`MaxGroupOfflinePushesPerMessage`（默认 200）
+  防超大群病理性 fanout，超限截断记日志。
+- **仍待补**：通知偏好/免打扰过滤（ACCOUNT-OPS-1，偏好存储落地后在触发点接入）。
 ### 群组
 
 - 廉价结构校验（`GroupCommandHandler.Validation.cs`）：成员上限/正 ID/去重、Title 长度、

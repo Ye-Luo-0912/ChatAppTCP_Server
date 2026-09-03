@@ -60,6 +60,12 @@ public sealed class PushOptions
     public int InvalidTokenCleanupQueueCapacity { get; set; } = 1024;
 
     /// <summary>
+    /// 单条群聊消息触发的离线推送数量上限（按提及优先排序后截断），
+    /// 防止超大群的病理性 fanout。超出部分丢弃并记日志。
+    /// </summary>
+    public int MaxGroupOfflinePushesPerMessage { get; set; } = 200;
+
+    /// <summary>
     /// 门禁3：Push Token 加密密钥环（支持旧 Key 读取 + 当前 Key 写入）。
     /// <para>
     /// 每项为 <see cref="TokenEncryptionKeyConfig"/>：<c>KeyId</c>（默认 "1"）+ <c>Key</c>
