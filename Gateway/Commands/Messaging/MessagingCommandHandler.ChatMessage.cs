@@ -65,6 +65,8 @@ internal sealed partial class MessagingCommandHandler
             (!isGroup && message.TargetUserId <= 0) ||
             (isGroup && message.ConversationId!.Length > 64) ||
             (string.IsNullOrWhiteSpace(message.Content) && !hasAttachments) ||
+            (message.Content is { Length: > 0 } &&
+             Encoding.UTF8.GetByteCount(message.Content) > ChatMessageLimits.MaxContentBytes) ||
             message.MessageId?.Length > ChatMessageLimits.MaxClientMessageIdLength ||
             (message.AttachmentIds is { Count: > 0 } &&
              message.AttachmentIds.Count > _options.MaxChatAttachments) ||

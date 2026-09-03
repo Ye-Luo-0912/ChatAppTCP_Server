@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Text.Json;
 using System.Buffers.Binary;
 using System.Net;
 using System.Net.Sockets;
@@ -1192,6 +1193,177 @@ public sealed class BinaryPayloadNegotiationTests
 
     // ──────────── 客户端原语：帧读写 / 二进制编解码 / 等待关闭 ────────────
 
+    // ──────────── 场景 8：超限命令 payload 两格式统一早投拒绝（对称契约） ────────────
+
+    // ChatMessage 的命令级 payload 上限是 64KiB（CommandCatalog），帧校验先于解码：
+    // 超限帧在两条格式下都必须得到相同的对称契约——按会话格式的 rejected ack
+    // （payload_too_large）后关闭连接。
+
+    [Fact(Timeout = 15_000)]
+    public async Task OversizedChatMessageFrame_SymmetricEarlyReject_OnBothFormats()
+    {
+        var port = ReserveLoopbackPort();
+        var gateway = CreateGateway(
+            port,
+            enableBinaryPayloadFormat: true);
+        using var metrics = gateway.Metrics;
+        using var service = gateway.Service;
+        await service.StartAsync(CancellationToken.None);
+        try
+        {
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            var oversized = new string('x', 64 * 1024 + 1024);
+
+            // 二进制会话：早投 rejected ack 后连接关闭。
+            using var binaryClient = await ConnectAsync(port, timeout.Token);
+            var binaryStream = binaryClient.GetStream();
+            await PerformBinaryHandshakeAndAuthenticationAsync(binaryStream, timeout.Token);
+
+            var binaryMessageId = Guid.CreateVersion7().ToString("N");
+            await WriteRelaxedBinaryFrameAsync(
+                binaryStream,
+                PacketCommand.ChatMessage,
+                new ChatMessage
+                {
+                    MessageId = binaryMessageId,
+                    ClientMessageId = binaryMessageId,
+                    TargetUserId = 42,
+                    Content = oversized
+                },
+                timeout.Token);
+
+            // 早投拒绝存在既知的 close/send 竞争（RejectOversizedPayload TryQueue 后同步关闭）：
+            // ack 帧可能到达，也可能直接观察到关闭。两者都符合契约。
+            await ReadUntilClosedAsync(
+                binaryStream,
+                PacketCommand.MessageAcknowledgement,
+                expectAccepted: false,
+                timeout.Token);
+
+            // JSON 会话：同一超限帧得到同样的对称契约。
+            using var jsonClient = await ConnectAsync(port, timeout.Token);
+            var jsonStream = jsonClient.GetStream();
+            var jsonServerHello = await HandshakeAsync(
+                jsonStream,
+                featureBits: (uint)GatewayFeature.CommandCapabilities,
+                resumeToken: null,
+                timeout.Token);
+            Assert.Equal(JsonFormat, jsonServerHello.PayloadFormat);
+            await AuthenticateAsJsonAsync(jsonStream, deviceIdHash: 7, timeout.Token);
+
+            await WriteJsonFrameAsync(
+                jsonStream,
+                PacketCommand.ChatMessage,
+                new ChatMessage
+                {
+                    MessageId = Guid.CreateVersion7().ToString("N"),
+                    ClientMessageId = Guid.CreateVersion7().ToString("N"),
+                    TargetUserId = 42,
+                    Content = oversized
+                },
+                timeout.Token);
+
+            await ReadUntilClosedAsync(
+                jsonStream,
+                PacketCommand.MessageAcknowledgement,
+                expectAccepted: false,
+                json: true,
+                cancellationToken: timeout.Token);
+
+            // 边界内（<64KiB 命令上限）的正常正文：两条格式都正常 accepted。
+            var withinBudget = new string('x', 60 * 1024);
+            using var withinClient = await ConnectAsync(port, timeout.Token);
+            var withinStream = withinClient.GetStream();
+            await PerformBinaryHandshakeAndAuthenticationAsync(withinStream, timeout.Token);
+            var withinId = Guid.CreateVersion7().ToString("N");
+            await WriteRelaxedBinaryFrameAsync(
+                withinStream,
+                PacketCommand.ChatMessage,
+                new ChatMessage
+                {
+                    MessageId = withinId,
+                    ClientMessageId = withinId,
+                    TargetUserId = 42,
+                    Content = withinBudget
+                },
+                timeout.Token);
+            var withinFrame = await ReadFrameAsync(withinStream, timeout.Token);
+            Assert.Equal(PacketCommand.MessageAcknowledgement, withinFrame.Command);
+            var withinAck = DecodeBinaryPayload<MessageAcknowledgement>(
+                PacketCommand.MessageAcknowledgement,
+                withinFrame.Payload);
+            Assert.True(withinAck.Accepted);
+        }
+        finally
+        {
+            await service.StopAsync(CancellationToken.None);
+        }
+    }
+
+    /// <summary>断言对端已关闭连接：读到 0 字节或 Socket/IO 异常，超时视为失败。</summary>
+    private static async Task AssertConnectionClosedAsync(Stream stream, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var buffer = new byte[16];
+            var read = await stream.ReadAsync(buffer, cancellationToken);
+            Assert.True(read == 0, $"预期连接关闭，实际读到 {read} 字节");
+        }
+        catch (Exception ex) when (
+            ex is SocketException ||
+            ex is IOException ||
+            ex is OperationCanceledException)
+        {
+            // 连接被强制关闭/中止：符合"关闭"预期。
+        }
+    }
+
+    /// <summary>
+    /// 读取直到连接关闭。早投拒绝存在既知的 close/send 竞争：
+    /// 若 ack/错误帧到达则按 <paramref name="expectAccepted"/> 断言后继续等关闭；
+    /// 若直接观察到关闭（帧被 close 竞争丢弃）同样符合契约。
+    /// </summary>
+    private static async Task ReadUntilClosedAsync(
+        Stream stream,
+        PacketCommand expectedCommand,
+        bool expectAccepted,
+        CancellationToken cancellationToken,
+        bool json = false)
+    {
+        try
+        {
+            while (true)
+            {
+                var frame = await ReadFrameAsync(stream, cancellationToken);
+                if (frame.Command == expectedCommand)
+                {
+                    if (json)
+                    {
+                        var ack = JsonSerializer.Deserialize(
+                            frame.Payload,
+                            GatewayJsonSerializerContext.Default.MessageAcknowledgement);
+                        Assert.NotNull(ack);
+                        Assert.Equal(expectAccepted, ack!.Accepted);
+                    }
+                    else
+                    {
+                        var decoded = DecodeBinaryPayload<MessageAcknowledgement>(
+                            PacketCommand.MessageAcknowledgement,
+                            frame.Payload);
+                        Assert.Equal(expectAccepted, decoded.Accepted);
+                    }
+                }
+            }
+        }
+        catch (Exception ex) when (
+            ex is IOException ||
+            ex is SocketException ||
+            ex is OperationCanceledException)
+        {
+            // 连接关闭：契约的终态。
+        }
+    }
+
     private static async Task<TcpClient> ConnectAsync(int port, CancellationToken cancellationToken)
     {
         var client = new TcpClient();
@@ -1317,13 +1489,50 @@ public sealed class BinaryPayloadNegotiationTests
         where T : class
     {
         var shared = BinaryPayloadMapper.ToShared(command, value);
-        var buffer = new byte[BinaryLimits.Default.MaxMessageBytes];
+        // 模拟"宽松预算的生产者"（如遗留客户端/直连工具）：字符串域放宽到帧预算，
+        // 用于验证服务端对 >64KiB 正文的拒绝语义（rejected ack + 连接保持），
+        // 而非依赖共享库默认 64KiB 限制在客户端编码阶段先失败。
+        var relaxedLimits = new BinaryLimits(
+            maxMessageBytes: 80 * 1024,
+            maxFieldBytes: 80 * 1024,
+            maxStringBytes: 80 * 1024,
+            maxByteArrayBytes: 64 * 1024,
+            maxFields: 256);
+        var buffer = new byte[relaxedLimits.MaxMessageBytes];
         var encode = TcpBinaryWireEncoder.TryEncode(
             shared,
             buffer,
-            BinaryLimits.Default);
+            relaxedLimits);
         Assert.Equal(TcpBinaryWireEncodeStatus.Encoded, encode.Status);
         return buffer.AsSpan(0, encode.Written).ToArray();
+    }
+
+    /// <summary>
+    /// 以"宽松预算生产者"（字符串域放宽到帧预算）编码并发送二进制帧，
+    /// 用于验证服务端对超出命令级上限帧的早投拒绝语义。
+    /// </summary>
+    private static async ValueTask WriteRelaxedBinaryFrameAsync<T>(
+        Stream stream,
+        PacketCommand command,
+        T value,
+        CancellationToken cancellationToken)
+        where T : class
+    {
+        var shared = BinaryPayloadMapper.ToShared(command, value);
+        var relaxedLimits = new BinaryLimits(
+            maxMessageBytes: 80 * 1024,
+            maxFieldBytes: 80 * 1024,
+            maxStringBytes: 80 * 1024,
+            maxByteArrayBytes: 64 * 1024,
+            maxFields: 256);
+        var buffer = new byte[relaxedLimits.MaxMessageBytes];
+        var encode = TcpBinaryWireEncoder.TryEncode(shared, buffer, relaxedLimits);
+        Assert.Equal(TcpBinaryWireEncodeStatus.Encoded, encode.Status);
+        await WriteRawFrameAsync(
+            stream,
+            command,
+            buffer.AsSpan(0, encode.Written).ToArray(),
+            cancellationToken);
     }
 
     private static async ValueTask WriteBinaryFrameAsync<T>(
@@ -1375,6 +1584,9 @@ public sealed class BinaryPayloadNegotiationTests
             (JsonPayloadCodec<T>)(object)JsonClientHelloCodec,
         var t when t == typeof(AuthenticationRequest) =>
             (JsonPayloadCodec<T>)(object)JsonAuthenticationRequestCodec,
+        var t when t == typeof(ChatMessage) =>
+            (JsonPayloadCodec<T>)(object)new JsonPayloadCodec<ChatMessage>(
+                GatewayJsonSerializerContext.Default.ChatMessage),
         _ => throw new InvalidOperationException(
             $"no cached json codec for {typeof(T).Name}")
     };

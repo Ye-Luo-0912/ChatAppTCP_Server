@@ -77,7 +77,7 @@ internal static class OutboundFrameFactory
     /// 用二进制 schema 编码并组帧。先把本地 DTO 映射为共享规范 DTO（寄存器按具体类型分发，
     /// 本地 DTO 不在 schema 目录内，直接编码必然 SchemaNotCovered）；再在当前空闲缓冲内单遍编码
     /// （小 payload 0 重试）；<see cref="BinaryStatus.DestinationTooSmall"/> 时把缓冲增长到满
-    /// payload 窗口重试一次（payload 上限 = <see cref="BinaryLimits.Default.MaxMessageBytes"/> =
+    /// payload 窗口重试一次（payload 上限 = <see cref="TcpBinaryPayloadCodec.DecodeLimits"/> =
     /// MaxPayloadSize），其余失败状态一律抛出，绝不发送半编码帧。
     /// </summary>
     public static SharedOutboundFrame CreateBinary<T>(PacketCommand command, T value)
@@ -94,14 +94,14 @@ internal static class OutboundFrameFactory
         var encode = TcpBinaryWireEncoder.TryEncode(
             shared,
             writer.GetSpan(0),
-            BinaryLimits.Default);
+            TcpBinaryPayloadCodec.DecodeLimits);
         if (encode.Status == TcpBinaryWireEncodeStatus.EncodeFailure &&
             encode.EncodeStatus == BinaryStatus.DestinationTooSmall)
         {
             encode = TcpBinaryWireEncoder.TryEncode(
                 shared,
                 writer.GetSpan(PacketProtocol.MaxPayloadSize),
-                BinaryLimits.Default);
+                TcpBinaryPayloadCodec.DecodeLimits);
         }
 
         if (encode.Status != TcpBinaryWireEncodeStatus.Encoded)

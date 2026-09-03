@@ -37,13 +37,25 @@ public sealed class BinaryPayloadDecodeException : Exception
 internal static class TcpBinaryPayloadCodec
 {
     /// <summary>
+    /// 网关解码预算：字符串域对齐 80KiB 帧预算（而非共享库默认的 64KiB），
+    /// 使二进制路径可解码的载荷域与 JSON 路径一致；超限正文由 handler 校验
+    /// 统一以 rejected ack 拒绝，避免 decode 阶段直接断连。
+    /// </summary>
+    internal static readonly BinaryLimits DecodeLimits = new(
+        maxMessageBytes: 80 * 1024,
+        maxFieldBytes: 80 * 1024,
+        maxStringBytes: 80 * 1024,
+        maxByteArrayBytes: 64 * 1024,
+        maxFields: 256);
+
+    /// <summary>
     /// 按命令分发到二进制 schema 解码。未覆盖命令与畸形/超限 payload fail-closed 抛出；
     /// 寄存器对每个命令只产出唯一 DTO 类型，类型不匹配属编程错误直接抛 InvalidCastException。
     /// </summary>
     public static T? Deserialize<T>(PacketCommand command, in ReadOnlySequence<byte> payload)
         where T : class
     {
-        var decode = TcpBinaryWireCodec.TryDecode(command, payload, BinaryLimits.Default);
+        var decode = TcpBinaryWireCodec.TryDecode(command, payload, DecodeLimits);
         switch (decode.Status)
         {
             case TcpBinaryWireStatus.Decoded:
