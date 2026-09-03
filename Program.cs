@@ -4,6 +4,8 @@ using ChatApp.TcpGateway.Gateway.Commands.Attachments;
 using ChatApp.TcpGateway.Gateway.Commands.Calls;
 using ChatApp.TcpGateway.Gateway.Commands.Conversations;
 using ChatApp.TcpGateway.Gateway.Commands.Groups;
+using Microsoft.Extensions.Options;
+using ChatApp.Realtime.Integration;
 using ChatApp.TcpGateway.Gateway.Commands.Messaging;
 using ChatApp.TcpGateway.Gateway.Commands.Presence;
 using ChatApp.TcpGateway.Gateway.Commands.Push;
@@ -112,6 +114,12 @@ builder.Services.AddChatAppRealtimeIntegration(
 // 命令处理器与分发器
 builder.Services.AddSingleton<PushTokenCommandHandler>();
 builder.Services.AddSingleton<ReactionCommandHandler>();
+builder.Services.AddSingleton<OfflinePushTrigger>(sp => new OfflinePushTrigger(
+    sp.GetRequiredService<IGlobalPresenceStore>(),
+    (command, ct) => sp.GetRequiredService<IRealtimeMessageBus>()
+        .PublishPushDeliveryAsync(command, ct),
+    sp.GetRequiredService<IOptions<PushOptions>>(),
+    sp.GetRequiredService<ILogger<OfflinePushTrigger>>()));
 builder.Services.AddSingleton<MessagingCommandHandler>();
 builder.Services.AddSingleton<HistoryQueryCommandHandler>();
 builder.Services.AddSingleton<ConversationPrefsCommandHandler>();

@@ -158,8 +158,14 @@ feed 中的 `ChatApp.Protocol.Tcp 0.5.0` / `.Json 0.5.0`、`ChatApp.Realtime.Con
   Token Retry（仅重试失败 Token）、幂等（复合键 UserId+CommandKind+RequestId+CanonicalPayloadHash + Redis L2）、
   DLQ、Provider 并发限制、无效 Token 注销、PushWorker 拆出（独立服务隔离网络资源）、
   AES-GCM Token 加密、Push delivery payload 不在 Information 级别记录。
-- **跨仓库待补**：真实 FCM/APNs/WebPush Provider、共享 token 边界和 Publisher 侧离线触发；
-  当前功能路线完成后再按真实客户端需求单独立项。
+- **离线触发已闭环（2026-09-02）**：`OfflinePushTrigger` 在直聊消息接受后经
+  `IGlobalPresenceStore.IsOnlineAsync` 判定接收方全局离线 → `PublishPushDeliveryAsync`
+  发布 `PushDeliveryCommand` 到 JetStream（`push_delivery.publish`），PushDeliveryConsumerService
+  消费后走 FCM/APNs/WebPush Provider。`Push.Enabled` 门控（默认 false，零开销）；
+  触发失败内部吞掉不影响消息主链路；v1 仅单聊。真实凭据联调（FCM 项目/APNs 证书/
+  WebPush VAPID）为部署事项。
+- **仍待补**：通知偏好/免打扰过滤（ACCOUNT-OPS-1，偏好存储落地后在触发点接入）；
+  群聊离线推送（成员批量判定与去重，单独立项）。
 ### 群组
 
 - 廉价结构校验（`GroupCommandHandler.Validation.cs`）：成员上限/正 ID/去重、Title 长度、

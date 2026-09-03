@@ -32,6 +32,7 @@ namespace ChatApp.TcpGateway.Gateway.Commands.Messaging;
 internal sealed partial class MessagingCommandHandler : ICommandHandler
 {
     private readonly IRealtimeMessageBus _messageBus;
+    private readonly OfflinePushTrigger? _offlinePushTrigger;
     private readonly IPayloadCodec<ChatMessage> _chatMessageCodec;
     private readonly IPayloadCodec<MessageAcknowledgement> _messageAcknowledgementCodec;
     private readonly IPayloadCodec<MessageReceiptRequest> _messageReceiptRequestCodec;
@@ -58,9 +59,11 @@ internal sealed partial class MessagingCommandHandler : ICommandHandler
         GatewayMetrics metrics,
         TimeProvider timeProvider,
         ILogger<MessagingCommandHandler> logger,
-        IOptions<TcpGatewayOptions> options)
+        IOptions<TcpGatewayOptions> options,
+        OfflinePushTrigger? offlinePushTrigger = null)
     {
         _messageBus = messageBus;
+        _offlinePushTrigger = offlinePushTrigger;
         _chatMessageCodec = chatMessageCodec;
         _messageAcknowledgementCodec = messageAcknowledgementCodec;
         _messageReceiptRequestCodec = messageReceiptRequestCodec;
