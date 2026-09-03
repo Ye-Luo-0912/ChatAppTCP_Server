@@ -18,15 +18,17 @@
     <PackageVersion Include="StackExchange.Redis" Version="3.0.17" />
     <PackageVersion Include="xunit.v3" Version="3.2.2" />
     <PackageVersion Include="ChatApp.Auth.Contracts" Version="0.2.0" />
-    <PackageVersion Include="ChatApp.Protocol.Tcp" Version="0.5.4" />
+    <PackageVersion Include="ChatApp.Protocol.Tcp" Version="0.5.6" />
     <PackageVersion Include="ChatApp.Protocol.Tcp.Json" Version="0.5.3" />
-    <PackageVersion Include="ChatApp.Binary.Core" Version="0.5.4" />
-    <PackageVersion Include="ChatApp.Protocol.Tcp.Binary" Version="0.5.4" />
-    <PackageVersion Include="ChatApp.Protocol.Tcp.Binary.Schemas" Version="0.5.4" />
+    <PackageVersion Include="ChatApp.Binary.Core" Version="0.5.6" />
+    <PackageVersion Include="ChatApp.Protocol.Tcp.Binary" Version="0.5.6" />
+    <PackageVersion Include="ChatApp.Protocol.Tcp.Binary.Schemas" Version="0.5.6" />
     <!-- P1-1：版本化 Contract Package 本地 feed 契约包（见 NuGet.config 中 packages/ 源）。 -->
-    <!-- VOICE-MSG-2：Contracts 2.5.3（IncomingMessageCommand.Attachments 元数据快照）
-         + Integration 3.1.4（source-gen 序列化携带该字段）。 -->
-    <PackageVersion Include="ChatApp.Realtime.Contracts" Version="2.5.3" />
-    <PackageVersion Include="ChatApp.Realtime.Integration" Version="3.1.4" />
+    <!-- VOICE-MSG-2 waveform：Contracts 2.5.4（AttachmentRef.VoiceWaveformPeaks 语音元数据）
+         + Integration 3.1.5（source-gen 序列化 IncomingMessageCommand.Attachments 携带该字段）；
+         Protocol.Tcp/Binary 系列 0.5.6（TcpAttachmentRef 二进制 field 16 + JSON 源生成携带该字段，
+         Tcp.Json 无 0.5.6 发布、维持 0.5.3）。 -->
+    <PackageVersion Include="ChatApp.Realtime.Contracts" Version="2.5.4" />
+    <PackageVersion Include="ChatApp.Realtime.Integration" Version="3.1.5" />
   </ItemGroup>
 </Project>

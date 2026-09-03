@@ -397,7 +397,9 @@ internal static partial class BinaryPayloadMapper
                 VoiceContainer = r.VoiceContainer,
                 VoiceDurationMs = r.VoiceDurationMs,
                 VoiceSampleRateHz = r.VoiceSampleRateHz,
-                VoiceChannels = r.VoiceChannels
+                VoiceChannels = r.VoiceChannels,
+                // VOICE-MSG-2 waveform：语音波形峰值包络透传（缺省/空 = 无波形）。
+                VoiceWaveformPeaks = r.VoiceWaveformPeaks
             };
         }
 
@@ -431,7 +433,9 @@ internal static partial class BinaryPayloadMapper
                 VoiceContainer = r.VoiceContainer,
                 VoiceDurationMs = r.VoiceDurationMs,
                 VoiceSampleRateHz = r.VoiceSampleRateHz,
-                VoiceChannels = r.VoiceChannels
+                VoiceChannels = r.VoiceChannels,
+                // VOICE-MSG-2 waveform：语音波形峰值包络透传（缺省/空 = 无波形）。
+                VoiceWaveformPeaks = r.VoiceWaveformPeaks
             };
         }
 

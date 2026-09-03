@@ -28,7 +28,8 @@ public sealed class HistoryWireMapperAttachmentTests
                 VoiceContainer = "ogg",
                 VoiceDurationMs = 4_500,
                 VoiceSampleRateHz = 48_000,
-                VoiceChannels = 1
+                VoiceChannels = 1,
+                VoiceWaveformPeaks = [9, 128, 240, 5]
             }
         };
 
@@ -42,6 +43,34 @@ public sealed class HistoryWireMapperAttachmentTests
         Assert.Equal(4_500, item.VoiceDurationMs);
         Assert.Equal(48_000, item.VoiceSampleRateHz);
         Assert.Equal((short)1, item.VoiceChannels);
+        // VOICE-MSG-2 waveform：波形峰值包络映射到 Shared TcpAttachmentRef（缺省/空 = 无波形）。
+        Assert.Equal(new byte[] { 9, 128, 240, 5 }, item.VoiceWaveformPeaks);
+    }
+
+    [Fact]
+    public void MapAttachments_VoiceWithoutWaveform_KeepsWaveformNull()
+    {
+        var source = new[]
+        {
+            new AttachmentRef
+            {
+                AttachmentId = "voice-02",
+                ContentType = "audio/opus",
+                Status = AttachmentWireStatus.Available,
+                IsVoice = true,
+                VoiceCodec = "opus",
+                VoiceContainer = "ogg",
+                VoiceDurationMs = 1_200,
+                VoiceSampleRateHz = 16_000,
+                VoiceChannels = 1
+            }
+        };
+
+        var mapped = HistoryWireMapper.MapAttachments(source);
+
+        var item = Assert.Single(mapped!);
+        Assert.True(item.IsVoice);
+        Assert.Null(item.VoiceWaveformPeaks);
     }
 
     [Fact]
@@ -67,6 +96,7 @@ public sealed class HistoryWireMapperAttachmentTests
         Assert.Null(item.VoiceDurationMs);
         Assert.Null(item.VoiceSampleRateHz);
         Assert.Null(item.VoiceChannels);
+        Assert.Null(item.VoiceWaveformPeaks);
         Assert.Equal("plain-01", item.AttachmentId);
     }
 

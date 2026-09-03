@@ -152,7 +152,8 @@ public sealed class BinaryPayloadMapperTests
                     VoiceContainer = "ogg",
                     VoiceDurationMs = 4321,
                     VoiceSampleRateHz = 48000,
-                    VoiceChannels = 1
+                    VoiceChannels = 1,
+                    VoiceWaveformPeaks = [1, 32, 200, 255, 64]
                 }
             ],
             ReplyToMessageId = "reply-1",
@@ -197,6 +198,9 @@ public sealed class BinaryPayloadMapperTests
         Assert.Equal(4321, voice.VoiceDurationMs);
         Assert.Equal(48000, voice.VoiceSampleRateHz);
         Assert.Equal((short)1, voice.VoiceChannels);
+        // VOICE-MSG-2 waveform：波形峰值经二进制 wire（TcpAttachmentRef field 16）往返保真。
+        Assert.Equal(new byte[] { 1, 32, 200, 255, 64 }, voice.VoiceWaveformPeaks);
+        Assert.Null(plain.VoiceWaveformPeaks);
     }
 
     // ──────────── 消息 ACK / 回执 / 编辑 / 撤回 ────────────

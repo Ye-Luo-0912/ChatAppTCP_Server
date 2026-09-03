@@ -53,7 +53,8 @@ public sealed class UplinkAttachmentMetadataTests
             VoiceContainer = "wav",
             VoiceDurationMs = 3_500,
             VoiceSampleRateHz = 16_000,
-            VoiceChannels = 1
+            VoiceChannels = 1,
+            VoiceWaveformPeaks = [3, 77, 200, 41]
         };
         var result = MessagingCommandHandler.MapUplinkAttachmentMetadata(
             ["att-voice"],
@@ -67,6 +68,8 @@ public sealed class UplinkAttachmentMetadataTests
         Assert.Equal(3_500L, attachment.VoiceDurationMs);
         Assert.Equal(16_000, attachment.VoiceSampleRateHz);
         Assert.Equal((short)1, attachment.VoiceChannels);
+        // VOICE-MSG-2 waveform：匹配引用的波形峰值随快照透传（进入 IncomingMessageCommand.Attachments）。
+        Assert.Equal(new byte[] { 3, 77, 200, 41 }, attachment.VoiceWaveformPeaks);
     }
 
     [Fact]

@@ -49,7 +49,9 @@ internal static class HistoryWireMapper
                 VoiceContainer = item.VoiceContainer,
                 VoiceDurationMs = item.VoiceDurationMs,
                 VoiceSampleRateHz = item.VoiceSampleRateHz,
-                VoiceChannels = item.VoiceChannels
+                VoiceChannels = item.VoiceChannels,
+                // VOICE-MSG-2 waveform：语音波形峰值包络随附件引用透传（缺省/空 = 无波形）。
+                VoiceWaveformPeaks = item.VoiceWaveformPeaks
             };
         }
 

@@ -4,15 +4,15 @@
     "net10.0": {
       "ChatApp.Protocol.Tcp": {
         "type": "Direct",
-        "requested": "[0.5.4, )",
-        "resolved": "0.5.4",
-        "contentHash": "oXQkcMIhqMyWZ7FRGgm3ciJH/kmbr9KNrhjzzFa5nRL4qo34GoN96Nek6TtUbuBOXUN6kTudyn72ibGWUT7vYw=="
+        "requested": "[0.5.6, )",
+        "resolved": "0.5.6",
+        "contentHash": "0YAJbmvm+olh2QLYW6JcEqsd4UMSZX0VuN0sohJRmOGzuNoinH3Pi8H+Oy9iqGO7rrCxra/t8lVR1fo8kRVkNQ=="
       },
       "ChatApp.Realtime.Contracts": {
         "type": "Direct",
-        "requested": "[2.5.3, )",
-        "resolved": "2.5.3",
-        "contentHash": "0cCGlOexWMVnyy6hNHyfPEyjNLZyi8V9fptYUncHtVtholI2O58WsK7agYqrABIUW2R+2BdP+JpW3Vk52h82Gw=="
+        "requested": "[2.5.4, )",
+        "resolved": "2.5.4",
+        "contentHash": "jnLr1Ii4wTSjRzShpyToZ00qJ0oAjnJJk9k+hG+hqefZa0TI2FHW77Pv/h15BunLPz4/lx8UY/pH2wx+IHUrUw=="
       }
     }
   }
