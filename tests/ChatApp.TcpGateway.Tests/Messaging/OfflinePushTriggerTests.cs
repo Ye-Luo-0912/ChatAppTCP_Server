@@ -1,3 +1,4 @@
+using ChatApp.Realtime.Abstractions.Conversations;
 using ChatApp.Realtime.Integration.Push;
 using ChatApp.TcpGateway.Core.Protocol;
 using ChatApp.TcpGateway.Gateway.Commands.Messaging;
@@ -10,7 +11,8 @@ namespace ChatApp.TcpGateway.Tests.Messaging;
 
 /// <summary>
 /// 离线推送触发器：Push.Enabled 门控、全局在线判定、预览截断、
-/// 附件占位与异常吞噬（触发失败绝不影响消息主链路）。
+/// 附件占位、异常吞噬（触发失败绝不影响消息主链路）与
+/// 免打扰过滤（ACCOUNT-OPS-1：静音跳过 / 提及豁免 / 查询失败 fail-open）。
 /// </summary>
 public sealed class OfflinePushTriggerTests
 {
@@ -22,7 +24,8 @@ public sealed class OfflinePushTriggerTests
         FakePresence presence,
         List<PushDeliveryCommand> published,
         bool enabled = true,
-        Action<PushOptions>? configureOptions = null)
+        Action<PushOptions>? configureOptions = null,
+        Func<ConversationMutesQuery, CancellationToken, Task<IReadOnlyList<long>>>? queryMutes = null)
     {
         published.Clear();
         presence.Reset();
@@ -42,7 +45,8 @@ public sealed class OfflinePushTriggerTests
                 return Task.FromResult(members ?? Array.Empty<long>());
             },
             Options.Create(options),
-            NullLogger<OfflinePushTrigger>.Instance);
+            NullLogger<OfflinePushTrigger>.Instance,
+            queryMutes);
     }
 
     [Fact]
@@ -216,6 +220,143 @@ public sealed class OfflinePushTriggerTests
             TestContext.Current.CancellationToken);
 
         Assert.Empty(published);
+    }
+
+    // ---- ACCOUNT-OPS-1：免打扰过滤 ----
+
+    [Fact]
+    public async Task GroupMessage_MutedNonMentionedMember_IsFiltered()
+    {
+        var presence = new FakePresence(isOnline: false);
+        var published = new List<PushDeliveryCommand>();
+        // 受众：41=发送者（排除）；42/43/44 全离线。42 静音（非提及）。
+        var queries = new List<ConversationMutesQuery>();
+        var trigger = CreateTrigger(presence, published,
+            queryMutes: (query, _) =>
+            {
+                queries.Add(query);
+                return Task.FromResult<IReadOnlyList<long>>([42]);
+            });
+        ResolvedAudiences["conv-mute"] = [41, 42, 43, 44];
+
+        await trigger.TryTriggerForGroupMessageAsync(
+            41, "conv-mute", "gm-m1", "hello", false,
+            mentionedUserIds: [44],
+            TestContext.Current.CancellationToken);
+
+        // 42 被过滤；提及的 44 优先，43 照常。
+        Assert.Equal([44, 43], published.Select(p => p.TargetUserId).ToArray());
+        Assert.DoesNotContain(published, p => p.TargetUserId == 42);
+        // 批量查询覆盖全部离线候选（44/42/43），会话正确。
+        var query = Assert.Single(queries);
+        Assert.Equal("conv-mute", query.ConversationId);
+        Assert.Equal(new long[] { 42, 43, 44 }, query.MemberUserIds.OrderBy(id => id).ToArray());
+    }
+
+    [Fact]
+    public async Task GroupMessage_MutedMentionedMember_StillPublished_WithMentionFlag()
+    {
+        var presence = new FakePresence(isOnline: false);
+        var published = new List<PushDeliveryCommand>();
+        // 42 静音且被提及：Mention 推送优先级更高，不受静音影响。
+        var trigger = CreateTrigger(presence, published,
+            queryMutes: (_, _) => Task.FromResult<IReadOnlyList<long>>([42]));
+        ResolvedAudiences["conv-mute-mention"] = [41, 42, 43];
+
+        await trigger.TryTriggerForGroupMessageAsync(
+            41, "conv-mute-mention", "gm-m2", "hello", false,
+            mentionedUserIds: [42],
+            TestContext.Current.CancellationToken);
+
+        Assert.Contains(published, p => p.TargetUserId == 42 && p.IsMention);
+        Assert.Contains(published, p => p.TargetUserId == 43 && !p.IsMention);
+        Assert.Equal(2, published.Count);
+    }
+
+    [Fact]
+    public async Task GroupMessage_MutesQueryFails_FailOpen_PublishesToAllOffline()
+    {
+        var presence = new FakePresence(isOnline: false);
+        var published = new List<PushDeliveryCommand>();
+        // 查询抛异常 → fail-open：不过滤，全部离线成员照常推送。
+        var trigger = CreateTrigger(presence, published,
+            queryMutes: (_, _) => throw new InvalidOperationException("nats down"));
+        ResolvedAudiences["conv-mute-fail"] = [41, 42, 43, 44];
+
+        await trigger.TryTriggerForGroupMessageAsync(
+            41, "conv-mute-fail", "gm-m3", "hello", false,
+            mentionedUserIds: [44],
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(new long[] { 44, 42, 43 }, published.Select(p => p.TargetUserId).ToArray());
+    }
+
+    [Fact]
+    public async Task GroupMessage_MuteFilter_AppliesBeforeCap()
+    {
+        var presence = new FakePresence(isOnline: false);
+        var published = new List<PushDeliveryCommand>();
+        // cap=1：42 静音（不占名额）被过滤后，仅 43 获得推送名额。
+        var trigger = CreateTrigger(presence, published,
+            configureOptions: options => options.MaxGroupOfflinePushesPerMessage = 1,
+            queryMutes: (_, _) => Task.FromResult<IReadOnlyList<long>>([42]));
+        ResolvedAudiences["conv-mute-cap"] = [41, 42, 43];
+
+        await trigger.TryTriggerForGroupMessageAsync(
+            41, "conv-mute-cap", "gm-m4", "hello", false,
+            mentionedUserIds: null,
+            TestContext.Current.CancellationToken);
+
+        var push = Assert.Single(published);
+        Assert.Equal(43, push.TargetUserId);
+    }
+
+    [Fact]
+    public async Task DirectMessage_MutedRecipient_IsNotPublished()
+    {
+        var presence = new FakePresence(isOnline: false);
+        var published = new List<PushDeliveryCommand>();
+        var queries = new List<ConversationMutesQuery>();
+        var trigger = CreateTrigger(presence, published,
+            queryMutes: (query, _) =>
+            {
+                queries.Add(query);
+                return Task.FromResult<IReadOnlyList<long>>([ReceiverId]);
+            });
+
+        await trigger.TryTriggerForDirectMessageAsync(ReceiverId, "conv-dm", "m-dm1", "hello", false, TestContext.Current.CancellationToken);
+
+        Assert.Empty(published);
+        var query = Assert.Single(queries);
+        Assert.Equal("conv-dm", query.ConversationId);
+        Assert.Equal(new long[] { ReceiverId }, query.MemberUserIds.ToArray());
+    }
+
+    [Fact]
+    public async Task DirectMessage_UnmutedRecipient_IsPublished()
+    {
+        var presence = new FakePresence(isOnline: false);
+        var published = new List<PushDeliveryCommand>();
+        var trigger = CreateTrigger(presence, published,
+            queryMutes: (_, _) => Task.FromResult<IReadOnlyList<long>>(Array.Empty<long>()));
+
+        await trigger.TryTriggerForDirectMessageAsync(ReceiverId, "conv-dm", "m-dm2", "hello", false, TestContext.Current.CancellationToken);
+
+        Assert.Equal(ReceiverId, Assert.Single(published).TargetUserId);
+    }
+
+    [Fact]
+    public async Task DirectMessage_MutesQueryFails_FailOpen_Publishes()
+    {
+        var presence = new FakePresence(isOnline: false);
+        var published = new List<PushDeliveryCommand>();
+        var trigger = CreateTrigger(presence, published,
+            queryMutes: (_, _) => throw new InvalidOperationException("realtime unavailable"));
+
+        // 不抛出：查询失败 fail-open，推送照发。
+        await trigger.TryTriggerForDirectMessageAsync(ReceiverId, "conv-dm", "m-dm3", "hello", false, TestContext.Current.CancellationToken);
+
+        Assert.Equal(ReceiverId, Assert.Single(published).TargetUserId);
     }
 
     internal sealed class FakePresence : IGlobalPresenceStore

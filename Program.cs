@@ -121,7 +121,12 @@ builder.Services.AddSingleton<OfflinePushTrigger>(sp => new OfflinePushTrigger(
     (conversationId, ct) => sp.GetRequiredService<RealtimeConversationAudienceCache>()
         .GetOrResolveAsync(conversationId, null, ct).AsTask(),
     sp.GetRequiredService<IOptions<PushOptions>>(),
-    sp.GetRequiredService<ILogger<OfflinePushTrigger>>()));
+    sp.GetRequiredService<ILogger<OfflinePushTrigger>>(),
+    // ACCOUNT-OPS-1：离线推送前批量查询成员免打扰状态（Realtime request/reply）。
+    // 委托内部异常在 Trigger 内 fail-open（不过滤），保持离线推送可用性。
+    async (query, ct) => (await sp.GetRequiredService<IRealtimeMessageBus>()
+            .QueryConversationMutesAsync(query, ct).ConfigureAwait(false))
+        .MutedUserIds));
 builder.Services.AddSingleton<MessagingCommandHandler>();
 builder.Services.AddSingleton<HistoryQueryCommandHandler>();
 builder.Services.AddSingleton<ConversationPrefsCommandHandler>();

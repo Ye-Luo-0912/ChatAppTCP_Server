@@ -24,11 +24,12 @@
     <PackageVersion Include="ChatApp.Protocol.Tcp.Binary" Version="0.5.6" />
     <PackageVersion Include="ChatApp.Protocol.Tcp.Binary.Schemas" Version="0.5.6" />
     <!-- P1-1：版本化 Contract Package 本地 feed 契约包（见 NuGet.config 中 packages/ 源）。 -->
-    <!-- VOICE-MSG-2 waveform：Contracts 2.5.4（AttachmentRef.VoiceWaveformPeaks 语音元数据）
-         + Integration 3.1.5（source-gen 序列化 IncomingMessageCommand.Attachments 携带该字段）；
-         Protocol.Tcp/Binary 系列 0.5.6（TcpAttachmentRef 二进制 field 16 + JSON 源生成携带该字段，
-         Tcp.Json 无 0.5.6 发布、维持 0.5.3）。 -->
-    <PackageVersion Include="ChatApp.Realtime.Contracts" Version="2.5.4" />
-    <PackageVersion Include="ChatApp.Realtime.Integration" Version="3.1.5" />
+    <!-- ACCOUNT-OPS-1 收尾：Contracts 2.5.5（ConversationMutesQuery/Result + IRealtimeConversationStore
+         .QueryMutedMemberIdsAsync）+ Integration 3.1.6（QueryConversationMutesAsync request/reply，
+         subject chat.conversation-mutes.query；离线推送免打扰过滤）。
+         VOICE-MSG-2 waveform：Protocol.Tcp/Binary 系列 0.5.6（TcpAttachmentRef 二进制 field 16 +
+         JSON 源生成携带该字段，Tcp.Json 无 0.5.6 发布、维持 0.5.3）。 -->
+    <PackageVersion Include="ChatApp.Realtime.Contracts" Version="2.5.5" />
+    <PackageVersion Include="ChatApp.Realtime.Integration" Version="3.1.6" />
   </ItemGroup>
 </Project>

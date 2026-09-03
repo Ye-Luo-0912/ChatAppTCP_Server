@@ -4,11 +4,11 @@
     "net10.0": {
       "ChatApp.Realtime.Integration": {
         "type": "Direct",
-        "requested": "[3.1.5, )",
-        "resolved": "3.1.5",
-        "contentHash": "qOos+MAjfzkkHnxYZAqMQqHxe/HhTOY7xEzdmY64C8t0EcoI715y0dDepnH/bwBfbx93VObbB3tb2Z+fijShtA==",
+        "requested": "[3.1.6, )",
+        "resolved": "3.1.6",
+        "contentHash": "qYmOwWJ4Sz01nKh32POUigenVKrViqNNJZkrMjbxYRRw16LJihfrQFgVhMtY/4Ct46X5VHQ+QXQT0hoQ9uQM6Q==",
         "dependencies": {
-          "ChatApp.Realtime.Contracts": "2.5.4",
+          "ChatApp.Realtime.Contracts": "2.5.5",
           "Microsoft.Extensions.DependencyInjection.Abstractions": "10.0.5",
           "Microsoft.Extensions.Logging.Abstractions": "10.0.5",
           "NATS.Client.JetStream": "2.8.0"
@@ -50,9 +50,9 @@
       },
       "ChatApp.Realtime.Contracts": {
         "type": "CentralTransitive",
-        "requested": "[2.5.4, )",
-        "resolved": "2.5.4",
-        "contentHash": "jnLr1Ii4wTSjRzShpyToZ00qJ0oAjnJJk9k+hG+hqefZa0TI2FHW77Pv/h15BunLPz4/lx8UY/pH2wx+IHUrUw=="
+        "requested": "[2.5.5, )",
+        "resolved": "2.5.5",
+        "contentHash": "RmfPtFACERVW9kodqQkKvvgUyE8JuantJmO+ggC4syrdEH4V1HbSKCcd860GZThHqMuOeXrI1NjL/0GJCoOuLg=="
       },
       "Microsoft.Extensions.DependencyInjection.Abstractions": {
         "type": "CentralTransitive",

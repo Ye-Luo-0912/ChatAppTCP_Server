@@ -10,9 +10,9 @@
       },
       "ChatApp.Realtime.Contracts": {
         "type": "Direct",
-        "requested": "[2.5.4, )",
-        "resolved": "2.5.4",
-        "contentHash": "jnLr1Ii4wTSjRzShpyToZ00qJ0oAjnJJk9k+hG+hqefZa0TI2FHW77Pv/h15BunLPz4/lx8UY/pH2wx+IHUrUw=="
+        "requested": "[2.5.5, )",
+        "resolved": "2.5.5",
+        "contentHash": "RmfPtFACERVW9kodqQkKvvgUyE8JuantJmO+ggC4syrdEH4V1HbSKCcd860GZThHqMuOeXrI1NjL/0GJCoOuLg=="
       }
     }
   }
