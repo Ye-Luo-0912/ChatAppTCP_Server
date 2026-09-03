@@ -12,6 +12,7 @@ using ChatApp.TcpGateway.Observability.Metrics;
 using Microsoft.Extensions.Logging;
 using RealtimeMessageReactionAction =
     ChatApp.Realtime.Abstractions.Messaging.MessageReactionAction;
+using ChatApp.TcpGateway.Gateway.Serialization;
 using RealtimeMessageReactionCommand =
     ChatApp.Realtime.Abstractions.Messaging.MessageReactionCommand;
 
@@ -77,7 +78,11 @@ internal sealed class ReactionCommandHandler : ICommandHandler
         TcpClientSession session,
         CancellationToken cancellationToken)
     {
-        var request = _addRequestCodec.Deserialize(payload);
+        var request = SessionPayload.Deserialize(
+            session,
+            PacketCommand.AddReactionRequest,
+            _addRequestCodec,
+            payload);
         if (request is null)
         {
             _metrics.ProtocolError();
@@ -170,7 +175,11 @@ internal sealed class ReactionCommandHandler : ICommandHandler
         TcpClientSession session,
         CancellationToken cancellationToken)
     {
-        var request = _removeRequestCodec.Deserialize(payload);
+        var request = SessionPayload.Deserialize(
+            session,
+            PacketCommand.RemoveReactionRequest,
+            _removeRequestCodec,
+            payload);
         if (request is null)
         {
             _metrics.ProtocolError();
@@ -265,6 +274,7 @@ internal sealed class ReactionCommandHandler : ICommandHandler
         using var frame = OutboundFrameFactory.Create(
             PacketCommand.AddReactionAck,
             _addAckCodec,
+            session,
             response);
         session.TryQueue(frame);
     }
@@ -276,6 +286,7 @@ internal sealed class ReactionCommandHandler : ICommandHandler
         using var frame = OutboundFrameFactory.Create(
             PacketCommand.RemoveReactionAck,
             _removeAckCodec,
+            session,
             response);
         session.TryQueue(frame);
     }

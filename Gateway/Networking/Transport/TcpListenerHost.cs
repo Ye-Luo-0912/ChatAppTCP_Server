@@ -315,6 +315,7 @@ internal sealed class TcpListenerHost : IDisposable
                     using var frame = OutboundFrameFactory.Create(
                         PacketCommand.GoAway,
                         _goAwayCodec,
+                        session,
                         goAway);
                     session.TryQueue(frame);
                 }

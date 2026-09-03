@@ -6,6 +6,7 @@ using ChatApp.TcpGateway.Core.Serialization;
 using ChatApp.TcpGateway.Gateway.Networking.Sessions;
 using RealtimeGroupConversationCommand =
     ChatApp.Realtime.Abstractions.Conversations.GroupConversationCommand;
+using ChatApp.TcpGateway.Gateway.Serialization;
 using RealtimeGroupConversationOperation =
     ChatApp.Realtime.Abstractions.Conversations.GroupConversationOperation;
 
@@ -25,7 +26,11 @@ internal sealed partial class GroupCommandHandler
         TcpClientSession session,
         CancellationToken cancellationToken)
     {
-        var request = _dissolveGroupRequestCodec.Deserialize(payload);
+        var request = SessionPayload.Deserialize(
+            session,
+            PacketCommand.DissolveGroupRequest,
+            _dissolveGroupRequestCodec,
+            payload);
         var requestId = request?.RequestId ?? string.Empty;
 
         // 廉价结构校验：通用字段。权限校验（仅 Owner 可解散）由 Realtime 侧判定。

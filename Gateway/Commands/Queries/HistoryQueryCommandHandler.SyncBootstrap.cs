@@ -16,6 +16,7 @@ using RealtimeSyncBootstrapQuery =
     ChatApp.Realtime.Abstractions.Sync.SyncBootstrapQuery;
 using RealtimeConversationSyncWatermark =
     ChatApp.Realtime.Abstractions.Sync.ConversationSyncWatermark;
+using ChatApp.TcpGateway.Gateway.Serialization;
 using RealtimeRelationshipSyncWatermark =
     ChatApp.Realtime.Abstractions.Sync.RelationshipSyncWatermark;
 
@@ -32,7 +33,11 @@ internal sealed partial class HistoryQueryCommandHandler
         TcpClientSession session,
         CancellationToken cancellationToken)
     {
-        var request = _syncBootstrapRequestCodec.Deserialize(payload);
+        var request = SessionPayload.Deserialize(
+            session,
+            PacketCommand.SyncBootstrapRequest,
+            _syncBootstrapRequestCodec,
+            payload);
         if (request is null)
         {
             _metrics.ProtocolError();
@@ -370,6 +375,7 @@ internal sealed partial class HistoryQueryCommandHandler
         using var outboundFrame = OutboundFrameFactory.Create(
             PacketCommand.SyncBootstrapResponse,
             _syncBootstrapResponseCodec,
+            session,
             response);
         session.TryQueue(outboundFrame);
     }

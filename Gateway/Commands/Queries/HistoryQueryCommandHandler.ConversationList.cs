@@ -9,6 +9,7 @@ using ChatApp.TcpGateway.Gateway.Networking.Sessions;
 using ChatApp.TcpGateway.Observability.Logging;
 using ChatApp.TcpGateway.Observability.Metrics;
 using Microsoft.Extensions.Logging;
+using ChatApp.TcpGateway.Gateway.Serialization;
 using RealtimeConversationListQuery =
     ChatApp.Realtime.Abstractions.Conversations.ConversationListQuery;
 
@@ -25,7 +26,11 @@ internal sealed partial class HistoryQueryCommandHandler
         TcpClientSession session,
         CancellationToken cancellationToken)
     {
-        var request = _conversationListRequestCodec.Deserialize(payload);
+        var request = SessionPayload.Deserialize(
+            session,
+            PacketCommand.ConversationListRequest,
+            _conversationListRequestCodec,
+            payload);
         if (request is null)
         {
             _metrics.ProtocolError();
@@ -193,6 +198,7 @@ internal sealed partial class HistoryQueryCommandHandler
         using var outboundFrame = OutboundFrameFactory.Create(
             PacketCommand.ConversationListPage,
             _conversationListResponseCodec,
+            session,
             response);
         session.TryQueue(outboundFrame);
     }

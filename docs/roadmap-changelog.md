@@ -3,6 +3,29 @@
 本文件记录已完成的历史变更，按时间倒序排列。当前状态见 `roadmap-current-state.md`，
 未完成工作见 `roadmap-todo.md`。本文件不再保留过期测试数字（当时通过数仅作参考）。
 
+## 2026-08-30
+
+### BIN-INTEGRATION-3 连接级二进制 payload 双端接入
+
+Gateway 侧完成 `chatapp-bin-v1` 双 codec 接入与验收（JSON 默认路径不变）：
+
+- 协商：`GatewayFeature.BinaryPayload` 入 `GatewayFeatureSet.Implemented`（修复缺位导致协商永不发生的 bug）；
+  `TcpGatewayOptions.EnableBinaryPayloadFormat`（默认 false）门控；非 Resume 路径协商出 BinaryPayload 时
+  `ServerHello.PayloadFormat` 回应 `chatapp-bin-v1`，`TcpClientSession.NegotiatedPayloadFormat` 握手后不可变；
+  Resume 路径强制 JSON 且协商位同步剥离该能力位。
+- 入站：`SessionPayload.Deserialize` 按会话格式分流；二进制走共享 `TcpBinaryWireCodec` 寄存器 +
+  `BinaryPayloadMapper.ToLocal`（68 个本地↔共享映射 + 11 个共享类型恒等）；畸形/超限 fail-closed 关连接。
+- 出站：`OutboundFrameFactory.Create(command, codec, session, value)` 按会话格式分流 + `CreateBinary`
+  （`TcpBinaryWireEncoder` 编码，DestinationTooSmall 单次扩容重试）；fanout 用 `FormatGroupedFrame`
+  按格式各至多编码一次共享帧。
+- 验证：新增 9 项真 TCP 集成测试（协商成功/JSON fallback×2/Resume-JSON/二进制往返/混合格式 fanout/
+  畸形 fail-closed/未知命令/二进制 GoAway），全量 630 项测试全绿；80/320/640 msg/s 短测
+  （`scratch/binary-shorttest-report-20260830.md`）payload −47%、640/s CPU −28.5%、
+  零漏投/零重复、p99 ≤1.9 ms。
+- 跨进程真机验证：部署 relgate 全栈 + e2e 驱动（.tmp-bin-e2e / .tmp-call-e2e 经 SSH 隧道）12/12 与 27/27 通过；过程中发现并修复 6 处 fanout/响应站点漏做格式分组的真实 bug（旧 3 参 JSON-only Create 向二进制会话投 JSON 帧），新增混合格式回归测试防复发；网关测试 632 全绿。
+- 依赖：共享契约包 `ChatApp.Protocol.Tcp.Binary.Schemas` 0.5.4（含新增编码寄存器
+  `TcpBinaryWireEncoder`；本地 feed Protocol.Tcp 0.5.3 残缺旧构建弃用，统一 0.5.4）。
+
 ## 2026-08-14
 
 ### REL-E2E-4 Gateway 关系读取端收口

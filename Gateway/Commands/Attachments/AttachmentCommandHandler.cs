@@ -8,6 +8,7 @@ using ChatApp.TcpGateway.Gateway.Networking.Sessions;
 using ChatApp.TcpGateway.Observability.Logging;
 using ChatApp.TcpGateway.Observability.Metrics;
 using Microsoft.Extensions.Logging;
+using ChatApp.TcpGateway.Gateway.Serialization;
 
 namespace ChatApp.TcpGateway.Gateway.Commands.Attachments;
 
@@ -71,7 +72,11 @@ internal sealed class AttachmentCommandHandler : ICommandHandler
         TcpClientSession session,
         CancellationToken cancellationToken)
     {
-        var request = _requestCodec.Deserialize(payload);
+        var request = SessionPayload.Deserialize(
+            session,
+            PacketCommand.AttachmentFinalizeRequest,
+            _requestCodec,
+            payload);
         if (request is null)
         {
             _metrics.ProtocolError();
@@ -161,6 +166,7 @@ internal sealed class AttachmentCommandHandler : ICommandHandler
         using var frame = OutboundFrameFactory.Create(
             PacketCommand.AttachmentFinalizeResponse,
             _responseCodec,
+            session,
             response);
         session.TryQueue(frame);
     }
@@ -170,7 +176,11 @@ internal sealed class AttachmentCommandHandler : ICommandHandler
         TcpClientSession session,
         CancellationToken cancellationToken)
     {
-        var request = _downloadAuthorizeRequestCodec.Deserialize(payload);
+        var request = SessionPayload.Deserialize(
+            session,
+            PacketCommand.AttachmentDownloadAuthorizeRequest,
+            _downloadAuthorizeRequestCodec,
+            payload);
         if (request is null)
         {
             _metrics.ProtocolError();
@@ -259,6 +269,7 @@ internal sealed class AttachmentCommandHandler : ICommandHandler
         using var frame = OutboundFrameFactory.Create(
             PacketCommand.AttachmentDownloadAuthorizeResponse,
             _downloadAuthorizeResponseCodec,
+            session,
             response);
         session.TryQueue(frame);
     }

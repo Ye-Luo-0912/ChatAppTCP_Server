@@ -12,6 +12,7 @@ using ChatApp.TcpGateway.Gateway.Networking.Sessions;
 using ChatApp.TcpGateway.Observability.Logging;
 using ChatApp.TcpGateway.Observability.Metrics;
 using Microsoft.Extensions.Logging;
+using ChatApp.TcpGateway.Gateway.Serialization;
 
 namespace ChatApp.TcpGateway.Gateway.Networking.Ephemeral;
 
@@ -146,7 +147,11 @@ internal sealed class TypingActorPipeline : IAsyncDisposable, ITypingAuthorizati
         in PacketFrame frame,
         TcpClientSession session)
     {
-        var notify = _typingNotifyCodec.Deserialize(frame.Payload);
+        var notify = SessionPayload.Deserialize(
+            session,
+            PacketCommand.TypingNotify,
+            _typingNotifyCodec,
+            frame.Payload);
         if (notify is null || string.IsNullOrWhiteSpace(notify.ConversationId))
             return true; // 静默丢弃无效 payload，不关闭连接
 

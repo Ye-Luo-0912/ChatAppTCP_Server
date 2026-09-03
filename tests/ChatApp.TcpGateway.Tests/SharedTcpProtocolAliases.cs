@@ -20,3 +20,40 @@ global using SyncCursorResetRequired = ChatApp.Shared.Protocol.Tcp.SyncCursorRes
 global using TcpRelationshipListRequest = ChatApp.Shared.Protocol.Tcp.TcpRelationshipListRequest;
 global using TcpRelationshipListResponse = ChatApp.Shared.Protocol.Tcp.TcpRelationshipListResponse;
 global using TcpRelationshipListItem = ChatApp.Shared.Protocol.Tcp.TcpRelationshipListItem;
+
+// 共享包 0.5.4 起在 ChatApp.Shared.Protocol.Tcp 新增了与网关本地/Realtime 契约同名的类型
+// （AuthenticationRequest 等），与文件内同时 using 两个命名空间的既有测试产生二义。
+// 测试项目整体针对网关本地 wire 形状与 Realtime 端口签名，全局别名统一消歧；
+// 需要共享规范类型的测试文件用文件级别名覆盖即可。
+global using AuthenticationRequest = ChatApp.TcpGateway.Core.Messaging.AuthenticationRequest;
+global using AuthenticationResponse = ChatApp.TcpGateway.Core.Messaging.AuthenticationResponse;
+global using ChatMessage = ChatApp.TcpGateway.Core.Messaging.ChatMessage;
+global using MessageAcknowledgement = ChatApp.TcpGateway.Core.Messaging.MessageAcknowledgement;
+global using ConversationListPage = ChatApp.Realtime.Abstractions.Conversations.ConversationListPage;
+global using MessageReceiptAcknowledgement = ChatApp.TcpGateway.Core.Messaging.MessageReceiptAcknowledgement;
+global using MessageEditRequest = ChatApp.TcpGateway.Core.Messaging.MessageEditRequest;
+global using MessageEditAcknowledgement = ChatApp.TcpGateway.Core.Messaging.MessageEditAcknowledgement;
+global using MessageEditedUpdate = ChatApp.TcpGateway.Core.Messaging.MessageEditedUpdate;
+global using MessageRecallRequest = ChatApp.TcpGateway.Core.Messaging.MessageRecallRequest;
+global using MessageRecallAcknowledgement = ChatApp.TcpGateway.Core.Messaging.MessageRecallAcknowledgement;
+global using MessageRecalledUpdate = ChatApp.TcpGateway.Core.Messaging.MessageRecalledUpdate;
+global using AddReactionRequest = ChatApp.TcpGateway.Core.Messaging.AddReactionRequest;
+global using AddReactionAcknowledgement = ChatApp.TcpGateway.Core.Messaging.AddReactionAcknowledgement;
+global using RemoveReactionRequest = ChatApp.TcpGateway.Core.Messaging.RemoveReactionRequest;
+global using RemoveReactionAcknowledgement = ChatApp.TcpGateway.Core.Messaging.RemoveReactionAcknowledgement;
+global using ReactionAddedUpdate = ChatApp.TcpGateway.Core.Messaging.ReactionAddedUpdate;
+global using ReactionRemovedUpdate = ChatApp.TcpGateway.Core.Messaging.ReactionRemovedUpdate;
+global using ConversationListRequest = ChatApp.TcpGateway.Core.Messaging.Conversations.ConversationListRequest;
+global using ConversationMarkReadRequest = ChatApp.TcpGateway.Core.Messaging.Conversations.ConversationMarkReadRequest;
+global using ConversationMarkReadResponse = ChatApp.TcpGateway.Core.Messaging.Conversations.ConversationMarkReadResponse;
+global using ConversationSetPrefsRequest = ChatApp.TcpGateway.Core.Messaging.Conversations.ConversationSetPrefsRequest;
+global using ConversationSetPrefsResponse = ChatApp.TcpGateway.Core.Messaging.Conversations.ConversationSetPrefsResponse;
+global using ConversationReadUpdate = ChatApp.TcpGateway.Core.Messaging.Conversations.ConversationReadUpdate;
+global using UnreadCountChanged = ChatApp.TcpGateway.Core.Messaging.Conversations.UnreadCountChanged;
+global using MessageReadReceiptQueryRequest = ChatApp.TcpGateway.Core.Messaging.Conversations.MessageReadReceiptQueryRequest;
+global using MessageReadReceiptQueryResponse = ChatApp.TcpGateway.Core.Messaging.Conversations.MessageReadReceiptQueryResponse;
+global using MessageReadReceiptItem = ChatApp.TcpGateway.Core.Messaging.Conversations.MessageReadReceiptItem;
+global using AttachmentFinalizeRequest = ChatApp.TcpGateway.Core.Messaging.Attachments.AttachmentFinalizeRequest;
+global using AttachmentFinalizeResponse = ChatApp.TcpGateway.Core.Messaging.Attachments.AttachmentFinalizeResponse;
+global using AttachmentDownloadAuthorizeRequest = ChatApp.TcpGateway.Core.Messaging.Attachments.AttachmentDownloadAuthorizeRequest;
+global using AttachmentDownloadAuthorizeResponse = ChatApp.TcpGateway.Core.Messaging.Attachments.AttachmentDownloadAuthorizeResponse;

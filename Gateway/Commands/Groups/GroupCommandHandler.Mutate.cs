@@ -8,6 +8,7 @@ using RealtimeGroupConversationCommand =
     ChatApp.Realtime.Abstractions.Conversations.GroupConversationCommand;
 using RealtimeGroupConversationOperation =
     ChatApp.Realtime.Abstractions.Conversations.GroupConversationOperation;
+using ChatApp.TcpGateway.Gateway.Serialization;
 using RealtimeConversationMemberRole =
     ChatApp.Realtime.Abstractions.Conversations.ConversationMemberRole;
 
@@ -31,7 +32,11 @@ internal sealed partial class GroupCommandHandler
         TcpClientSession session,
         CancellationToken cancellationToken)
     {
-        var request = _addGroupMembersRequestCodec.Deserialize(payload);
+        var request = SessionPayload.Deserialize(
+            session,
+            PacketCommand.AddGroupMembersRequest,
+            _addGroupMembersRequestCodec,
+            payload);
 
         // 显式分支 request is null 以帮助编译器流分析，避免后续 CS8602。
         if (request is null)
@@ -105,7 +110,11 @@ internal sealed partial class GroupCommandHandler
         TcpClientSession session,
         CancellationToken cancellationToken)
     {
-        var request = _removeGroupMemberRequestCodec.Deserialize(payload);
+        var request = SessionPayload.Deserialize(
+            session,
+            PacketCommand.RemoveGroupMemberRequest,
+            _removeGroupMemberRequestCodec,
+            payload);
         var requestId = request?.RequestId ?? string.Empty;
 
         if (request is null
@@ -157,7 +166,11 @@ internal sealed partial class GroupCommandHandler
         TcpClientSession session,
         CancellationToken cancellationToken)
     {
-        var request = _leaveGroupRequestCodec.Deserialize(payload);
+        var request = SessionPayload.Deserialize(
+            session,
+            PacketCommand.LeaveGroupRequest,
+            _leaveGroupRequestCodec,
+            payload);
         var requestId = request?.RequestId ?? string.Empty;
 
         if (request is null
@@ -207,7 +220,11 @@ internal sealed partial class GroupCommandHandler
         TcpClientSession session,
         CancellationToken cancellationToken)
     {
-        var request = _changeMemberRoleRequestCodec.Deserialize(payload);
+        var request = SessionPayload.Deserialize(
+            session,
+            PacketCommand.ChangeMemberRoleRequest,
+            _changeMemberRoleRequestCodec,
+            payload);
         var requestId = request?.RequestId ?? string.Empty;
 
         // 廉价结构校验：通用字段 + TargetUserId > 0 + NewRole 枚举合法性。
@@ -263,7 +280,11 @@ internal sealed partial class GroupCommandHandler
         TcpClientSession session,
         CancellationToken cancellationToken)
     {
-        var request = _listGroupMembersRequestCodec.Deserialize(payload);
+        var request = SessionPayload.Deserialize(
+            session,
+            PacketCommand.ListGroupMembersRequest,
+            _listGroupMembersRequestCodec,
+            payload);
         var requestId = request?.RequestId ?? string.Empty;
 
         if (request is null

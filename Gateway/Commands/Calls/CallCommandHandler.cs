@@ -8,6 +8,7 @@ using ChatApp.TcpGateway.Gateway.Networking.Sessions;
 using ChatApp.TcpGateway.Observability.Logging;
 using ChatApp.TcpGateway.Observability.Metrics;
 using Microsoft.Extensions.Logging;
+using ChatApp.TcpGateway.Gateway.Serialization;
 
 namespace ChatApp.TcpGateway.Gateway.Commands.Calls;
 
@@ -73,7 +74,11 @@ internal sealed class CallCommandHandler : ICommandHandler
         TcpClientSession session,
         CancellationToken cancellationToken)
     {
-        var request = _requestCodec.Deserialize(payload);
+        var request = SessionPayload.Deserialize(
+            session,
+            PacketCommand.CallCommandRequest,
+            _requestCodec,
+            payload);
         if (request is null)
         {
             _metrics.ProtocolError();
@@ -185,14 +190,14 @@ internal sealed class CallCommandHandler : ICommandHandler
         if (targets.Length == 0)
             return;
 
-        using var frame = OutboundFrameFactory.Create(
+        using var frames = new FormatGroupedFrame<TcpCallSignal>(
             PacketCommand.CallSignal,
             _signalCodec,
             signal);
         var queued = 0;
         foreach (var target in targets)
         {
-            if (target.TryQueue(frame))
+            if (target.TryQueue(frames.GetFrame(target)))
                 queued++;
         }
 
@@ -206,6 +211,7 @@ internal sealed class CallCommandHandler : ICommandHandler
         using var frame = OutboundFrameFactory.Create(
             PacketCommand.CallCommandResponse,
             _responseCodec,
+            session,
             response);
         session.TryQueue(frame);
     }

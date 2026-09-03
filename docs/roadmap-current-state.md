@@ -111,6 +111,23 @@ feed 中的 `ChatApp.Protocol.Tcp 0.5.0` / `.Json 0.5.0`、`ChatApp.Realtime.Con
 - `CommandDescriptor` 含 `Deprecated` 标志，弃用命令返回 `UnsupportedCommand`。
 - 详见 `docs/protocol-capabilities.md`。
 
+### 连接级二进制 payload（`chatapp-bin-v1`，BIN-INTEGRATION-3，2026-08-30 已实现）
+
+- **默认关闭**：`TcpGatewayOptions.EnableBinaryPayloadFormat=false` 时行为与旧版完全一致。
+  开启后：客户端 ClientHello 声明 `GatewayFeature.BinaryPayload`（该位已入 `GatewayFeatureSet.Implemented`）
+  且非 Resume 路径时，`ServerHello.PayloadFormat` 回应 `chatapp-bin-v1`，会话 `NegotiatedPayloadFormat`
+  固定为二进制（握手后不可变）；ClientHello/ServerHello 与 Resume 恒 JSON。
+- 入站：handler 经 `SessionPayload.Deserialize` 按会话格式分流，二进制走共享寄存器
+  `TcpBinaryWireCodec` + `BinaryPayloadMapper.ToLocal`（79 命令/方向：68 本地↔共享 + 11 恒等共享）；
+  解码失败抛 `BinaryPayloadDecodeException`，按协议错误关连接（fail-closed）。
+- 出站：`OutboundFrameFactory.Create(command, codec, session, value)` 按会话格式分流；
+  fanout 用 `FormatGroupedFrame`（JSON/binary 各至多编码一次共享帧，禁止逐 session 序列化）。
+- 消费共享包 `ChatApp.Protocol.Tcp.Binary.Schemas` 0.5.4（本地 feed；0.5.3 前缀包已弃用）。
+- 验证：集成测试 9 项（协商/JSON fallback/Resume-JSON/二进制往返/混合 fanout/fail-closed/二进制 GoAway），
+  全量 630 项测试全绿；80/320/640 msg/s 短测报告 `scratch/binary-shorttest-report-20260830.md`
+  （payload −47%、640/s CPU −28.5%、零漏投/零重复、p99 ≤1.9 ms；in-proc 口径）。
+  正式启用属部署决策（开关 + 滚动发布）；跨进程 soak 待 relgate 基础设施复跑。
+
 ### Resume（已完成事务化）
 
 - Resume 同步水位恢复：`ResumeResponse.LastConversationSequence` 通过 SyncBootstrap

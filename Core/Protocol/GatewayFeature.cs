@@ -7,6 +7,7 @@ public static class GatewayFeatureSet
 {
     /// <summary>当前服务端已实现、可在 ServerHello 中协商的能力。</summary>
     public const GatewayFeature Implemented =
+        GatewayFeature.BinaryPayload |
         GatewayFeature.CommandCapabilities |
         GatewayFeature.SessionResume |
         GatewayFeature.ConversationSync |

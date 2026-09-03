@@ -46,12 +46,20 @@ Server HTTP 与 public `T_*` 表继续作为唯一关系权威；Gateway 只提�
 
 完成标准：所有信令序列得到唯一终态，鉴权和预算可测试，TCP Gateway 不承载连续媒体包或自定义 UDP 可靠层。
 
-## 支撑：`BIN-INTEGRATION-3`
+## 支撑：`BIN-INTEGRATION-3`（✅ 已完成，2026-08-30）
 
-1. 仅在 Shared 当前 schema 批次完成且功能命令目录稳定后接入。握手与协商前保持 JSON，首版 Resume 也保持 JSON；协商后 session 固定 exact format，不 sniff、不在线切换。
-2. 入站使用 Shared generated decoder，出站使用普通源码 encoder；Gateway 负责 buffer owner、池归还和敏感区清理，不复制 Core 指针实现或 schema。
-3. 混合连接按 format 分组，每个事件每种格式最多编码一次并共享只读 frame；不能退化为逐 session 序列化。
-4. 用真实 Chat/History/Sync/关系/语音/通话 corpus 比较 payload、CPU、allocation 和 p95/p99；完成 malformed/oversize/fuzz、fallback、GoAway/重连与 80/320/640 msg/s 短测。收益不足时继续使用 JSON。
+1. 仅在 Shared 当前 schema 批次完成且功能命令目录稳定后接入。握手与协商前保持 JSON，首版 Resume 也保持 JSON；协商后 session 固定 exact format，不 sniff、不在线切换。— 已落地（`EnableBinaryPayloadFormat` 默认关闭，行为与旧版一致）。
+2. 入站使用 Shared generated decoder，出站使用普通源码 encoder；Gateway 负责 buffer owner、池归还和敏感区清理，不复制 Core 指针实现或 schema。— 已落地（`SessionPayload.Deserialize` 分流 + `TcpBinaryWireEncoder` 编码，共享包 0.5.4）。
+3. 混合连接按 format 分组，每个事件每种格式最多编码一次并共享只读 frame；不能退化为逐 session 序列化。— 已落地（`FormatGroupedFrame`）。
+4. 用真实 Chat/History/Sync/关系/语音/通话 corpus 比较 payload、CPU、allocation 和 p95/p99；完成 malformed/oversize/fuzz、fallback、GoAway/重连与 80/320/640 msg/s 短测。收益不足时继续使用 JSON。— 已完成（`scratch/binary-shorttest-report-20260830.md`：payload −47%、640/s CPU −28.5%、零漏投/零重复、p99 ≤1.9 ms）。
+   遗留已清（2026-08-30）：跨进程真机验证已完成——新构建经 `relgate-deploy.ps1 -SkipInfra` 部署至
+   chatapp-linux 全栈（Gateway 启动脚本加 `TcpGateway__EnableBinaryPayloadFormat='true'`），二进制 e2e 驱动
+   （`.tmp-bin-e2e`，复用真实 ChatSessionClient 经 SSH 隧道）12/12 通过：chatapp-bin-v1 协商、JSON fallback、
+   双格式真实进程混布 fanout 双向消息往返、二进制 MessageAcknowledgement。e2e 发现并修复 6 处 fanout/响应站点漏格式分组（CallSignal push、Ephemeral typing/presence、TypingFanoutHost、Presence 广播、PresenceQuery 快照响应），新增 2 个混合格式回归测试（EphemeralMixedFormatFanoutTests，还原修复必现失败已验证），全量 632 全绿。本机 Docker Desktop 已卸载（按用户
+   要求，释放 ~69GB），本地验证改用原生基础设施路径：`scratch/native-infra.ps1 start`（PostgreSQL 17.4 +
+   Garnet 2.1.5，`--lua --lua-transaction-mode` 必须开启）+ `CHATAPP_TEST_POSTGRES` / `CHATAPP_TEST_GARNET`
+   环境变量直连；Server 集成测试 141 过/130 跳过 → 268 过/3 跳过（跳过项均为容器重启/ClamAV 守护进程语义）；RealtimeServices 两个测试项目同样恢复：测试夹具加 CHATAPP_TEST_POSTGRES/NATS/GARNET 环境变量双模式，Realtime.Tests 391/391、IntegrationTests 135/135 全绿（含修复 PerfHarness pg_stat_statements 跨库 queryid 冲突与 ConfigureSchema 静态态跨类污染两个测试缺陷）。
+   正式启用（开关 + 滚动发布）为部署决策。运行提示（2026-09-02）：Windows→relgate 的 SSH 隧道不稳定时，可把三套 e2e 驱动的 bin 输出直接部署到远程本机运行（`dotnet <X>.dll --base=http://127.0.0.1:8080 --gw=127.0.0.1`，最终门已以此方式全绿：BinE2E 12/12、CallE2E 27/0、VoiceE2E 41/0）；VoiceE2E 受 Server `user-sensitive` 限流（附件 presign 10 次/900 秒/用户）约束，连续重跑需间隔一个窗口。
 
 ## 支撑：`PERF-SUPPORT-1`
 

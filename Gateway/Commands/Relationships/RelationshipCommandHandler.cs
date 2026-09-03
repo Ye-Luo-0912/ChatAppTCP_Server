@@ -10,6 +10,7 @@ using ChatApp.TcpGateway.Gateway.Networking.Sessions;
 using ChatApp.TcpGateway.Observability.Logging;
 using ChatApp.TcpGateway.Observability.Metrics;
 using Microsoft.Extensions.Logging;
+using ChatApp.TcpGateway.Gateway.Serialization;
 
 namespace ChatApp.TcpGateway.Gateway.Commands.Relationships;
 
@@ -77,7 +78,11 @@ internal sealed class RelationshipCommandHandler : ICommandHandler
         TcpClientSession session,
         CancellationToken cancellationToken)
     {
-        var request = _commandRequestCodec.Deserialize(payload);
+        var request = SessionPayload.Deserialize(
+            session,
+            PacketCommand.RelationshipCommandRequest,
+            _commandRequestCodec,
+            payload);
         if (request is null)
         {
             _metrics.ProtocolError();
@@ -202,7 +207,11 @@ internal sealed class RelationshipCommandHandler : ICommandHandler
         TcpClientSession session,
         CancellationToken cancellationToken)
     {
-        var request = _listRequestCodec.Deserialize(payload);
+        var request = SessionPayload.Deserialize(
+            session,
+            PacketCommand.RelationshipListRequest,
+            _listRequestCodec,
+            payload);
         if (request is null)
         {
             _metrics.ProtocolError();
@@ -283,6 +292,7 @@ internal sealed class RelationshipCommandHandler : ICommandHandler
         using var frame = OutboundFrameFactory.Create(
             PacketCommand.RelationshipCommandResponse,
             _commandResponseCodec,
+            session,
             response);
         session.TryQueue(frame);
     }
@@ -312,6 +322,7 @@ internal sealed class RelationshipCommandHandler : ICommandHandler
         using var frame = OutboundFrameFactory.Create(
             PacketCommand.RelationshipListResponse,
             _listResponseCodec,
+            session,
             response);
         session.TryQueue(frame);
     }

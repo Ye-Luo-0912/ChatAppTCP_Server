@@ -15,6 +15,7 @@
     <PackageReference Include="ChatApp.Auth.Contracts" />
     <PackageReference Include="ChatApp.Protocol.Tcp" />
     <PackageReference Include="ChatApp.Protocol.Tcp.Json" />
+    <PackageReference Include="ChatApp.Protocol.Tcp.Binary.Schemas" />
   </ItemGroup>
 
   <ItemGroup>
