@@ -25,6 +25,13 @@ namespace ChatApp.TcpGateway.Gateway.Commands.Calls;
 /// 媒体/SDP 只走临时信令路径，不进入持久化存储。
 /// </para>
 /// <para>
+/// <b>群组路径（GROUP-CALL-1，Mesh ≤4 人）</b>：携带群组 grant（<see cref="TcpCallKind.Group"/>）
+/// 的命令不经 Realtime 1:1 状态机，由 <see cref="GroupCallSignalRelay"/> 无状态中继——校验
+/// grant（HMAC 覆盖全部参与者）通过后按参与者名单扇出到其余在线成员（invite），成员离开
+/// （End）扇出 <c>participant-left</c> 事件；房间状态由客户端按 revision/成员列表自洽，
+/// Gateway 不做服务端房间状态。
+/// </para>
+/// <para>
 /// 校验顺序、错误码与 metric 事件遵循 <see cref="RelationshipCommandHandler"/> 既有约定。
 /// </para>
 /// </summary>
@@ -33,6 +40,7 @@ internal sealed class CallCommandHandler : ICommandHandler
     private const int MaxRequestIdLength = 64;
 
     private readonly ICallBackend _backend;
+    private readonly GroupCallSignalRelay _groupRelay;
     private readonly IPayloadCodec<TcpCallCommandRequest> _requestCodec;
     private readonly IPayloadCodec<TcpCallCommandResponse> _responseCodec;
     private readonly IPayloadCodec<TcpCallSignal> _signalCodec;
@@ -42,6 +50,7 @@ internal sealed class CallCommandHandler : ICommandHandler
 
     public CallCommandHandler(
         ICallBackend backend,
+        GroupCallSignalRelay groupRelay,
         IPayloadCodec<TcpCallCommandRequest> requestCodec,
         IPayloadCodec<TcpCallCommandResponse> responseCodec,
         IPayloadCodec<TcpCallSignal> signalCodec,
@@ -50,6 +59,7 @@ internal sealed class CallCommandHandler : ICommandHandler
         ILogger<CallCommandHandler> logger)
     {
         _backend = backend;
+        _groupRelay = groupRelay;
         _requestCodec = requestCodec;
         _responseCodec = responseCodec;
         _signalCodec = signalCodec;
@@ -121,6 +131,14 @@ internal sealed class CallCommandHandler : ICommandHandler
 
         try
         {
+            // 群组路径（GROUP-CALL-1）：群组 grant 不进入 Realtime 1:1 状态机，无状态中继扇出。
+            if (request.Grant is not null && GroupCallSignalRelay.IsGroupGrant(request.Grant))
+            {
+                await HandleGroupAsync(request, requestId, callId, session, cancellationToken)
+                    .ConfigureAwait(false);
+                return;
+            }
+
             var result = await _backend
                 .SendCommandAsync(
                     requestId,
@@ -179,6 +197,51 @@ internal sealed class CallCommandHandler : ICommandHandler
                     ErrorMessage = "通话服务暂时不可用。"
                 });
         }
+    }
+
+    /// <summary>
+    /// 群组信令无状态中继：grant 校验通过后按参与者名单扇出到其余在线成员（排除发起者）。
+    /// </summary>
+    private ValueTask HandleGroupAsync(
+        TcpCallCommandRequest request,
+        string requestId,
+        string callId,
+        TcpClientSession session,
+        CancellationToken cancellationToken)
+    {
+        var verdict = _groupRelay.Evaluate(requestId, request, request.Grant!, session.UserId);
+        if (!verdict.Succeeded)
+        {
+            SendResponse(
+                session,
+                new TcpCallCommandResponse
+                {
+                    RequestId = requestId,
+                    CallId = callId,
+                    Succeeded = false,
+                    ErrorCode = verdict.ErrorCode,
+                    ErrorMessage = verdict.ErrorMessage
+                });
+            return ValueTask.CompletedTask;
+        }
+
+        foreach (var signal in verdict.Signals)
+        {
+            PushSignal(signal);
+        }
+
+        SendResponse(
+            session,
+            new TcpCallCommandResponse
+            {
+                RequestId = requestId,
+                CallId = callId,
+                Succeeded = true,
+                State = verdict.RelayState,
+                EndReason = verdict.RelayEndReason,
+                Revision = request.Revision
+            });
+        return ValueTask.CompletedTask;
     }
 
     /// <summary>

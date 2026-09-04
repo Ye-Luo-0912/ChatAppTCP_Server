@@ -150,6 +150,11 @@ builder.Services.AddSingleton<AttachmentCommandHandler>();
 builder.Services.AddSingleton<RelationshipCommandHandler>();
 // CALL-E2E-2：通话信令控制面（RealtimeCallBackend 经 IRealtimeMessageBus.SendCallCommandAsync 转发）。
 builder.Services.AddSingleton<ICallBackend, RealtimeCallBackend>();
+// GROUP-CALL-1：群通话（Mesh ≤4 人）无状态信令中继。密钥与 Server JwtSettings.Secret 同源
+// （CallGrantSigning:Secret）；未配置时群组命令 fail-closed（call_grant_invalid），1:1 链路不受影响。
+builder.Services.Configure<GroupCallGrantOptions>(
+    builder.Configuration.GetSection(GroupCallGrantOptions.SectionName));
+builder.Services.AddSingleton<GroupCallSignalRelay>();
 builder.Services.AddSingleton<CallCommandHandler>();
 builder.Services.AddSingleton<CommandDispatcher>();
 builder.Services.AddHostedService<RealtimeEventConsumerService>();

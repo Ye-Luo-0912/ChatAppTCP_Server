@@ -659,6 +659,7 @@ public sealed class RelationshipListReadIntegrationTests
 
             var callHandler = new CallCommandHandler(
                 new StubCallBackend(NullLogger<StubCallBackend>.Instance),
+                CallSignalingIntegrationTests.DisabledGroupRelay(),
                 new JsonPayloadCodec<TcpCallCommandRequest>(
                     GatewayJsonSerializerContext.Default.TcpCallCommandRequest),
                 new JsonPayloadCodec<TcpCallCommandResponse>(

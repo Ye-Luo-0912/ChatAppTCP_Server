@@ -173,6 +173,12 @@ public sealed class CallSignalingIntegrationTests
         Assert.False(scriptedBackend.Called);
     }
 
+    /// <summary>测试用群组中继：未配置密钥（群组命令 fail-closed，不影响 1:1 断言）。</summary>
+    internal static GroupCallSignalRelay DisabledGroupRelay() => new(
+        Options.Create(new GroupCallGrantOptions()),
+        TimeProvider.System,
+        NullLogger<GroupCallSignalRelay>.Instance);
+
     /// <summary>可编程通话后端：记录收到的命令，返回可配置结果。</summary>
     private sealed class ScriptedCallBackend : ICallBackend
     {
@@ -237,6 +243,8 @@ public sealed class CallSignalingIntegrationTests
             {
                 "caller-token" => (42L, "caller-session"),
                 "callee-token" => (43L, "callee-session"),
+                "third-token" => (44L, "third-session"),
+                "intruder-token" => (99L, "intruder-session"),
                 _ => (0L, "unknown-session")
             };
 
@@ -244,7 +252,13 @@ public sealed class CallSignalingIntegrationTests
                 RealtimeAuthenticationResult.Success(
                     userId: userId,
                     sessionId: sessionId,
-                    userName: accessToken == "caller-token" ? "caller" : "callee",
+                    userName: accessToken switch
+                    {
+                        "caller-token" => "caller",
+                        "callee-token" => "callee",
+                        "third-token" => "third",
+                        _ => "intruder"
+                    },
                     deviceIdHash,
                     roles: []));
         }
@@ -265,7 +279,7 @@ public sealed class CallSignalingIntegrationTests
         public int Port { get; }
         public CancellationToken Token { get; }
 
-        public static async Task<CallHarness> StartAsync(ICallBackend backend)
+        public static async Task<CallHarness> StartAsync(ICallBackend backend, string? groupCallSecret = null)
         {
             var port = ReserveLoopbackPort();
             var options = new TcpGatewayOptions
@@ -499,6 +513,10 @@ public sealed class CallSignalingIntegrationTests
 
             var callHandler = new CallCommandHandler(
                 backend,
+                new GroupCallSignalRelay(
+                    Options.Create(new GroupCallGrantOptions { Secret = groupCallSecret }),
+                    TimeProvider.System,
+                    NullLogger<GroupCallSignalRelay>.Instance),
                 new JsonPayloadCodec<TcpCallCommandRequest>(
                     GatewayJsonSerializerContext.Default.TcpCallCommandRequest),
                 new JsonPayloadCodec<TcpCallCommandResponse>(

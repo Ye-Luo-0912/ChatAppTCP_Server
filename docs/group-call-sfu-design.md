@@ -114,3 +114,44 @@ N 人（初始目标：视频 ≤9 路 / 音频 ≤30 路）多方通话，复�
 - Realtime：跨实例信令扇出沿用（participant 事件）；
 - Client：状态机多人化 + 媒体栈分阶段替换；
 - 本设计不覆盖：录制、直播、会议纪要等衍生能力。
+
+## 10. 阶段一实现记录（GROUP-CALL-1，信令面已交付）
+
+> 范围：Shared 0.5.7 wire 扩展 + Server grant 多人化 + Gateway 无状态中继。
+> 媒体面（多路 PeerConnection / Mesh 客户端代理）不在本批，按 §3 由客户端阶段承接。
+
+### 10.1 wire（Shared 0.5.7，全加性）
+
+- `TcpCallGrant` + `CallKind`（TcpCallKind：Direct=1 缺省 / Group=2；wire 缺省/null 即
+  Direct，旧端零改动）+ `Participants`（完整成员名单：含主叫、升序、2..4 人）。
+- `TcpCallSignal` + `Event`（新世代 kind 词表，string：`participant-joined` /
+  `participant-left`，预留 `offer/answer/ice/accept/reject/cancel/end`；**接收端 unknown
+  值容忍跳过**）+ `ParticipantUserId`。1:1 既有语义仍用既有 `Kind` 字段，本字段保持 null。
+- 二进制 schema 字段续编（grant 7/8、signal 9/10），Direct/1:1 缺省值**不写出**——0.5.6
+  旧解码端逐字节兼容；JSON 新属性 nullable，既有 golden 逐字节不变。
+- `TcpCallGrantSignature`：canonical 载荷权威实现。Direct 与 0.5.6 双人格式逐字节一致；
+  Group 追加 `|G|升序参与者`（HMAC 覆盖全部参与者，防替换/增删/重排/Direct↔Group 互换
+  重放；群组 CalleeUserId 恒 0 → 旧双人校验端天然 fail-closed）。
+
+### 10.2 Server grant 多人化
+
+- `POST /api/calls/grants`：`callKind="group"` + `participantUserIds`（被邀请人，不含
+  主叫，1..3 人）→ 群组 grant（名单含主叫共 ≤4 人）；逐参与者关系/拉黑校验，任一不合格
+  整体拒绝（`call_grant_not_friends` / `call_grant_blocked` + `userId` 指明成员）；名单
+  非法 → `call_grant_invalid_participants`；未知 kind → `call_grant_invalid_call_kind`。
+- 旧请求（无新字段）= 双人通话现状，行为与响应 wire 不变。
+
+### 10.3 Gateway 无状态信令中继（本文档"文档注明"项）
+
+- 群组命令（grant.CallKind=Group）**不进入 Realtime 1:1 状态机**：由
+  `GroupCallSignalRelay` 逐命令校验 grant（结构 + 过期 + HMAC + actor 成员资格：
+  invite/cancel 仅限主叫，其余命令限名单内成员）后按名单扇出到其余在线会话
+  （排除发起者）。invite/accept/reject/cancel/ringing/reconnect 原样中继（既有 Kind）；
+  成员主动离开（End）转为 `participant-left` 事件（带 ParticipantUserId）。
+- **无服务端房间状态**：授权完全由 grant 承载（签名覆盖名单），信令为无状态中继；
+  成员变更 = Server 重签新 grant 批次 + revision 递增，客户端以 revision/成员列表自洽
+  （§4.1 惯例）。SignalId = `commandId:recipient`，同命令重放产生稳定去重键。
+- 配置：`CallGrantSigning:Secret`（与 Server `JwtSettings.Secret` 同源）；未配置时群组
+  命令 fail-closed（`call_grant_invalid`），1:1 既有链路零影响。
+- 兼容矩阵：旧客户端双人通话（Direct grant）走既有 RealtimeCallBackend 路径，零改动；
+  群组 grant（CalleeUserId=0）误入旧 1:1 校验端即被拒绝，两阶段互不干扰。

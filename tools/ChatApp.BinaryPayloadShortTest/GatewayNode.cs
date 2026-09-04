@@ -307,6 +307,10 @@ internal sealed class GatewayNode : IDisposable
             NullLogger<RelationshipCommandHandler>.Instance);
         var callHandler = new CallCommandHandler(
             new StubCallBackend(NullLogger<StubCallBackend>.Instance),
+            new GroupCallSignalRelay(
+                Microsoft.Extensions.Options.Options.Create(new GroupCallGrantOptions()),
+                TimeProvider.System,
+                NullLogger<GroupCallSignalRelay>.Instance),
             new JsonPayloadCodec<TcpCallCommandRequest>(
                 GatewayJsonSerializerContext.Default.TcpCallCommandRequest),
             new JsonPayloadCodec<TcpCallCommandResponse>(

@@ -4,9 +4,9 @@
     "net10.0": {
       "ChatApp.Protocol.Tcp": {
         "type": "Direct",
-        "requested": "[0.5.6, )",
-        "resolved": "0.5.6",
-        "contentHash": "0YAJbmvm+olh2QLYW6JcEqsd4UMSZX0VuN0sohJRmOGzuNoinH3Pi8H+Oy9iqGO7rrCxra/t8lVR1fo8kRVkNQ=="
+        "requested": "[0.5.7, )",
+        "resolved": "0.5.7",
+        "contentHash": "oSYZHNF3m0Jr4UIfuTm0tZMjOPZ5WWkjeFXkil9hFO9/vuZZeWZW9UQnXX3ZVU/u/juVQbLp3cCdd2/5807DFw=="
       },
       "Microsoft.Extensions.Logging.Abstractions": {
         "type": "Direct",
