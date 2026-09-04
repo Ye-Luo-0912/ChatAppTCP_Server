@@ -71,6 +71,10 @@ Server HTTP 与 public `T_*` 表继续作为唯一关系权威；Gateway 只提�
 ## 后续但不在当前阶段
 
 - 群通话/SFU：1:1 通话稳定后再设计独立媒体服务与容量模型。
+  ✅ **立项设计已完成（2026-09-04）**：`docs/group-call-sfu-design.md`——
+  阶段一 Mesh（≤4 人，零新基础设施）→ 阶段二 SFU（选型技术验证后定，
+  LiveKit/mediasoup/Jitsi 候选）；控制面扩展（grant 多人化 + wire 信令 kind 扩展）
+  与容量公式已定稿；待评审后启动阶段一。
 - QUIC：只在真实移动网络问题无法由 TCP/WebRTC 解决时做可关闭对照；裸 UDP 不进入聊天控制面。
 - Push/更深可观测性：按真实客户端需求和故障缺口逐项接入，不先建设空壳平台。
 
