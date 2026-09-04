@@ -107,7 +107,25 @@ N 人（初始目标：视频 ≤9 路 / 音频 ≤30 路）多方通话，复�
 3. 视频是否进入阶段二 MVP（音频优先建议）；
 4. 免打扰/来电聚合的产品交互细则（控制面已预留 IsMention/聚合位）。
 
-## 9. 与既有文档的边界
+## 9. SFU 技术验证记录
+
+### LiveKit 第一轮冒烟（2026-09-04，relgate 主机 ✅ 通过）
+- 部署形态：**独立二进制** v1.13.6（GitHub Releases，55MB，非容器——relgate 到 Docker Hub
+  的 DNS 解析被污染不可达，GitHub 直连正常）；配置 `~/sfu-validation/livekit.yaml`
+  （HTTP 7880 绑 127.0.0.1、RTC UDP 7881/TCP 7882、显式 dev keys，密钥 ≥32 字符强制）；
+- 冒烟结果：进程启动 ✅、HS256 手签 access token 鉴权 ✅、RoomService CreateRoom/ListRooms ✅
+  （房间创建含 turn_password 与编解码协商，TURN 集成点已内建）；
+- 注意事项：v1.13 起 API 必须配 `keys`（密钥 ≥32 字符）；仓库已迁移 livekit/livekit
+  （旧 URL 404）；RoomService 请求字段为 `name`（非 `room`）；
+- 待阶段二 MVP 前完成：真实 RTP 发布/订阅压测（SDK bot）、30 房间×10 人×30 分钟容量
+  验收（§6）、生产绑定地址/防火墙（UDP 7881 对外）。
+
+### mediasoup 候选
+- mediasoup 为 **库**（Node.js/C++），无独立服务可部署——验证需自建 wrapper 应用
+  （信令桥接 + 房间管理），工作量显著高于 LiveKit 首轮冒烟；建议阶段二选型评审时
+  按定制需求决定是否投入。
+
+## 10. 与既有文档的边界
 
 - Server：仅 grant 多人化扩展；不接收/持久化 SDP/ICE/media（原则不变）；
 - Gateway：信令 wire 扩展的校验与转发（CommandCatalog/CallCommandHandler 延伸）；
