@@ -9,6 +9,7 @@ using ChatApp.TcpGateway.Gateway.Networking.Buffers;
 using ChatApp.TcpGateway.Observability.Logging;
 using ChatApp.TcpGateway.Observability.Metrics;
 using Microsoft.Extensions.Logging;
+using ChatApp.TcpGateway.Gateway.Serialization;
 
 namespace ChatApp.TcpGateway.Gateway.Commands.Push;
 
@@ -79,7 +80,11 @@ internal sealed class PushTokenCommandHandler : ICommandHandler
             return;
         }
 
-        var request = _registerRequestCodec.Deserialize(payload);
+        var request = SessionPayload.Deserialize(
+            session,
+            PacketCommand.RegisterPushTokenRequest,
+            _registerRequestCodec,
+            payload);
         if (request is null)
         {
             _metrics.ProtocolError();
@@ -176,7 +181,11 @@ internal sealed class PushTokenCommandHandler : ICommandHandler
             return;
         }
 
-        var request = _unregisterRequestCodec.Deserialize(payload);
+        var request = SessionPayload.Deserialize(
+            session,
+            PacketCommand.UnregisterPushTokenRequest,
+            _unregisterRequestCodec,
+            payload);
         if (request is null)
         {
             _metrics.ProtocolError();
@@ -268,6 +277,7 @@ internal sealed class PushTokenCommandHandler : ICommandHandler
         using var frame = OutboundFrameFactory.Create(
             PacketCommand.RegisterPushTokenResponse,
             _registerResponseCodec,
+            session,
             response);
         session.TryQueue(frame);
     }
@@ -279,6 +289,7 @@ internal sealed class PushTokenCommandHandler : ICommandHandler
         using var frame = OutboundFrameFactory.Create(
             PacketCommand.UnregisterPushTokenResponse,
             _unregisterResponseCodec,
+            session,
             response);
         session.TryQueue(frame);
     }

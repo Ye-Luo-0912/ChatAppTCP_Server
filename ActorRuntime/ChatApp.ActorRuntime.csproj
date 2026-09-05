@@ -11,6 +11,7 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageReference Include="Microsoft.NET.ILLink.Tasks" PrivateAssets="all" />
     <!-- 测试需要访问 internal 原语（BoundedMpscRing/SpscRing/AsyncOperationExecutor 等）进行白盒测试。 -->
     <InternalsVisibleTo Include="ChatApp.TcpGateway.Tests" />
   </ItemGroup>

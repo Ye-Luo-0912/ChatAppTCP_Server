@@ -3,6 +3,7 @@ using System.Net.Sockets;
 using ChatApp.Realtime.Abstractions.Events;
 using ChatApp.Realtime.Integration;
 using ChatApp.Shared.Protocol.Tcp;
+using ChatApp.Shared.Protocol.Tcp.Binary;
 using ChatApp.TcpGateway.Core.Authentication;
 using ChatApp.TcpGateway.Core.Messaging;
 using ChatApp.TcpGateway.Core.Protocol;
@@ -11,8 +12,13 @@ using ChatApp.TcpGateway.Core.Server;
 using ChatApp.TcpGateway.Gateway.Configuration;
 using ChatApp.TcpGateway.Gateway.Networking.Buffers;
 using ChatApp.TcpGateway.Gateway.Networking.Transport;
+using ChatApp.TcpGateway.Gateway.Serialization;
 using ChatApp.TcpGateway.Observability.Metrics;
 using Microsoft.Extensions.Logging;
+// 共享 0.5.4 起在 ChatApp.Shared.Protocol.Tcp 引入同名 AuthenticationRequest/Response，
+// 与本地 wire DTO 二义；网关 wire 所有权在 Core.Messaging，显式别名消歧。
+using AuthenticationRequest = ChatApp.TcpGateway.Core.Messaging.AuthenticationRequest;
+using AuthenticationResponse = ChatApp.TcpGateway.Core.Messaging.AuthenticationResponse;
 
 namespace ChatApp.TcpGateway.Gateway.Networking.Sessions;
 
@@ -139,7 +145,12 @@ internal sealed class SessionControlHandler
             return;
         }
 
-        var request = _authenticationRequestCodec.Deserialize(payload);
+        // 认证是握手后命令：会话已固定格式，按协商格式分流（二进制连接上认证走 binary-v1）。
+        var request = SessionPayload.Deserialize(
+            session,
+            PacketCommand.AuthenticationRequest,
+            _authenticationRequestCodec,
+            payload);
         if (request is null ||
             string.IsNullOrWhiteSpace(request.AccessToken))
         {
@@ -233,6 +244,7 @@ internal sealed class SessionControlHandler
         using var responseFrame = OutboundFrameFactory.Create(
             PacketCommand.AuthenticationResponse,
             _authenticationResponseCodec,
+            session,
             response);
         session.TryQueue(responseFrame);
     }
@@ -302,6 +314,11 @@ internal sealed class SessionControlHandler
         {
             serverFeatureBits &=
                 ~(uint)GatewayFeature.PresenceAndTyping;
+        }
+        if (!_options.EnableBinaryPayloadFormat)
+        {
+            serverFeatureBits &=
+                ~(uint)GatewayFeature.BinaryPayload;
         }
 
         var negotiatedFeatureBits =
@@ -396,6 +413,26 @@ internal sealed class SessionControlHandler
             }
         }
 
+        // 连接级 payload 格式协商（BIN-INTEGRATION-3）：
+        // - ClientHello/ServerHello 握手段本身始终 JSON；
+        // - 双方协商出 BinaryPayload 且本次不是 Resume 路径（Resume 首版保持 JSON）时，
+        //   ServerHello.PayloadFormat 回应 chatapp-bin-v1，会话完整握手后固定二进制，不在中途切换；
+        // - 其余情况回应 json，与既有 v1 行为一致。
+        // Resume 路径连接固定 JSON（首版策略）：能力位同步剥离 BinaryPayload，
+        // 避免“广告了能力但格式是 JSON”的不一致误导按位发二进制的客户端。
+        if (!string.IsNullOrWhiteSpace(hello.ResumeToken))
+        {
+            negotiatedFeatureBits &= ~(uint)GatewayFeature.BinaryPayload;
+        }
+        var binaryPayloadNegotiated =
+            string.IsNullOrWhiteSpace(hello.ResumeToken) &&
+            GatewayFeatureSet.ContainsAll(
+                negotiatedFeatureBits,
+                GatewayFeature.BinaryPayload);
+        var negotiatedPayloadFormat = binaryPayloadNegotiated
+            ? PayloadFormat.Binary
+            : PayloadFormat.Json;
+
         // 发送 ServerHello 握手响应。FeatureBits 为双方能力交集；
         // CommandCapabilities 未进入交集时，命令门控保持 v1 兼容。
         var serverHello = new ServerHello
@@ -408,7 +445,9 @@ internal sealed class SessionControlHandler
             MaxPayloadBytes = _options.MaxInboundPayloadBytes,
             ResumeSupported =
                 _options.EnableResume && resumeNegotiated,
-            PayloadFormat = ProtocolPayloadFormat.Json
+            PayloadFormat = binaryPayloadNegotiated
+                ? BinaryPayloadFormat.Id
+                : ProtocolPayloadFormat.Json
         };
 
         using var helloFrame = OutboundFrameFactory.Create(
@@ -418,7 +457,8 @@ internal sealed class SessionControlHandler
         session.TryQueue(helloFrame);
         session.CompleteHandshake(
             negotiatedProtocolVersion,
-            negotiatedFeatureBits);
+            negotiatedFeatureBits,
+            negotiatedPayloadFormat);
     }
 
     private void SendAuthenticationFailure(
@@ -495,6 +535,7 @@ internal sealed class SessionControlHandler
         using var frame = OutboundFrameFactory.Create(
             PacketCommand.Error,
             _protocolErrorFrameCodec,
+            session,
             error);
         // Critical 等级：使用 TryQueue 保证发送（满时关闭连接）。
         session.TryQueue(frame, closeAfterSend: fatal ? SessionCloseReason.ProtocolViolation : null);

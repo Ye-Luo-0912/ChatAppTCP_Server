@@ -24,7 +24,7 @@ namespace ChatApp.TcpGateway.Gateway.Networking.Ephemeral;
 /// </list>
 /// </para>
 /// </summary>
-internal sealed class EphemeralCommandPipeline : IAsyncDisposable
+internal sealed partial class EphemeralCommandPipeline : IAsyncDisposable
 {
     private const int ActorAdmissionLockCount = 256;
 
@@ -88,7 +88,7 @@ internal sealed class EphemeralCommandPipeline : IAsyncDisposable
                     options.CommandSchedulerEphemeralCapacity * 256),
                 commandTimeout: TimeSpan.Zero,
                 perUserConcurrency: 0,
-                onFatalError: null,
+                onFatalError: ex => LogEphemeralCommandFatal(logger, ex),
                 logger);
             return;
         }
@@ -659,4 +659,10 @@ internal sealed class EphemeralCommandPipeline : IAsyncDisposable
                 _ => "actor_dropped"
             };
     }
+    [LoggerMessage(
+        EventId = 3000,
+        Level = LogLevel.Error,
+        Message = "Ephemeral 排队命令处理致命异常")]
+    private static partial void LogEphemeralCommandFatal(ILogger logger, Exception exception);
+
 }

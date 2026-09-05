@@ -2,6 +2,7 @@ using System.Net.Sockets;
 using System.Threading.Tasks.Sources;
 using ChatApp.TcpGateway.Core.Authentication;
 using ChatApp.TcpGateway.Core.Protocol;
+using ChatApp.TcpGateway.Core.Serialization;
 using ChatApp.TcpGateway.Gateway.Configuration;
 using ChatApp.TcpGateway.Gateway.Networking.Buffers;
 using ChatApp.TcpGateway.Gateway.Networking.Executor;
@@ -217,6 +218,9 @@ internal sealed partial class TcpClientSession : IAsyncDisposable
     private int _handshakeCompleted;
     private int _negotiatedProtocolVersion;
     private int _negotiatedFeatureBits;
+    // 连接级 payload 格式：完整握手（非 Resume）时协商一次，之后不可变。
+    // JSON 默认；仅当双方协商 BinaryPayload 且服务端开关启用时为 Binary。
+    private int _negotiatedPayloadFormat = (int)PayloadFormat.Json;
     private int _closeState;
     private int _closeReason;
     // P0-4 / 主线二子项2：admission 状态机，独立于 _authenticated 以避免 Resume Commit 失败时泄漏未认证计数。
@@ -421,14 +425,23 @@ internal sealed partial class TcpClientSession : IAsyncDisposable
     /// </summary>
     public void CompleteHandshake(
         ushort protocolVersion,
-        uint featureBits)
+        uint featureBits,
+        PayloadFormat payloadFormat = PayloadFormat.Json)
     {
         Volatile.Write(ref _negotiatedProtocolVersion, protocolVersion);
         Volatile.Write(
             ref _negotiatedFeatureBits,
             unchecked((int)featureBits));
+        Volatile.Write(ref _negotiatedPayloadFormat, (int)payloadFormat);
         Volatile.Write(ref _handshakeCompleted, 1);
     }
+
+    /// <summary>
+    /// 本连接的 payload 编解码格式。握手完成前恒为 Json；
+    /// 完成后不可变（协商在握手内一次完成，不在连接中途切换）。
+    /// </summary>
+    public PayloadFormat NegotiatedPayloadFormat =>
+        (PayloadFormat)Volatile.Read(ref _negotiatedPayloadFormat);
 
     /// <summary>
     /// 判断扩展能力是否可用。未启用命令能力门控的旧客户端保持兼容；

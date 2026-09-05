@@ -11,6 +11,7 @@ using ChatApp.TcpGateway.Observability.Metrics;
 using Microsoft.Extensions.Logging;
 using RealtimeGroupConversationCommand =
     ChatApp.Realtime.Abstractions.Conversations.GroupConversationCommand;
+using ChatApp.TcpGateway.Gateway.Serialization;
 using RealtimeGroupConversationOperation =
     ChatApp.Realtime.Abstractions.Conversations.GroupConversationOperation;
 
@@ -31,7 +32,11 @@ internal sealed partial class GroupCommandHandler
         TcpClientSession session,
         CancellationToken cancellationToken)
     {
-        var request = _createGroupRequestCodec.Deserialize(payload);
+        var request = SessionPayload.Deserialize(
+            session,
+            PacketCommand.CreateGroupRequest,
+            _createGroupRequestCodec,
+            payload);
 
         // 廉价结构校验：RequestId 长度、Title 长度、初始成员数量上限、正 ID、去重。
         // 权限校验（任何已认证用户可建群）与累计成员上限由 Realtime 侧判定。

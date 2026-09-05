@@ -7,6 +7,7 @@ public static class GatewayFeatureSet
 {
     /// <summary>当前服务端已实现、可在 ServerHello 中协商的能力。</summary>
     public const GatewayFeature Implemented =
+        GatewayFeature.BinaryPayload |
         GatewayFeature.CommandCapabilities |
         GatewayFeature.SessionResume |
         GatewayFeature.ConversationSync |
@@ -15,7 +16,9 @@ public static class GatewayFeatureSet
         GatewayFeature.PresenceAndTyping |
         GatewayFeature.MessageReactions |
         GatewayFeature.GroupManagement |
-        GatewayFeature.PushTokenManagement;
+        GatewayFeature.PushTokenManagement |
+        GatewayFeature.CallSignaling |
+        GatewayFeature.RelationshipRead;
 
     /// <summary>协议已经分配的全部能力位，包括尚未实现的预留位。</summary>
     public const GatewayFeature Known =

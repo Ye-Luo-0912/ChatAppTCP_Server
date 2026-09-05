@@ -278,6 +278,10 @@ file sealed class InMemoryEphemeralBus : IRealtimeMessageBus
     public Task<RealtimeHistoryMessage?> TryGetMessageByIdAsync(long userId, string messageId, CancellationToken ct = default) =>
         Task.FromResult<RealtimeHistoryMessage?>(null);
 
+    public Task<CallProcessResult> SendCallCommandAsync(
+        CallCommand command, CancellationToken ct = default) =>
+        Task.FromResult(CallProcessResult.Failed(CallErrorCode.StateStoreUnavailable, "unavailable"));
+
     public Task PublishEventAsync(RealtimeEvent evt, CancellationToken ct = default) => Task.CompletedTask;
 
     public async IAsyncEnumerable<RealtimeEventDelivery> ConsumeEventsAsync(

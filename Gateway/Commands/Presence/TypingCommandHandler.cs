@@ -8,6 +8,7 @@ using ChatApp.TcpGateway.Gateway.Dispatching;
 using ChatApp.TcpGateway.Gateway.Networking.Sessions;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using ChatApp.TcpGateway.Gateway.Serialization;
 
 namespace ChatApp.TcpGateway.Gateway.Commands.Presence;
 
@@ -63,7 +64,11 @@ internal sealed class TypingCommandHandler : ICommandHandler
         if (!_options.EnableEphemeralPresenceAndTyping)
             return;
 
-        var notify = _typingNotifyCodec.Deserialize(payload);
+        var notify = SessionPayload.Deserialize(
+            session,
+            PacketCommand.TypingNotify,
+            _typingNotifyCodec,
+            payload);
         if (notify is null || string.IsNullOrWhiteSpace(notify.ConversationId))
             return;
 

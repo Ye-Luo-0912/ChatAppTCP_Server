@@ -9,6 +9,7 @@ using ChatApp.TcpGateway.Gateway.Networking.Sessions;
 using ChatApp.TcpGateway.Observability.Logging;
 using ChatApp.TcpGateway.Observability.Metrics;
 using Microsoft.Extensions.Logging;
+using ChatApp.TcpGateway.Gateway.Serialization;
 using RealtimeMessageRecallCommand =
     ChatApp.Realtime.Abstractions.Messaging.MessageRecallCommand;
 
@@ -25,7 +26,11 @@ internal sealed partial class MessagingCommandHandler
         TcpClientSession session,
         CancellationToken cancellationToken)
     {
-        var request = _messageRecallRequestCodec.Deserialize(payload);
+        var request = SessionPayload.Deserialize(
+            session,
+            PacketCommand.MessageRecallRequest,
+            _messageRecallRequestCodec,
+            payload);
         if (request is null)
         {
             _metrics.ProtocolError();
@@ -117,6 +122,7 @@ internal sealed partial class MessagingCommandHandler
         using var outboundFrame = OutboundFrameFactory.Create(
             PacketCommand.MessageRecallAck,
             _messageRecallAcknowledgementCodec,
+            session,
             response);
         session.TryQueue(outboundFrame);
     }

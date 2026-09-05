@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>ChatApp.BinaryPayloadShortTest</AssemblyName>
+    <RootNamespace>ChatApp.BinaryPayloadShortTest</RootNamespace>
+    <!--
+      BIN-INTEGRATION-3 收益与稳定性短测 harness：in-proc 组装真 TcpGatewayService，
+      用真实 socket + 共享包 codec 驱动 JSON vs binary 两轮短测（80/320/640 msg/s）。
+      与网关生产 runtimeconfig 保持一致的 GC 形态（ServerGC + Concurrent GC），
+      使 JSON / binary 两轮 harness 侧开销同质、差值可归因于 codec。
+    -->
+    <ServerGarbageCollection>true</ServerGarbageCollection>
+    <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="ChatApp.Binary.Core" />
+    <PackageReference Include="ChatApp.Protocol.Tcp" />
+    <PackageReference Include="ChatApp.Protocol.Tcp.Binary" />
+    <PackageReference Include="ChatApp.Protocol.Tcp.Binary.Schemas" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\ChatApp.TcpGateway.csproj" />
+  </ItemGroup>
+</Project>

@@ -273,7 +273,7 @@ internal sealed class TypingFanoutHost
             IsTyping = isTyping
         };
 
-        using var frame = OutboundFrameFactory.Create(
+        using var frames = new FormatGroupedFrame<TypingUpdate>(
             PacketCommand.TypingUpdate,
             _typingUpdateCodec,
             update);
@@ -283,7 +283,7 @@ internal sealed class TypingFanoutHost
             senderUserId,
             EphemeralKey.HashConversationId(conversationId));
         foreach (var target in targets)
-            target.TryQueueEphemeral(frame, key);
+            target.TryQueueEphemeral(frames.GetFrame(target), key);
     }
 
     /// <summary>

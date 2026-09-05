@@ -42,4 +42,16 @@ public static partial class GatewayLog
         string requestId,
         int listType,
         long userId);
+
+    [LoggerMessage(
+        GatewayEventIds.CallBackendUnavailable,
+        LogLevel.Warning,
+        "Call command backend not configured; returning service_unavailable. " +
+        "RequestId={RequestId}, CallId={CallId}, UserId={UserId}.",
+        EventName = "Stub.CallBackendUnavailable")]
+    public static partial void CallBackendUnavailable(
+        this ILogger logger,
+        string requestId,
+        string callId,
+        long userId);
 }

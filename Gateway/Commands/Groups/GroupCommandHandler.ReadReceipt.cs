@@ -11,6 +11,7 @@ using RealtimeGroupConversationOperation =
     ChatApp.Realtime.Abstractions.Conversations.GroupConversationOperation;
 using RealtimeGroupConversationResult =
     ChatApp.Realtime.Abstractions.Conversations.GroupConversationResult;
+using ChatApp.TcpGateway.Gateway.Serialization;
 using RealtimeMessageReader =
     ChatApp.Realtime.Abstractions.Stores.MessageReader;
 
@@ -31,7 +32,11 @@ internal sealed partial class GroupCommandHandler
         TcpClientSession session,
         CancellationToken cancellationToken)
     {
-        var request = _messageReadReceiptQueryRequestCodec.Deserialize(payload);
+        var request = SessionPayload.Deserialize(
+            session,
+            PacketCommand.MessageReadReceiptQueryRequest,
+            _messageReadReceiptQueryRequestCodec,
+            payload);
         var requestId = request?.RequestId ?? string.Empty;
 
         // 廉价结构校验：RequestId / ConversationId / MessageId 非空。

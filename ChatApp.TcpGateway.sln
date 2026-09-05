@@ -1,4 +1,4 @@
-
+﻿
 Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 18
 VisualStudioVersion = 18.6.11723.189
@@ -34,6 +34,8 @@ EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ChatApp.PushWorker", "PushWorker\ChatApp.PushWorker.csproj", "{005EE0EA-7733-4DB3-9BA4-3DCB5CF8E05A}"
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ChatApp.OutboundChannel.Benchmarks", "tools\ChatApp.OutboundChannel.Benchmarks\ChatApp.OutboundChannel.Benchmarks.csproj", "{FCC079A8-D981-4082-B45F-2608465C1BD0}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ChatApp.BinaryPayloadShortTest", "tools\ChatApp.BinaryPayloadShortTest\ChatApp.BinaryPayloadShortTest.csproj", "{4F3A0584-783B-45F1-9091-FF8103C22D4B}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
@@ -213,6 +215,18 @@ Global
 		{FCC079A8-D981-4082-B45F-2608465C1BD0}.Release|x64.Build.0 = Release|Any CPU
 		{FCC079A8-D981-4082-B45F-2608465C1BD0}.Release|x86.ActiveCfg = Release|Any CPU
 		{FCC079A8-D981-4082-B45F-2608465C1BD0}.Release|x86.Build.0 = Release|Any CPU
+		{4F3A0584-783B-45F1-9091-FF8103C22D4B}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{4F3A0584-783B-45F1-9091-FF8103C22D4B}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{4F3A0584-783B-45F1-9091-FF8103C22D4B}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{4F3A0584-783B-45F1-9091-FF8103C22D4B}.Debug|x64.Build.0 = Debug|Any CPU
+		{4F3A0584-783B-45F1-9091-FF8103C22D4B}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{4F3A0584-783B-45F1-9091-FF8103C22D4B}.Debug|x86.Build.0 = Debug|Any CPU
+		{4F3A0584-783B-45F1-9091-FF8103C22D4B}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{4F3A0584-783B-45F1-9091-FF8103C22D4B}.Release|Any CPU.Build.0 = Release|Any CPU
+		{4F3A0584-783B-45F1-9091-FF8103C22D4B}.Release|x64.ActiveCfg = Release|Any CPU
+		{4F3A0584-783B-45F1-9091-FF8103C22D4B}.Release|x64.Build.0 = Release|Any CPU
+		{4F3A0584-783B-45F1-9091-FF8103C22D4B}.Release|x86.ActiveCfg = Release|Any CPU
+		{4F3A0584-783B-45F1-9091-FF8103C22D4B}.Release|x86.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
@@ -226,5 +240,6 @@ Global
 		{F4A0C2D1-6E5B-4A73-9D80-1C2B3A4E5F60} = {07C2787E-EAC7-C090-1BA3-A61EC2A24D84}
 		{005EE0EA-7733-4DB3-9BA4-3DCB5CF8E05A} = {58A7D8C5-76D4-DA48-2BB7-0BAF7EE7A12A}
 		{FCC079A8-D981-4082-B45F-2608465C1BD0} = {07C2787E-EAC7-C090-1BA3-A61EC2A24D84}
+		{4F3A0584-783B-45F1-9091-FF8103C22D4B} = {07C2787E-EAC7-C090-1BA3-A61EC2A24D84}
 	EndGlobalSection
 EndGlobal

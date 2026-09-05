@@ -43,6 +43,7 @@ internal sealed class RealtimeEventDeliveryHelper
         IPayloadCodec<TUpdate> codec,
         TUpdate update,
         bool skipOriginSession)
+        where TUpdate : class
     {
         var targets = _userSessions.GetSnapshot(realtimeEvent.TargetUserId);
         if (targets.Length == 0)
@@ -51,7 +52,7 @@ internal sealed class RealtimeEventDeliveryHelper
             return 0;
         }
 
-        using var frame = OutboundFrameFactory.Create(command, codec, update);
+        using var frames = new FormatGroupedFrame<TUpdate>(command, codec, update);
         var queued = 0;
         foreach (var target in targets)
         {
@@ -61,7 +62,7 @@ internal sealed class RealtimeEventDeliveryHelper
             if (ShouldSkipByProtocolVersion(target, realtimeEvent))
                 continue;
 
-            if (target.TryQueue(frame))
+            if (target.TryQueue(frames.GetFrame(target)))
                 queued++;
         }
 
@@ -80,6 +81,7 @@ internal sealed class RealtimeEventDeliveryHelper
         IPayloadCodec<TUpdate> codec,
         TUpdate update,
         bool skipOriginSession)
+        where TUpdate : class
         => DeliverAggregatedCore(
             realtimeEvent,
             command,
@@ -98,6 +100,7 @@ internal sealed class RealtimeEventDeliveryHelper
         IPayloadCodec<TUpdate> codec,
         TUpdate update,
         long skipOriginForUserId)
+        where TUpdate : class
         => DeliverAggregatedCore(
             realtimeEvent,
             command,
@@ -113,12 +116,13 @@ internal sealed class RealtimeEventDeliveryHelper
         TUpdate update,
         bool skipOriginSession,
         long? skipOriginForUserId)
+        where TUpdate : class
     {
         var targetUserIds = realtimeEvent.TargetUserIds;
         if (targetUserIds is null || targetUserIds.Length == 0)
             return 0;
 
-        using var frame = OutboundFrameFactory.Create(command, codec, update);
+        using var frames = new FormatGroupedFrame<TUpdate>(command, codec, update);
         var queued = 0;
         foreach (var userId in targetUserIds)
         {
@@ -134,7 +138,7 @@ internal sealed class RealtimeEventDeliveryHelper
                 if (ShouldSkipByProtocolVersion(target, realtimeEvent))
                     continue;
 
-                if (target.TryQueue(frame))
+                if (target.TryQueue(frames.GetFrame(target)))
                     queued++;
             }
         }
@@ -163,6 +167,7 @@ internal sealed class RealtimeEventDeliveryHelper
         TUpdate update,
         bool skipOriginSession,
         CancellationToken ct)
+        where TUpdate : class
     {
         if (_audienceCache is null
             || string.IsNullOrWhiteSpace(realtimeEvent.ConversationId))
@@ -198,7 +203,7 @@ internal sealed class RealtimeEventDeliveryHelper
             return 0;
         }
 
-        using var frame = OutboundFrameFactory.Create(command, codec, update);
+        using var frames = new FormatGroupedFrame<TUpdate>(command, codec, update);
         var queued = 0;
         var exclude = realtimeEvent.ExcludeUserId;
         foreach (var userId in memberUserIds)
@@ -216,7 +221,7 @@ internal sealed class RealtimeEventDeliveryHelper
                 if (ShouldSkipByProtocolVersion(target, realtimeEvent))
                     continue;
 
-                if (target.TryQueue(frame))
+                if (target.TryQueue(frames.GetFrame(target)))
                     queued++;
             }
         }

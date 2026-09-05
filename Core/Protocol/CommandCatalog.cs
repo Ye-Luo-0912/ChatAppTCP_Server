@@ -380,7 +380,10 @@ internal static class CommandCatalog
             ConnectionPhase.Authenticated, CommandLane.Inline, -1, 1),
         PacketCommand.RelationshipListRequest => new(
             PacketCommand.RelationshipListRequest, CommandDirection.ClientToServer,
-            ConnectionPhase.Authenticated, CommandLane.Query, 4096, 1),
+            ConnectionPhase.Authenticated, CommandLane.Query, 4096, 1)
+        {
+            RequiredFeature = GatewayFeature.RelationshipRead
+        },
         PacketCommand.RelationshipListResponse => new(
             PacketCommand.RelationshipListResponse, CommandDirection.ServerToClient,
             ConnectionPhase.Authenticated, CommandLane.Inline, -1, 1),
@@ -389,6 +392,20 @@ internal static class CommandCatalog
             ConnectionPhase.Authenticated, CommandLane.Inline, -1, 1),
         PacketCommand.ConversationDissolvedUpdate => new(
             PacketCommand.ConversationDissolvedUpdate, CommandDirection.ServerToClient,
+            ConnectionPhase.Authenticated, CommandLane.Inline, -1, 1),
+
+        // 通话控制面
+        PacketCommand.CallCommandRequest => new(
+            PacketCommand.CallCommandRequest, CommandDirection.ClientToServer,
+            ConnectionPhase.Authenticated, CommandLane.OrderedWrite, 64 * 1024, 4)
+        {
+            RequiredFeature = GatewayFeature.CallSignaling
+        },
+        PacketCommand.CallCommandResponse => new(
+            PacketCommand.CallCommandResponse, CommandDirection.ServerToClient,
+            ConnectionPhase.Authenticated, CommandLane.Inline, -1, 1),
+        PacketCommand.CallSignal => new(
+            PacketCommand.CallSignal, CommandDirection.ServerToClient,
             ConnectionPhase.Authenticated, CommandLane.Inline, -1, 1),
 
         // 离线推送

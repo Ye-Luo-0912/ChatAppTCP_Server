@@ -61,6 +61,7 @@ var realtimeIntegrationOptions = builder.Configuration
 
 // PushWorker 不引入完整 Gateway 可观测性栈（OpenTelemetry exporter 等），
 // 仅注册 GatewayMetrics——PushDeliveryConsumerService / RedisGroupIdempotencyStore 依赖。
+builder.Services.AddSingleton<TimeProvider>(TimeProvider.System);
 builder.Services.AddSingleton<GatewayMetrics>();
 builder.Services.AddGatewayInfrastructure();
 builder.Services.AddChatAppRealtimeIntegration(realtimeIntegrationOptions);

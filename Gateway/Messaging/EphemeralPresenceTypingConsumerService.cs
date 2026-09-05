@@ -149,7 +149,7 @@ internal sealed class EphemeralPresenceTypingConsumerService : BackgroundService
             IsTyping = evt.IsTyping
         };
 
-        using var frame = OutboundFrameFactory.Create(
+        using var frames = new FormatGroupedFrame<TypingUpdate>(
             PacketCommand.TypingUpdate,
             _typingUpdateCodec,
             update);
@@ -159,7 +159,7 @@ internal sealed class EphemeralPresenceTypingConsumerService : BackgroundService
             evt.SenderUserId,
             EphemeralKey.HashConversationId(evt.ConversationId));
         foreach (var target in targets)
-            target.TryQueueEphemeral(frame, key);
+            target.TryQueueEphemeral(frames.GetFrame(target), key);
     }
 
     private void FanoutPresence(EphemeralPresenceEvent evt)
@@ -177,7 +177,7 @@ internal sealed class EphemeralPresenceTypingConsumerService : BackgroundService
             IsOnline = evt.IsOnline
         };
 
-        using var frame = OutboundFrameFactory.Create(
+        using var frames = new FormatGroupedFrame<PresenceChanged>(
             PacketCommand.PresenceChanged,
             _presenceChangedCodec,
             update);
@@ -188,7 +188,7 @@ internal sealed class EphemeralPresenceTypingConsumerService : BackgroundService
         {
             foreach (var session in _userSessions.GetSnapshot(watcherId))
             {
-                session.TryQueueEphemeral(frame, key);
+                session.TryQueueEphemeral(frames.GetFrame(session), key);
                 recipientCount++;
             }
         }

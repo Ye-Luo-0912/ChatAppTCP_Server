@@ -34,6 +34,7 @@
     <ProjectReference Include="Observability\ChatApp.TcpGateway.Observability.csproj" />
     <ProjectReference Include="ActorRuntime\ChatApp.ActorRuntime.csproj" />
     <!-- P1-1：Realtime 集成层改为版本化 NuGet 包（本地 feed packages/）。 -->
+    <PackageReference Include="ChatApp.Protocol.Tcp.Binary.Schemas" />
     <PackageReference Include="ChatApp.Realtime.Integration" />
   </ItemGroup>
 
@@ -43,5 +44,9 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="ChatApp.TcpGateway.Tests" />
+    <!-- BIN-INTEGRATION-3 收益短测 harness（tools/ChatApp.BinaryPayloadShortTest）：
+         组装真 TcpGatewayService 需要访问 internal 的 Stub*Backend 测试替身；
+         仅程序集可见性元数据，不影响运行时语义。 -->
+    <InternalsVisibleTo Include="ChatApp.BinaryPayloadShortTest" />
   </ItemGroup>
 </Project>

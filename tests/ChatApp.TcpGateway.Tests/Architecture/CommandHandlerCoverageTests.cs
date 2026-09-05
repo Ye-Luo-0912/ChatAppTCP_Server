@@ -63,6 +63,8 @@ public sealed class CommandHandlerCoverageTests
         PacketCommand.AttachmentDownloadAuthorizeRequest,
         PacketCommand.RelationshipCommandRequest,
         PacketCommand.RelationshipListRequest,
+        // Calls (CALL-E2E-2)
+        PacketCommand.CallCommandRequest,
     };
 
     /// <summary>

@@ -101,7 +101,7 @@ internal sealed partial class SessionLifecycleCoordinator
             IsOnline = isOnline
         };
 
-        using var frame = OutboundFrameFactory.Create(
+        using var frames = new FormatGroupedFrame<PresenceChanged>(
             PacketCommand.PresenceChanged,
             _presenceChangedCodec,
             update);
@@ -112,7 +112,7 @@ internal sealed partial class SessionLifecycleCoordinator
         {
             foreach (var watcherSession in _userSessions.GetSnapshot(watcherId))
             {
-                watcherSession.TryQueueEphemeral(frame, key);
+                watcherSession.TryQueueEphemeral(frames.GetFrame(watcherSession), key);
                 recipientCount++;
             }
         }

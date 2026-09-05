@@ -39,6 +39,7 @@ internal sealed partial class GroupCommandHandler
         PacketCommand responseCommand,
         IPayloadCodec<TResponse> responseCodec,
         CancellationToken cancellationToken)
+        where TResponse : class
     {
         // 幂等快速路径：缓存命中时直接返回缓存的 Realtime 结果，跳过 Redis/NATS 往返。
         // 仅对 mutate 命令生效（CreateGroup 走独立路径，见 HandleCreateGroupRequestAsync）。
@@ -130,8 +131,9 @@ internal sealed partial class GroupCommandHandler
         PacketCommand command,
         IPayloadCodec<TResponse> codec,
         TResponse response)
+        where TResponse : class
     {
-        using var frame = OutboundFrameFactory.Create(command, codec, response);
+        using var frame = OutboundFrameFactory.Create(command, codec, session, response);
         session.TryQueue(frame);
     }
 

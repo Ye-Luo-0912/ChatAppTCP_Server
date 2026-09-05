@@ -7,6 +7,9 @@ using ChatApp.TcpGateway.Gateway.Networking.Buffers;
 using ChatApp.TcpGateway.Gateway.Networking.Sessions;
 using ChatApp.TcpGateway.Observability.Tracing;
 using Microsoft.Extensions.Hosting;
+// 共享 0.5.4 起在 ChatApp.Shared.Protocol.Tcp 引入同名 MessageAcknowledgement，与本地 wire DTO 二义；
+// 网关 wire 所有权在 Core.Messaging，显式别名消歧。
+using MessageAcknowledgement = ChatApp.TcpGateway.Core.Messaging.MessageAcknowledgement;
 
 namespace ChatApp.TcpGateway.Gateway.Networking;
 
@@ -123,6 +126,7 @@ internal sealed partial class TcpGatewayService
         using var frame = OutboundFrameFactory.Create(
             PacketCommand.Error,
             _protocolErrorFrameCodec,
+            session,
             error);
         // Critical 等级：使用 TryQueue 保证发送（满时关闭连接）。
         session.TryQueue(frame, closeAfterSend: fatal ? SessionCloseReason.ProtocolViolation : null);
@@ -150,6 +154,7 @@ internal sealed partial class TcpGatewayService
             using var outboundFrame = OutboundFrameFactory.Create(
                 PacketCommand.MessageAcknowledgement,
                 _messageAcknowledgementCodec,
+                session,
                 acknowledgement);
             if (!session.TryQueue(outboundFrame, SessionCloseReason.ProtocolViolation))
             {

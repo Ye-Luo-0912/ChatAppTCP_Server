@@ -11,6 +11,7 @@ using ChatApp.TcpGateway.Observability.Metrics;
 using Microsoft.Extensions.Logging;
 using RealtimeConversationMarkReadCommand =
     ChatApp.Realtime.Abstractions.Conversations.ConversationMarkReadCommand;
+using ChatApp.TcpGateway.Gateway.Serialization;
 using RealtimeConversationSetPrefsCommand =
     ChatApp.Realtime.Abstractions.Conversations.ConversationSetPrefsCommand;
 
@@ -77,7 +78,11 @@ internal sealed class ConversationPrefsCommandHandler : ICommandHandler
         TcpClientSession session,
         CancellationToken cancellationToken)
     {
-        var request = _markReadRequestCodec.Deserialize(payload);
+        var request = SessionPayload.Deserialize(
+            session,
+            PacketCommand.ConversationMarkReadRequest,
+            _markReadRequestCodec,
+            payload);
         if (request is null)
         {
             _metrics.ProtocolError();
@@ -175,7 +180,11 @@ internal sealed class ConversationPrefsCommandHandler : ICommandHandler
         TcpClientSession session,
         CancellationToken cancellationToken)
     {
-        var request = _setPrefsRequestCodec.Deserialize(payload);
+        var request = SessionPayload.Deserialize(
+            session,
+            PacketCommand.ConversationSetPrefsRequest,
+            _setPrefsRequestCodec,
+            payload);
         if (request is null)
         {
             _metrics.ProtocolError();
@@ -269,6 +278,7 @@ internal sealed class ConversationPrefsCommandHandler : ICommandHandler
         using var frame = OutboundFrameFactory.Create(
             PacketCommand.ConversationMarkReadResponse,
             _markReadResponseCodec,
+            session,
             response);
         session.TryQueue(frame);
     }
@@ -280,6 +290,7 @@ internal sealed class ConversationPrefsCommandHandler : ICommandHandler
         using var frame = OutboundFrameFactory.Create(
             PacketCommand.ConversationSetPrefsResponse,
             _setPrefsResponseCodec,
+            session,
             response);
         session.TryQueue(frame);
     }

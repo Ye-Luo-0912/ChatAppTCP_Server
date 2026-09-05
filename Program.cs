@@ -1,8 +1,11 @@
 using ChatApp.Realtime.Integration.Configuration;
 using ChatApp.Realtime.Integration.DependencyInjection;
 using ChatApp.TcpGateway.Gateway.Commands.Attachments;
+using ChatApp.TcpGateway.Gateway.Commands.Calls;
 using ChatApp.TcpGateway.Gateway.Commands.Conversations;
 using ChatApp.TcpGateway.Gateway.Commands.Groups;
+using Microsoft.Extensions.Options;
+using ChatApp.Realtime.Integration;
 using ChatApp.TcpGateway.Gateway.Commands.Messaging;
 using ChatApp.TcpGateway.Gateway.Commands.Presence;
 using ChatApp.TcpGateway.Gateway.Commands.Push;
@@ -111,6 +114,19 @@ builder.Services.AddChatAppRealtimeIntegration(
 // 命令处理器与分发器
 builder.Services.AddSingleton<PushTokenCommandHandler>();
 builder.Services.AddSingleton<ReactionCommandHandler>();
+builder.Services.AddSingleton<OfflinePushTrigger>(sp => new OfflinePushTrigger(
+    sp.GetRequiredService<IGlobalPresenceStore>(),
+    (command, ct) => sp.GetRequiredService<IRealtimeMessageBus>()
+        .PublishPushDeliveryAsync(command, ct),
+    (conversationId, ct) => sp.GetRequiredService<RealtimeConversationAudienceCache>()
+        .GetOrResolveAsync(conversationId, null, ct).AsTask(),
+    sp.GetRequiredService<IOptions<PushOptions>>(),
+    sp.GetRequiredService<ILogger<OfflinePushTrigger>>(),
+    // ACCOUNT-OPS-1：离线推送前批量查询成员免打扰状态（Realtime request/reply）。
+    // 委托内部异常在 Trigger 内 fail-open（不过滤），保持离线推送可用性。
+    async (query, ct) => (await sp.GetRequiredService<IRealtimeMessageBus>()
+            .QueryConversationMutesAsync(query, ct).ConfigureAwait(false))
+        .MutedUserIds));
 builder.Services.AddSingleton<MessagingCommandHandler>();
 builder.Services.AddSingleton<HistoryQueryCommandHandler>();
 builder.Services.AddSingleton<ConversationPrefsCommandHandler>();
@@ -132,6 +148,14 @@ builder.Services.AddSingleton<IAttachmentBackend, RealtimeAttachmentBackend>();
 builder.Services.AddSingleton<IRelationshipBackend, RealtimeRelationshipBackend>();
 builder.Services.AddSingleton<AttachmentCommandHandler>();
 builder.Services.AddSingleton<RelationshipCommandHandler>();
+// CALL-E2E-2：通话信令控制面（RealtimeCallBackend 经 IRealtimeMessageBus.SendCallCommandAsync 转发）。
+builder.Services.AddSingleton<ICallBackend, RealtimeCallBackend>();
+// GROUP-CALL-1：群通话（Mesh ≤4 人）无状态信令中继。密钥与 Server JwtSettings.Secret 同源
+// （CallGrantSigning:Secret）；未配置时群组命令 fail-closed（call_grant_invalid），1:1 链路不受影响。
+builder.Services.Configure<GroupCallGrantOptions>(
+    builder.Configuration.GetSection(GroupCallGrantOptions.SectionName));
+builder.Services.AddSingleton<GroupCallSignalRelay>();
+builder.Services.AddSingleton<CallCommandHandler>();
 builder.Services.AddSingleton<CommandDispatcher>();
 builder.Services.AddHostedService<RealtimeEventConsumerService>();
 

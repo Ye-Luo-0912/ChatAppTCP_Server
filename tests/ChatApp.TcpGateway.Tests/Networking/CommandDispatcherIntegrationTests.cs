@@ -35,6 +35,8 @@ using ChatApp.TcpGateway.Gateway.Commands.Conversations;
 using ChatApp.TcpGateway.Gateway.Commands.Groups;
 using ChatApp.TcpGateway.Gateway.Commands.Presence;
 using ChatApp.TcpGateway.Gateway.Commands.Relationships;
+using ChatApp.TcpGateway.Gateway.Commands.Calls;
+using ChatApp.Shared.Protocol.Tcp;
 using ChatApp.TcpGateway.Gateway.Configuration;
 using ChatApp.TcpGateway.Gateway.Diagnostics;
 using ChatApp.TcpGateway.Gateway.Dispatching;
@@ -313,12 +315,25 @@ public sealed class CommandDispatcherIntegrationTests
                 GatewayJsonSerializerContext.Default.RelationshipCommandRequest),
             new JsonPayloadCodec<RelationshipCommandResponse>(
                 GatewayJsonSerializerContext.Default.RelationshipCommandResponse),
-            new JsonPayloadCodec<RelationshipListRequest>(
-                GatewayJsonSerializerContext.Default.RelationshipListRequest),
-            new JsonPayloadCodec<RelationshipListResponse>(
-                GatewayJsonSerializerContext.Default.RelationshipListResponse),
+            new JsonPayloadCodec<TcpRelationshipListRequest>(
+                GatewayJsonSerializerContext.Default.TcpRelationshipListRequest),
+            new JsonPayloadCodec<TcpRelationshipListResponse>(
+                GatewayJsonSerializerContext.Default.TcpRelationshipListResponse),
             metrics,
             NullLogger<RelationshipCommandHandler>.Instance);
+
+        var callHandler = new CallCommandHandler(
+            new StubCallBackend(NullLogger<StubCallBackend>.Instance),
+            CallSignalingIntegrationTests.DisabledGroupRelay(),
+            new JsonPayloadCodec<TcpCallCommandRequest>(
+                GatewayJsonSerializerContext.Default.TcpCallCommandRequest),
+            new JsonPayloadCodec<TcpCallCommandResponse>(
+                GatewayJsonSerializerContext.Default.TcpCallCommandResponse),
+            new JsonPayloadCodec<TcpCallSignal>(
+                GatewayJsonSerializerContext.Default.TcpCallSignal),
+            userSessions,
+            metrics,
+            NullLogger<CallCommandHandler>.Instance);
 
         var dispatcher = new CommandDispatcher(
             pushHandler,
@@ -330,7 +345,8 @@ public sealed class CommandDispatcherIntegrationTests
             typingHandler,
             presenceHandler,
             attachmentHandler,
-            relationshipHandler);
+            relationshipHandler,
+            callHandler);
 
         using var service = new TcpGatewayService(
             Options.Create(options),
@@ -740,6 +756,10 @@ public sealed class CommandDispatcherIntegrationTests
         public Task<RealtimeHistoryMessage?> TryGetMessageByIdAsync(
             long userId, string messageId, CancellationToken ct = default) =>
             Task.FromResult<RealtimeHistoryMessage?>(null);
+
+        public Task<CallProcessResult> SendCallCommandAsync(
+            CallCommand command, CancellationToken ct = default) =>
+            Task.FromResult(CallProcessResult.Failed(CallErrorCode.StateStoreUnavailable, "unavailable"));
 
         public Task PublishEventAsync(RealtimeEvent evt, CancellationToken ct = default) =>
             Task.CompletedTask;

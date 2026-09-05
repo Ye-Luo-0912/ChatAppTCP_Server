@@ -32,6 +32,8 @@ using ChatApp.TcpGateway.Gateway.Commands.Push;
 using ChatApp.TcpGateway.Gateway.Commands.Queries;
 using ChatApp.TcpGateway.Gateway.Commands.Reactions;
 using ChatApp.TcpGateway.Gateway.Commands.Relationships;
+using ChatApp.TcpGateway.Gateway.Commands.Calls;
+using ChatApp.Shared.Protocol.Tcp;
 using ChatApp.TcpGateway.Gateway.Configuration;
 using ChatApp.TcpGateway.Gateway.Diagnostics;
 using ChatApp.TcpGateway.Gateway.Dispatching;
@@ -49,6 +51,14 @@ using TcpGatewayService = ChatApp.TcpGateway.Gateway.Networking.TcpGatewayServic
 
 namespace ChatApp.TcpGateway.Tests.Networking;
 
+/// <summary>
+/// 时序敏感联网测试：并行下线程池调度饥饿会导致握手超时或连接中止，
+/// 需串行执行以消除并行资源竞争。
+/// </summary>
+[CollectionDefinition("TcpSessionSerial", DisableParallelization = true)]
+public sealed class TcpSessionSerialDefinition { }
+
+[Collection("TcpSessionSerial")]
 public sealed class TcpGatewayServiceTests
 {
     [Theory(Timeout = 10_000)]
@@ -371,12 +381,25 @@ public sealed class TcpGatewayServiceTests
                 GatewayJsonSerializerContext.Default.RelationshipCommandRequest),
             new JsonPayloadCodec<RelationshipCommandResponse>(
                 GatewayJsonSerializerContext.Default.RelationshipCommandResponse),
-            new JsonPayloadCodec<RelationshipListRequest>(
-                GatewayJsonSerializerContext.Default.RelationshipListRequest),
-            new JsonPayloadCodec<RelationshipListResponse>(
-                GatewayJsonSerializerContext.Default.RelationshipListResponse),
+            new JsonPayloadCodec<TcpRelationshipListRequest>(
+                GatewayJsonSerializerContext.Default.TcpRelationshipListRequest),
+            new JsonPayloadCodec<TcpRelationshipListResponse>(
+                GatewayJsonSerializerContext.Default.TcpRelationshipListResponse),
             metrics,
             NullLogger<RelationshipCommandHandler>.Instance);
+
+        var callHandler = new CallCommandHandler(
+            new StubCallBackend(NullLogger<StubCallBackend>.Instance),
+            CallSignalingIntegrationTests.DisabledGroupRelay(),
+            new JsonPayloadCodec<TcpCallCommandRequest>(
+                GatewayJsonSerializerContext.Default.TcpCallCommandRequest),
+            new JsonPayloadCodec<TcpCallCommandResponse>(
+                GatewayJsonSerializerContext.Default.TcpCallCommandResponse),
+            new JsonPayloadCodec<TcpCallSignal>(
+                GatewayJsonSerializerContext.Default.TcpCallSignal),
+            userSessions,
+            metrics,
+            NullLogger<CallCommandHandler>.Instance);
 
         var commandDispatcher = new CommandDispatcher(
             pushHandler,
@@ -388,7 +411,8 @@ public sealed class TcpGatewayServiceTests
             typingHandler,
             presenceHandler,
             attachmentHandler,
-            relationshipHandler);
+            relationshipHandler,
+            callHandler);
 
         using var service = new TcpGatewayService(
             Options.Create(options),
@@ -1291,6 +1315,11 @@ public sealed class TcpGatewayServiceTests
                     ReceivedAtMs = message.ReceivedAtMs
                 });
         }
+
+        public Task<CallProcessResult> SendCallCommandAsync(
+            CallCommand command,
+            CancellationToken ct = default) =>
+            Task.FromResult(CallProcessResult.Failed(CallErrorCode.StateStoreUnavailable, "unavailable"));
 
         public Task PublishEventAsync(
             RealtimeEvent evt,

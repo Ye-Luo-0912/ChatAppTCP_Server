@@ -13,6 +13,7 @@ using ChatApp.TcpGateway.Observability.Logging;
 using ChatApp.TcpGateway.Observability.Metrics;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using ChatApp.TcpGateway.Gateway.Serialization;
 
 namespace ChatApp.TcpGateway.Gateway.Commands.Messaging;
 
@@ -27,7 +28,10 @@ internal sealed partial class MessagingCommandHandler
         TcpClientSession sender,
         CancellationToken cancellationToken)
     {
-        if (!InboundPayloadEarlyValidator.TryValidateChatMessage(
+        // 早检是 JSON 结构扫描（Utf8JsonReader），只对 JSON 会话有意义；
+        // 二进制会话的 ChatMessage 走 schema 解码 + 下方同一套业务校验，跳过 JSON 早检。
+        if (sender.NegotiatedPayloadFormat == PayloadFormat.Json &&
+            !InboundPayloadEarlyValidator.TryValidateChatMessage(
                 payload,
                 _options.MaxChatAttachments,
                 ChatMessageLimits.MaxAttachmentIdLength,
@@ -46,7 +50,11 @@ internal sealed partial class MessagingCommandHandler
             return;
         }
 
-        var message = _chatMessageCodec.Deserialize(payload);
+        var message = SessionPayload.Deserialize(
+            sender,
+            PacketCommand.ChatMessage,
+            _chatMessageCodec,
+            payload);
         var hasAttachments = message?.AttachmentIds is { Count: > 0 };
         var hasReply = !string.IsNullOrWhiteSpace(message?.ReplyToMessageId);
         var hasForward = !string.IsNullOrWhiteSpace(message?.ForwardedFromMessageId);
@@ -57,6 +65,8 @@ internal sealed partial class MessagingCommandHandler
             (!isGroup && message.TargetUserId <= 0) ||
             (isGroup && message.ConversationId!.Length > 64) ||
             (string.IsNullOrWhiteSpace(message.Content) && !hasAttachments) ||
+            (message.Content is { Length: > 0 } &&
+             Encoding.UTF8.GetByteCount(message.Content) > ChatMessageLimits.MaxContentBytes) ||
             message.MessageId?.Length > ChatMessageLimits.MaxClientMessageIdLength ||
             (message.AttachmentIds is { Count: > 0 } &&
              message.AttachmentIds.Count > _options.MaxChatAttachments) ||
@@ -96,6 +106,13 @@ internal sealed partial class MessagingCommandHandler
         var commandId = CreateCommandId(
             sender.UserId,
             clientMessageId);
+
+        // VOICE-MSG-2：把消息里出现的附件元数据快照带上（AttachmentIds 对齐）。
+        // 历史消息经附件注册表回查构建，语音 6 字段需经此快照持久化到注册表。
+        var attachmentMetadata = MapUplinkAttachmentMetadata(
+            message.AttachmentIds,
+            message.Attachments);
+
         var command = new IncomingMessageCommand
         {
             CommandId = commandId,
@@ -107,6 +124,7 @@ internal sealed partial class MessagingCommandHandler
             ConversationId = isGroup ? message.ConversationId!.Trim() : null,
             Content = message.Content ?? string.Empty,
             AttachmentIds = message.AttachmentIds,
+            Attachments = attachmentMetadata,
             ReplyToMessageId = string.IsNullOrWhiteSpace(message.ReplyToMessageId)
                 ? null
                 : message.ReplyToMessageId.Trim(),
@@ -142,6 +160,37 @@ internal sealed partial class MessagingCommandHandler
                 clientMessageId,
                 commandId,
                 accepted: true);
+
+            // 接收方全局离线时触发离线推送（Push.Enabled 门控；
+            // 触发失败内部吞掉，不影响已完成的 ack 与消息投递）。v1 仅单聊。
+            if (_offlinePushTrigger is not null)
+            {
+                if (!isGroup)
+                {
+                    await _offlinePushTrigger
+                        .TryTriggerForDirectMessageAsync(
+                            message.TargetUserId,
+                            message.ConversationId,
+                            clientMessageId,
+                            message.Content,
+                            hasAttachments,
+                            cancellationToken)
+                        .ConfigureAwait(false);
+                }
+                else if (message.ConversationId is { Length: > 0 } groupConversationId)
+                {
+                    await _offlinePushTrigger
+                        .TryTriggerForGroupMessageAsync(
+                            sender.UserId,
+                            groupConversationId,
+                            clientMessageId,
+                            message.Content,
+                            hasAttachments,
+                            message.MentionedUserIds,
+                            cancellationToken)
+                        .ConfigureAwait(false);
+                }
+            }
         }
         catch (OperationCanceledException)
             when (cancellationToken.IsCancellationRequested)
@@ -190,6 +239,7 @@ internal sealed partial class MessagingCommandHandler
         using var outboundFrame = OutboundFrameFactory.Create(
             PacketCommand.MessageAcknowledgement,
             _messageAcknowledgementCodec,
+            session,
             acknowledgement);
         if (!session.TryQueue(outboundFrame, closeAfterSend) &&
             closeAfterSend is { } reason)
@@ -266,6 +316,38 @@ internal sealed partial class MessagingCommandHandler
         }
 
         return result.Count == 0 ? null : result;
+    }
+
+    /// <summary>
+    /// VOICE-MSG-2：提取上行 ChatMessage.Attachments 中与本消息 AttachmentIds 对齐的元数据快照。
+    /// 只保留消息里出现的附件（按 attachment_id 匹配）；上行未携带引用或引用与 ids 无交集时
+    /// 返回 null（仅 id 上行的旧客户端路径不受影响）。元数据由 Realtime 绑定链路持久化到附件注册表，
+    /// 语音 6 字段经注册表在历史回查时带出。
+    /// </summary>
+    internal static IReadOnlyList<AttachmentRef>? MapUplinkAttachmentMetadata(
+        IReadOnlyList<string>? attachmentIds,
+        IReadOnlyList<AttachmentRef>? uplinkAttachments)
+    {
+        if (uplinkAttachments is not { Count: > 0 })
+            return null;
+
+        List<AttachmentRef>? metadata = null;
+        if (attachmentIds is { Count: > 0 })
+        {
+            foreach (var reference in uplinkAttachments)
+            {
+                if (reference?.AttachmentId is not { Length: > 0 } referenceId
+                    || !attachmentIds.Contains(referenceId))
+                {
+                    continue;
+                }
+
+                metadata ??= new List<AttachmentRef>(uplinkAttachments.Count);
+                metadata.Add(reference);
+            }
+        }
+
+        return metadata is { Count: > 0 } ? metadata : null;
     }
 
     // 20（long 含符号最大位数）+ 1（':'）+ clientMessageId 最大 UTF8 字节数 + 余量。

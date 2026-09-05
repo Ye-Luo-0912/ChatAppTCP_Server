@@ -7,9 +7,11 @@ using SharedConversationItem = ChatApp.Shared.Protocol.Tcp.TcpConversationListIt
 using SharedConversationCursor = ChatApp.Shared.Protocol.Tcp.TcpConversationListCursor;
 using SharedRelationshipCatchUp = ChatApp.Shared.Protocol.Tcp.RelationshipCatchUp;
 using SharedRelationshipChange = ChatApp.Shared.Protocol.Tcp.RelationshipChangeLogEntry;
+using SharedRelationshipListItem = ChatApp.Shared.Protocol.Tcp.TcpRelationshipListItem;
 using RealtimeConversationItem = ChatApp.Realtime.Abstractions.Conversations.ConversationListItem;
 using RealtimeConversationCursor = ChatApp.Realtime.Abstractions.Conversations.ConversationListCursor;
 using RealtimeRelationshipCatchUp = ChatApp.Realtime.Abstractions.Sync.RelationshipCatchUp;
+using RealtimeRelationshipListItem = ChatApp.Realtime.Abstractions.Relationships.RelationshipListItem;
 
 namespace ChatApp.TcpGateway.Gateway.Messaging;
 
@@ -41,7 +43,15 @@ internal static class HistoryWireMapper
                 Status = (short)item.Status,
                 DownloadApiHint = item.DownloadApiHint,
                 DownloadToken = item.DownloadToken,
-                ThumbnailApiHint = item.ThumbnailApiHint
+                ThumbnailApiHint = item.ThumbnailApiHint,
+                IsVoice = item.IsVoice,
+                VoiceCodec = item.VoiceCodec,
+                VoiceContainer = item.VoiceContainer,
+                VoiceDurationMs = item.VoiceDurationMs,
+                VoiceSampleRateHz = item.VoiceSampleRateHz,
+                VoiceChannels = item.VoiceChannels,
+                // VOICE-MSG-2 waveform：语音波形峰值包络随附件引用透传（缺省/空 = 无波形）。
+                VoiceWaveformPeaks = item.VoiceWaveformPeaks
             };
         }
 
@@ -130,15 +140,13 @@ internal static class HistoryWireMapper
                 var change = catchUp.Changes[j];
                 changes[j] = new SharedRelationshipChange
                 {
-                    ChangeSequence = change.ChangeSequence,
                     Operation = (ChatApp.Shared.Protocol.Tcp.TcpRelationshipChangeOperation)change.Operation,
                     ResourceId = change.ResourceId,
                     UserId = change.UserId,
                     Status = change.Status,
                     Message = change.Message,
                     CreatedAtMs = change.CreatedAtMs,
-                    OccurredAtMs = change.OccurredAtMs,
-                    RequestId = change.RequestId
+                    OccurredAtMs = change.OccurredAtMs
                 };
             }
 
@@ -149,9 +157,36 @@ internal static class HistoryWireMapper
                 HasMore = catchUp.HasMore,
                 NextCursor = catchUp.NextCursor,
                 NextSequence = catchUp.NextSequence,
-                RetentionFloorSequence = catchUp.RetentionFloorSequence,
-                ResetRequired = catchUp.ResetRequired,
-                ResetReason = catchUp.ResetReason
+                ResetRequired = catchUp.ResetRequired
+            };
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Maps a Realtime relationship list page to the Shared <c>TcpRelationshipListItem</c> wire items.
+    /// Returns null when the source is empty or absent so the handler can fall back to an empty list.
+    /// </summary>
+    public static SharedRelationshipListItem[]? MapRelationshipItems(
+        IReadOnlyList<RealtimeRelationshipListItem>? source)
+    {
+        if (source is null || source.Count == 0)
+        {
+            return null;
+        }
+
+        var result = new SharedRelationshipListItem[source.Count];
+        for (var i = 0; i < source.Count; i++)
+        {
+            var item = source[i];
+            result[i] = new SharedRelationshipListItem
+            {
+                UserId = item.UserId,
+                ResourceId = item.ResourceId,
+                Status = item.Status,
+                Message = item.Message,
+                CreatedAtMs = item.CreatedAtMs
             };
         }
 

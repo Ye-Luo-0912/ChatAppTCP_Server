@@ -19,4 +19,12 @@ public static class ChatMessageLimits
 
     /// <summary>单条消息 @ 角色数上限。</summary>
     public const int MaxMentionedRoles = 10;
+
+    /// <summary>
+    /// 正文 UTF-8 字节数上限。与二进制 schema 的字符串域解耦：JSON/二进制两条入站路径
+    /// 在 handler 校验里统一按此值以 rejected ack 拒绝（而非断连），消除
+    /// "JSON 能进、二进制 decode 抛异常断连"的不对称，也杜绝超限正文经持久化后
+    /// 在 fanout 出站编码时形成投递毒丸循环。
+    /// </summary>
+    public const int MaxContentBytes = 64 * 1024;
 }

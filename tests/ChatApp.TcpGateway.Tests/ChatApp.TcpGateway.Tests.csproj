@@ -15,6 +15,7 @@
     <PackageReference Include="ChatApp.Auth.Contracts" />
     <PackageReference Include="ChatApp.Protocol.Tcp" />
     <PackageReference Include="ChatApp.Protocol.Tcp.Json" />
+    <PackageReference Include="ChatApp.Protocol.Tcp.Binary.Schemas" />
   </ItemGroup>
 
   <ItemGroup>
@@ -26,5 +27,6 @@
     <ProjectReference Include="..\..\tools\ChatApp.Realtime.PipelineLoadGenerator\ChatApp.Realtime.PipelineLoadGenerator.csproj" />
     <ProjectReference Include="..\..\tools\ChatApp.Performance.Orchestrator\ChatApp.Performance.Orchestrator.csproj" />
     <ProjectReference Include="..\..\tools\ChatApp.TcpGateway.LoadGenerator\ChatApp.TcpGateway.LoadGenerator.csproj" />
+    <ProjectReference Include="..\..\..\ChatApp.RealtimeServices\ChatApp.Realtime.Infrastructure.Core\ChatApp.Realtime.Infrastructure.Core.csproj" />
   </ItemGroup>
 </Project>

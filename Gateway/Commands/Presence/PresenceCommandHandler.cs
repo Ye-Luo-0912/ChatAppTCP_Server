@@ -14,6 +14,7 @@ using ChatApp.TcpGateway.Observability.Logging;
 using ChatApp.TcpGateway.Observability.Metrics;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using ChatApp.TcpGateway.Gateway.Serialization;
 
 namespace ChatApp.TcpGateway.Gateway.Commands.Presence;
 
@@ -95,7 +96,11 @@ internal sealed class PresenceCommandHandler : ICommandHandler
         TcpClientSession session,
         CancellationToken cancellationToken)
     {
-        var request = _presenceQueryRequestCodec.Deserialize(payload);
+        var request = SessionPayload.Deserialize(
+            session,
+            PacketCommand.PresenceQuery,
+            _presenceQueryRequestCodec,
+            payload);
         if (request is null || string.IsNullOrWhiteSpace(request.RequestId))
             return;
 
@@ -104,6 +109,7 @@ internal sealed class PresenceCommandHandler : ICommandHandler
             using var disabled = OutboundFrameFactory.Create(
                 PacketCommand.PresenceSnapshot,
                 _presenceSnapshotResponseCodec,
+                session,
                 new PresenceSnapshotResponse
                 {
                     RequestId = request.RequestId.Trim(),
@@ -247,9 +253,12 @@ internal sealed class PresenceCommandHandler : ICommandHandler
             Items = items
         };
 
+        // 连接级格式分流：binary 协商的会话必须收到 chatapp-bin-v1 编码的快照
+        //（与上方 disabled 分支保持一致），否则 binary 客户端无法解码。
         using var outbound = OutboundFrameFactory.Create(
             PacketCommand.PresenceSnapshot,
             _presenceSnapshotResponseCodec,
+            session,
             response);
         session.TryQueue(outbound);
     }
@@ -266,7 +275,11 @@ internal sealed class PresenceCommandHandler : ICommandHandler
         if (!_options.EnableEphemeralPresenceAndTyping)
             return;
 
-        var request = _presenceUnwatchRequestCodec.Deserialize(payload);
+        var request = SessionPayload.Deserialize(
+            session,
+            PacketCommand.PresenceUnwatch,
+            _presenceUnwatchRequestCodec,
+            payload);
         if (request?.UserIds is null || request.UserIds.Count == 0)
             return;
 

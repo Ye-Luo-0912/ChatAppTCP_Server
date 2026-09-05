@@ -166,7 +166,9 @@ internal sealed partial class SessionRuntime
                     _typingActorPipeline.TryHandleFrame(in frame, session);
                     return true;
                 }
-                catch (JsonException)
+                catch (Exception ex) when (
+                    ex is JsonException ||
+                    ex is Serialization.BinaryPayloadDecodeException)
                 {
                     _metrics.ProtocolError();
                     _sendProtocolError(
@@ -193,7 +195,9 @@ internal sealed partial class SessionRuntime
                         .ConfigureAwait(false);
                     return true;
                 }
-                catch (JsonException)
+                catch (Exception ex) when (
+                    ex is JsonException ||
+                    ex is Serialization.BinaryPayloadDecodeException)
                 {
                     _metrics.ProtocolError();
                     session.Close(

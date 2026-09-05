@@ -284,7 +284,14 @@ internal sealed partial class TcpGatewayService : BackgroundService
             globalCapacity: Math.Max(1024, _options.CommandSchedulerOrderedWriteCapacity * 256),
             commandTimeout: TimeSpan.Zero,
             perUserConcurrency: 0,
-            onFatalError: null,
+            // 排队 lane 内的异常（如损坏 payload 反序列化失败）此前被静默吞掉：
+            // 命令消失、无日志无指标。至少记录并计入协议错误指标；
+            // 连接处置仍交给命令自身的失败路径（如 ack 拒绝/协议错误关连接）。
+            onFatalError: ex =>
+            {
+                LogQueuedCommandFatal(_logger, ex);
+                _metrics.ProtocolError();
+            },
             logger: _logger);
 
         // 全局命令执行器：Query lane。
@@ -299,7 +306,14 @@ internal sealed partial class TcpGatewayService : BackgroundService
             globalCapacity: Math.Max(1024, _options.CommandSchedulerQueryCapacity * 256),
             commandTimeout: TimeSpan.Zero,
             perUserConcurrency: 0,
-            onFatalError: null,
+            // 排队 lane 内的异常（如损坏 payload 反序列化失败）此前被静默吞掉：
+            // 命令消失、无日志无指标。至少记录并计入协议错误指标；
+            // 连接处置仍交给命令自身的失败路径（如 ack 拒绝/协议错误关连接）。
+            onFatalError: ex =>
+            {
+                LogQueuedCommandFatal(_logger, ex);
+                _metrics.ProtocolError();
+            },
             logger: _logger);
 
         // Ephemeral lane 可切换到轻量 ActorRuntime；旧 SessionCommandExecutor 保留为 A/B 回退。
@@ -845,4 +859,10 @@ internal sealed partial class TcpGatewayService : BackgroundService
             reasons.Select(
                 reason => $"{reason}={Volatile.Read(ref _sessionCloseCounts[(int)reason])}"));
     }
+    [LoggerMessage(
+        EventId = 3000,
+        Level = LogLevel.Error,
+        Message = "排队命令处理致命异常")]
+    private static partial void LogQueuedCommandFatal(ILogger logger, Exception exception);
+
 }

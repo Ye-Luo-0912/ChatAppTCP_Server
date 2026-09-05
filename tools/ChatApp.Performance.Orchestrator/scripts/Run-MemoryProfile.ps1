@@ -10,8 +10,9 @@
     并行采集每例 Gateway 的 dotnet-gcdump 与 socket 证据（ss -tinm、/proc/net/sockstat）。
 
     三类画像的映射：
-      - silent：heartbeat 长间隔近似。10000 连接只认证、保持空闲；少部分 active sender
-        以极低速率发心跳，其余连接的 keepalive 间隔远大于测量窗口，从而近似静默。
+      - silent：低活跃静默近似。10000 连接只认证、保持空闲；少部分 active sender
+        以极低速率发心跳，其余连接以低于 Gateway 空闲超时（IdleTimeout 90s）的
+        keepalive 间隔保活，从而近似低流量静默且不因 idle timeout 被断开。
       - heartbeat：heartbeat-only。全部连接按配置速率发心跳。
       - active：chat。1% 连接为 active sender，另 1% 为 slow reader，其余保持空闲心跳。
 
@@ -52,8 +53,10 @@
     active 画像中 active sender 与 slow reader 各占连接的比例。默认 0.01（1%）。
 
 .PARAMETER SilentInactiveHeartbeatSeconds
-    silent 画像非 active 连接的 keepalive 间隔；应远大于测量窗口（上限 900s）以近似静默。
-    默认 3600（受底层容量曲线校验上限约束）。
+    silent 画像非 active 连接的 keepalive 间隔。必须小于 Gateway 空闲超时
+    （IdleTimeout 默认 90s），否则连接会在测量中被 `IdleTimedOut` 断开（smoke 因
+    60s<90s 未暴露，正式 10 分钟测量会触发）。取值 60 既保证连接存活，又比
+    heartbeat 画像（2 msg/s）轻得多，近似低活跃静默。
 
 .PARAMETER ActiveInactiveHeartbeatSeconds
     heartbeat/active 画像非发送连接的 keepalive 间隔。默认 30。
@@ -95,8 +98,9 @@ param(
     [ValidateRange(0.001, 100)] [double] $HeartbeatMessagesPerSecond = 2.0,
     [ValidateRange(1, 1048576)] [int] $TcpPayloadBytes = 512,
     [ValidateRange(0.0001, 0.5)] [double] $ActiveSenderFraction = 0.01,
-    [ValidateRange(0, 3600)] [int] $SilentInactiveHeartbeatSeconds = 3600,
+    [ValidateRange(1, 3600)] [int] $SilentInactiveHeartbeatSeconds = 60,
     [ValidateRange(0, 3600)] [int] $ActiveInactiveHeartbeatSeconds = 30,
+    [ValidateRange(1, 86400)] [int] $TcpInflightTtlSeconds = 120,
     [ValidateRange(0.001, 100)] [double] $ActiveMessagesPerSecond = 1.0,
     [ValidateRange(1024, 65535)] [int] $GatewayBasePort = 18888,
     [ValidateRange(1024, 65535)] [int] $RealtimePort = 18080,
@@ -165,13 +169,18 @@ $activePercent = [int]($ActiveSenderFraction * 100)
 $profileConfigs = [ordered]@{
     silent = [ordered]@{
         Label = 'silent'
-        Description = '10k authenticated idle (heartbeat long-interval approximation)'
+        Description = '10k authenticated near-idle (low-activity keepalive below gateway idle timeout)'
         TcpMode = 'heartbeat'
         TcpActiveSenders = $silentSenders
-        TcpMessagesPerSecond = 0.01
+        # 0.01 msg/s=每 100s 一条，超过 Gateway IdleTimeout(90s) 会被 IdleTimedOut 断开；
+        # 提高到 0.1 (每 10s 一条) 保证 active sender 连接存活，同时仍远低于 heartbeat 画像(2 msg/s)。
+        TcpMessagesPerSecond = 0.1
         TcpInactiveHeartbeatSeconds = $SilentInactiveHeartbeatSeconds
         TcpSlowReaders = 0
         TcpPayloadBytes = 128
+        TcpDeliveryDrainSeconds = 30
+        MaximumDeadLetters = 0
+        TcpInflightTtlSeconds = $TcpInflightTtlSeconds
     }
     heartbeat = [ordered]@{
         Label = 'heartbeat'
@@ -182,6 +191,9 @@ $profileConfigs = [ordered]@{
         TcpInactiveHeartbeatSeconds = $ActiveInactiveHeartbeatSeconds
         TcpSlowReaders = 0
         TcpPayloadBytes = 128
+        TcpDeliveryDrainSeconds = 30
+        MaximumDeadLetters = 0
+        TcpInflightTtlSeconds = $TcpInflightTtlSeconds
     }
     active = [ordered]@{
         Label = 'active'
@@ -192,6 +204,25 @@ $profileConfigs = [ordered]@{
         TcpInactiveHeartbeatSeconds = $ActiveInactiveHeartbeatSeconds
         TcpSlowReaders = $slowReaders
         TcpPayloadBytes = $TcpPayloadBytes
+        # slow reader 刻意不消费 chat 投递，交付 drain 门在 30s 窗口内必然无法完成；
+        # 该画像只测内存归因，不校验端到端交付收尾，故禁用 delivery drain 语义门。
+        TcpDeliveryDrainSeconds = 0
+        # slow reader 不消费导致指向它们的投递被实时服务限流而死信（rate_limited），
+<<<<<<< HEAD
+        # 属 slow-reader 画像的固有语义；该画像只测内存归因，不校验端到端交付收尾，
+        # 故把死信门上限放宽到「本画像消息理论上限 = 全部 chat 消息量」，
+        # 使门在 slow-reader 语义下恒过（实测约 6% 消息被限流死信，slowReaders*2 过紧）。
+        MaximumDeadLetters = [long]($activeSenders * $ActiveMessagesPerSecond *
+            ($rampSeconds + $WarmupSeconds + $DurationSeconds))
+=======
+        # 属 slow-reader 画像的固有语义；放宽死信门上限（按 slow reader 数量比例）。
+        MaximumDeadLetters = [long]($slowReaders * 2)
+>>>>>>> origin/master
+        # slow reader 不消费导致指向它们的消息在 load generator 的 in-flight 表滞留；
+        # 默认 inflight TTL(120s) 会在测量中段触发 fail-fast（"In-flight message ... exceeded the configured TTL"）。
+        # 该画像只测内存归因，不校验端到端交付收尾，故把 in-flight TTL 放大到覆盖完整测量窗口
+        # (ramp+warmup+measure+余量)，使 slow-reader 消息不会在测量期间过期。
+        TcpInflightTtlSeconds = [int]($rampSeconds + $WarmupSeconds + $DurationSeconds + 120)
     }
 }
 
@@ -209,6 +240,12 @@ function Get-OptionalProperty {
         [AllowNull()] [object] $DefaultValue = $null
     )
     if ($null -eq $InputObject) { return $DefaultValue }
+    # 后台作业反序列化的 [ordered]@{} 是 OrderedDictionary，psobject.Properties 按名索引取不到键，
+    # 需显式按字典键读取；PSCustomObject（如 ConvertFrom-Json）走 psobject.Properties。
+    if ($InputObject -is [System.Collections.IDictionary]) {
+        if ($InputObject.Contains($Name)) { return $InputObject[$Name] }
+        return $DefaultValue
+    }
     $property = $InputObject.psobject.Properties[$Name]
     if ($null -eq $property -or $null -eq $property.Value) { return $DefaultValue }
     return $property.Value
@@ -247,9 +284,18 @@ $collectorScript = {
         $ssPath = Join-Path $OutputDirectory 'ss-tinm.txt'
         [IO.File]::WriteAllLines($ssPath, $ssRaw, [Text.UTF8Encoding]::new($false))
 
-        foreach ($pid in $Pids) {
-            $matching = @($ssRaw | Where-Object { $_ -match "(^|\s)pid=$pid," })
-            $snapshot.SocketCountByPid["$pid"] = $matching.Count
+        # 注意：$PID 是 PowerShell 只读自动变量（大小写不敏感），不能用作循环变量；
+        # 否则赋值会抛 "Cannot overwrite variable PID because it is read-only or constant"。
+        foreach ($gatewayPid in $Pids) {
+<<<<<<< HEAD
+            # ss -tinm -p 的进程归属形如 users:(("dotnet",pid=2446643,fd=199))，
+            # pid= 前是逗号而非空白，故不能用 (^|\s) 前缀；直接用 pid=<pid>, 精确匹配，
+            # 尾随逗号确保不会误配更长数字（如 pid=24466430,）。
+            $matching = @($ssRaw | Where-Object { $_ -match "pid=$gatewayPid," })
+=======
+            $matching = @($ssRaw | Where-Object { $_ -match "(^|\s)pid=$gatewayPid," })
+>>>>>>> origin/master
+            $snapshot.SocketCountByPid["$gatewayPid"] = $matching.Count
         }
 
         $sockstatLines = @()
@@ -364,7 +410,9 @@ foreach ($profileName in $selectedProfiles) {
             TcpActiveSenders = [int]$config.TcpActiveSenders
             TcpMode = [string]$config.TcpMode
             TcpMessagesPerSecond = [double]$config.TcpMessagesPerSecond
-            TcpDeliveryDrainSeconds = 30
+            TcpDeliveryDrainSeconds = [int]$config.TcpDeliveryDrainSeconds
+            TcpInflightTtlSeconds = [int]$config.TcpInflightTtlSeconds
+            MaximumDeadLetters = [long]$config.MaximumDeadLetters
             TcpInactiveHeartbeatSeconds = [int]$config.TcpInactiveHeartbeatSeconds
             TcpPayloadBytes = [int]$config.TcpPayloadBytes
             TcpSlowReaders = [int]$config.TcpSlowReaders
@@ -414,8 +462,14 @@ foreach ($profileName in $selectedProfiles) {
                 Wait-Job -Job $collectorJob -Timeout 600 | Out-Null
                 $jobRaw = Receive-Job -Job $collectorJob -ErrorAction SilentlyContinue
                 Remove-Job -Job $collectorJob -Force -ErrorAction SilentlyContinue
-                $jobResult = @($jobRaw) | Where-Object { $_ -is [System.Management.Automation.PSCustomObject] } |
-                    Select-Object -First 1
+                # 后台作业返回的 [ordered]@{} 在反序列化后是 OrderedDictionary（-is PSCustomObject 为 False），
+                # 因此按类型过滤必须同时覆盖 IDictionary；真正输出的结果对象唯一（外层的 result 字典）。
+                $jobResult = @($jobRaw) | Where-Object {
+                    $null -ne $_ -and (
+                        $_ -is [System.Management.Automation.PSCustomObject] -or
+                        $_ -is [System.Collections.IDictionary]
+                    )
+                } | Select-Object -First 1
             }
             catch {
                 $collectorOutcome.CollectorError = $_.Exception.Message

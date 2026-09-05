@@ -46,19 +46,16 @@ chat.message-history.query 的 Core NATS request/reply 完成。
 
 ## 序列化扩展
 
-业务层只依赖 IPayloadCodec<T>。当前 JsonPayloadCodec<T> 使用
-JsonSerializerContext（源生成 JsonTypeInfo）。默认发布为 JIT + TieredPGO；
-Native AOT 可选，见 [AGENTS.md](AGENTS.md)。
+当前 JSON 业务路径依赖 `IPayloadCodec<T>`；`JsonPayloadCodec<T>` 使用
+`JsonSerializerContext`（源生成 `JsonTypeInfo`）。默认运行为 JIT + TieredPGO；
+Native AOT 可选，见 [AGENTS.md](AGENTS.md)。二进制接入不会强行套用该对象型接口：
+编码热路径由 frame owner 提供连续 `Span<byte>` 并在成功后提交，解码调用 Shared 的静态生成入口。
 
-增加二进制协议时：
-
-1. 在 Infrastructure/Serialization 下新增 Binary 目录。
-2. 为每个消息类型实现 IPayloadCodec<T>。
-3. 在 InfrastructureServiceCollectionExtensions 中替换对应注册。
-4. 保持 Core/Protocol 和 Gateway/Networking 不变。
-
-如果未来需要 JSON 与二进制客户端同时在线，再在包头中加入协议版本或通过
-登录握手协商格式；这属于协议版本升级，不能直接改变现有 10 字节包头。
+二进制 `chatapp-bin-v1` 的 wire、公共 runtime、无生成器单遍 encoder 与 decode-only generator 规则由
+[`ChatApp.Shared/docs/BINARY-PROTOCOL.md`](https://github.com/Ye-Luo-0912/ChatApp.Shared/blob/main/docs/BINARY-PROTOCOL.md)
+统一维护。Gateway 只消费 Shared 包并负责连接级协商、session 固化 codec、按格式共享出站帧、
+kill switch 与 JSON 回退；不在本仓复制 schema 或另建逐消息契约。现有 10 字节包头保持不变，
+协商前 `ClientHello/ServerHello` 使用 JSON，完整握手后一个连接只使用一种 payload format。
 
 ## 配置
 
@@ -80,7 +77,7 @@ InstanceId 必须单实例唯一且重启稳定，网关的
 为主，采样率由 `TraceSampleRatio` 控制。
 
 Gateway 的独立 Prometheus HttpListener 仅保留给本地诊断，默认关闭；该 exporter 仍是
-预发布开发组件，不作为稳定性门禁。RealtimeServices 使用 Kestrel
+本地诊断组件，不作为稳定性门禁。RealtimeServices 使用 Kestrel
 提供 `GET /metrics` 的 Prometheus 文本端点，并把原 JSON 快照移动到
 `GET /diagnostics/runtime`。Outbox pending、最老待发布消息年龄、最大尝试次数、历史查询
 队列/执行中数量、NATS 连接/重连、JetStream pending/redelivery/ACK、运行时和 Npgsql
@@ -130,4 +127,4 @@ AccessToken 缓存键保持现有约定：
 跨项目消息语义见[消息链路说明](docs/realtime-message-flow.md)，性能测试方法见
 [性能基线说明](docs/performance-baseline.md)，一键组合基准见
 [多进程编排器](tools/ChatApp.Performance.Orchestrator/README.md)，后续功能与验收标准见
-[优化路线图](docs/optimization-roadmap.md)。
+[下一阶段摘要](docs/NEXT-STAGE.md)，详细待办见 [路线执行清单](docs/roadmap-todo.md)。

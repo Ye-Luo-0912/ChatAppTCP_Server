@@ -1,126 +1,83 @@
 # 待办路线图
 
-本文件只保留尚未完成的工作。当前状态见 `roadmap-current-state.md`，已完成事项见
-`roadmap-changelog.md`；跨仓统一顺序和验收口径见 `docs/NEXT-STAGE.md`。
+本文件是 TCP Gateway **唯一的详细执行清单**。当前事实见 [`roadmap-current-state.md`](roadmap-current-state.md)，完成记录见 [`roadmap-changelog.md`](roadmap-changelog.md)，跨仓摘要见 [`NEXT-STAGE.md`](NEXT-STAGE.md)。
 
-## 当前执行批次与交接顺序
+修改前先读相关实现、调用方、上下游契约和测试，确认命令语义与资源所有权。每个批次只解决一个问题，不复制 Shared DTO，不引入无界队列、连接级后台线程或隐式格式切换。
 
-| 批次 | Owner / 可并行性 | 前置条件 | 必须交付的接手证据 |
+## 批次顺序
+
+| 顺序 | 批次 | 主要 Owner | 完成证据 |
 | --- | --- | --- | --- |
-| `PROTO-FEED-1` | Shared；Gateway/Client 验证，可与 `REL-GATE-1` 并行 | 六包候选源码和版本冻结 | 不可变 nupkg/hash、locked restore、Gateway/Client 短联调报告 |
-| `REL-GATE-1` | Server + Realtime | Contracts `2.5.2`、Integration `3.1.3` 与 Migration 060–062 冻结 | `run-manifest.json`、reconcile report、故障矩阵；密钥不得入档 |
-| `REL-WIRE-2` | Shared；必须等待 `REL-GATE-1` 通过 | 两轮全量对账和故障恢复均通过 | list/catch-up/reset schema、reserved 字段、old/new golden、包/hash |
-| `REL-READ-3` | Realtime → Gateway → Client | `REL-WIRE-2` 的不可变包已发布 | 默认关闭的 capability、HTTP 权威对照、短时 canary/回滚报告 |
-| `TCP-MEM-1` | Gateway，只测量，可与前三项并行 | 单独冻结源码、二进制和负载 | 三类 10k 短画像及 gcdump/PSS/socket 归因；不得夹带功能改动 |
+| 1 | `REL-E2E-4` | Realtime → Gateway → Client | list/catch-up 真实联调、HTTP 对照、reset/gap/断线恢复 |
+| 2 | `VOICE-MSG-2` | Server → Realtime → Shared → Gateway → Client | 上传到播放的端到端链路与错误恢复 |
+| 3 | `CALL-E2E-2` | Server → Realtime → Shared → Gateway → Client | grant、信令状态机、跨 Gateway 与弱网恢复 |
+| 支撑 | `BIN-INTEGRATION-3` | Shared → Gateway + Client | 完整命令覆盖、双 codec、JSON fallback、短测 |
+| 支撑 | `PERF-SUPPORT-1` | 发生热点的仓库 | profiler 归因、微基准、同构短 A/B |
 
-后续 Agent 只接一个批次，并先读取上一批次证据；没有证据时不得按“代码已存在”推定门禁通过。
-`REL-READ-3` 完成前，关系 mutation 永久走 Server HTTP，TCP 入口继续 fail-closed。二进制生产协商、
-语音/通话和 QUIC 不与关系只读首轮同时灰度。
+后续 Agent 一次只接一个批次，并在交接中写明修改范围、未解决风险和验证结果。
 
-## P0：共享契约候选发布
+## P0：`REL-E2E-4` 关系读取
 
-1. 在 Shared 补帧级超限/畸形输入 fuzz，以及旧附件、关系字段组合的 old/new fixture。
-2. 在干净 CI 中重新打包六个 `0.4.1` 候选包并核对已记录 SHA-256；任何源码或包元数据变化都升新版本，禁止覆盖同版本。
-3. 发布不可变 feed 后，让 Gateway 与 Client 只从 feed 做 locked restore，并运行一次短时 TCP 联调，覆盖 request-id 错配、JSON 降级、超限和截断。
-4. 回滚只切回上一不可变包；不恢复本地重复 DTO，也不回滚已经成功的客户端 SQLite migration。
+Server HTTP 与 public `T_*` 表继续作为唯一关系权威；Gateway 只提供读取映射，关系 mutation 不迁入 TCP。
 
-## P0：关系只读投影
+1. [x] 将 Realtime 投影 list/catch-up backend 接入现有 handler，使用 Shared `TcpRelationship*` 与 sync 类型做唯一 wire 输入；禁止从 Realtime 数据库实体或内部 DTO 自动序列化客户端响应。（Gateway 侧已完成，见 `roadmap-changelog.md` 2026-08-14）
+2. [x] 显式映射 owner/list/resource/version、opaque cursor/watermark、partial/reset 与稳定错误；响应预算裁剪后才能决定下一水位，不能返回伪空成功或 `HasMore` 缺 cursor。（Gateway 侧已完成）
+3. [x] 覆盖 unavailable、projection changed、gap、retention exceeded、invalid cursor、重复请求、分页中权限变化、断线续页和 capability 关闭。失败必须保留旧有效状态且不推动 Client 水位。（Gateway 侧已落地 fail-closed 与 reset 语义，集成测试见 `RelationshipListReadIntegrationTests`）
+4. [ ] 以同一账户的 Server HTTP 好友、申请和黑名单列表逐项对照；出现差异时只修投影、mapper 或分页语义，禁止恢复 legacy Realtime 关系表或 Gateway 本地权威。（跨仓：Server HTTP 权威逐项对照）
+5. [ ] 完成 Client 首次加载、增量、reset、账户切换和多设备变化联调；用 5–20 分钟短测覆盖断线与续页，不把性能基准混进正确性结论。（跨仓：Client 水位恢复联调）
 
-当前 Server HTTP 和 public `T_*` 表是唯一关系权威。Server 已在关系事务内写 Realtime Outbox
-连续版本 delta；Realtime 已在 JetStream ACK 前原子提交 inbox/item/version，并能通过权威 stream
-快照回填、重复扫描和 count/hash 对账修复单流。Rebuilder 与 snapshot-gated list processor 均默认关闭，
-TCP relation list/sync/mutation 继续 fail-closed，旧 Realtime 关系表不得恢复为在线权威。
+完成标准：Client 仅依赖 TCP read 即可从 snapshot 收敛并持续 catch-up；所有 gap 都显式 reset，mutation 仍由 HTTP 完成，关闭能力后安全 fail-closed。
 
-1. 在隔离环境以 secret store 服务密钥启用 Rebuilder，验证多实例抢租/过期接管、取消重启、整页失败续跑、
-   429/5xx/超时退避、密钥轮换、并发 mutation 和扫描期间新增较小 owner id；不得把 key、列表正文或响应体写日志。
-2. 受 Ops API key 保护的 status/streams 已提供持久化 cursor、稳定轮次、租约/最后错误，以及逐 stream
-   current/snapshot version、数量/hash、快照后 inbox count/max version 和本地连续性。隔离环境用 secret store
-   注入 key，运行 Realtime 的 `scripts/Invoke-RelationshipProjectionReconcile.ps1`；工具自动从空 cursor 分页、
-   校验每轮前后状态 token，并比较连续两轮全量 SHA-256 指纹。200 表示页面一致，409 带稳定差异原因，
-   503 表示权威摘要源或本地投影不可用；报告不得包含服务密钥、好友明细或响应正文。
-3. 只有连续两轮 stable 且两轮所有 reconcile 页面均为 200、总差异为零，故障注入恢复后再次全量对账
-   仍一致，才独立开启 Realtime list canary；无 snapshot checkpoint 返回 unavailable，分页 version 变化要求
-   从第一页重启。canary 期间继续抽样与 Server HTTP 权威列表逐项对照，任一失败立即关闭读取开关。
-4. Shared/Gateway/Client 再统一 list/catch-up/reset wire，固定 version/watermark、partial/reset、
-   unavailable/version-changed/gap 和游标失效语义；Sync 超限不得静默丢段，mutation 永久走 Server HTTP。
+## P1：`VOICE-MSG-2` 语音消息
 
-## P1：TCP 长连接 CPU/内存
+1. Shared 固定语音附件的 codec/container、MIME、duration、sample rate、channels、size 与可选 waveform；Gateway 只映射这些有界字段和附件引用。
+2. 发送继续复用现有附件 ownership、finalize、扫描、绑定和消息幂等。只有 `Available` 附件可发送；扫描中、拒绝、过期、非本人和已绑定冲突返回稳定错误。
+3. 历史、同步、撤回、保留清理和跨 Gateway delivery 与普通附件消息共享语义；音频正文、临时本地路径和下载票不得进入日志、Outbox 或 TCP payload。
+4. 增加畸形元数据、超限、重复 client message id、断线重试和旧客户端未知字段测试；再联调录制 → 上传 → 发送 → 接收 → 播放。
 
-已完成 executor 惰性队列、发送泵唯一清理、LazySegmented writer admission、接收缓冲安全降级和
-90 秒 lease/presence 刷新。下一步不再凭对象估算继续改代码，先做 10–15 分钟可归因画像：
+完成标准：语音消息不新增独立传输栈，正常与失败路径均可恢复，关闭语音能力不影响普通附件和文本消息。
 
-1. 分别运行 10k authenticated 静默、heartbeat-only、1% active + 1% slow-reader；固定源码、
-   Release 二进制、连接 ramp、配置和运行目录，每个候选至少三轮短样本。
-2. 同时采集 gcdump 类型计数、PSS/smaps、fd、`ss -tinm`、cgroup sock、GC/分配、线程、句柄、
-   heartbeat counter 与 p95/p99；区分 managed retained、GC committed、ArrayPool、native cache 和内核 socket。
-3. 只有新热点能带来至少约 15% PSS/retained 改善，或单个已有开关能稳定节省至少约 0.5 KiB/连接，
-   才继续 linked CTS、send waiter、deadline callback 或 socket buffer 优化。
-4. 验收必须保持零漏帧、零重复、零预算/retained 泄漏，吞吐和 p95/p99 不回退超过 5%，并覆盖
-   connection-id 复用、Stop/Dispose、慢读者公平、resume/fencing 和 10k shutdown。
+## P1：`CALL-E2E-2` 1:1 通话控制面
 
-## P1：消息链路与数据库性能
+1. Shared 固定 CallInvite/Accept/Reject/Cancel/End/Reconnect 及必要 SDP/ICE envelope，包含 call id、command id、revision、TTL 和明确预算。
+2. Gateway 校验 authenticated actor、Server 短期 call grant、好友/拉黑权限、并发通话上限和用户/连接速率；重复 command id 幂等，过期或乱序命令 fail-closed。
+3. 复用 Realtime 临时状态机与非持久化 signal 路径完成跨 Gateway 路由；结束、超时和断线后清理 route，不把 SDP/ICE 写入 PostgreSQL、Outbox 或聊天 JetStream。
+4. 覆盖双方同时发起/挂断、多设备竞争、Gateway 切换、依赖短暂中断、ICE restart 和旧 capability 客户端。控制面只决定状态，媒体使用 WebRTC/SRTP 与 ICE/STUN/TURN。
 
-1. 用 trace、`pg_stat_statements`、WAL/消息、DB ops/消息和 allocation/消息先确认 Top 路径；
-   每轮只改一个 SQL、批处理、索引或调度因素，以同构重复 A/B 中位数判断。
-2. Outbox hint 合并默认保持 `0 ms`。`2 ms` 只作为显式资源优先模式；未证明尾延迟风险可接受前，
-   不改变默认值。
-3. 短时 80/320/640 msg/s admission/capacity 必须验证 ACK/跨 Gateway 投递、重复/漏投、
-   Outbox/JetStream/死信、CPU、GC、SQL、WAL 和 p95/p99；30 分钟仅冻结候选，8 小时仅用于发布门禁。
-4. Linux 仍需补慢速 header/payload、全局入站预算、连接风暴、依赖断开/恢复和跨 Gateway 重连；
-   每轮使用独立目录、manifest、源码/二进制 hash，禁止从历史运行拼接结论。
+完成标准：所有信令序列得到唯一终态，鉴权和预算可测试，TCP Gateway 不承载连续媒体包或自定义 UDP 可靠层。
 
-## P1：Push 与附件闭环
+## 支撑：`BIN-INTEGRATION-3`（✅ 已完成，2026-08-30）
 
-### Push
+1. 仅在 Shared 当前 schema 批次完成且功能命令目录稳定后接入。握手与协商前保持 JSON，首版 Resume 也保持 JSON；协商后 session 固定 exact format，不 sniff、不在线切换。— 已落地（`EnableBinaryPayloadFormat` 默认关闭，行为与旧版一致）。
+2. 入站使用 Shared generated decoder，出站使用普通源码 encoder；Gateway 负责 buffer owner、池归还和敏感区清理，不复制 Core 指针实现或 schema。— 已落地（`SessionPayload.Deserialize` 分流 + `TcpBinaryWireEncoder` 编码，共享包 0.5.4）。
+3. 混合连接按 format 分组，每个事件每种格式最多编码一次并共享只读 frame；不能退化为逐 session 序列化。— 已落地（`FormatGroupedFrame`）。
+4. 用真实 Chat/History/Sync/关系/语音/通话 corpus 比较 payload、CPU、allocation 和 p95/p99；完成 malformed/oversize/fuzz、fallback、GoAway/重连与 80/320/640 msg/s 短测。收益不足时继续使用 JSON。— 已完成（`scratch/binary-shorttest-report-20260830.md`：payload −47%、640/s CPU −28.5%、零漏投/零重复、p99 ≤1.9 ms）。
+   遗留已清（2026-08-30）：跨进程真机验证已完成——新构建经 `relgate-deploy.ps1 -SkipInfra` 部署至
+   chatapp-linux 全栈（Gateway 启动脚本加 `TcpGateway__EnableBinaryPayloadFormat='true'`），二进制 e2e 驱动
+   （`.tmp-bin-e2e`，复用真实 ChatSessionClient 经 SSH 隧道）12/12 通过：chatapp-bin-v1 协商、JSON fallback、
+   双格式真实进程混布 fanout 双向消息往返、二进制 MessageAcknowledgement。e2e 发现并修复 6 处 fanout/响应站点漏格式分组（CallSignal push、Ephemeral typing/presence、TypingFanoutHost、Presence 广播、PresenceQuery 快照响应），新增 2 个混合格式回归测试（EphemeralMixedFormatFanoutTests，还原修复必现失败已验证），全量 632 全绿。本机 Docker Desktop 已卸载（按用户
+   要求，释放 ~69GB），本地验证改用原生基础设施路径：`scratch/native-infra.ps1 start`（PostgreSQL 17.4 +
+   Garnet 2.1.5，`--lua --lua-transaction-mode` 必须开启）+ `CHATAPP_TEST_POSTGRES` / `CHATAPP_TEST_GARNET`
+   环境变量直连；Server 集成测试 141 过/130 跳过 → 268 过/3 跳过（跳过项均为容器重启/ClamAV 守护进程语义）；RealtimeServices 两个测试项目同样恢复：测试夹具加 CHATAPP_TEST_POSTGRES/NATS/GARNET 环境变量双模式，Realtime.Tests 391/391、IntegrationTests 135/135 全绿（含修复 PerfHarness pg_stat_statements 跨库 queryid 冲突与 ConfigureSchema 静态态跨类污染两个测试缺陷）。
+   正式启用（开关 + 滚动发布）为部署决策。运行提示（2026-09-02）：Windows→relgate 的 SSH 隧道不稳定时，可把三套 e2e 驱动的 bin 输出直接部署到远程本机运行（`dotnet <X>.dll --base=http://127.0.0.1:8080 --gw=127.0.0.1`，最终门已以此方式全绿：BinE2E 12/12、CallE2E 27/0、VoiceE2E 41/0）；VoiceE2E 受 Server `user-sensitive` 限流（附件 presign 10 次/900 秒/用户）约束，连续重跑需间隔一个窗口。
 
-1. 实现真实 FCM/APNs/WebPush provider、凭据轮换和 provider 级限流；Gateway 继续只负责路由，
-   网络资源由 PushWorker 隔离。
-2. Realtime publisher 在可靠判断 `UserOffline` 后入队；区分用户离线和目录查询失败，后者必须重试，
-   不能误判为离线。
-3. Client 完成 token 注册、轮换、撤销、退出登录和通知偏好；覆盖多设备、无效 token、部分成功、
-   DLQ 重放和幂等。
+## 支撑：`PERF-SUPPORT-1`
 
-### 附件
+1. 先读取现有 `TCP-MEM-1`、数据库和 soak 证据，仅为当前功能回归或 profiler Top 热点补采样。
+2. 微基准或聚焦计数先证明原因，再一次修改一个因素；优先处理可测量的 per-session retained、allocation/message、CPU sample、DB ops/WAL 或 p99 问题。
+3. 原实现与候选至少做两轮交错的 3–5 分钟同构 A/B；保持连接 ramp、负载、配置和依赖一致。只有趋势不清时补一次 10–15 分钟样本。
+4. 必须保持零漏投、零重复、零预算泄漏和资源正确释放；复杂度增加但收益不稳定时撤回实现并记录负结论。
 
-1. 补所有权校验、扫描/审核触发、过期 sweep、下载授权和保留策略；Gateway 不签发下载 token，
-   只转发稳定 wire 状态。
-2. 用新 migration 对齐数据库状态约束与 wire/domain 枚举，保留显式 mapper，禁止跨层强制转换未知值。
-3. 覆盖重复 finalize、消息绑定竞态、扫描失败、过期、下载越权和恢复；语音消息复用同一附件生命周期，
-   音频内容不进入 TCP frame、Postgres Outbox 或 JetStream。
+## 后续但不在当前阶段
 
-## P1：二进制 payload 接入
-
-Shared 已完成默认不可协商的 `chatapp-tagged-v1` runtime/generator；生产 JSON 和 10-byte 帧头不变。
-
-1. 先完成全部握手后 payload 命令的 schema、reserved field、old/new golden、fuzz 和 source-generated codec；
-   不能只给 ChatMessage 开 binary，因为当前帧头没有逐帧格式位。
-2. `ClientHello/ServerHello` 始终 JSON；完整握手后把格式固化到 session，首版 Resume 强制 JSON。
-   入站不 sniff，连接中途不切换；回滚关闭选择，让已协商连接排空或 GoAway 重连。
-3. 混合灰度按格式分组，每个事件每种格式最多编码一次并复用共享帧；不得退化为逐 session 序列化。
-   鉴权、resume 等敏感 buffer 在成功、异常、扩容和引用归零路径都由所有者清零。
-4. 只有 payload 至少下降 30%、序列化 CPU 或分配至少下降 20%，且 80/320/640 msg/s 短测
-   ACK/投递零漏零重、p95/p99 无显著回退，才进入 canary；否则继续 JSON 默认。
-
-## P2：语音、媒体与 QUIC
-
-1. 语音消息复用附件上传；1:1 通话使用 WebRTC/SRTP + ICE/STUN/TURN，TCP 只承载可靠信令。
-   裸 UDP 不进入聊天、鉴权、同步、ACK 或媒体业务层。
-2. 群通话在 1:1 稳定后使用独立 SFU；TURN/SFU 的 CPU、带宽和成本进入独立容量模型，
-   不能把“媒体未进入 Gateway”写成当前 TCP 资源下降。
-3. QUIC stream 仅在共享契约和 binary 灰度稳定后做可关闭 A/B，覆盖 UDP 阻断、0/1/3/5% 丢包、
-   20/80/200 ms RTT、网络切换和 NAT rebinding；TCP 始终保留回退。
-
-## 工程治理
-
-1. 注册 Linux 自托管 runner，接入 locked restore、Release build、完整测试、数据库契约、真实依赖探针、
-   定时短门禁和发布 soak；保存报告并与冻结基线比较。
-2. 配置 OTLP Collector 与 Alertmanager 实际通知通道，校准告警阈值；日志只保留结构化故障信息，
-   不在热路径恢复高频 Information，也不记录 token 或消息正文。
-3. 继续拆分 oversized 类型并补确定性竞态测试；当前 Windows 默认并行全套仍有 DirectSocket/Persistent
-   loopback 握手 abort 的测试隔离债，串行全量与隔离重复通过，但 CI 应消除该时序噪声。
+- 群通话/SFU：1:1 通话稳定后再设计独立媒体服务与容量模型。
+  ✅ **立项设计已完成（2026-09-04）**：`docs/group-call-sfu-design.md`——
+  阶段一 Mesh（≤4 人，零新基础设施）→ 阶段二 SFU（选型技术验证后定，
+  LiveKit/mediasoup/Jitsi 候选）；控制面扩展（grant 多人化 + wire 信令 kind 扩展）
+  与容量公式已定稿；待评审后启动阶段一。
+- QUIC：只在真实移动网络问题无法由 TCP/WebRTC 解决时做可关闭对照；裸 UDP 不进入聊天控制面。
+- Push/更深可观测性：按真实客户端需求和故障缺口逐项接入，不先建设空壳平台。
 
 ## 验证顺序
 
-聚焦单测/契约测试 → Release 构建 → 5–20 分钟短时 A/B → 必要时 30 分钟冻结候选 →
-仅发布候选执行 8 小时或更长 soak。任何正确性、兼容性、资源所有权或 p95/p99 门禁失败都先回退候选，
-不靠延长测试时间掩盖问题。
+聚焦单测/契约测试 → Release 构建 → 3–5 分钟 smoke 或同构 A/B；必要时补一次 10–15 分钟样本。当前阶段到功能联调验收为止。

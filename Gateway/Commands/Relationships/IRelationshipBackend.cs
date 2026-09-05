@@ -1,4 +1,5 @@
 using ChatApp.Realtime.Integration;
+using ChatApp.Shared.Protocol.Tcp;
 using ChatApp.TcpGateway.Core.Messaging.Relationships;
 using ChatApp.TcpGateway.Observability.Logging;
 using Microsoft.Extensions.Logging;
@@ -130,7 +131,7 @@ internal sealed class StubRelationshipBackend : IRelationshipBackend
         _logger.RelationshipListBackendUnavailable(requestId, (int)listType, actorUserId);
         return Task.FromResult(RelationshipListBackendResult.Failed(
             requestId,
-            "relationship_service_unavailable",
+            TcpRelationshipListErrorCode.ProjectionUnavailable,
             "关系服务暂未配置。"));
     }
 }

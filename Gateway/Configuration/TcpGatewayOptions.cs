@@ -381,6 +381,14 @@ public sealed class TcpGatewayOptions
     public bool EnableResume { get; set; } = true;
 
     /// <summary>
+    /// 连接级二进制 payload 格式（chatapp-bin-v1，BIN-INTEGRATION-3）。
+    /// 启用后：客户端在 ClientHello 声明 BinaryPayload 能力位且非 Resume 路径时，
+    /// ServerHello.PayloadFormat 回应 chatapp-bin-v1，该连接完整握手后固定二进制编解码；
+    /// 握手段（ClientHello/ServerHello）与 Resume 始终 JSON。默认关闭，保持 JSON 默认路径。
+    /// </summary>
+    public bool EnableBinaryPayloadFormat { get; set; }
+
+    /// <summary>
     /// ResumeToken 有效期。客户端断线后须在此时间内重连。
     /// 默认 30 秒：足够客户端检测断线并重连，又不至于过长占用会话资源。
     /// </summary>

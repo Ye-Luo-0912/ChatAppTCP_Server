@@ -11,6 +11,7 @@ using ChatApp.TcpGateway.Gateway.Networking.Sessions;
 using ChatApp.TcpGateway.Observability.Logging;
 using ChatApp.TcpGateway.Observability.Metrics;
 using Microsoft.Extensions.Logging;
+using ChatApp.TcpGateway.Gateway.Serialization;
 
 namespace ChatApp.TcpGateway.Gateway.Commands.Messaging;
 
@@ -25,7 +26,11 @@ internal sealed partial class MessagingCommandHandler
         TcpClientSession receiver,
         CancellationToken cancellationToken)
     {
-        var request = _messageReceiptRequestCodec.Deserialize(payload);
+        var request = SessionPayload.Deserialize(
+            receiver,
+            PacketCommand.MessageReceipt,
+            _messageReceiptRequestCodec,
+            payload);
         if (request is null ||
             string.IsNullOrWhiteSpace(request.MessageId) ||
             request.MessageId.Length > 64 ||
@@ -109,6 +114,7 @@ internal sealed partial class MessagingCommandHandler
         using var outboundFrame = OutboundFrameFactory.Create(
             PacketCommand.MessageReceiptAcknowledgement,
             _messageReceiptAcknowledgementCodec,
+            session,
             acknowledgement);
         session.TryQueue(outboundFrame);
     }

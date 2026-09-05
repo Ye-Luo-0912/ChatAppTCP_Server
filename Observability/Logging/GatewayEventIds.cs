@@ -45,4 +45,5 @@ public static class GatewayEventIds
     public const int AttachmentBackendUnavailable = 1600;
     public const int RelationshipMutateBackendUnavailable = 1601;
     public const int RelationshipListBackendUnavailable = 1602;
+    public const int CallBackendUnavailable = 1603;
 }

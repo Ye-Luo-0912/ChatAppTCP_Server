@@ -2,7 +2,7 @@
 
 Guidance for humans and coding agents working in this repository.
 
-接手时先读相关实现、调用方、上下游契约和测试，确认命令语义、兼容窗口与资源所有权后再改。优先级是正确/安全、可维护、可测量的性能、真实复用；只共享稳定、线程安全且生命周期匹配的资源，禁止共享 `DbContext`、事务、流和连接级可变会话。验证按聚焦单测/契约测试 → Release 构建 → 短时 smoke 推进，阶段长测和发布 soak 只用于功能冻结后的候选版本。当前路线见 `docs/NEXT-STAGE.md`。
+接手时先读相关实现、调用方、上下游契约和测试，确认命令语义、兼容窗口与资源所有权后再改。优先级依次是正确/安全、功能链路完整、可维护、真实复用、可测量的性能；只共享稳定、线程安全且生命周期匹配的资源，禁止共享 `DbContext`、事务、流和连接级可变会话。验证按聚焦单测/契约测试 → Release 构建 → 短时 smoke 推进。当前路线见 `docs/NEXT-STAGE.md`。
 
 ## Architecture boundaries
 
@@ -47,7 +47,7 @@ dotnet test tests/ChatApp.TcpGateway.Tests/ChatApp.TcpGateway.Tests.csproj -c Re
 
 ### Performance tools
 
-See `tools/ChatApp.Performance.Orchestrator/README.md`, `docs/performance-baseline.md`, and `docs/optimization-roadmap.md`.
+See `tools/ChatApp.Performance.Orchestrator/README.md`, `docs/performance-baseline.md`, and `docs/roadmap-todo.md`.
 
 ## Known structural debt
 
@@ -66,4 +66,4 @@ Use `scratch/` for temporary scripts (gitignored).
 
 ## Performance runs
 
-按 `tools/ChatApp.Performance.Orchestrator/README.md` 执行：每轮使用独立 run 目录，记录 invocation manifest、源码/工具 hash 与报告路径；开发阶段优先短测，长测只用于冻结后的候选版本，禁止用 `git pull` 改写已声明的测试快照。
+按 `tools/ChatApp.Performance.Orchestrator/README.md` 执行：每轮使用独立 run 目录，记录 invocation manifest、源码/工具 hash 与报告路径；当前阶段优先短测，禁止用 `git pull` 改写已声明的测试快照。

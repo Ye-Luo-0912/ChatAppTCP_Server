@@ -3,6 +3,86 @@
 本文件记录已完成的历史变更，按时间倒序排列。当前状态见 `roadmap-current-state.md`，
 未完成工作见 `roadmap-todo.md`。本文件不再保留过期测试数字（当时通过数仅作参考）。
 
+## 2026-08-30
+
+### BIN-INTEGRATION-3 连接级二进制 payload 双端接入
+
+Gateway 侧完成 `chatapp-bin-v1` 双 codec 接入与验收（JSON 默认路径不变）：
+
+- 协商：`GatewayFeature.BinaryPayload` 入 `GatewayFeatureSet.Implemented`（修复缺位导致协商永不发生的 bug）；
+  `TcpGatewayOptions.EnableBinaryPayloadFormat`（默认 false）门控；非 Resume 路径协商出 BinaryPayload 时
+  `ServerHello.PayloadFormat` 回应 `chatapp-bin-v1`，`TcpClientSession.NegotiatedPayloadFormat` 握手后不可变；
+  Resume 路径强制 JSON 且协商位同步剥离该能力位。
+- 入站：`SessionPayload.Deserialize` 按会话格式分流；二进制走共享 `TcpBinaryWireCodec` 寄存器 +
+  `BinaryPayloadMapper.ToLocal`（68 个本地↔共享映射 + 11 个共享类型恒等）；畸形/超限 fail-closed 关连接。
+- 出站：`OutboundFrameFactory.Create(command, codec, session, value)` 按会话格式分流 + `CreateBinary`
+  （`TcpBinaryWireEncoder` 编码，DestinationTooSmall 单次扩容重试）；fanout 用 `FormatGroupedFrame`
+  按格式各至多编码一次共享帧。
+- 验证：新增 9 项真 TCP 集成测试（协商成功/JSON fallback×2/Resume-JSON/二进制往返/混合格式 fanout/
+  畸形 fail-closed/未知命令/二进制 GoAway），全量 630 项测试全绿；80/320/640 msg/s 短测
+  （`scratch/binary-shorttest-report-20260830.md`）payload −47%、640/s CPU −28.5%、
+  零漏投/零重复、p99 ≤1.9 ms。
+- 跨进程真机验证：部署 relgate 全栈 + e2e 驱动（.tmp-bin-e2e / .tmp-call-e2e 经 SSH 隧道）12/12 与 27/27 通过；过程中发现并修复 6 处 fanout/响应站点漏做格式分组的真实 bug（旧 3 参 JSON-only Create 向二进制会话投 JSON 帧），新增混合格式回归测试防复发；网关测试 632 全绿。
+- 依赖：共享契约包 `ChatApp.Protocol.Tcp.Binary.Schemas` 0.5.4（含新增编码寄存器
+  `TcpBinaryWireEncoder`；本地 feed Protocol.Tcp 0.5.3 残缺旧构建弃用，统一 0.5.4）。
+
+## 2026-08-14
+
+### REL-E2E-4 Gateway 关系读取端收口
+
+Gateway 关系读取 handler 从 Core/Realtime 内部 DTO 迁到 Shared `TcpRelationshipList*`
+wire 契约，作为 Client↔Gateway 之间关系只读列表的唯一 schema。
+
+- `RelationshipCommandHandler.HandleListAsync` 使用 Shared
+  `TcpRelationshipListRequest/Response`；内部经 `HistoryWireMapper.MapRelationshipItems`
+  显式把 Realtime `RelationshipListItem` 映射为 Shared `TcpRelationshipListItem`，
+  禁止把 Realtime 内部 DTO 直接序列化给客户端。
+- 稳定错误码落地：`ProjectionUnavailable` / `ProjectionChanged` / `GapDetected` /
+  `InvalidCursor` / `PageSizeOutOfRange` / `BadRequest`；`ResetRequired` 仅在
+  projection-changed / gap 时置位，失败不推动 Client 水位。
+- 命令级门控：`CommandCatalog.RelationshipListRequest` 增加
+  `RequiredFeature = GatewayFeature.RelationshipRead`（Shared 分配位 `1u<<13`），
+  加入 `GatewayFeatureSet.Implemented`；严格客户端需协商能力位，legacy 客户端向后兼容。
+- DI 与序列化：`GatewayJsonSerializerContext` 注册 Shared `TcpRelationshipList*` 类型，
+  `InfrastructureServiceCollectionExtensions` 改用 Shared list codec；5 个既有测试文件
+  更新 handler 构造参数。
+- 新增端到端集成测试 `RelationshipListReadIntegrationTests`（5 项）：item 映射、分页
+  （HasMore/NextCursor）、gap 触发 reset、unavailable fail-closed、page size 越界。
+  全部 574 项测试通过（1 项 Redis 用例按设计跳过）。
+- Server/Client 侧剩余工作（HTTP 权威逐项对照、Client 水位恢复）见 `roadmap-todo.md`。
+
+## 2026-08-11
+
+### TCP-MEM-1 正式测量完成（Linux 真机 192.168.5.49）
+
+完整批次 `3 画像 × 3 轮 × 10 分钟` 全部 `VALID`（`memory-profile-20260811-011250Z`，
+`TCP-MEM-1: PASSED (all profiles/repeats valid)`）。该批次只产证据、不改功能，
+详细归因与数值见 `roadmap-current-state.md` 性能基线段。
+
+- 证据：每轮 2 Gateway 的 `Max PSS`（smaps_rollup）、`Max VmRSS/VmHWM`（/proc）、
+  cgroup 峰值、`/proc/{pid}/fd` 峰值，每轮 2 个 gcdump（共 18 个），
+  `ss -tinm` socket 归属（每 Gateway ≈5002 socket = 5000 连接 + 监听）。
+- 画像内存梯度符合预期：active（213–230 MiB PSS）> heartbeat（197–209 MiB）>
+  silent（175–183 MiB）。
+- 管道修复：
+  - 后台任务 `[ordered]@{}` 反序列化为 `OrderedDictionary`，类型过滤需覆盖
+    `IDictionary`、`Get-OptionalProperty` 需按字典键读取，使 gcdump/socket 证据正确聚合；
+  - `ss` 归属正则改为 `pid=<pid>,`（逗号而非空白前缀），使 socket 计数正确归因；
+  - `$pid` 只读变量冲突改用 `$gatewayPid`；
+  - active 画像死信门放宽到「本画像消息理论上限」（slow-reader 场景非内存归因语义，
+    实测约 6% 消息被限流死信，原 `slowReaders*2=200` 过紧导致误报 INVALID）。
+
+## 2026-08-10
+
+### TCP-MEM-1 测量工具交付
+
+- 编排器新增 Linux 内存归因：PSS/smaps_rollup、`/proc/{pid}/fd` 峰值、cgroup sock/oom。
+- `scripts/Run-MemoryProfile.ps1` 编排 10k 静默 / heartbeat-only / 1% active+slow-reader
+  三类画像 × 每轮 10–15 分钟，测量中段并行采集 gcdump 与 `ss -tinm`/sockstat 证据。
+- 相关脚本全部通过 PowerShell AST 解析，orchestrator Release 构建 `0 warning / 0 error`。
+- 修复归因 Markdown 汇总里 `-f` 逗号/除法优先级导致的 "Index (zero based)..."
+  格式化报错（改为先算标量再格式化），smoke 报告生成链路可用。
+
 ## 2026-08-04
 
 ### P1 跨仓库与功能语义问题（5 项全部完成）
