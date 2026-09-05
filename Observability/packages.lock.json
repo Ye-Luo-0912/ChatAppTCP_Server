@@ -4,9 +4,15 @@
     "net10.0": {
       "ChatApp.Protocol.Tcp": {
         "type": "Direct",
+<<<<<<< HEAD
         "requested": "[0.5.8, )",
         "resolved": "0.5.8",
         "contentHash": "UvlQEWespnuJxaRjKZuuKwBUd/N96zWI4qfLcrapUIrT7EiN61Ki1oST10/apnl1+sw834RlWqeN50d2I5YD6w=="
+=======
+        "requested": "[0.4.1, )",
+        "resolved": "0.4.1",
+        "contentHash": "gzy/T+fKmELp1OH7jUaATnWXfyBzsxfDtFl688gSBBMxzosN++zMY8dfx+2pnBNz0NrAdWs8TRIRn1MZg5StHQ=="
+>>>>>>> agent/contract-binary-and-p0-20260811
       },
       "Microsoft.Extensions.Logging.Abstractions": {
         "type": "Direct",

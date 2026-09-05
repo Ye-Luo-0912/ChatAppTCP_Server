@@ -180,7 +180,10 @@ $profileConfigs = [ordered]@{
         TcpPayloadBytes = 128
         TcpDeliveryDrainSeconds = 30
         MaximumDeadLetters = 0
+<<<<<<< HEAD
         TcpInflightTtlSeconds = $TcpInflightTtlSeconds
+=======
+>>>>>>> agent/contract-binary-and-p0-20260811
     }
     heartbeat = [ordered]@{
         Label = 'heartbeat'
@@ -193,7 +196,10 @@ $profileConfigs = [ordered]@{
         TcpPayloadBytes = 128
         TcpDeliveryDrainSeconds = 30
         MaximumDeadLetters = 0
+<<<<<<< HEAD
         TcpInflightTtlSeconds = $TcpInflightTtlSeconds
+=======
+>>>>>>> agent/contract-binary-and-p0-20260811
     }
     active = [ordered]@{
         Label = 'active'
@@ -209,6 +215,7 @@ $profileConfigs = [ordered]@{
         TcpDeliveryDrainSeconds = 0
         # slow reader 不消费导致指向它们的投递被实时服务限流而死信（rate_limited），
 <<<<<<< HEAD
+<<<<<<< HEAD
         # 属 slow-reader 画像的固有语义；该画像只测内存归因，不校验端到端交付收尾，
         # 故把死信门上限放宽到「本画像消息理论上限 = 全部 chat 消息量」，
         # 使门在 slow-reader 语义下恒过（实测约 6% 消息被限流死信，slowReaders*2 过紧）。
@@ -223,6 +230,10 @@ $profileConfigs = [ordered]@{
         # 该画像只测内存归因，不校验端到端交付收尾，故把 in-flight TTL 放大到覆盖完整测量窗口
         # (ramp+warmup+measure+余量)，使 slow-reader 消息不会在测量期间过期。
         TcpInflightTtlSeconds = [int]($rampSeconds + $WarmupSeconds + $DurationSeconds + 120)
+=======
+        # 属 slow-reader 画像的固有语义；放宽死信门上限（按 slow reader 数量比例）。
+        MaximumDeadLetters = [long]($slowReaders * 2)
+>>>>>>> agent/contract-binary-and-p0-20260811
     }
 }
 
@@ -411,7 +422,10 @@ foreach ($profileName in $selectedProfiles) {
             TcpMode = [string]$config.TcpMode
             TcpMessagesPerSecond = [double]$config.TcpMessagesPerSecond
             TcpDeliveryDrainSeconds = [int]$config.TcpDeliveryDrainSeconds
+<<<<<<< HEAD
             TcpInflightTtlSeconds = [int]$config.TcpInflightTtlSeconds
+=======
+>>>>>>> agent/contract-binary-and-p0-20260811
             MaximumDeadLetters = [long]$config.MaximumDeadLetters
             TcpInactiveHeartbeatSeconds = [int]$config.TcpInactiveHeartbeatSeconds
             TcpPayloadBytes = [int]$config.TcpPayloadBytes

@@ -10,6 +10,7 @@
       },
       "ChatApp.Protocol.Tcp": {
         "type": "Direct",
+<<<<<<< HEAD
         "requested": "[0.5.8, )",
         "resolved": "0.5.8",
         "contentHash": "UvlQEWespnuJxaRjKZuuKwBUd/N96zWI4qfLcrapUIrT7EiN61Ki1oST10/apnl1+sw834RlWqeN50d2I5YD6w=="
@@ -30,6 +31,17 @@
         "requested": "[0.5.3, )",
         "resolved": "0.5.3",
         "contentHash": "nC8kLRTxHCg12trU++6VkvygPu9AuWjSnnk1CCXZDRfO5y4g3mvXQuPtgKcG3zNcF4ddQy0y7OJxJY1I65cCHA==",
+=======
+        "requested": "[0.4.1, )",
+        "resolved": "0.4.1",
+        "contentHash": "gzy/T+fKmELp1OH7jUaATnWXfyBzsxfDtFl688gSBBMxzosN++zMY8dfx+2pnBNz0NrAdWs8TRIRn1MZg5StHQ=="
+      },
+      "ChatApp.Protocol.Tcp.Json": {
+        "type": "Direct",
+        "requested": "[0.4.1, )",
+        "resolved": "0.4.1",
+        "contentHash": "vU3DzT3SzpE3lWT7DZb8Iz8UIzwRTRCjHJg6K/5ljYgIP9AdJdG0yms4cHQHnCRYKrgvWPP8pCOiK9MYix2CWg==",
+>>>>>>> agent/contract-binary-and-p0-20260811
         "dependencies": {
           "ChatApp.Protocol.Tcp": "0.5.3"
         }
