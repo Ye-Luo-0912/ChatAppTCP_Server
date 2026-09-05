@@ -49,8 +49,14 @@ internal sealed record GroupCallRelayVerdict(
 /// 中继逐命令校验 grant（结构 + 过期 + 签名 + actor 成员资格），通过后把信令按参与者名单
 /// 扇出到其余成员的在线会话：invite/accept/reject/cancel/ringing/reconnect 原样中继（既有
 /// <see cref="TcpCallCommandType"/> kind），成员主动离开（End）转为
-/// <see cref="TcpCallConstants.SignalEventParticipantLeft"/> 事件。成员变更 = 新 grant 批次 +
-/// revision 递增，客户端以 revision/成员列表自洽（见 group-call-sfu-design.md §4.1/§4.2）。
+/// <see cref="TcpCallConstants.SignalEventParticipantLeft"/> 事件。成员变更 = 同 CallId 重签
+/// 新批次 + revision 递增（客户端以 revision/成员列表自洽，见 group-call-sfu-design §4.1/§4.2）。
+/// </para>
+/// <para>
+/// 0.5.8 加性语义（GROUP-CALL-SDP-1 / GAP-1）：逐成员 invite 的目标成员 Id 随信号透传
+/// （<see cref="TcpCallSignal.ParticipantUserId"/>，目标不在名单内 fail-closed），被叫据此过滤；
+/// invite 信号同时携带 grant（<see cref="TcpCallSignal.Grant"/>）下发被叫，被叫 accept/end
+/// 据此回带授权。目标/grant 缺省（null）保持 0.5.7 广播形态，既有客户端零改动。
 /// </para>
 /// <para>
 /// 群组命令<b>不进入</b> Realtime 1:1 状态机（<see cref="ICallBackend"/>）——群组 grant 的
@@ -126,6 +132,21 @@ internal sealed class GroupCallSignalRelay
                 TcpCallErrorCode.GrantInvalid, "发起者不在群组通话成员名单内。");
         }
 
+        // 逐成员 invite 的目标成员（GROUP-CALL-SDP-1）：随信令透传，被叫据此过滤——
+        // 只有目标成员应用该 invite 的 offer/建会话，其余成员对当前会话无操作。
+        // 目标必须在名单内（不在名单内 = 客户端未重签即邀人，fail-closed）；
+        // 目标缺省（null，0.5.7 旧客户端）保持广播形态，既有客户端零改动。
+        long? inviteTarget = null;
+        if (request.Type == TcpCallCommandType.Invite)
+        {
+            inviteTarget = request.ParticipantUserId;
+            if (inviteTarget is { } target && !grant.Participants!.Contains(target))
+            {
+                return GroupCallRelayVerdict.Fail(
+                    TcpCallErrorCode.GrantInvalid, "群组 invite 目标不在成员名单内。");
+            }
+        }
+
         var occurredAtMs = nowMs;
         var recipients = grant.Participants!.Where(id => id != actorUserId);
         var signals = recipients
@@ -145,9 +166,17 @@ internal sealed class GroupCallSignalRelay
                 Event = request.Type == TcpCallCommandType.End
                     ? TcpCallConstants.SignalEventParticipantLeft
                     : null,
-                ParticipantUserId = request.Type == TcpCallCommandType.End
-                    ? actorUserId
-                    : null
+                ParticipantUserId = request.Type switch
+                {
+                    // 成员离开：事件带离开者 Id。
+                    TcpCallCommandType.End => actorUserId,
+                    // 逐成员 invite：事件带被邀成员 Id（其余成员据此忽略，GROUP-CALL-SDP-1）。
+                    TcpCallCommandType.Invite => inviteTarget,
+                    _ => null
+                },
+                // 群组 invite 随信令下发 grant（GROUP-CALL-GAP-1）：被叫 accept/end 据此
+                // 携带授权回中继。grant 签名覆盖 CallId/名单，对授权完整性无影响。
+                Grant = request.Type == TcpCallCommandType.Invite ? grant : null
             })
             .ToArray();
 

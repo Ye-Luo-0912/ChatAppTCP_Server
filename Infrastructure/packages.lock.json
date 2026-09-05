@@ -151,22 +151,22 @@
       "ChatApp.TcpGateway.Core": {
         "type": "Project",
         "dependencies": {
-          "ChatApp.Protocol.Tcp": "[0.5.7, )",
+          "ChatApp.Protocol.Tcp": "[0.5.8, )",
           "ChatApp.Realtime.Contracts": "[2.5.5, )"
         }
       },
       "chatapp.tcpgateway.observability": {
         "type": "Project",
         "dependencies": {
-          "ChatApp.Protocol.Tcp": "[0.5.7, )",
+          "ChatApp.Protocol.Tcp": "[0.5.8, )",
           "Microsoft.Extensions.Logging.Abstractions": "[10.0.5, )"
         }
       },
       "ChatApp.Protocol.Tcp": {
         "type": "CentralTransitive",
-        "requested": "[0.5.7, )",
-        "resolved": "0.5.7",
-        "contentHash": "oSYZHNF3m0Jr4UIfuTm0tZMjOPZ5WWkjeFXkil9hFO9/vuZZeWZW9UQnXX3ZVU/u/juVQbLp3cCdd2/5807DFw=="
+        "requested": "[0.5.8, )",
+        "resolved": "0.5.8",
+        "contentHash": "UvlQEWespnuJxaRjKZuuKwBUd/N96zWI4qfLcrapUIrT7EiN61Ki1oST10/apnl1+sw834RlWqeN50d2I5YD6w=="
       },
       "ChatApp.Realtime.Contracts": {
         "type": "CentralTransitive",

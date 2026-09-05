@@ -18,11 +18,11 @@
     <PackageVersion Include="StackExchange.Redis" Version="3.0.17" />
     <PackageVersion Include="xunit.v3" Version="3.2.2" />
     <PackageVersion Include="ChatApp.Auth.Contracts" Version="0.2.0" />
-    <PackageVersion Include="ChatApp.Protocol.Tcp" Version="0.5.7" />
+    <PackageVersion Include="ChatApp.Protocol.Tcp" Version="0.5.8" />
     <PackageVersion Include="ChatApp.Protocol.Tcp.Json" Version="0.5.3" />
-    <PackageVersion Include="ChatApp.Binary.Core" Version="0.5.7" />
-    <PackageVersion Include="ChatApp.Protocol.Tcp.Binary" Version="0.5.7" />
-    <PackageVersion Include="ChatApp.Protocol.Tcp.Binary.Schemas" Version="0.5.7" />
+    <PackageVersion Include="ChatApp.Binary.Core" Version="0.5.8" />
+    <PackageVersion Include="ChatApp.Protocol.Tcp.Binary" Version="0.5.8" />
+    <PackageVersion Include="ChatApp.Protocol.Tcp.Binary.Schemas" Version="0.5.8" />
     <!-- P1-1：版本化 Contract Package 本地 feed 契约包（见 NuGet.config 中 packages/ 源）。 -->
     <!-- ACCOUNT-OPS-1 收尾：Contracts 2.5.5（ConversationMutesQuery/Result + IRealtimeConversationStore
          .QueryMutedMemberIdsAsync）+ Integration 3.1.6（QueryConversationMutesAsync request/reply，

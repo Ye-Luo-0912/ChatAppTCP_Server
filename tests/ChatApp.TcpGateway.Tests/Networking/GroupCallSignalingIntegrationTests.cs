@@ -50,7 +50,8 @@ public sealed class GroupCallSignalingIntegrationTests
         TcpCallCommandType type,
         TcpCallGrant grant,
         long actorUserId,
-        long revision = 1) => new()
+        long revision = 1,
+        long? inviteTarget = null) => new()
     {
         RequestId = $"req-{Guid.NewGuid():N}",
         CommandId = $"cmd-{(int)type}-{Guid.NewGuid():N}",
@@ -60,7 +61,8 @@ public sealed class GroupCallSignalingIntegrationTests
         Revision = revision,
         Grant = grant,
         Sdp = type == TcpCallCommandType.Invite ? OfferSdp : null,
-        ClientOccurredAtMs = 1_900_000_000_000L
+        ClientOccurredAtMs = 1_900_000_000_000L,
+        ParticipantUserId = inviteTarget
     };
 
     [Fact(Timeout = 15_000)]
@@ -346,6 +348,118 @@ public sealed class GroupCallSignalingIntegrationTests
         var readTask = harness.ReadFrameAsync(stream).AsTask();
         var completed = await Task.WhenAny(readTask, Task.Delay(400));
         Assert.NotSame(readTask, completed);
+    }
+
+    // ---- GROUP-CALL-SDP-1 / GAP-1：逐成员 invite 目标透传 + invite 随信令下发 grant ----
+
+    [Fact(Timeout = 15_000)]
+    public async Task GroupInvite_WithRosterTarget_SignalsCarryTargetAndGrant()
+    {
+        var backend = new RecordingBackend();
+        await using var harness = await CallSignalingIntegrationTests.CallHarness.StartAsync(backend, Secret);
+
+        using var caller = new TcpClient { NoDelay = true };
+        using var callee = new TcpClient { NoDelay = true };
+        using var third = new TcpClient { NoDelay = true };
+        await caller.ConnectAsync(IPAddress.Loopback, harness.Port, harness.Token);
+        await callee.ConnectAsync(IPAddress.Loopback, harness.Port, harness.Token);
+        await third.ConnectAsync(IPAddress.Loopback, harness.Port, harness.Token);
+        await using var callerStream = caller.GetStream();
+        await using var calleeStream = callee.GetStream();
+        await using var thirdStream = third.GetStream();
+        await harness.AuthenticateAsync(callerStream, "caller-token", CallerId);
+        await harness.AuthenticateAsync(calleeStream, "callee-token", 43);
+        await harness.AuthenticateAsync(thirdStream, "third-token", 44);
+
+        // 逐成员 invite：目标成员 43（grant 名单内）。
+        var grant = SignedGroupGrant(1_900_000_100_000L);
+        await harness.WriteCallCommandAsync(
+            callerStream,
+            GroupRequest(TcpCallCommandType.Invite, grant, CallerId, inviteTarget: 43));
+
+        var response = CallSignalingIntegrationTests.CallHarness.DeserializeResponse(
+            (await harness.ReadFrameAsync(callerStream)).Payload);
+        Assert.NotNull(response);
+        Assert.True(response.Succeeded);
+
+        // 全部扇出信号携带目标成员 Id 与随信令下发的 grant（真实 wire 编解码往返）。
+        foreach (var (stream, expectedToUserId) in new[] { (calleeStream, 43L), (thirdStream, 44L) })
+        {
+            var signal = CallSignalingIntegrationTests.CallHarness.DeserializeSignal(
+                (await harness.ReadFrameAsync(stream)).Payload);
+            Assert.NotNull(signal);
+            Assert.Equal(TcpCallCommandType.Invite, signal.Kind);
+            Assert.Equal(expectedToUserId, signal.ToUserId);
+            Assert.Equal(43, signal.ParticipantUserId); // 被邀成员 Id（非 ToUserId）
+            Assert.Null(signal.Event);
+            Assert.NotNull(signal.Grant);
+            Assert.Equal("call-group-1", signal.Grant.CallId);
+            Assert.Equal(TcpCallKind.Group, signal.Grant.CallKind);
+            Assert.Equal(Participants, signal.Grant.Participants);
+            Assert.Equal(grant.Signature, signal.Grant.Signature);
+        }
+    }
+
+    [Fact(Timeout = 15_000)]
+    public async Task GroupInvite_TargetOutsideRoster_FailClosed()
+    {
+        var backend = new RecordingBackend();
+        await using var harness = await CallSignalingIntegrationTests.CallHarness.StartAsync(backend, Secret);
+
+        using var caller = new TcpClient { NoDelay = true };
+        using var callee = new TcpClient { NoDelay = true };
+        await caller.ConnectAsync(IPAddress.Loopback, harness.Port, harness.Token);
+        await callee.ConnectAsync(IPAddress.Loopback, harness.Port, harness.Token);
+        await using var callerStream = caller.GetStream();
+        await using var calleeStream = callee.GetStream();
+        await harness.AuthenticateAsync(callerStream, "caller-token", CallerId);
+        await harness.AuthenticateAsync(calleeStream, "callee-token", 43);
+
+        // 邀请名单外用户 77（客户端未重签即邀人）→ fail-closed，不扇出。
+        await harness.WriteCallCommandAsync(
+            callerStream,
+            GroupRequest(TcpCallCommandType.Invite, SignedGroupGrant(1_900_000_100_000L), CallerId, inviteTarget: 77));
+
+        var response = CallSignalingIntegrationTests.CallHarness.DeserializeResponse(
+            (await harness.ReadFrameAsync(callerStream)).Payload);
+        Assert.NotNull(response);
+        Assert.False(response.Succeeded);
+        Assert.Equal(TcpCallErrorCode.GrantInvalid, response.ErrorCode);
+        await AssertNoSignalAsync(harness, calleeStream);
+    }
+
+    [Fact(Timeout = 15_000)]
+    public async Task GroupInvite_WithoutTarget_LegacyBroadcastSignalsCarryNoTarget()
+    {
+        var backend = new RecordingBackend();
+        await using var harness = await CallSignalingIntegrationTests.CallHarness.StartAsync(backend, Secret);
+
+        using var caller = new TcpClient { NoDelay = true };
+        using var callee = new TcpClient { NoDelay = true };
+        await caller.ConnectAsync(IPAddress.Loopback, harness.Port, harness.Token);
+        await callee.ConnectAsync(IPAddress.Loopback, harness.Port, harness.Token);
+        await using var callerStream = caller.GetStream();
+        await using var calleeStream = callee.GetStream();
+        await harness.AuthenticateAsync(callerStream, "caller-token", CallerId);
+        await harness.AuthenticateAsync(calleeStream, "callee-token", 43);
+
+        // 0.5.7 形态（目标缺省）：广播 invite 信号不携带目标成员（grant 仍加性下发——
+        // 0.5.7 旧解码端忽略未知字段，零改动）。
+        await harness.WriteCallCommandAsync(
+            callerStream,
+            GroupRequest(TcpCallCommandType.Invite, SignedGroupGrant(1_900_000_100_000L), CallerId));
+
+        var response = CallSignalingIntegrationTests.CallHarness.DeserializeResponse(
+            (await harness.ReadFrameAsync(callerStream)).Payload);
+        Assert.NotNull(response);
+        Assert.True(response.Succeeded);
+
+        var signal = CallSignalingIntegrationTests.CallHarness.DeserializeSignal(
+            (await harness.ReadFrameAsync(calleeStream)).Payload);
+        Assert.NotNull(signal);
+        Assert.Equal(TcpCallCommandType.Invite, signal.Kind);
+        Assert.Null(signal.ParticipantUserId);
+        Assert.Null(signal.Event);
     }
 
     /// <summary>记录型 1:1 后端：群组命令绝不应触达。</summary>
