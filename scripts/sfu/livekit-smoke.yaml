@@ -1,0 +1,8 @@
+port: 7880
+bind_addresses:
+  - 127.0.0.1
+rtc:
+  udp_port: 7881
+  tcp_port: 7882
+keys:
+  devkey: smoke-secret-0123456789-abcdef-ghijkl
