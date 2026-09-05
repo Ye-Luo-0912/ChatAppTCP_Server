@@ -208,11 +208,16 @@ $profileConfigs = [ordered]@{
         # 该画像只测内存归因，不校验端到端交付收尾，故禁用 delivery drain 语义门。
         TcpDeliveryDrainSeconds = 0
         # slow reader 不消费导致指向它们的投递被实时服务限流而死信（rate_limited），
+<<<<<<< HEAD
         # 属 slow-reader 画像的固有语义；该画像只测内存归因，不校验端到端交付收尾，
         # 故把死信门上限放宽到「本画像消息理论上限 = 全部 chat 消息量」，
         # 使门在 slow-reader 语义下恒过（实测约 6% 消息被限流死信，slowReaders*2 过紧）。
         MaximumDeadLetters = [long]($activeSenders * $ActiveMessagesPerSecond *
             ($rampSeconds + $WarmupSeconds + $DurationSeconds))
+=======
+        # 属 slow-reader 画像的固有语义；放宽死信门上限（按 slow reader 数量比例）。
+        MaximumDeadLetters = [long]($slowReaders * 2)
+>>>>>>> origin/master
         # slow reader 不消费导致指向它们的消息在 load generator 的 in-flight 表滞留；
         # 默认 inflight TTL(120s) 会在测量中段触发 fail-fast（"In-flight message ... exceeded the configured TTL"）。
         # 该画像只测内存归因，不校验端到端交付收尾，故把 in-flight TTL 放大到覆盖完整测量窗口
@@ -282,10 +287,14 @@ $collectorScript = {
         # 注意：$PID 是 PowerShell 只读自动变量（大小写不敏感），不能用作循环变量；
         # 否则赋值会抛 "Cannot overwrite variable PID because it is read-only or constant"。
         foreach ($gatewayPid in $Pids) {
+<<<<<<< HEAD
             # ss -tinm -p 的进程归属形如 users:(("dotnet",pid=2446643,fd=199))，
             # pid= 前是逗号而非空白，故不能用 (^|\s) 前缀；直接用 pid=<pid>, 精确匹配，
             # 尾随逗号确保不会误配更长数字（如 pid=24466430,）。
             $matching = @($ssRaw | Where-Object { $_ -match "pid=$gatewayPid," })
+=======
+            $matching = @($ssRaw | Where-Object { $_ -match "(^|\s)pid=$gatewayPid," })
+>>>>>>> origin/master
             $snapshot.SocketCountByPid["$gatewayPid"] = $matching.Count
         }
 
