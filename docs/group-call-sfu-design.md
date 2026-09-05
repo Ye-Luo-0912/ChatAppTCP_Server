@@ -42,8 +42,13 @@ N 人（初始目标：视频 ≤9 路 / 音频 ≤30 路）多方通话，复�
   2. **mediasoup（Node/C++ lib）**：更底层、可完全自定义信令（复用本项目 wire 信令）、
      运维与开发成本更高。
   3. **Jitsi Videobridge**：成熟但栈重。
-  - **建议**：阶段二启动时做 2 周技术验证（LiveKit 与 mediasoup 各跑通 1 房间 12 路
-    音频压测），按验证结果定选型；本设计不预设结论。
+  - **✅ 选型结论（2026-09-06，基于第一二轮验证数据）**：**选型 LiveKit**。
+    理由：①部署验证通过（独立二进制 v1.13.6，Docker Hub 不可达环境可 GitHub Releases 部署）；
+    ②负载达标（30P/30S 零丢包、CPU 7.3%、RSS 2.1GB——目标规格余量充分）；
+    ③TURN 集成内建（房间创建自动分配 turn_password，与既有 coturn 协同）；
+    ④运维成本最低（单二进制 + YAML 配置，无 Node.js wrapper 开发）。
+    mediasoup 保留为后续定制需求备选（需自建 wrapper，投入约为 LiveKit 的 3-5 倍）。
+    **阶段二 MVP 选型定稿：LiveKit self-hosted。**
 - 硬边界（沿用既定原则）：SFU 只转发 RTP/RTCP 与房间级媒体事件；**信令与权限仍走
   既有 TCP wire + Realtime + Server grant 链**；SFU 不落库、不进 Outbox。
 
